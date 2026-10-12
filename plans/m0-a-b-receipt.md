@@ -75,3 +75,18 @@ The pre-fix working tree was not staged when the slice review ran, so its tree h
 - Post-fix tree `788a6acd93508abc84d8f6f6df300e1bab9afaf1` = commit `4d2805d`; final head `1770956` tree `6de5ddf0332da6d86d5df9479da801d9f1af4cc0` recorded in `.needletail-dev/m0-tree-hash.txt`.
 - Final verification at `1770956`/`6de5ddf…` returned NEEDS_EVIDENCE on F-3 (catalog status of reassigned IDs contradicted the report) plus stale-text gaps N2–N4; all corrected in the follow-up commit.
 - Closure verification at `a91f689`/`0315650…` found one surviving stale sentence (this file's F-8 row and the report's F-8 bullet); corrected in the next commit. Both tree hashes are immutable in git history (`4d2805d`→`788a6ac…`, `1770956`→`6de5ddf…`, `a91f689`→`0315650…`); `.needletail-dev/m0-tree-hash.txt` points at the latest reviewed head.
+
+---
+
+## Closure determination
+
+| Review | Subject | Disposition |
+|---|---|---|
+| Plan review (pre-implementation) | plan `974ad35d…`, baseline `86a717b0…` | READY (DR-01…DR-14 folded) |
+| Completed-slice review | pre-fix slice tree | NEEDS_EVIDENCE (F-1…F-10; all fixed) |
+| Toolchain re-qualification review | `1770956` / `6de5ddf…` | NEEDS_EVIDENCE (F-3 PARTIAL + N2–N4; fixed at `a91f689`) |
+| Closure verification | `a91f689` / `0315650…` | NEEDS_EVIDENCE (surviving F-8 sentence; fixed at `5ad7d28`) |
+| Final check | `5ad7d28` / `a8d7177…` | NEEDS_EVIDENCE (stale 20-test count in STATUS; fixed at `07e0269`) |
+| Incremental doc-only review | `07e0269` / `d7a1107…` | **READY TO CLOSE** |
+
+Final closure: `deepseek-reviewer` route `opencode-go/deepseek-v4.1-flash`, documentation-only diff verified at `07e0269`, no new blocker. M0-A/M0-B slice is closed at head `07e0269b5254194a73f65928f8f32f03aa3c06bf` (base `86a717b0…`). No tests were re-executed by the reviewer at any round (shell allowlist); all runtime evidence is the retained logs referenced in `plans/m0-milestone-report.md`.

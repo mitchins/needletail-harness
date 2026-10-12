@@ -4,7 +4,7 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 
 ## Current position
 
-- **Milestone:** M0 — M0-A and non-GRDB M0-B implemented and evidenced; slice-closeout review pending; M0-C/M0-D remain (replxx PTY feasibility, clean-runtime bundle, CI, CodeRabbit epic review).
+- **Milestone:** M0 — M0-A and M0-B CLOSED at head `07e0269` (DeepSeek final disposition READY TO CLOSE; base `86a717b0…`). Remaining M0 work: M0-C (replxx PTY feasibility spike) and M0-D (clean-runtime bundle, Linux CI, CodeRabbit epic review when the remote is authorized).
 - **Plan:** `plans/m0-a-b-plan.md` — reviewed by `deepseek-reviewer` (route `opencode-go/deepseek-v4.1-flash`), disposition READY, receipts in `plans/m0-a-b-receipt.md`. REV-01 satisfied before implementation.
 - **Closeout:** `plans/m0-milestone-report.md`.
 - **Scope guard:** M0–M3 only, Linux x86_64/Ubuntu 24.04. No remote writes (push/PR not authorized; GitHub remote configured). No macOS work.
@@ -48,7 +48,7 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 - Timings (DR-07): cold test-graph build 70.0 s (6.3.3) / 1:43.20 (Swift 6.4.0 toolchain-switch rebuild); warm cycle ≤4 s; slowest test 0.033 s; pure vs native split by command. Raw logs under `.needletail-dev/logs/`.
 - **Operator decisions resolved 12 Oct 2026:** D-1 — Swift 6.4.0 installed (spec pin satisfied); D-2 — `libsqlite3-dev` installed, GRDB linked, STORE-01 (native SQLite reopen) PASSES. Slice re-qualified end-to-end on 6.4.0: 21 tests green, DX-08 offline green, bare `swift test` exit 0, qualification detection re-verified.
 - Closeout report: `plans/m0-milestone-report.md` (all fields attested; no pending promises).
-- Slice review by `deepseek-reviewer`: due at slice closeout per REVIEW.md cadence; packet = closeout report + this file. Recorded receipt after the review returns.
+- Slice reviews by `deepseek-reviewer` (route `opencode-go/deepseek-v4.1-flash`): plan READY; completed-slice NEEDS_EVIDENCE → fixed; final closure READY TO CLOSE at `07e0269`. Full review history and dispositions: `plans/m0-a-b-receipt.md`.
 - Review findings DR-01…DR-14 from the plan review: all folded (see plan §13 and receipt).
 
 ## Findings and decisions

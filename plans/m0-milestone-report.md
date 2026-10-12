@@ -83,3 +83,7 @@ NET-05 and CORE-02: DEFERRED_BY_PLAN (due M1) — the cancellation probe exercis
 - F-3 (STATUS): replxx is not a SwiftPM package; vendored at M0-C (unchanged).
 - Catalogue provenance: ACCEPTANCE.md exists only embedded in COMPLETE-SPEC.md Part 10; `expected-index.json` is the frozen hand-audited expectation; digests recorded (accepted DR-04 disposition).
 - Gate status: M0-A closed for scope; M0-B closed including the native SQLite-reopen probe (STORE-01 PASS on Swift 6.4.0). Next authorized action: operator rulings (D-2), then M0-C (replxx PTY feasibility) and M0-D (clean-runtime bundle, CI, CodeRabbit epic review). Stop at M3 for the viability decision (no M4+ work).
+
+## Closure
+
+Final review chain recorded in `plans/m0-a-b-receipt.md`: plan READY → slice NEEDS_EVIDENCE (F-1…F-10 fixed) → re-qualification NEEDS_EVIDENCE (F-3 + stale text fixed) → closure NEEDS_EVIDENCE (F-8 sentence + test count fixed) → final doc-only review **READY TO CLOSE** at head `07e0269b5254194a73f65928f8f32f03aa3c06bf` (base `86a717b0…`). Slice closed; next authorized action: M0-C (replxx PTY feasibility) per the reviewed plan.
