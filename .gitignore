@@ -1,0 +1,14 @@
+# Build outputs
+.build/
+DerivedData/
+
+# Raw developer evidence (M0-A onward): sanitized public summaries only
+.needletail-dev/
+
+# macOS AppleDouble resource-fork files from the spec packet
+._*
+.DS_Store
+
+# Editor/OS scratch
+*.swp
+*~
