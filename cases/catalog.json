@@ -3,7 +3,7 @@
   "format_version": 1,
   "current_milestone": "M0",
   "case_count": 200,
-  "provenance": "Extracted 12 October 2026 from the ACCEPTANCE.md tables embedded in COMPLETE-SPEC.md Part 10 (the standalone ACCEPTANCE.md is absent from this workspace). Scenario text verbatim from the tables. due_milestone and evidence_layers are the implementer's assignment read from MILESTONES.md and the M0-M6 exit criteria; changing them requires slice review. status reflects the M0 baseline: NOT_IMPLEMENTED for cases due at M0, DEFERRED_BY_PLAN for cases due later. No entry is PASS without executed evidence. Per-case status_detail annotations record the M0 slice closeout (plans/m0-milestone-report.md); status field remains the visibility vocabulary, never a self-awarded pass.",
+  "provenance": "Extracted 12 October 2026 from the ACCEPTANCE.md tables embedded in COMPLETE-SPEC.md Part 10 (the standalone ACCEPTANCE.md is absent from this workspace). Scenario text verbatim from the tables. due_milestone and evidence_layers are the implementer's assignment read from MILESTONES.md and the M0-M6 exit criteria; changing them requires slice review. status reflects the M0 baseline: NOT_IMPLEMENTED for cases due at M0, DEFERRED_BY_PLAN for cases due later. No entry is PASS without executed evidence. Per-case status_detail annotations record the M0 slice closeout (plans/m0-milestone-report.md); status field remains the visibility vocabulary, never a self-awarded pass. 12 Oct 2026 update: decisions D-1 (Swift 6.4.0 installed) and D-2 (libsqlite3-dev installed) resolved by the operator; the slice was re-qualified on Swift 6.4.0 and STORE-01 executed.",
   "entries": [
     {
       "id": "BDD-01",
@@ -1199,7 +1199,7 @@
         "integration"
       ],
       "status": "DEFERRED_BY_PLAN",
-      "status_detail": "test_status: DEFERRED_BY_PLAN (due M2); environment_status: UNQUALIFIED_ENVIRONMENT (missing sqlite3.h while decision D-2 is open)"
+      "status_detail": "executed PASS (nativeStorage) 12 Oct 2026 after decision D-2 resolved (libsqlite3-dev installed): SQLite reopen probe green on Swift 6.4.0; evidence .needletail-dev/logs/test-native-swift64-grdb.log"
     },
     {
       "id": "STORE-02",

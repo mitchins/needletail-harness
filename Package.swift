@@ -4,11 +4,12 @@ import PackageDescription
 // Needletail v0.3 — dependency manifest.
 //
 // Pins are the DEPENDENCIES.md candidate set, resolved for real on Linux
-// x86_64 and committed in Package.resolved. GRDB is declared but
-// product-linked by NO target while decision D-2 (SQLite headers) is open:
-// declaring keeps the locked graph honest, not linking keeps the build and
-// the evidence honest. replxx is NOT a package dependency (no Package.swift
-// at revision 1f149bfe…); it is vendored at M0-C per DEPENDENCIES.md.
+// x86_64 and committed in Package.resolved. GRDB now links the
+// NeedletailPrimitiveTests target: decision D-2 was resolved on
+// 12 October 2026 when the operator installed libsqlite3-dev (3.45.1) on
+// the builder, so the STORE-01 SQLite-reopen probe compiles and runs.
+// replxx is NOT a package dependency (no Package.swift at revision
+// 1f149bfe…); it is vendored at M0-C per DEPENDENCIES.md.
 
 let package = Package(
     name: "needletail",
@@ -68,6 +69,10 @@ let package = Package(
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
                 .product(name: "Subprocess", package: "swift-subprocess"),
+                // GRDB was declared-but-unlinked while decision D-2 (SQLite
+                // headers) was open. The operator installed libsqlite3-dev
+                // on 12 October 2026; the STORE-01 reopen probe is linked.
+                .product(name: "GRDB", package: "GRDB.swift"),
             ]
         ),
         .testTarget(

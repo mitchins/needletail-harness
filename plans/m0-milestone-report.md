@@ -8,7 +8,7 @@ Filled 12 October 2026. Every field is attested to work already executed; nothin
 - Base SHA `86a717b0fda17d7690ce97b3161110cd169f5d33`; head SHA: see STATUS.md after commit (the commit containing this report is the reviewed subject).
 - Plan digest: `plans/m0-a-b-plan.md` sha256 `974ad35d…` (reviewed) / `4b0ee01d…` (post-disposition).
 - Dependency-lock digest: `Package.resolved` sha256 `de95226ee800ecb7609e5d8083d7c14dc4bc1f1ddbb2deabf1b23f1d7a8689cc` (26 pins).
-- OS / toolchain / architecture: Ubuntu 24.04.4 LTS x86_64, kernel 7.0.0-31-generic, Swift 6.3.3 via swiftly (Swift 6.4.0 unavailable for Linux — finding F-2 of STATUS.md).
+- OS / toolchain / architecture: Ubuntu 24.04.4 LTS x86_64, kernel 7.0.0-31-generic, **Swift 6.4.0 (swift-6.4-RELEASE)** — the SPEC §3 pin, installed by the operator 12 Oct 2026 and used for the final qualification of this slice; sqlite3 dev headers 3.45.1-1ubuntu2.8 installed (decision D-2).
 
 ## Scope
 
@@ -30,6 +30,11 @@ All raw outputs retained under `.needletail-dev/logs/`:
 | 7-pin scratch build (probe) | `sqlite3.h` not found (GRDBSQLite) | `grdb-sqlite-failure.log` |
 | `./dev build` | Build complete, exit 0 | `dev-build.log` |
 | `./dev test quick` (cold) | 19 tests / 6 suites pass; 70.0 s build+test | `test-quick-cold.log` |
+| `./dev test quick` (Swift 6.4.0 + GRDB, cold on toolchain switch) | 20 tests pass (incl. STORE-01); 1:43.20 build+test | `test-quick-swift64-grdb.log` |
+| `./dev test native` (Swift 6.4.0) | 5 primitive tests pass incl. STORE-01 SQLite reopen | `test-native-swift64-grdb.log` |
+| `./dev test quick` (offline, Swift 6.4.0) | green; proxy-blackholed, no Node/Python on PATH | `test-quick-offline-swift64.log` |
+| `swift test` (bare, Swift 6.4.0) | exit 0; 25 tests; intentional failure unreachable | `bare-swift-test-swift64.log` |
+| `./dev test qualification` (Swift 6.4.0) | intentional failure detected; skips reported | `test-qualification-swift64.log` |
 | `./dev test quick` (warm) | 19 tests pass, 0.014 s bodies; 4.07 s cycle | `test-quick-warm.log` |
 | `./dev test quick` (DX-08 offline) | 19 tests pass; proxy-blackholed network, PATH without Node/Python, fake HOME; exit 0 | `test-quick-offline.log` |
 | `swift test` (bare, default path) | exit 0; intentional failure unreachable by construction | `bare-swift-test.log` |
@@ -40,7 +45,7 @@ All raw outputs retained under `.needletail-dev/logs/`:
 | `./.build/debug/needletail --version`, `--help` | `0.3.0`; offline | `cli-version-help.log` |
 
 - RED evidence: (1) `red-evidence-caseid-parse.log` — the spec-inventory reconciliation failed against the first `CaseID` implementation (multi-hyphen families rejected) and passed after the validator fix; intended failure for the intended reason; (2) the qualification intentional failure is a constructed RED observation, reported distinctly from passes.
-- Cold 70.0 s / warm 4.07 s / slowest test 0.016 s; pure vs native split by command (`quick` = pure + primitives, `native` = primitives only).
+- Cold on toolchain switch 1:43.20 / warm ≤4 s / slowest test 0.033 s (cancellation probe); pure vs native split by command (`quick` = pure + primitives, `native` = primitives only).
 
 ## Results by evidence layer and platform (Linux x86_64 only)
 
@@ -49,7 +54,7 @@ All raw outputs retained under `.needletail-dev/logs/`:
 | pure | BDD-01..04 | 15 | 0 | 0 | 0 | 0 | — |
 | integration | WIRE-01, WIRE-02, NET-04 | 3 | 0 | 0 | 0 | 0 | — |
 | nativeProcess | PROC-01 | 1 | 0 | 0 | 0 | 0 | — |
-| nativeStorage | STORE-01 | 0 | 0 | 0 | 1 | 0 | 0 |
+| nativeStorage | STORE-01 | 1 | 0 | 0 | 0 | 0 | 0 |
 | reviewProcess | REV-01..04, DEV-01, DEV-02, DEV-04 | 7 | 0 | 0 | 0 | 0 | 0 |
 | packaging | PORT-01, DX-08 | 2 | 0 | 0 | 0 | 0 | 0 |
 
@@ -73,8 +78,8 @@ NET-05 and CORE-02: DEFERRED_BY_PLAN (due M1) — the cancellation probe exercis
 
 ## Limitations and gate status
 
-- F-1 (STATUS): GRDB declared-but-not-linked; operator must run `sudo apt install -y libsqlite3-dev` (passwordless sudo unavailable to this agent). STORE-01 then runs.
-- F-2 (STATUS): Swift 6.4.0 unavailable for Linux (404 on all Ubuntu release paths); deviation on 6.3.3 recorded, re-qualify before release.
-- F-3 (STATUS): replxx is not a SwiftPM package; vendored at M0-C.
+- F-1 (STATUS): RESOLVED 12 Oct 2026 — operator installed libsqlite3-dev; GRDB linked; STORE-01 passes.
+- F-2 (STATUS): RESOLVED 12 Oct 2026 — Swift 6.4.0 installed by operator; slice re-qualified on the pinned toolchain.
+- F-3 (STATUS): replxx is not a SwiftPM package; vendored at M0-C (unchanged).
 - Catalogue provenance: ACCEPTANCE.md exists only embedded in COMPLETE-SPEC.md Part 10; `expected-index.json` is the frozen hand-audited expectation; digests recorded (accepted DR-04 disposition).
-- Gate status: M0-A closed for scope; M0-B closed except the SQLite probe (UNQUALIFIED_ENVIRONMENT). Next authorized action: operator rulings (D-2), then M0-C (replxx PTY feasibility) and M0-D (clean-runtime bundle, CI, CodeRabbit epic review). Stop at M3 for the viability decision (no M4+ work).
+- Gate status: M0-A closed for scope; M0-B closed including the native SQLite-reopen probe (STORE-01 PASS on Swift 6.4.0). Next authorized action: operator rulings (D-2), then M0-C (replxx PTY feasibility) and M0-D (clean-runtime bundle, CI, CodeRabbit epic review). Stop at M3 for the viability decision (no M4+ work).

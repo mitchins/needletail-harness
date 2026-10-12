@@ -4,15 +4,15 @@
   "generated": "2026-10-12",
   "milestone": "M0-B",
   "status": "draft \u2014 whole-graph qualification (linkage, plugins, binary contribution, SBOM) is due at M0-D/M6",
-  "platform": "Linux x86_64 / Ubuntu 24.04.4 LTS / Swift 6.3.3",
+  "platform": "Linux x86_64 / Ubuntu 24.04.4 LTS / Swift 6.4.0 (swift-6.4-RELEASE)",
   "pin_count": 26,
   "direct_pin_count": 7,
   "notes": [
     "Candidate pins are the DEPENDENCIES.md selection; this inventory records the ACTUAL resolved graph from Package.resolved, not a fabricated one.",
     "Licence identities are detected from licence files present at each resolved revision and require review before release.",
-    "GRDB is declared but product-linked by no target while decision D-2 (SQLite headers) is open.",
     "replxx (commit 1f149bfe...) is NOT a package: no Package.swift exists at that revision. It is vendored C/C++ at M0-C.",
-    "swift-crypto, like GRDB, is declared but product-linked by no target at M0; build warnings record this. Transitive BoringSSL still compiles for NIOSSL."
+    "swift-crypto, like GRDB, is declared but product-linked by no target at M0; build warnings record this. Transitive BoringSSL still compiles for NIOSSL.",
+    "GRDB links the NeedletailPrimitiveTests target after decision D-2 resolved 12 Oct 2026 (libsqlite3-dev 3.45.1 installed on the builder); direct dependency usage in production targets arrives with M2-A."
   ],
   "packages": [
     {
@@ -34,8 +34,8 @@
       "revision": "b83108d10f42680d78f23fe4d4d80fc88dab3212",
       "licence": "MIT",
       "direct": true,
-      "product": "GRDB (declared, not product-linked while D-2 open)",
-      "use": "SQLite persistence"
+      "product": "GRDB (linked by NeedletailPrimitiveTests after decision D-2 resolved)",
+      "use": "SQLite persistence (STORE-01 reopen probe linked on Linux)"
     },
     {
       "identity": "swift-algorithms",

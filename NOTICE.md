@@ -29,6 +29,8 @@ and re-verified before release (M0-D/M6).
   preserved. It is not a SwiftPM package dependency.
 - **ripgrep** and **git** are operator-provisioned executables, never
   downloaded at runtime.
-- SQLite linkage (target OS library vs pinned amalgamation) is decided by
-  operator decision D-2 and recorded here and in `dependency-inventory.json`
-  when settled.
+- **SQLite:** decision D-2 was resolved on 12 October 2026 (operator ruling):
+  link the target OS SQLite (`libsqlite3-dev` 3.45.1-1ubuntu2.8 on the
+  builder; runtime `libsqlite3-0` already present). GRDB links the
+  NeedletailPrimitiveTests target and the STORE-01 reopen probe passes. A
+  bundled pinned amalgamation remains an M6 packaging option to qualify.
