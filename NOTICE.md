@@ -24,6 +24,13 @@ and re-verified before release (M0-D/M6).
 
 ## Vendored / external components
 
+- **replxx** is vendored as C++ source in `Sources/CReplxx/replxx/` (upstream
+  commit `1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2`, licence in
+  `Sources/CReplxx/replxx/LICENSE.md`). Only the bridge files are
+  Needletail's: `shim.h`, `include/module.modulemap`, `README.provenance`,
+  and `SHA256SUMS-vendored`. C++ runtime: the bundle links the system
+  `libstdc++` (declared in the linkage manifest).
+
 - **replxx** (candidate commit `1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2`) is
   vendored C/C++ source at M0-C with its BSD-style licence and copyright
   preserved. It is not a SwiftPM package dependency.
@@ -34,3 +41,9 @@ and re-verified before release (M0-D/M6).
   builder; runtime `libsqlite3-0` already present). GRDB links the
   NeedletailPrimitiveTests target and the STORE-01 reopen probe passes. A
   bundled pinned amalgamation remains an M6 packaging option to qualify.
+- **Release runtime:** the M0-D bundle links the toolchain Swift runtime
+  dynamically (static Swift stdlib failed to link on Swift 6.4.0 with
+  `Synchronization._MutexHandle` undefined — a recorded toolchain finding);
+  the bundle ships those libraries with a pure-shell launcher. Docker is a
+  LOCAL qualification aid for the clean-host smoke only; it is not a
+  product dependency and the harness never invokes it at runtime.

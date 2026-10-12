@@ -4,7 +4,7 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 
 ## Current position
 
-- **Milestone:** M0 — M0-A and M0-B CLOSED at head `07e0269` (DeepSeek final disposition READY TO CLOSE; base `86a717b0…`). Remaining M0 work: M0-C (replxx PTY feasibility spike) and M0-D (clean-runtime bundle, Linux CI, CodeRabbit epic review when the remote is authorized).
+- **Milestone:** M0 — M0-A/M0-B CLOSED at `07e0269` (DeepSeek READY TO CLOSE); M0-C/M0-D implemented and evidenced, slice review pending (plan reviewed READY at plan revision 2; completed-slice review due at closeout). M0-C replxx feasibility: PASS. M0-D local scope: bundle + clean-host smoke + CI preparation + `./dev` hardening DONE; CodeRabbit activation awaits remote authorization (BLOCKED_REVIEW).
 - **Plan:** `plans/m0-a-b-plan.md` — reviewed by `deepseek-reviewer` (route `opencode-go/deepseek-v4.1-flash`), disposition READY, receipts in `plans/m0-a-b-receipt.md`. REV-01 satisfied before implementation.
 - **Closeout:** `plans/m0-milestone-report.md`.
 - **Scope guard:** M0–M3 only, Linux x86_64/Ubuntu 24.04. No remote writes (push/PR not authorized; GitHub remote configured). No macOS work.
@@ -29,16 +29,24 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 - **F-3 (dependency shape):** replxx revision `1f149bfe…` has no `Package.swift` at that ref → not a SwiftPM dependency; must be vendored C/C++ bridge (M0-C, matches DEPENDENCIES.md).
 - **D-1, D-2:** see F-1/F-2. Rulings recorded; implementation proceeds on unaffected work.
 
-## Dependency evidence (M0-B, recorded)
+## Dependency evidence (M0-B, recorded; superseded historical rows are labeled)
 
-- Full 7-pin resolution on Linux: **26-pin transitive graph** (argument-parser 1.8.2, async-http-client 1.36.2, openapi-runtime 1.13.0, subprocess 1.0.1, system 1.8.1, crypto 5.0.0, GRDB 7.11.1; transitives incl. nio 2.104.0, nio-ssl 2.37.5, swift-certificates 1.21.0, http-types 1.8.0).
-- Six-of-seven build+link on 6.3.3: PASS (32.3 s warm; probe ran `ok`; links libswift*/libdispatch/libstdc++/libz/glibc). Scratch: `/tmp/opencode/needletail-probe`, logs `/tmp/opencode/probe-build*.log`.
-- GRDB build: FAIL with `sqlite3.h` not found (F-1). No fabricated graph, no downgrade.
+- Full 7-pin resolution on Linux: **26-pin transitive graph** incl. GRDB 7.11.1 (argument-parser 1.8.2, async-http-client 1.36.2, openapi-runtime 1.13.0, subprocess 1.0.1, system 1.8.1, crypto 5.0.0, GRDB 7.11.1; transitives incl. nio 2.104.0, nio-ssl 2.37.5, swift-certificates 1.21.0, http-types 1.8.0). Still current; `Package.resolved` unchanged by the toolchain switch.
+- **[SUPERSEDED — historical evidence only; NOT a current blocker]** Six-of-seven build+link on **Swift 6.3.3** (32.3 s warm; probe ran `ok`; links libswift*/libdispatch/libstdc++/libz/glibc; scratch `/tmp/opencode/needletail-probe`, logs `/tmp/opencode/probe-build*.log`). Current state: the full graph incl. GRDB builds on **Swift 6.4.0** (evidence `test-quick-swift64-grdb.log`).
+- **[SUPERSEDED — historical evidence only; NOT a current blocker]** GRDB 7.11.1 build FAIL `sqlite3.h` not found on 6.3.3. This was finding F-1, **resolved** 12 Oct 2026 when the operator installed `libsqlite3-dev`; GRDB now links `NeedletailPrimitiveTests` and STORE-01 passes. Pins never changed — no fabricated graph, no downgrade.
 
 ## Case catalogue
 
 - `cases/expected-index.json`: frozen hand-audited 200-ID expectation (100 product PKG…REAL + 68 UX/DX/PTY + 32 v0.3 delivery; 168 product/UX + 32 delivery), provenance + digest recorded.
 - `cases/catalog.json`: normalized catalogue; reconciliation runs both directions vs the fixture and vs Part 10 of COMPLETE-SPEC.md. Catalog status vocabulary (enforced by a BDD-04 rule test): `IMPLEMENTED` (due at the current milestone with executed evidence in `status_detail`), `NOT_IMPLEMENTED` (due now, no evidence yet), `DEFERRED_BY_PLAN` (due later than the current milestone). No entry is a self-awarded pass.
+
+## M0-C / M0-D progress (12 October 2026)
+
+- **M0-C replxx — FEASIBILITY PASS.** Pinned replxx `1f149bfe…` vendored as a SwiftPM C/C++ target (`Sources/CReplxx`, licence + provenance + `./dev vendor-check` integrity). Swift seam `NeedletailLineEditor` (C API only); debug-only fixture executable `NeedletailTypingProbe` (never shipped); test-only C PTY shim (`Tests/PTYShim`); ONE bounded Linux scenario (`./dev test feasibility`) proving: editor live during synthetic streamed output; an unsent multiline Unicode draft preserved exactly across streaming + resize 40→120→80; completion-callback invocation with observable candidates; Ctrl+C cancel returning to clean input; clean exit; canonical-echo restored. A deliberate-wrong-expectation probe confirms the oracle is real (`.needletail-dev/logs/m0c-oracle-probe-wrong-expectation.log`).
+- **M0-C findings kept for M4 (not blockers):** replxx Ctrl+C returns NULL like EOF (probe treats it as cancel and re-enters); Tab inserts the common completion prefix (scenario orders the exactness oracle before any completion invocation); SIGUSR1 inherited a blocked mask from the Swift Testing runner — the probe unblocks it via `pthread_sigmask`; `replxx_print` is variadic and not Swift-callable — the seam uses `replxx_write`.
+- **M0-D local — DONE.** Static Swift stdlib release build FAILS on Swift 6.4.0 (`Synchronization._MutexHandle` undefined — toolchain finding recorded); the bundle is dynamic: bundled Swift runtime + pure-shell launcher + linkage manifest (`./dev release-bundle`). Clean-host smoke PASSES in a digest-pinned `ubuntu:24.04` with `--network none`, asserting swift/node/python3 absent, running `--version`/`--help`/`doctor` (`./dev test packaging`, evidence `.needletail-dev/logs/cleanhost-smoke.log`). `doctor` is the offline inspection command (git/rg presence → exact disabled capability). CI workflow + `.coderabbit.yaml` prepared locally: pinned action SHAs verified via the GitHub API, `persist-credentials: false`, no `pull_request_target`, `contents: read`, false-pass guard steps; activation NOT authorized (BLOCKED_REVIEW).
+- **`./dev` hardening — DONE.** Every `swift test` invocation must emit a result line (a runner crash is not a pass); `test case` validates the exact catalogue ID (bogus/prefix IDs fail red) and refuses zero-match runs; qualification distinguishes an expected test failure from a runner crash. Guards evidenced in `.needletail-dev/logs/dev-guard-*.log`.
+- **Scope reduction honored:** the mock/session-provider smoke is deferred to M1-D and recorded in `cases/catalog.json` PKG-01 `status_detail` (maintainer-visible; no status value changed).
 
 ## M0-A / M0-B closeout (this session)
 

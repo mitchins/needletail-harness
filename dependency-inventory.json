@@ -12,7 +12,10 @@
     "Licence identities are detected from licence files present at each resolved revision and require review before release.",
     "replxx (commit 1f149bfe...) is NOT a package: no Package.swift exists at that revision. It is vendored C/C++ at M0-C.",
     "swift-crypto is declared but product-linked by no target at M0 (SHA-256 receipts arrive with the M2 side-effect ledger). GRDB linked NeedletailPrimitiveTests from 12 Oct 2026 after decision D-2 resolved; direct GRDB usage in production targets arrives with M2-A.",
-    "GRDB links the NeedletailPrimitiveTests target after decision D-2 resolved 12 Oct 2026 (libsqlite3-dev 3.45.1 installed on the builder); direct dependency usage in production targets arrives with M2-A."
+    "GRDB links the NeedletailPrimitiveTests target after decision D-2 resolved 12 Oct 2026 (libsqlite3-dev 3.45.1 installed on the builder); direct dependency usage in production targets arrives with M2-A.",
+    "Static Swift stdlib release build FAILS on Swift 6.4.0 (undefined Synchronization._MutexHandle); the release bundle is dynamic with the toolchain Swift runtime bundled and a launcher. Recorded as a toolchain finding, M0-D.",
+    "replxx vendored at 1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2 as a C++ target (CReplxx); licence BSD-style (LICENSE.md preserved); integrity check: ./dev vendor-check.",
+    "Docker is used ONLY by the local clean-host smoke (./dev test packaging, digest-pinned image, --network none); it is not a product or runtime dependency."
   ],
   "packages": [
     {

@@ -1,0 +1,105 @@
+# Needletail Linux CI (M0-D, prepared locally — NOT ACTIVATED).
+#
+# Activation requires the maintainer's remote authorization (GitHub push
+# and the CodeRabbit installation); this file is the prepared gate, not a
+# running one. Guardrails per DEVELOPMENT §8 / REVIEW §5:
+#   - actions pinned to verified immutable revisions (no tags in `uses:`);
+#   - token permissions default to read-only (contents: read);
+#   - no pull_request_target; fork PRs receive no credentials;
+#   - offline application tests only: no provider or reviewer secrets.
+#
+# Toolchain: swiftly-installed Swift 6.4 (the same route as the local
+# builder). If the pinned Swift download moves, update both places; CI
+# never resolves packages implicitly because ./dev passes
+# --disable-automatic-resolution after a resolve step.
+
+name: linux
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    name: offline build and tests (Linux x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Swift toolchain (swiftly)
+        run: |
+          curl -fsSL https://download.swift.org/install/linux/swiftly-$(uname -m).tar.gz | tar -xz -C /tmp
+          /tmp/swiftly init --quiet-shell-followup 2>/dev/null || true
+          . "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/env.sh" 2>/dev/null || true
+          swiftly install 6.4 --assume-yes
+          swiftly use 6.4 --global-default
+          swift --version
+          case "$(swift --version 2>&1)" in
+            *"Swift version 6.4"*) echo "toolchain pin satisfied" ;;
+            *) echo "FAIL: expected Swift 6.4"; exit 1 ;;
+          esac
+
+      - name: Resolve the locked graph (pinned)
+        run: |
+          swift package resolve
+          git diff --exit-code Package.resolved || {
+            echo "FAIL: Package.resolved changed during resolve; the lock is authoritative."
+            exit 1
+          }
+
+      - name: Build
+        run: ./dev build
+
+      - name: Pure and primitive suites (quick)
+        run: ./dev test quick
+
+      - name: Native primitives (native)
+        run: ./dev test native
+
+      - name: Vendor integrity
+        run: ./dev vendor-check
+
+      - name: Catalogue reconciliation (coverage)
+        run: ./dev coverage
+
+      - name: False-pass guards
+        run: |
+          # A bogus case ID or a zero-match filter must be red.
+          if ./dev test case BOGUS-99; then
+            echo "FAIL: a bogus case ID passed."
+            exit 1
+          fi
+          if ./dev test case REV-0; then
+            echo "FAIL: a prefix case ID passed."
+            exit 1
+          fi
+
+      - name: Runner qualification (expected failure)
+        run: ./dev test qualification
+
+  packaging:
+    name: release bundle smoke (clean host)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Release bundle
+        run: ./dev release-bundle
+
+      - name: Clean-host smoke (digest-pinned image, no network)
+        run: ./dev test packaging

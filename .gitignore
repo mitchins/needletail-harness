@@ -2,6 +2,13 @@
 .build/
 DerivedData/
 
+# Release bundle outputs (rebuilt by ./dev release-bundle)
+release/bundle/
+
+# Reference clone for vendored-source integrity checks (never committed;
+# ./dev vendor-check requires a local clone at this path)
+ThirdParty/
+
 # Raw developer evidence (M0-A onward): sanitized public summaries only
 .needletail-dev/
 

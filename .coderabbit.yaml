@@ -1,0 +1,53 @@
+# CodeRabbit configuration — prepared at M0-D, NOT ACTIVATED.
+#
+# REVIEW.md §5: the supplied configuration opts into epic-labelled,
+# non-draft review, keeps actual review status visible, disables decorative
+# poetry and automatic code-generation/finishing touches, and supplies
+# boundary-focused path instructions. This file has NOT been validated
+# against the installed service schema: that validation requires the
+# authorized remote and is recorded as BLOCKED_REVIEW until activation
+# (REV-06/DEV-03 remain DEFERRED_BY_PLAN for the same reason).
+
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  high_level_summary: true
+  high_level_summary_in_walkthrough: false
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  path_filters:
+    # Boundary-focused instructions: the portable core must not gain
+    # platform, terminal, HTTP or SQLite implementation imports.
+    - "!**/COMPLETE-SPEC.md"
+    - "!**/DEPENDENCIES.md"
+  path_instructions:
+    - path: "Sources/NeedletailCore/**"
+      instructions: |
+        Portable domain contracts only. No terminal, HTTP, SQLite, process
+        or platform-specific imports. Apple-only or Linux-specific code
+        belongs behind a qualified shim (PORT-02).
+    - path: "Sources/NeedletailTestSupport/**"
+      instructions: |
+        Development support only. The behaviour-case ledger and results
+        reconciliation must never convert a missing, skipped or unexecuted
+        case into a pass (BDD-01..04).
+    - path: "Tests/**"
+      instructions: |
+        Behaviour-labelled Swift Testing. Display names begin with the
+        stable catalogue case ID (TESTING section 2). No sleeps in place of
+        readiness; no oracle regenerated from the code under test.
+    - path: "Sources/CReplxx/**"
+      instructions: |
+        Vendored third-party sources: changes must be limited to bridge
+        files (shim.h, include/module.modulemap). Upstream sources must
+        remain byte-identical to the pinned commit (`./dev vendor-check`).
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+chat:
+  auto_reply: true
+finish_review: false
+generate_code_suggestions: false

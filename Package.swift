@@ -50,6 +50,20 @@ let package = Package(
             name: "NeedletailTestSupport",
             dependencies: ["NeedletailCore"]
         ),
+        .target(
+            name: "CReplxx",
+            dependencies: [],
+            cSettings: [.headerSearchPath("replxx"), .headerSearchPath("include")],
+            cxxSettings: [.headerSearchPath("replxx"), .headerSearchPath("include")]
+        ),
+        .target(
+            name: "NeedletailLineEditor",
+            dependencies: ["CReplxx"]
+        ),
+        .executableTarget(
+            name: "NeedletailTypingProbe",
+            dependencies: ["NeedletailLineEditor", "PTYShim"]
+        ),
         .executableTarget(
             name: "NeedletailCLI",
             dependencies: [
@@ -73,6 +87,18 @@ let package = Package(
                 // headers) was open. The operator installed libsqlite3-dev
                 // on 12 October 2026; the STORE-01 reopen probe is linked.
                 .product(name: "GRDB", package: "GRDB.swift"),
+            ]
+        ),
+        .target(
+            name: "PTYShim",
+            path: "Tests/PTYShim"
+        ),
+        .testTarget(
+            name: "NeedletailTerminalTests",
+            dependencies: [
+                "NeedletailCore",
+                "NeedletailLineEditor",
+                "PTYShim",
             ]
         ),
         .testTarget(

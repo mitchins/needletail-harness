@@ -10,7 +10,8 @@ struct NeedletailCLI: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "needletail",
         abstract: "Needletail — minimal local-first Swift coding harness (M0 bootstrap).",
-        version: NeedletailVersion(major: 0, minor: 3, patch: 0).description
+        version: NeedletailVersion(major: 0, minor: 3, patch: 0).description,
+        subcommands: [Doctor.self]
     )
 
     mutating func run() throws {
