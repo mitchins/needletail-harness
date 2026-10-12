@@ -4,7 +4,7 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 
 ## Current position
 
-- **Milestone:** M0 — M0-A/M0-B CLOSED at `07e0269` (DeepSeek READY TO CLOSE); M0-C/M0-D implemented and evidenced, slice review pending (plan reviewed READY at plan revision 2; completed-slice review due at closeout). M0-C replxx feasibility: PASS. M0-D local scope: bundle + clean-host smoke + CI preparation + `./dev` hardening DONE; CodeRabbit activation awaits remote authorization (BLOCKED_REVIEW).
+- **Milestone:** M0 — M0-A/M0-B CLOSED at `07e0269` (DeepSeek READY TO CLOSE); M0-C/M0-D implemented and evidenced, slice review pending (plan reviewed READY at plan revision 2; completed-slice review due at closeout). M0-C replxx feasibility: PASS; M0-D local scope (bundle, clean-host smoke, `doctor`, CI/CodeRabbit preparation, `./dev` hardening) DONE and slice-closed (DeepSeek READY TO CLOSE at `188bb47`). Remote gates (push/PR, CodeRabbit activation and the M0 epic review) await explicit authorization (BLOCKED_REVIEW).
 - **Plan:** `plans/m0-a-b-plan.md` — reviewed by `deepseek-reviewer` (route `opencode-go/deepseek-v4.1-flash`), disposition READY, receipts in `plans/m0-a-b-receipt.md`. REV-01 satisfied before implementation.
 - **Closeout:** `plans/m0-milestone-report.md`.
 - **Scope guard:** M0–M3 only, Linux x86_64/Ubuntu 24.04. No remote writes (push/PR not authorized; GitHub remote configured). No macOS work.

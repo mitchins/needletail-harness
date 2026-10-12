@@ -53,3 +53,15 @@ Reviewer `deepseek-reviewer`, route `opencode-go/deepseek-v4.1-flash`, head `aed
 | F-12 | Suggestion | workflow name / report drift | FIXED: `linux-ci.yml`; M0-C/D section added to the milestone report |
 
 Reviewer uncertainties recorded: action-SHA verification log retained; CI runner provision of `libsqlite3-dev` handled in-workflow; runtime-lib bundling filter made toolchain-path-independent.
+
+---
+
+## Closure determination (M0-C + M0-D)
+
+| Review | Subject | Disposition |
+|---|---|---|
+| Plan review (pre-implementation, rev 1 → rev 2) | `9fb04d02…` → `8b114092…` | NEEDS_EVIDENCE → **READY** after FR-01…FR-11 folded |
+| Completed-slice review | `aedece4` | NEEDS_EVIDENCE (F-01…F-12; all folded) |
+| Closure verification | `188bb47` / tree `6942ca3…` | **READY TO CLOSE** |
+
+Final closure: `deepseek-reviewer` route `opencode-go/deepseek-v4.1-flash`; every folded fix verified against files and retained evidence; new-defect scan found none. No builds or tests were re-executed by the reviewer (shell allowlist); runtime evidence is the retained logs referenced in `plans/m0-milestone-report.md`. M0-C and local M0-D are closed. The M0 epic CodeRabbit review, the remote push/PR, and CodeRabbit activation remain explicit maintainer gates (not authorized).

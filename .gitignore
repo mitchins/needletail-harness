@@ -5,8 +5,9 @@ DerivedData/
 # Release bundle outputs (rebuilt by ./dev release-bundle)
 release/bundle/
 
-# Reference clone for vendored-source integrity checks (never committed;
-# ./dev vendor-check requires a local clone at this path)
+# Optional reference clone for the secondary vendored-source byte-for-byte
+# check (never committed). The primary ./dev vendor-check is offline:
+# sha256sum -c against Sources/CReplxx/SHA256SUMS-vendored.
 ThirdParty/
 
 # Raw developer evidence (M0-A onward): sanitized public summaries only
