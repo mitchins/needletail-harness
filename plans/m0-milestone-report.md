@@ -1,6 +1,6 @@
 # Milestone closeout report — M0 (M0-A + M0-B)
 
-Filled 12 October 2026. Every field is attested to work already executed; nothing here promises later evidence. Subject identity for review: base `86a717b0fda17d7690ce97b3161110cd169f5d33`; head = the commit carrying this report (frozen before the final slice review); tree hash recorded in `.needletail-dev/m0-tree-hash.txt`.
+Filled 12 October 2026, revision 2. Every field is attested to work already executed; nothing here promises later evidence. Subject identity for review: base `86a717b0fda17d7690ce97b3161110cd169f5d33`; slice commits `4d2805d` (M0-A/M0-B) and `1770956` (Swift 6.4.0 re-qualification + GRDB linkage); head = the commit carrying this revision (tree hash recorded in `.needletail-dev/m0-tree-hash.txt`, updated in the same commit).
 
 ## Identity
 
@@ -12,8 +12,8 @@ Filled 12 October 2026. Every field is attested to work already executed; nothin
 
 ## Scope
 
-- Closed M0-due catalogue IDs (13), all with executed evidence: **BDD-01, BDD-02, BDD-03, BDD-04** (pure tests), **REV-01, REV-02, REV-03, REV-04** (review receipts), **DEV-01, DEV-02, DEV-04** (route/sanitized-packets/test-owned-children evidence), **PORT-01** (Linux gates ran), **DX-08** (offline run executed).
-- Due-M0 IDs reassigned by reviewed disposition (evidence cannot exist at M0): BDD-05→M2, BDD-06→M1, BDD-07→M4, BDD-08→M1, REV-05..08→M0-D, DEV-03→M0-D. Reassignment recorded in `cases/expected-index.json` provenance and in the review receipt; catalog status for each is DEFERRED_BY_PLAN.
+- Closed M0-due catalogue IDs (13, catalog status IMPLEMENTED with evidence pointers), all with executed evidence: **BDD-01, BDD-02, BDD-03, BDD-04** (pure tests), **REV-01, REV-02, REV-03, REV-04** (review receipts), **DEV-01, DEV-02, DEV-04** (route/sanitized-packets/test-owned-children evidence), **PORT-01** (Linux gates ran), **DX-08** (offline run executed).
+- Due-M0 IDs reassigned by reviewed disposition (evidence cannot exist at M0): BDD-05→M2, BDD-06→M1, BDD-07→M4, BDD-08→M1, REV-05..08→M0-D, DEV-03→M0-D. Reassignment recorded in `cases/expected-index.json` provenance and in the review receipt; catalog status DEFERRED_BY_PLAN for each, enforced by the new BDD-04 rule test.
 - Other executed cases (earlier than their due milestone): WIRE-01, WIRE-02, NET-04, PROC-01 (integration/nativeProcess).
 - Invariants touched: I01 (offline build/test/CLI paths), I02 (no runtime downloads), process guardrails (no host modification; D-1/D-2 routed to the operator).
 - Changed files: as listed in `.needletail-dev/m0-file-list.txt` — package manifest/lock, inventory, catalogue fixtures, `dev`, `.gitignore`, `LICENSE`, `NOTICE.md`, `STATUS.md`, `templates/milestone-report.md`, five source files, eight test files, plan/receipt/report docs; packet files tracked unchanged.
@@ -51,7 +51,7 @@ All raw outputs retained under `.needletail-dev/logs/`:
 
 | Layer | Cases | PASS | FAIL | BLOCKED_REVIEW | UNQUALIFIED_ENVIRONMENT | DEFERRED_BY_PLAN | NOT_IMPLEMENTED |
 |---|---|---|---|---|---|---|---|
-| pure | BDD-01..04 | 15 | 0 | 0 | 0 | 0 | — |
+| pure | BDD-01..04 | 16 | 0 | 0 | 0 | 0 | — |
 | integration | WIRE-01, WIRE-02, NET-04 | 3 | 0 | 0 | 0 | 0 | — |
 | nativeProcess | PROC-01 | 1 | 0 | 0 | 0 | 0 | — |
 | nativeStorage | STORE-01 | 1 | 0 | 0 | 0 | 0 | 0 |
@@ -74,7 +74,7 @@ NET-05 and CORE-02: DEFERRED_BY_PLAN (due M1) — the cancellation probe exercis
   - F-8 (Minor, STORE-01 labels): catalog now carries `status_detail` with both `test_status: DEFERRED_BY_PLAN` and `environment_status: UNQUALIFIED_ENVIRONMENT`.
   - F-9 (Minor, swift-crypto linkage): inventory and Package.swift comments record declared-but-not-linked.
   - F-10 (Suggestion, server teardown): readiness wait bounded by a deadline; teardown is a timed semaphore wait, no polling loop.
-- Final re-review at the frozen head is the closure gate (receipt to be appended to `plans/m0-a-b-receipt.md`). M0 epic CodeRabbit review remains due at M0-D when the remote is authorized.
+- Final verification at `1770956`/tree `6de5ddf…` returned NEEDS_EVIDENCE: F-3 PARTIAL (reassigned IDs carried `NOT_IMPLEMENTED` while the report claimed `DEFERRED_BY_PLAN`; the catalog's own status rule was violated and no test read the status fields) plus stale text N2–N4 (STATUS milestone counts, F-8 wording, inventory note, dangling pre-fix hash reference). Corrections in revision 2: catalog statuses fixed and the vocabulary extended with `IMPLEMENTED` for executed M0-due cases; a new BDD-04 rule test enforces status↔due-milestone agreement and requires evidence pointers for IMPLEMENTED entries; `status`/`status_detail` added to the Codable model so they round-trip; STATUS/receipt/inventory stale text corrected; the pre-fix tree-hash recording gap recorded in the receipt. Re-verification at the head carrying this revision is the closure gate (appended to `plans/m0-a-b-receipt.md`). M0 epic CodeRabbit review remains due at M0-D when the remote is authorized.
 
 ## Limitations and gate status
 

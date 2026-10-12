@@ -75,19 +75,28 @@ public struct CatalogueEntry: Sendable, Equatable, Codable {
     public var scenario: String
     public var dueMilestone: String
     public var evidenceLayers: [EvidenceLayer]
+    /// Catalog-side annotations (disposition status, executed-evidence
+    /// pointers). Optional so the frozen expectation fixture does not need
+    /// to duplicate them; decoding ignores absence, and the field round-trips
+    /// when the catalog is re-encoded.
+    public var status: String?
+    public var statusDetail: String?
 
-    public init(id: String, family: String, scenario: String, dueMilestone: String, evidenceLayers: [EvidenceLayer]) {
+    public init(id: String, family: String, scenario: String, dueMilestone: String, evidenceLayers: [EvidenceLayer], status: String? = nil, statusDetail: String? = nil) {
         self.id = id
         self.family = family
         self.scenario = scenario
         self.dueMilestone = dueMilestone
         self.evidenceLayers = evidenceLayers
+        self.status = status
+        self.statusDetail = statusDetail
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, family, scenario
+        case id, family, scenario, status
         case dueMilestone = "due_milestone"
         case evidenceLayers = "evidence_layers"
+        case statusDetail = "status_detail"
     }
 }
 

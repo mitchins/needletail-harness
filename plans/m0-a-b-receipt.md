@@ -70,4 +70,7 @@ Subject: full M0 slice tree (file list `.needletail-dev/m0-file-list.txt`), clos
 
 ## Subject freshness
 
-Pre-fix tree hash (reviewed): see `.needletail-dev/m0-tree-hash-before-fixes.txt`. Post-fix tree hash (final review subject): `.needletail-dev/m0-tree-hash.txt`. Locate and re-review bound to that hash and the commit carrying it; a bare retry count is not acceptance (REVIEW §3).
+The pre-fix working tree was not staged when the slice review ran, so its tree hash was not captured — a recording gap recorded here rather than reconstructed. What is immutable:
+- Slice review (NEEDS_EVIDENCE) inspected the pre-fix tree by file list `.needletail-dev/m0-file-list.txt` and logs; findings F-1…F-10 are quoted verbatim above.
+- Post-fix tree `788a6acd93508abc84d8f6f6df300e1bab9afaf1` = commit `4d2805d`; final head `1770956` tree `6de5ddf0332da6d86d5df9479da801d9f1af4cc0` recorded in `.needletail-dev/m0-tree-hash.txt`.
+- Final verification review bound to `1770956`/`6de5ddf…` returned NEEDS_EVIDENCE on F-3 (catalog status of reassigned IDs contradicted the report) plus stale-text gaps N2–N4; all corrected in the follow-up commit and re-verified at that head.

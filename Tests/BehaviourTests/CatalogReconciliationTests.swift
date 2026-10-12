@@ -104,4 +104,23 @@ struct CatalogReconciliationTests {
             Issue.record("unexpected error: \(error)")
         }
     }
+
+    @Test("BDD-04 catalog status vocabulary follows the due-milestone rule")
+    func BDD_04_catalogStatusFollowsDueMilestoneRule() throws {
+        let catalogue = try CatalogueStore.loadCatalogue()
+        let currentMilestone = "M0"
+        for entry in catalogue.entries {
+            if entry.dueMilestone == currentMilestone {
+                #expect(entry.status == "IMPLEMENTED" || entry.status == "NOT_IMPLEMENTED",
+                        "\(entry.id): due \(entry.dueMilestone) must be IMPLEMENTED or NOT_IMPLEMENTED, got \(entry.status ?? "nil")")
+                if entry.status == "IMPLEMENTED" {
+                    let detail = try #require(entry.statusDetail, "\(entry.id): IMPLEMENTED requires an evidence pointer")
+                    #expect(detail.contains("executed"), "\(entry.id): evidence pointer must name executed evidence: \(detail)")
+                }
+            } else {
+                #expect(entry.status == "DEFERRED_BY_PLAN",
+                        "\(entry.id): due \(entry.dueMilestone) is later than \(currentMilestone), must be DEFERRED_BY_PLAN, got \(entry.status ?? "nil")")
+            }
+        }
+    }
 }

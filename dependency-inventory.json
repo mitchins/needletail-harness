@@ -11,7 +11,7 @@
     "Candidate pins are the DEPENDENCIES.md selection; this inventory records the ACTUAL resolved graph from Package.resolved, not a fabricated one.",
     "Licence identities are detected from licence files present at each resolved revision and require review before release.",
     "replxx (commit 1f149bfe...) is NOT a package: no Package.swift exists at that revision. It is vendored C/C++ at M0-C.",
-    "swift-crypto, like GRDB, is declared but product-linked by no target at M0; build warnings record this. Transitive BoringSSL still compiles for NIOSSL.",
+    "swift-crypto is declared but product-linked by no target at M0 (SHA-256 receipts arrive with the M2 side-effect ledger). GRDB linked NeedletailPrimitiveTests from 12 Oct 2026 after decision D-2 resolved; direct GRDB usage in production targets arrives with M2-A.",
     "GRDB links the NeedletailPrimitiveTests target after decision D-2 resolved 12 Oct 2026 (libsqlite3-dev 3.45.1 installed on the builder); direct dependency usage in production targets arrives with M2-A."
   ],
   "packages": [
