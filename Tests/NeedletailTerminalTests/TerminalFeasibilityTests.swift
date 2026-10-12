@@ -46,10 +46,10 @@ private final class ProbeProcess {
         var buffer = ""
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutMS) / 1000)
         while Date() < deadline {
-            var chunk = [CChar](repeating: 0, count: 4096)
+            var chunk = [UInt8](repeating: 0, count: 4096)
             let count = nt_pty_read(&pty, &chunk, 4096, 250)
             if count > 0 {
-                buffer += String(cString: chunk)
+                buffer += String(decoding: chunk.prefix(Int(count)), as: UTF8.self)
                 if buffer.contains(marker) { return buffer }
             } else if count == 0 {
                 return buffer // child closed the PTY
@@ -88,10 +88,10 @@ private final class ProbeProcess {
         var collected = ""
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline {
-            var chunk = [CChar](repeating: 0, count: 256)
+            var chunk = [UInt8](repeating: 0, count: 256)
             let count = nt_pty_read(&pty, &chunk, 256, 200)
             if count > 0 {
-                collected += String(cString: chunk)
+                collected += String(decoding: chunk.prefix(Int(count)), as: UTF8.self)
                 if collected.contains("echo-probe") { return true }
             }
         }

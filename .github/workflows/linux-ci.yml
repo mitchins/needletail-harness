@@ -51,6 +51,15 @@ jobs:
             *) echo "FAIL: expected Swift 6.4"; exit 1 ;;
           esac
 
+      - name: Provision SQLite headers (GRDB system-library requirement)
+        run: |
+          # GRDB's GRDBSQLite system-library target requires sqlite3.h. This
+          # installs the distro dev package on the ephemeral runner only; the
+          # harness itself never installs anything (I02).
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+          test -f /usr/include/sqlite3.h || { echo "FAIL: sqlite3.h missing after install"; exit 1; }
+
       - name: Resolve the locked graph (pinned)
         run: |
           swift package resolve

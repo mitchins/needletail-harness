@@ -67,7 +67,7 @@ int nt_pty_spawn(nt_pty_t *pty, char *const argv[]) {
     return 0;
 }
 
-int nt_pty_read(nt_pty_t *pty, char *buf, size_t capacity, int timeout_ms) {
+int nt_pty_read(nt_pty_t *pty, unsigned char *buf, size_t capacity, int timeout_ms) {
     if (pty == NULL || pty->masterFd < 0 || buf == NULL || capacity == 0) {
         return -1;
     }
@@ -95,7 +95,7 @@ int nt_pty_read(nt_pty_t *pty, char *buf, size_t capacity, int timeout_ms) {
     return (int)count;
 }
 
-int nt_pty_write(nt_pty_t *pty, const char *buf, size_t length) {
+int nt_pty_write(nt_pty_t *pty, const unsigned char *buf, size_t length) {
     if (pty == NULL || pty->masterFd < 0 || buf == NULL) {
         return -1;
     }

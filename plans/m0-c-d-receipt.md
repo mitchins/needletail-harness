@@ -30,3 +30,26 @@ Disposition: **READY** (no new blocker). Two optional fold-ins accepted during i
 - `replxx_input` returns NULL on Ctrl+C abort as well as EOF: the probe treats it as a cancel and re-enters input; the scenario's exact-draft oracle runs before any completion invocation because Tab inserts the common prefix.
 - SIGUSR1 inherited the Swift Testing runner's blocked signal mask (fork inherits it): the probe unblocks it via `pthread_sigmask` in `nt_install_usr1_pipe`. This was found by scenario failure, fixed, and the scenario then passed 5/5 runs plus a wrong-expectation oracle probe.
 - Static Swift stdlib linking fails on Swift 6.4.0 for this graph (`Synchronization._MutexHandle` undefined) — recorded as a toolchain finding; the dynamic bundle is the documented M0-D path.
+
+---
+
+## Completed-slice review (M0-C + M0-D)
+
+Reviewer `deepseek-reviewer`, route `opencode-go/deepseek-v4.1-flash`, head `aedece4`. Disposition **NEEDS_EVIDENCE** (no over-claims found; the M0-C result itself verified as honestly executed and evidenced). Findings folded before closure:
+
+| ID | Severity | Finding | Disposition |
+|---|---|---|---|
+| F-01 | Major | `vendor-check` required the gitignored reference clone, so it could never pass on a clean CI checkout; no vendor evidence retained | FIXED: offline-first `sha256sum -c SHA256SUMS-vendored` (manifest generated from upstream blob hashes at the pinned commit), clone check optional; log retained |
+| F-02 | Major | `test feasibility` bypassed the result-line guard (zero-match would be green) | FIXED: routed through `run_swift_test` |
+| F-03 | Minor | static-branch `cp` without `mkdir -p bin` | FIXED |
+| F-04 | Minor | container digest not recorded in evidence | FIXED: digest and `network: none` are written into `cleanhost-smoke.log` |
+| F-05 | Minor | guard temp files leaked on failure paths | FIXED: deterministic evidence logs under `.needletail-dev/logs/` (no `mktemp`) |
+| F-06 | Minor | `String(cString:)` over-read risk + deprecation | FIXED: bounded `String(decoding:)`; shim now byte-typed (`unsigned char*`) |
+| F-07 | Minor | missing CReplxx/vendor-check/linkage evidence | FIXED: logs retained under `.needletail-dev/logs/` |
+| F-08 | Minor | `.coderabbit.yaml` lacks epic-label/knowledge-base opt-in keys | ACCEPT-WITH-DOCUMENTATION: exact fields need the installed schema; activation is BLOCKED_REVIEW |
+| F-09 | Minor | catalogue rule cannot distinguish `M0-D` from later milestones | ACCEPT-WITH-DOCUMENTATION: revisit at M0-D closeout; the rule is conservative (deferred), never a false pass |
+| F-10 | Suggestion | scenario drives the probe, not the composition root | ACCEPT: documented M0-C stand-in; M4 drives the real root |
+| F-11 | Suggestion | `Unmanaged.passUnretained(self)` lifetime contract | ACCEPT: probe holds the session for process lifetime; M4 must document a stronger contract |
+| F-12 | Suggestion | workflow name / report drift | FIXED: `linux-ci.yml`; M0-C/D section added to the milestone report |
+
+Reviewer uncertainties recorded: action-SHA verification log retained; CI runner provision of `libsqlite3-dev` handled in-workflow; runtime-lib bundling filter made toolchain-path-independent.

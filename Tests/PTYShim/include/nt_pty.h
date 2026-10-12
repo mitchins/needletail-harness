@@ -24,10 +24,10 @@ int nt_pty_spawn(nt_pty_t *pty, char *const argv[]);
 
 /* Bounded read from the master. Returns bytes read, 0 on EOF, -1 on error
  * or timeout (timeout in milliseconds). Never blocks past the deadline. */
-int nt_pty_read(nt_pty_t *pty, char *buf, size_t capacity, int timeout_ms);
+int nt_pty_read(nt_pty_t *pty, unsigned char *buf, size_t capacity, int timeout_ms);
 
 /* Write bytes to the master (i.e. to the child's input). */
-int nt_pty_write(nt_pty_t *pty, const char *buf, size_t length);
+int nt_pty_write(nt_pty_t *pty, const unsigned char *buf, size_t length);
 
 /* Resize the slave window (rows x cols). */
 int nt_pty_resize(nt_pty_t *pty, int rows, int cols);

@@ -87,3 +87,38 @@ NET-05 and CORE-02: DEFERRED_BY_PLAN (due M1) — the cancellation probe exercis
 ## Closure
 
 Final review chain recorded in `plans/m0-a-b-receipt.md`: plan READY → slice NEEDS_EVIDENCE (F-1…F-10 fixed) → re-qualification NEEDS_EVIDENCE (F-3 + stale text fixed) → closure NEEDS_EVIDENCE (F-8 sentence + test count fixed) → final doc-only review **READY TO CLOSE** at head `07e0269b5254194a73f65928f8f32f03aa3c06bf` (base `86a717b0…`). Slice closed; next authorized action: M0-C (replxx PTY feasibility) per the reviewed plan.
+
+---
+
+# M0-C / M0-D closeout (12 October 2026, revision 1)
+
+Attests to executed work only. Slice plan `plans/m0-c-d-plan.md` (revision 2, plan review READY); receipts `plans/m0-c-d-receipt.md`.
+
+## M0-C — replxx line-editor feasibility: PASS (development evidence, not interactive acceptance)
+
+- Vendored target `Sources/CReplxx` at the pinned upstream commit `1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2`: upstream sources byte-identical (offline `sha256sum -c SHA256SUMS-vendored`, manifest generated from upstream blob hashes; optional byte-for-byte clone check), licence preserved, bridge files limited to `shim.h` + `include/module.modulemap` + provenance + manifest. Evidence: `logs/vendor-check.log`, `logs/creplxx-swiftpm-build.log`.
+- `NeedletailLineEditor` wraps only the C API (`replxx_init/end/input/write`, completion callback); `NeedletailTypingProbe` is a debug-only fixture executable never shipped; `Tests/PTYShim` is a test-only C shim (fork/setsid/TIOCSCTTY, bounded select reads, TIOCSWINSZ, signal trampoline, owned-child teardown).
+- ONE bounded Linux PTY scenario (`./dev test feasibility`, 5/5 stable runs): editor live during synthetic streamed output; an unsent multiline Unicode draft (combining mark + 4-byte emoji) submitted byte-identically after streaming and resizes 40→120→80; completion callback invoked with its candidates; Ctrl+C cancel returning to clean input; clean exit code 0; canonical echo restored after exit. Evidence: `logs/m0c-feasibility-final.log`; oracle probe `logs/m0c-oracle-probe-wrong-expectation.log` (a wrong expectation fails — the oracle is real).
+- Findings kept for M4 (not blockers): replxx Ctrl+C returns NULL like EOF; Tab inserts the common candidate prefix (the exactness oracle therefore precedes any completion invocation); SIGUSR1 needed explicit unblocking in the child because the Swift Testing runner blocks it and `fork` inherits the mask; `replxx_print` is variadic and not Swift-callable (the seam uses `replxx_write`).
+
+## M0-D — local release foundations
+
+| Item | Result | Evidence |
+|---|---|---|
+| Release bundle (`./dev release-bundle`) | dynamic bundle, 3,646,992-byte binary, 15 bundled runtime libs, pure-shell launcher, linkage manifest | `logs/release-bundle-final.log`, `logs/linkage-manifest.txt`, `logs/size.txt` |
+| Static Swift stdlib | FAILS on Swift 6.4.0 (`Synchronization._MutexHandle` undefined) — toolchain finding; dynamic bundle is the documented path | `logs/release-build-static-FAILED.log` |
+| Clean-host smoke (`./dev test packaging`) | PASS: digest-pinned `ubuntu:24.04`, `--network none`, swift/node/python3 asserted absent, `--version`/`--help`/`doctor` green | `logs/cleanhost-smoke.log` |
+| Offline inspection | `needletail doctor` reports build identity, platform and git/rg presence with the exact capability each absence disables (PKG-05 machinery) | run under normal and restricted PATH |
+| CI preparation | `.github/workflows/linux-ci.yml` (pinned action SHA, `persist-credentials: false`, no `pull_request_target`, `contents: read`, swiftly toolchain pin, SQLite headers provision, false-pass guard steps) — NOT ACTIVATED | file + plan |
+| CodeRabbit config | `.coderabbit.yaml` prepared; epic-label/knowledge-base keys deferred to the installed schema (BLOCKED_REVIEW) | file + receipt |
+| `./dev` hardening | every `swift test` requires a result line; `test case` validates the exact catalogue ID and refuses zero-match; qualification distinguishes crash from expected failure | `logs/dev-guard-*.log`, `logs/dev-*.log` |
+
+## Results
+
+- M0-C: 1 native PTY scenario PASS (development evidence for PTY-01…08/TERM-*, which stay `DEFERRED_BY_PLAN`).
+- M0-D: PKG-01 thin smoke executed; PKG-03/04 preparation only (no activation, no CI evidence); PKG-05 machinery early; DX-08 re-executed offline with a minimal PATH; DEV-03/REV-05…08 remain `DEFERRED_BY_PLAN` pending remote authorization.
+- Toolchain: Swift 6.4.0; `NEEDLETAIL_SWIFT` override used because the shared swiftly shim was replaced by another session on this builder (STATUS F-4).
+
+## Gate status
+
+M0-C and local M0-D are implemented and evidenced; the slice's completed-review findings are folded (receipt table). Remote-dependent items (push/PR/CodeRabbit activation, epic review) remain an explicit maintainer gate. The M0 epic CodeRabbit review is still the M0 closeout gate and awaits authorization.

@@ -51,3 +51,12 @@ chat:
   auto_reply: true
 finish_review: false
 generate_code_suggestions: false
+
+# At activation (remote authorized), validate this file against the installed
+# CodeRabbit service schema (REVIEW §5) and confirm the epic-label opt-in and
+# the cross-repository knowledge/MCP/web-expansion disable required by
+# REVIEW §5 (line: "Disable automatic cross-repository knowledge/MCP/web
+# expansion for this project"). The exact field names come from the installed
+# service reference at that time and are deliberately not invented here
+# (schema validation is recorded BLOCKED_REVIEW until activation, REV-06 /
+# DEV-03 remain DEFERRED_BY_PLAN).

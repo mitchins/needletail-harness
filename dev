@@ -8,6 +8,12 @@ set -eu
 root_dir=$(dirname "$0")
 cd "$root_dir"
 
+# Toolchain driver override. The shared swiftly shim on this builder was
+# replaced with a looping wrapper by another session on 12 Oct 2026 (see
+# STATUS.md), so the builder records a direct toolchain path here. Default
+# remains plain `swift` for a healthy swiftly install.
+NEEDLETAIL_SWIFT="${NEEDLETAIL_SWIFT:-swift}"
+
 usage() {
     cat <<'EOF'
 Usage: ./dev <command>
@@ -37,7 +43,7 @@ FILTER_PRIMITIVE="NeedletailPrimitiveTests"
 FILTER_QUALIFICATION="NeedletailQualificationProbes"
 
 swift_test() {
-    swift test -j 4 --disable-automatic-resolution "$@"
+    "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution "$@"
 }
 
 # False-pass guards (M0-D):
@@ -49,14 +55,15 @@ require_test_result() {
     _log="$1"; _label="$2"
     if ! grep -q "Test run with" "$_log"; then
         echo "FAIL [$_label]: the test runner produced no result line (crash or no build). Not a pass."
-        echo "---- last output ----"
+        echo "---- last output (evidence: $_log) ----"
         tail -20 "$_log"
         exit 1
     fi
 }
 run_swift_test() {
     _label="$1"; shift
-    _log=$(mktemp)
+    _log="$root_dir/.needletail-dev/logs/dev-$_label.log"
+    mkdir -p "$root_dir/.needletail-dev/logs"
     if swift_test "$@" > "$_log" 2>&1; then
         _rc=0
     else
@@ -64,12 +71,10 @@ run_swift_test() {
     fi
     cat "$_log"
     if [ "$_rc" -ne 0 ]; then
-        echo "FAIL [$_label]: test runner exited $_rc (see above). Not a pass."
-        rm -f "$_log"
+        echo "FAIL [$_label]: test runner exited $_rc (evidence: $_log). Not a pass."
         exit "$_rc"
     fi
     require_test_result "$_log" "$_label"
-    rm -f "$_log"
 }
 
 
@@ -78,7 +83,7 @@ shift || true
 
 case "$cmd" in
 build)
-    swift build -j 4 --disable-automatic-resolution
+    "$NEEDLETAIL_SWIFT" build -j 4 --disable-automatic-resolution
     ;;
 test)
     sub="${1:-quick}"
@@ -93,8 +98,10 @@ test)
     feasibility)
         # M0-C: the ONE bounded Linux PTY feasibility scenario over the
         # vendored replxx bridge. The full M4 terminal/PTY suites remain
-        # deferred; this runs only the feasibility driver.
-        swift_test --filter NeedletailTerminalTests
+        # deferred; this runs only the feasibility driver. Guarded like
+        # every other swift test invocation: a zero-match or crashed runner
+        # is not a pass.
+        run_swift_test feasibility --filter NeedletailTerminalTests
         ;;
     qualification)
         echo "== qualification fixtures: expect one failure and two skips; these are demonstrations, not gates =="
@@ -103,21 +110,19 @@ test)
         # green by construction. A non-zero exit here is expected, but a
         # runner CRASH is not: the output must show the intentional-failure
         # test AND a runner result line before QUALIFICATION OK is printed.
-        _qual_log=$(mktemp)
+        _qual_log="$root_dir/.needletail-dev/logs/dev-qualification.log"
+        mkdir -p "$root_dir/.needletail-dev/logs"
         if NEEDLETAIL_QUALIFICATION=1 swift_test --filter "$FILTER_QUALIFICATION" > "$_qual_log" 2>&1; then
             cat "$_qual_log"
-            rm -f "$_qual_log"
             echo "UNEXPECTED: qualification suite passed. The intentional failure must fail (M0-A evidence void)."
             exit 1
         fi
         cat "$_qual_log"
         require_test_result "$_qual_log" qualification
         if ! grep -q "qualification intentional failure must be reported as a failure" "$_qual_log"; then
-            rm -f "$_qual_log"
-            echo "FAIL: qualification run failed without the intentional-failure test; the runner may have crashed. Not a qualification pass."
+            echo "FAIL: qualification run failed without the intentional-failure test; the runner may have crashed (evidence: $_qual_log). Not a qualification pass."
             exit 1
         fi
-        rm -f "$_qual_log"
         echo "QUALIFICATION OK: runner reported the intentional failure and skipped cases distinctly."
         ;;
     case)
@@ -133,7 +138,8 @@ test)
             exit 1
         fi
         case_filter=$(printf '%s' "$case_id" | sed 's/-/_/g')
-        _case_log=$(mktemp)
+        _case_log="$root_dir/.needletail-dev/logs/dev-case-$(printf '%s' "$case_id" | tr -c 'A-Za-z0-9_-' '_').log"
+        mkdir -p "$root_dir/.needletail-dev/logs"
         if swift_test --filter "$case_filter" > "$_case_log" 2>&1; then
             _case_rc=0
         else
@@ -141,19 +147,16 @@ test)
         fi
         cat "$_case_log"
         if [ "$_case_rc" -ne 0 ]; then
-            echo "FAIL: tests for $case_id exited $_case_rc."
-            rm -f "$_case_log"
+            echo "FAIL: tests for $case_id exited $_case_rc (evidence: $_case_log)."
             exit "$_case_rc"
         fi
         require_test_result "$_case_log" "case $case_id"
         # Zero matched tests is a runner green with nothing run: refuse it.
         _ran=$(grep -o "Test run with [0-9]* tests" "$_case_log" | grep -o "[0-9]*" | head -1 || true)
         if [ "${_ran:-0}" = "0" ]; then
-            rm -f "$_case_log"
-            echo "FAIL: no tests matched case $case_id (filter '$case_filter'). A zero-match run is not a pass."
+            echo "FAIL: no tests matched case $case_id (filter '$case_filter', evidence: $_case_log). A zero-match run is not a pass."
             exit 1
         fi
-        rm -f "$_case_log"
         ;;
     integration|terminal|pty)
         echo "DEFERRED_BY_PLAN: '$sub' is scheduled at a later milestone (integration M2, terminal/pty M4). Not run, not passed."
@@ -184,8 +187,11 @@ test)
             echo "BLOCKED: no repo digest available for $image_ref; refusing to smoke an unpinned image."
             exit 2
         fi
-        echo "clean-host image: $digest"
-        if docker run --rm --network none -v "$bundle:/bundle:ro" "$digest" sh -c '
+        smoke_rc=0
+        {
+            echo "clean-host image: $digest"
+            echo "network: none"
+            if docker run --rm --network none -v "$bundle:/bundle:ro" "$digest" sh -c '
                 set -e
                 command -v swift >/dev/null 2>&1 && { echo "UNEXPECTED: swift present"; exit 1; } || echo "absent: swift"
                 command -v node >/dev/null 2>&1 && { echo "UNEXPECTED: node present"; exit 1; } || echo "absent: node"
@@ -193,7 +199,14 @@ test)
                 /bundle/needletail --version
                 /bundle/needletail --help >/dev/null
                 /bundle/needletail doctor
-            ' > "$root_dir/.needletail-dev/logs/cleanhost-smoke.log" 2>&1; then
+            '; then
+                echo "smoke: PASS"
+            else
+                smoke_rc=1
+                echo "smoke: FAIL"
+            fi
+        } > "$root_dir/.needletail-dev/logs/cleanhost-smoke.log" 2>&1
+        if [ "$smoke_rc" -eq 0 ]; then
             echo "CLEAN-HOST SMOKE OK (evidence: .needletail-dev/logs/cleanhost-smoke.log)"
         else
             echo "FAIL: clean-host smoke failed; see .needletail-dev/logs/cleanhost-smoke.log"
@@ -220,40 +233,48 @@ coverage)
     run_swift_test coverage --filter "$FILTER_BEHAVIOUR"
     ;;
 vendor-check)
-    # Vendored integrity: every file in Sources/CReplxx/replxx must be
-    # byte-identical to the pinned upstream commit. The reference clone in
-    # ThirdParty/replxx is gitignored and never committed; without it the
-    # check reports the missing reference rather than passing silently.
+    # Vendored integrity. OFFLINE FIRST: SHA256SUMS-vendored records the
+    # blob hashes of the pinned upstream commit (1f149bfe...), so
+    # `sha256sum -c` verifies the vendored tree on any clean checkout
+    # without a reference clone. The clone check (byte-for-byte against a
+    # local full clone in ThirdParty/replxx) is an optional secondary.
     root_dir=$(dirname "$0")
-    vendor_dir="$root_dir/Sources/CReplxx/replxx"
-    upstream_dir="$root_dir/ThirdParty/replxx"
-    if [ ! -d "$upstream_dir/.git" ]; then
-        echo "BLOCKED: reference clone $upstream_dir absent (gitignored). Clone the pinned commit first; do not record a pass."
-        exit 2
-    fi
-    pinned=$(git -C "$upstream_dir" rev-parse HEAD)
-    if [ "$pinned" != "1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2" ]; then
-        echo "FAIL: reference clone at $pinned, expected 1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2"
-        exit 1
-    fi
     status=0
-    for f in "$vendor_dir"/*; do
-        base=$(basename "$f")
-        [ "$base" = "LICENSE.md" ] && continue
-        upstream="$upstream_dir/src/$base"
-        [ -f "$upstream" ] || upstream="$upstream_dir/include/$base"
-        if [ ! -f "$upstream" ]; then
-            echo "FAIL: $base has no upstream counterpart at the pinned commit"
+    if (cd "$root_dir/Sources/CReplxx/replxx" && sha256sum -c ../SHA256SUMS-vendored >/dev/null 2>&1); then
+        echo "VENDOR OK (offline): all vendored sources match the pinned upstream blob hashes"
+    else
+        echo "FAIL: vendored sources do not match SHA256SUMS-vendored"
+        (cd "$root_dir/Sources/CReplxx/replxx" && sha256sum -c ../SHA256SUMS-vendored 2>&1 | grep -v ': OK' | head -5)
+        status=1
+    fi
+    # Secondary check when a reference clone is present.
+    upstream_dir="$root_dir/ThirdParty/replxx"
+    if [ -d "$upstream_dir/.git" ]; then
+        pinned=$(git -C "$upstream_dir" rev-parse HEAD 2>/dev/null || true)
+        if [ "$pinned" != "1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2" ]; then
+            echo "FAIL: reference clone at '$pinned', expected 1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2"
             status=1
-            continue
+        else
+            for f in "$root_dir/Sources/CReplxx/replxx"/*; do
+                base=$(basename "$f")
+                [ "$base" = "LICENSE.md" ] && upstream="$upstream_dir/LICENSE.md" || {
+                    upstream="$upstream_dir/src/$base"
+                    [ -f "$upstream" ] || upstream="$upstream_dir/include/$base"
+                }
+                if [ ! -f "$upstream" ]; then
+                    echo "FAIL: $base has no upstream counterpart at the pinned commit"
+                    status=1
+                    continue
+                fi
+                if ! cmp -s "$f" "$upstream"; then
+                    echo "FAIL: $base differs from the pinned upstream clone"
+                    status=1
+                fi
+            done
+            echo "VENDOR OK (clone): byte-identical to the pinned upstream commit"
         fi
-        if ! cmp -s "$f" "$upstream"; then
-            echo "FAIL: $base differs from the pinned upstream"
-            status=1
-        fi
-    done
-    if [ "$status" -eq 0 ]; then
-        echo "VENDOR OK: all vendored replxx sources byte-identical to 1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2"
+    else
+        echo "NOTE: no reference clone at $upstream_dir (gitignored); offline manifest check is authoritative."
     fi
     exit "$status"
     ;;
@@ -268,7 +289,8 @@ release-bundle)
     rm -rf "$bundle"
     mkdir -p "$bundle"
     echo "== static Swift stdlib release build =="
-    if swift build -c release -j 4 --static-swift-stdlib --product needletail > "$root_dir/.needletail-dev/logs/release-build-static.log" 2>&1; then
+    if "$NEEDLETAIL_SWIFT" build -c release -j 4 --static-swift-stdlib --product needletail > "$root_dir/.needletail-dev/logs/release-build-static.log" 2>&1; then
+        mkdir -p "$bundle/bin"
         cp "$root_dir/.build/release/needletail" "$bundle/bin/needletail.real"
         cp "$root_dir/.build/release/needletail" "$bundle/needletail"
         echo "static-stdlib" > "$bundle/linkage-mode.txt"
@@ -276,13 +298,17 @@ release-bundle)
         echo "static build failed; recording the failure and falling back to a dynamic bundle"
         cp "$root_dir/.needletail-dev/logs/release-build-static.log" "$root_dir/.needletail-dev/logs/release-build-static-FAILED.log" 2>/dev/null || true
         echo "== dynamic release build =="
-        swift build -c release -j 4 --product needletail > "$root_dir/.needletail-dev/logs/release-build-dynamic.log" 2>&1
+        "$NEEDLETAIL_SWIFT" build -c release -j 4 --product needletail > "$root_dir/.needletail-dev/logs/release-build-dynamic.log" 2>&1
         mkdir -p "$bundle/bin"
         cp "$root_dir/.build/release/needletail" "$bundle/bin/needletail.real"
         # Bundle the declared Swift runtime libraries (the manifest lists
         # every non-system .so) and launcher that sets the loader path.
         mkdir -p "$bundle/lib"
-        ldd "$bundle/bin/needletail.real" | awk '/=> \// && /swiftly/ {print $3}' | sort -u > "$bundle/.runtime-libs.txt"
+        # Match Swift runtime libraries by BASENAME (toolchain-path
+        # independent), so the bundle works for any swiftly/toolchain path.
+        ldd "$bundle/bin/needletail.real" | awk '/=> \// {print $1, $3}' \
+            | awk '$1 ~ /^(libswift|libdispatch|libFoundation|libFoundationEssentials|libFoundationInternationalization|libBlocksRuntime|lib_FoundationICU|lib_FoundationCURL)/ {print $2}' \
+            | sort -u > "$bundle/.runtime-libs.txt"
         while read -r lib; do
             [ -n "$lib" ] && cp "$lib" "$bundle/lib/"
         done < "$bundle/.runtime-libs.txt"
