@@ -60,7 +60,7 @@ struct ResultsClassificationTests {
         #expect(report.missing == ["BDD-04"])
     }
 
-    @Test("TESTING-11 example-kind records cannot certify their own run")
+    @Test("BDD-03 example-kind records cannot certify their own run (TESTING §11)")
     func BDD_03_exampleRecordsAreRejected() {
         let cases = Self.singleCaseCatalogue()
         let results = [

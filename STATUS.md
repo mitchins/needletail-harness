@@ -38,7 +38,7 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 ## Case catalogue
 
 - `cases/expected-index.json`: frozen hand-audited 200-ID expectation (100 product PKG…REAL + 68 UX/DX/PTY + 32 v0.3 delivery; 168 product/UX + 32 delivery), provenance + digest recorded.
-- `cases/catalog.json`: normalized catalogue; reconciliation runs both directions vs the fixture and vs Part 10 of COMPLETE-SPEC.md. All not-yet-due entries: `NOT_IMPLEMENTED` / `DEFERRED_BY_PLAN`. No entry may be reported PASS without executed evidence.
+- `cases/catalog.json`: normalized catalogue; reconciliation runs both directions vs the fixture and vs Part 10 of COMPLETE-SPEC.md. Catalog status vocabulary (enforced by a BDD-04 rule test): `IMPLEMENTED` (due at the current milestone with executed evidence in `status_detail`), `NOT_IMPLEMENTED` (due now, no evidence yet), `DEFERRED_BY_PLAN` (due later than the current milestone). No entry is a self-awarded pass.
 
 ## M0-A / M0-B closeout (this session)
 

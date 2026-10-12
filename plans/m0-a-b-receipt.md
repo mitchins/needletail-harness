@@ -64,7 +64,7 @@ Subject: full M0 slice tree (file list `.needletail-dev/m0-file-list.txt`), clos
 | F-5 | Minor | Asserted commands lacked raw evidence | FIXED: all command outputs retained under `.needletail-dev/logs/` |
 | F-6 | Minor | DX-08 claimed, not exercised | FIXED: executed under proxy blackhole + Node/Python-free PATH + fake HOME; exit 0 (`test-quick-offline.log`) |
 | F-7 | Minor | `coverage` not TESTING §4 reconciliation; reconciler milestone-blind | FIXED (documented): M0-scope reconciliation documented in `dev` and STATUS; tier/due-aware coverage deferred with results ingestion |
-| F-8 | Minor | STORE-01 labeled DEFERRED_BY_PLAN (catalog) vs UNQUALIFIED_ENVIRONMENT (status/report) | FIXED: catalog `status_detail` carries both fields explicitly |
+| F-8 | Minor | STORE-01 labeled DEFERRED_BY_PLAN (catalog) vs UNQUALIFIED_ENVIRONMENT (status/report) | FIXED: catalog `status_detail` first carried both `test_status: DEFERRED_BY_PLAN` and `environment_status: UNQUALIFIED_ENVIRONMENT`; after decision D-2 resolved (operator installed libsqlite3-dev), STORE-01 executed PASS on Swift 6.4.0 and `cases/catalog.json` records the executed evidence |
 | F-9 | Minor | swift-crypto declared-but-unlinked, not recorded | FIXED: inventory note; Package.swift comment |
 | F-10 | Suggestion | Server readiness wait unbounded; polling teardown | FIXED: bounded readiness watchdog; timed semaphore wait |
 
@@ -73,4 +73,5 @@ Subject: full M0 slice tree (file list `.needletail-dev/m0-file-list.txt`), clos
 The pre-fix working tree was not staged when the slice review ran, so its tree hash was not captured — a recording gap recorded here rather than reconstructed. What is immutable:
 - Slice review (NEEDS_EVIDENCE) inspected the pre-fix tree by file list `.needletail-dev/m0-file-list.txt` and logs; findings F-1…F-10 are quoted verbatim above.
 - Post-fix tree `788a6acd93508abc84d8f6f6df300e1bab9afaf1` = commit `4d2805d`; final head `1770956` tree `6de5ddf0332da6d86d5df9479da801d9f1af4cc0` recorded in `.needletail-dev/m0-tree-hash.txt`.
-- Final verification review bound to `1770956`/`6de5ddf…` returned NEEDS_EVIDENCE on F-3 (catalog status of reassigned IDs contradicted the report) plus stale-text gaps N2–N4; all corrected in the follow-up commit and re-verified at that head.
+- Final verification at `1770956`/`6de5ddf…` returned NEEDS_EVIDENCE on F-3 (catalog status of reassigned IDs contradicted the report) plus stale-text gaps N2–N4; all corrected in the follow-up commit.
+- Closure verification at `a91f689`/`0315650…` found one surviving stale sentence (this file's F-8 row and the report's F-8 bullet); corrected in the next commit. Both tree hashes are immutable in git history (`4d2805d`→`788a6ac…`, `1770956`→`6de5ddf…`, `a91f689`→`0315650…`); `.needletail-dev/m0-tree-hash.txt` points at the latest reviewed head.
