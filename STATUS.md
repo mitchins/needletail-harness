@@ -4,10 +4,16 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 
 ## Current position
 
-- **Milestone:** M0 — M0-A/M0-B CLOSED at `07e0269` (DeepSeek READY TO CLOSE); M0-C/M0-D implemented and evidenced, slice review pending (plan reviewed READY at plan revision 2; completed-slice review due at closeout). M0-C replxx feasibility: PASS; M0-D local scope (bundle, clean-host smoke, `doctor`, CI/CodeRabbit preparation, `./dev` hardening) DONE and slice-closed (DeepSeek READY TO CLOSE at `188bb47`); swiftly launcher restored and all local gates re-verified without override 13 Oct 2026 (see F-4). Remote gates (push/PR, CodeRabbit review, M0 epic disposition) authorized conditionally 13 Oct 2026 — executed as branch `m0-epic` + PR, no merge; **M0 is not claimed closed until GitHub CI and CodeRabbit produce their actual dispositions.**
+- **Milestone:** M0 — M0-A/M0-B CLOSED at `07e0269` (DeepSeek READY TO CLOSE); M0-C/M0-D implemented and evidenced, slice review pending (plan reviewed READY at plan revision 2; completed-slice review due at closeout). M0-C replxx feasibility: PASS; M0-D local scope (bundle, clean-host smoke, `doctor`, CI/CodeRabbit preparation, `./dev` hardening) DONE and slice-closed (DeepSeek READY TO CLOSE at `188bb47`); swiftly launcher restored and all local gates re-verified without override 13 Oct 2026 (see F-4). Remote gates (push/PR, CodeRabbit review, M0 epic disposition) authorized conditionally 13 Oct 2026 — executed as branch `m0-epic` + **PR #1**, no merge; **M0 is not claimed closed until GitHub CI and CodeRabbit produce their actual dispositions.**
+
+## Remote gates (13 October 2026)
+
+- **Push + PR:** local `main` pushed to `origin:m0-epic`; PR #1 `m0-epic → main` opened with the M0 scope, review history and ask (CI run + full CodeRabbit epic review, do-not-merge).
+- **CI first activation:** run `38332383475` triggered on the PR as designed — both jobs failed in ~6 s on two defects invisible locally: (a) the workflow's swiftly installer URL (`/install/linux/...`) 404s — corrected to the verified `/swiftly/linux/...` URL; (b) `release-bundle`/`test packaging` redirected into gitignored `.needletail-dev/logs/` without creating it — `mkdir -p` added (fresh-directory simulation: zero `Directory nonexistent` errors). Fix commit `e3198e8` pushed; re-run pending.
+- **CodeRabbit:** check reported `pending — Review in progress` on PR #1, i.e. the app is installed and engaged; review comments pending.
 - **Plan:** `plans/m0-a-b-plan.md` — reviewed by `deepseek-reviewer` (route `opencode-go/deepseek-v4.1-flash`), disposition READY, receipts in `plans/m0-a-b-receipt.md`. REV-01 satisfied before implementation.
 - **Closeout:** `plans/m0-milestone-report.md`.
-- **Scope guard:** M0–M3 only, Linux x86_64/Ubuntu 24.04. No remote writes (push/PR not authorized; GitHub remote configured). No macOS work.
+- **Scope guard:** M0–M3 only, Linux x86_64/Ubuntu 24.04. Remote writes: bounded M0 push/PR/CI/CodeRabbit authorized and executed 13 Oct 2026 (branch `m0-epic`, PR #1, no merge); no other remote action authorized. No macOS work.
 
 ## Environment record (M0-A)
 
