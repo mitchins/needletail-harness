@@ -18,7 +18,25 @@ import Foundation
 /// The server is test-only code using OS socket interfaces; no additional
 /// package dependency is introduced.
 
-private enum TestServerError: Error { case socketFailed, bindFailed, listenFailed }
+private enum TestServerError: Error { case socketFailed, bindFailed, listenFailed, pipeFailed }
+
+/// Thread-exit latch for the synthetic listener: set exactly once when
+/// the detached thread returns, on every path. Polled by tests; never
+/// slept on.
+private final class ListenerLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _exited = false
+    var exited: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _exited
+    }
+    func markExited() {
+        lock.lock()
+        defer { lock.unlock() }
+        _exited = true
+    }
+}
 
 private func bindTestServerSocket(_ listenFD: Int32) throws -> UInt16 {
     var yes: Int32 = 1
@@ -51,11 +69,26 @@ private final class SyntheticLoopbackServer: @unchecked Sendable {
     private let requestReceivedStream: AsyncStream<Void>
     private let requestReceivedContinuation: AsyncStream<Void>.Continuation
     private let holdSemaphore = DispatchSemaphore(value: 0)
+    private let lifetime = ListenerLifetime()
+    /// Wakeup pipe: one byte here releases the listener thread from its
+    /// bounded poll. Closing the listening socket is deliberately NOT the
+    /// mechanism — on Linux it does not reliably wake a blocked accept().
+    private let wakePipeRead: Int32
+    private let wakePipeWrite: Int32
+
+    var threadExited: Bool { lifetime.exited }
 
     init() throws {
         listenFD = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
         guard listenFD >= 0 else { throw TestServerError.socketFailed }
         let boundPort = try bindTestServerSocket(listenFD)
+        var pipeFDs: [Int32] = [-1, -1]
+        guard pipe(&pipeFDs) == 0 else {
+            close(listenFD)
+            throw TestServerError.pipeFailed
+        }
+        wakePipeRead = pipeFDs[0]
+        wakePipeWrite = pipeFDs[1]
         let (stream, continuation) = AsyncStream<Void>.makeStream()
         self.port = boundPort
         self.requestReceivedStream = stream
@@ -68,8 +101,33 @@ private final class SyntheticLoopbackServer: @unchecked Sendable {
         let continuation = requestReceivedContinuation
         let listenFD = self.listenFD
         let holdSemaphore = self.holdSemaphore
+        let lifetime = self.lifetime
+        let wakePipeRead = self.wakePipeRead
         Thread.detachNewThread {
-            let clientFD = accept(listenFD, nil, nil)
+            defer { lifetime.markExited() }
+            // Bounded accept: poll the listening socket alongside the
+            // wakeup pipe so stop()/abandon() always terminate this thread
+            // promptly, even with zero connections. A bare blocking
+            // accept() would linger forever (close() does not wake it).
+            var clientFD: Int32 = -1
+            var pollFDs = [
+                pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: wakePipeRead, events: Int16(POLLIN), revents: 0),
+            ]
+            while true {
+                let ready = poll(&pollFDs, 2, 100)
+                if ready < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                if pollFDs[1].revents != 0 { break } // woken: stop/abandon/deinit
+                if pollFDs[0].revents != 0 {
+                    clientFD = accept(listenFD, nil, nil)
+                    break
+                }
+                // Timeout: re-poll, so wake latency stays bounded at ~100 ms
+                // even if a wakeup raced the poll entry.
+            }
             guard clientFD >= 0 else { continuation.finish(); return }
             var buffer = [UInt8](repeating: 0, count: 1024)
             _ = read(clientFD, &buffer, buffer.count)
@@ -86,16 +144,28 @@ private final class SyntheticLoopbackServer: @unchecked Sendable {
 
     func stop() {
         holdSemaphore.signal()
+        wakeListener()
     }
 
     /// Finishes the readiness stream so a waiter suspended on it
     /// terminates instead of lingering. Test-only cleanup for the timeout
-    /// path; finishing an already-finished stream is a no-op.
+    /// path; finishing an already-finished stream is a no-op. Also wakes
+    /// the listener thread (see start()).
     func abandon() {
         requestReceivedContinuation.finish()
+        wakeListener()
     }
 
-    deinit { close(listenFD) }
+    private func wakeListener() {
+        var byte: UInt8 = 1
+        _ = write(wakePipeWrite, &byte, 1)
+    }
+
+    deinit {
+        close(listenFD)
+        close(wakePipeRead)
+        close(wakePipeWrite)
+    }
 }
 
 /// Maps a request-task error to its outcome string. Only a genuine
@@ -319,6 +389,28 @@ struct TransportCancellationTests {
         #expect(!ready, "an unstarted server must not report readiness")
         #expect(elapsed >= 1.0, "the full deadline must elapse, returned after \(elapsed)s")
         #expect(elapsed < 5.0, "readiness must fail at ~1s, took \(elapsed)s")
+    }
+
+    @Test("NET-04 a started-but-idle listener terminates on timeout")
+    func NET_04_idleListenerTerminatesOnTimeout() async throws {
+        // Started server, zero connections: the accept thread must still
+        // terminate once the readiness wait times out and abandons it.
+        // Finishing the stream is not enough — pre-fix the thread lingers
+        // blocked in accept() (this fails at the 5 s drain instead of
+        // hanging the suite).
+        let server = try SyntheticLoopbackServer()
+        server.start()
+        let start = Date()
+        let ready = await awaitRequestHead(server, deadlineSeconds: 1)
+        #expect(!ready, "an idle server must not report readiness")
+        let deadline = Date().addingTimeInterval(5)
+        while !server.threadExited && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(server.threadExited, "idle listener thread must terminate after timeout")
+        #expect(elapsed < 6.0, "termination must be prompt, took \(elapsed)s")
+        server.stop()
     }
 
     @Test("NET-04 a timed-out readiness wait releases the server")
