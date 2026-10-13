@@ -67,19 +67,20 @@ struct CatalogReconciliationTests {
         #expect(CaseID("UX-UNDO-+2") == nil, "the suffix is plain digits")
         #expect(CaseID("-UNDO-02") == nil, "the family is non-empty")
         #expect(CaseID("UX---02") == nil, "family words are non-empty")
+        #expect(CaseID("UX-UNDO-2") == nil, "the numeric suffix is exactly two digits")
         #expect(CaseID("") == nil)
     }
 
     @Test("BDD-01 a well-formed but uncatalogued identifier is unknown, not silently accepted")
     func BDD_01_uncataloguedIdentifierIsUnknown() throws {
         let catalogue = try CatalogueStore.loadCatalogue()
-        let results = [CaseResult(caseID: "UX-UNDO-2", testStatus: .pass)]
+        let results = [CaseResult(caseID: "UX-UNDO-98", testStatus: .pass)]
         let reconciliation = ResultsReconciler.reconcile(catalogue: catalogue, results: results)
         guard case .invalid(let reason) = reconciliation else {
             Issue.record("expected invalid reconciliation for an uncatalogued identifier")
             return
         }
-        #expect(reason.contains("UX-UNDO-2"), "reason must name the exact identifier: \(reason)")
+        #expect(reason.contains("UX-UNDO-98"), "reason must name the exact identifier: \(reason)")
     }
 
     @Test("BDD-01 duplicate catalogue keys are detectable")

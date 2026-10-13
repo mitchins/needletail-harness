@@ -16,16 +16,21 @@ public struct NeedletailVersion: Sendable, Equatable, Comparable, CustomStringCo
         self.patch = patch
     }
 
-    /// Parses `major.minor.patch`. Numeric-looking components are the only
-    /// accepted form; no normalization, no partial versions (CFG-05 spirit:
+    /// Parses `major.minor.patch`. Components are canonical decimal: ASCII
+    /// digits, no sign, no leading zero unless the component is exactly
+    /// "0". No normalization, no partial versions (CFG-05 spirit:
     /// identity strings are never coerced or reinterpreted).
     public init?(parsing text: String) {
         let parts = text.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 3,
-              let major = Int(parts[0]), let minor = Int(parts[1]), let patch = Int(parts[2]),
-              major >= 0, minor >= 0, patch >= 0
+        guard parts.count == 3, parts.allSatisfy(Self.isCanonicalComponent),
+              let major = Int(parts[0]), let minor = Int(parts[1]), let patch = Int(parts[2])
         else { return nil }
         self.init(major: major, minor: minor, patch: patch)
+    }
+
+    private static func isCanonicalComponent(_ part: Substring) -> Bool {
+        guard !part.isEmpty, part.allSatisfy({ $0.isASCII && $0.isNumber }) else { return false }
+        return part.count == 1 || part.first != "0"
     }
 
     public static func < (lhs: NeedletailVersion, rhs: NeedletailVersion) -> Bool {

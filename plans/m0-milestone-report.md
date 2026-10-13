@@ -30,7 +30,7 @@ All raw outputs retained under `.needletail-dev/logs/`:
 | 7-pin scratch build (probe) | `sqlite3.h` not found (GRDBSQLite) | `grdb-sqlite-failure.log` |
 | `./dev build` | Build complete, exit 0 | `dev-build.log` |
 | `./dev test quick` (cold) | 19 tests / 6 suites pass; 70.0 s build+test | `test-quick-cold.log` |
-| `./dev test quick` (Swift 6.4.0 + GRDB, cold on toolchain switch) | 20 tests pass (incl. STORE-01); 1:43.20 build+test | `test-quick-swift64-grdb.log` |
+| `./dev test quick` (Swift 6.4.0 + GRDB, cold on toolchain switch) | 20 tests pass (5 primitive + 15 behaviour, incl. STORE-01); 1:43.20 build+test. The 16th behaviour test (BDD-04 due-milestone rule) landed afterwards (`a91f689`); current quick runs report 21 (5+16) | `test-quick-swift64-grdb.log` |
 | `./dev test native` (Swift 6.4.0) | 5 primitive tests pass incl. STORE-01 SQLite reopen | `test-native-swift64-grdb.log` |
 | `./dev test quick` (offline, Swift 6.4.0) | green; proxy-blackholed, no Node/Python on PATH | `test-quick-offline-swift64.log` |
 | `swift test` (bare, Swift 6.4.0) | exit 0; 25 tests; intentional failure unreachable | `bare-swift-test-swift64.log` |
@@ -51,7 +51,7 @@ All raw outputs retained under `.needletail-dev/logs/`:
 
 | Layer | Cases | PASS | FAIL | BLOCKED_REVIEW | UNQUALIFIED_ENVIRONMENT | DEFERRED_BY_PLAN | NOT_IMPLEMENTED |
 |---|---|---|---|---|---|---|---|
-| pure | BDD-01..04 | 16 | 0 | 0 | 0 | 0 | — |
+| pure | BDD-01..04 | 4 semantic cases (16 test executions: 8 reconciliation + 5 classification + 3 variant-counting) | 0 | 0 | 0 | 0 | — |
 | integration | WIRE-01, WIRE-02, NET-04 | 3 | 0 | 0 | 0 | 0 | — |
 | nativeProcess | PROC-01 | 1 | 0 | 0 | 0 | 0 | — |
 | nativeStorage | STORE-01 | 1 | 0 | 0 | 0 | 0 | 0 |
@@ -82,7 +82,7 @@ NET-05 and CORE-02: DEFERRED_BY_PLAN (due M1) — the cancellation probe exercis
 - F-2 (STATUS): RESOLVED 12 Oct 2026 — Swift 6.4.0 installed by operator; slice re-qualified on the pinned toolchain.
 - F-3 (STATUS): replxx is not a SwiftPM package; vendored at M0-C (unchanged).
 - Catalogue provenance: ACCEPTANCE.md exists only embedded in COMPLETE-SPEC.md Part 10; `expected-index.json` is the frozen hand-audited expectation; digests recorded (accepted DR-04 disposition).
-- Gate status: M0-A closed for scope; M0-B closed including the native SQLite-reopen probe (STORE-01 PASS on Swift 6.4.0). Next authorized action: operator rulings (D-2), then M0-C (replxx PTY feasibility) and M0-D (clean-runtime bundle, CI, CodeRabbit epic review). Stop at M3 for the viability decision (no M4+ work).
+- Gate status: M0-A closed for scope; M0-B closed including the native SQLite-reopen probe (STORE-01 PASS on Swift 6.4.0). Next authorized action: M0-C (replxx PTY feasibility) and M0-D (clean-runtime bundle, CI, CodeRabbit epic review). Stop at M3 for the viability decision (no M4+ work).
 
 ## Closure
 

@@ -60,12 +60,34 @@ struct SSEFramingTests {
     func WIRE_02_commentsAndMultiLineData() async throws {
         let bytes = Array(Self.payload.utf8)
         let events = try await Self.decode(bytes, chunkSize: 5)
-        #expect(events.count == 2)
+        // Require before indexing: a short decode must report a failure,
+        // never trap on events[0]/events[1].
+        try #require(events.count == 2, "expected two events, got \(events.count)")
         #expect(events[0].id == "evt-1")
         #expect(events[0].event == "message")
         #expect(events[0].data?.contains(": heartbeat") != true, "comment lines must not leak into data")
         #expect(events[0].data?.contains("🌍") == true, "multi-byte UTF-8 must survive splitting")
         #expect(events[1].id == "evt-2")
         #expect(events[1].data == "line-one\nline-two", "multi-line data fields join per SSE semantics, got \(events[1].data ?? "nil")")
+    }
+
+    @Test("WIRE-02 truncated input decodes to fewer events")
+    func WIRE_02_truncatedInputDecodesPartially() async throws {
+        // A truncated stream is reachable (transport cut): the decoder
+        // yields only the complete first event. Guards that index decoded
+        // events must therefore establish the count first — see the
+        // `#require` in WIRE_02_commentsAndMultiLineData.
+        let bytes = Array(Self.payload.utf8)
+        let marker = Array("id: evt-2".utf8)
+        var cut = bytes.endIndex
+        for start in bytes.indices {
+            if bytes[start...].prefix(marker.count).elementsEqual(marker) { cut = start; break }
+        }
+        guard cut != bytes.endIndex else {
+            Issue.record("fixture marker missing from payload")
+            return
+        }
+        let events = try await Self.decode(Array(bytes[..<cut]), chunkSize: 5)
+        #expect(events.count == 1, "truncated input yields one complete event, got \(events.count)")
     }
 }

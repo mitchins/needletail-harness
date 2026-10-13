@@ -45,6 +45,7 @@ private func bindTestServerSocket(_ listenFD: Int32) throws -> UInt16 {
 }
 
 private final class SyntheticLoopbackServer: @unchecked Sendable {
+
     private let listenFD: Int32
     let port: UInt16
     private let requestReceivedStream: AsyncStream<Void>
@@ -90,6 +91,63 @@ private final class SyntheticLoopbackServer: @unchecked Sendable {
     deinit { close(listenFD) }
 }
 
+/// Maps a request-task error to its outcome string. Only a genuine
+/// cancellation reports cancellation. Observed on the wire: cancelling the
+/// awaiting task surfaces Swift's own `CancellationError` at the suspension
+/// point (AsyncHTTPClient's `HTTPClientError.cancelled`, produced via its
+/// task-cancellation handler, is accepted too for other/older paths). Any
+/// other error — refused connection, server-side close, deadline — reports
+/// as a failure and can never masquerade as a cancellation.
+private func classifyRequestError(_ error: Error) -> String {
+    if error is CancellationError { return "cancelled" }
+    if (error as? HTTPClientError) == HTTPClientError.cancelled { return "cancelled" }
+    return "failed: \(error)"
+}
+
+/// Races `produce` against a wall-clock deadline WITHOUT a task group. A
+/// task-group race cannot return past a stalled child: the group awaits
+/// cancelled children at scope exit, and awaiting a task value is not
+/// itself cancellable. The unstructured waiter may outlive this call on
+/// the timeout path; the caller must release the underlying work (e.g.
+/// `server.stop()`) so cleanup stays bounded.
+private func raceToCompletion(
+    produce: @Sendable @escaping () async -> String,
+    deadlineSeconds: Double
+) async -> String {
+    final class Latch: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: String?
+        func set(_ string: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            if value == nil { value = string }
+        }
+        func get() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+    let latch = Latch()
+    Task { await latch.set(await produce()) }
+    let deadline = Date().addingTimeInterval(deadlineSeconds)
+    while Date() < deadline {
+        if let done = latch.get() { return done }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+    }
+    return latch.get() ?? "timeout"
+}
+
+/// A loopback port with nothing listening: bind, read the port back, close.
+/// Connecting there fails fast with connection-refused (no cancellation).
+private func bindThenCloseLoopbackPort() throws -> UInt16 {
+    let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+    guard fd >= 0 else { throw TestServerError.socketFailed }
+    let port = try bindTestServerSocket(fd)
+    close(fd)
+    return port
+}
+
 struct TransportCancellationTests {
 
     @Test("NET-04 cancelling an in-flight request completes bounded with no resend")
@@ -108,7 +166,7 @@ struct TransportCancellationTests {
                 _ = try await client.execute(request, timeout: .seconds(60))
                 return "completed-with-response"
             } catch {
-                return "completed-with-error"
+                return classifyRequestError(error)
             }
         }
 
@@ -132,21 +190,103 @@ struct TransportCancellationTests {
 
         requestTask.cancel()
 
-        // Bounded completion: cancellation must resolve, not hang.
-        let outcome = await withTaskGroup(of: String.self, returning: String.self) { group in
-            group.addTask { await requestTask.value }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                return "timeout"
-            }
-            let first = await group.next() ?? "timeout"
-            group.cancelAll()
-            return first
-        }
+        // Bounded completion: cancellation must resolve, not hang. The
+        // deadline race must be able to RETURN on timeout, so it does not
+        // use a task group (a group awaits even cancelled children, and
+        // awaiting a task value is not itself cancellable). server.stop()
+        // releases a stalled request, so cleanup stays bounded too.
+        let outcome = await raceToCompletion(produce: { await requestTask.value }, deadlineSeconds: 10)
         server.stop()
-        #expect(outcome != "timeout", "cancellation did not complete within the deadline")
-        #expect(outcome == "completed-with-error", "expected a cancellation error, got \(outcome)")
+        #expect(outcome == "cancelled", "expected a cancellation error, got \(outcome)")
 
         try await client.shutdown()
+    }
+
+    @Test("NET-04 cancellation errors classify as cancelled")
+    func NET_04_cancellationErrorClassifies() {
+        #expect(classifyRequestError(CancellationError()) == "cancelled")
+        #expect(classifyRequestError(HTTPClientError.cancelled) == "cancelled")
+    }
+
+    @Test("NET-04 non-cancellation errors never classify as cancelled")
+    func NET_04_otherErrorsNeverClassifyAsCancelled() {
+        #expect(classifyRequestError(TestServerError.bindFailed) != "cancelled")
+        #expect(classifyRequestError(HTTPClientError.cancelled) == "cancelled")
+    }
+
+    @Test("NET-04 a refused connection is not reported as a cancellation")
+    func NET_04_refusedConnectionIsNotCancellation() async throws {
+        // No cancellation happens on the refused path; the cancel path
+        // cancels against a holding server. The two outcomes must differ —
+        // the old mapping returned "completed-with-error" for both.
+        let refused = try await runRefusedRequest()
+        let cancelled = try await runCancelledRequest()
+        #expect(refused != cancelled, "refused (\(refused)) and cancelled (\(cancelled)) must report differently")
+    }
+
+    @Test("NET-04 a stalled request does not hold the deadline past its bound")
+    func NET_04_stalledRequestReleasesAtDeadline() async {
+        // Mechanism regression test for the deadline race: a producer that
+        // ignores cancellation must not prevent the deadline from firing.
+        // The gate is released afterwards so the waiter finishes and
+        // nothing leaks past the test.
+        actor ReleaseGate {
+            var released = false
+            func release() { released = true }
+        }
+        let gate = ReleaseGate()
+        let start = Date()
+        let outcome = await raceToCompletion(produce: {
+            while await gate.released == false {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            return "released"
+        }, deadlineSeconds: 1)
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(outcome == "timeout", "a stalled producer must hit the deadline, got \(outcome)")
+        #expect(elapsed >= 1.0, "the full deadline must elapse, returned after \(elapsed)s")
+        #expect(elapsed < 5.0, "the deadline must fire at ~1s, took \(elapsed)s")
+        await gate.release()
+    }
+
+    private func runRefusedRequest() async throws -> String {
+        let port = try bindThenCloseLoopbackPort()
+        let client = HTTPClient(eventLoopGroupProvider: .singleton)
+        var request = HTTPClientRequest(url: "http://127.0.0.1:\(port)/v1/chat/completions")
+        request.method = .POST
+        // AsyncHTTPClient retries a refused connection until the request
+        // deadline, so this resolves at ~2 s with a non-cancellation error —
+        // deterministically different from a cancellation either way.
+        let outcome: String
+        do {
+            _ = try await client.execute(request, timeout: .seconds(2))
+            outcome = "completed-with-response"
+        } catch {
+            outcome = classifyRequestError(error)
+        }
+        try await client.shutdown()
+        return outcome
+    }
+
+    private func runCancelledRequest() async throws -> String {
+        let server = try SyntheticLoopbackServer()
+        server.start()
+        let client = HTTPClient(eventLoopGroupProvider: .singleton)
+        var request = HTTPClientRequest(url: "http://127.0.0.1:\(server.port)/v1/chat/completions")
+        request.method = .POST
+        let requestTask = Task { () -> String in
+            do {
+                _ = try await client.execute(request, timeout: .seconds(60))
+                return "completed-with-response"
+            } catch {
+                return classifyRequestError(error)
+            }
+        }
+        for await _ in server.requestReceived { break }
+        requestTask.cancel()
+        let outcome = await raceToCompletion(produce: { await requestTask.value }, deadlineSeconds: 10)
+        server.stop()
+        try await client.shutdown()
+        return outcome
     }
 }

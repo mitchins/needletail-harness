@@ -35,13 +35,13 @@ struct QualificationSkipTests {
 
     /// Skip demonstration: disabled tests are not executed. Reconciliation
     /// must treat an unexecuted case as missing, never as PASS (BDD-04).
-    @Test("qualification skipped case is never counted as passing", .disabled("demonstration only"))
+    @Test("BDD-04 qualification skipped case is never counted as passing", .disabled("demonstration only"))
     func skippedCase() {
         #expect(Bool(true))
     }
 
     /// A skipped variant of a due case leaves its gate unsatisfied.
-    @Test("qualification skipped variant of a due case", .disabled("demonstration only"))
+    @Test("BDD-04 qualification skipped variant of a due case", .disabled("demonstration only"))
     func skippedVariant() {
         #expect(Bool(true))
     }
@@ -49,7 +49,7 @@ struct QualificationSkipTests {
 
 struct QualificationParameterizedTests {
 
-    @Test("qualification parameterized cases", arguments: [
+    @Test("BDD-02 qualification parameterized cases", arguments: [
         ("byte-split-1", 2),
         ("byte-split-2", 4),
         ("byte-split-3", 8),

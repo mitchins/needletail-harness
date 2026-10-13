@@ -26,6 +26,9 @@ public final class LineEditorSession: @unchecked Sendable {
     public init?() {
         guard let handle = replxx_init() else { return nil }
         self.handle = handle
+        // Without this, SIGWINCH never reaches replxx: resizes change the
+        // kernel winsize but the editor never repaints (M0-C evidence).
+        _ = replxx_install_window_change_handler(handle)
     }
 
     deinit {

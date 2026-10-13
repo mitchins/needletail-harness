@@ -1,12 +1,14 @@
-# CodeRabbit configuration — prepared at M0-D, NOT ACTIVATED.
+# CodeRabbit configuration — prepared at M0-D, ACTIVATED on PR #1 (13 Oct 2026).
 #
 # REVIEW.md §5: the supplied configuration opts into epic-labelled,
 # non-draft review, keeps actual review status visible, disables decorative
 # poetry and automatic code-generation/finishing touches, and supplies
-# boundary-focused path instructions. This file has NOT been validated
-# against the installed service schema: that validation requires the
-# authorized remote and is recorded as BLOCKED_REVIEW until activation
-# (REV-06/DEV-03 remain DEFERRED_BY_PLAN for the same reason).
+# boundary-focused path instructions. Validated 13 Oct 2026 against the
+# installed service schema (docs.coderabbit.ai/reference/configuration,
+# schema dated 7 Oct 2026): the former top-level `finish_review` /
+# `generate_code_suggestions` keys are not in the schema and were replaced
+# with the supported `reviews.finishing_touches.*.enabled` and
+# `knowledge_base.*` settings below (CodeRabbit PR #1 finding, fixed).
 
 reviews:
   profile: assertive
@@ -16,6 +18,13 @@ reviews:
   poem: false
   review_status: true
   collapse_walkthrough: false
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    autofix:
+      enabled: false
   path_filters:
     # Boundary-focused instructions: the portable core must not gain
     # platform, terminal, HTTP or SQLite implementation imports.
@@ -49,14 +58,14 @@ reviews:
       - main
 chat:
   auto_reply: true
-finish_review: false
-generate_code_suggestions: false
+knowledge_base:
+  web_search:
+    enabled: false
+  mcp:
+    usage: disabled
+  automatic_linking_mode: disabled
 
-# At activation (remote authorized), validate this file against the installed
-# CodeRabbit service schema (REVIEW §5) and confirm the epic-label opt-in and
-# the cross-repository knowledge/MCP/web-expansion disable required by
-# REVIEW §5 (line: "Disable automatic cross-repository knowledge/MCP/web
-# expansion for this project"). The exact field names come from the installed
-# service reference at that time and are deliberately not invented here
-# (schema validation is recorded BLOCKED_REVIEW until activation, REV-06 /
-# DEV-03 remain DEFERRED_BY_PLAN).
+# REVIEW §5 ("Disable automatic cross-repository knowledge/MCP/web
+# expansion for this project") is implemented by the knowledge_base block
+# above; field names verified against the installed service reference
+# (docs.coderabbit.ai/reference/configuration, schema 7 Oct 2026).

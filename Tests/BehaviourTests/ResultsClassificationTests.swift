@@ -39,7 +39,7 @@ struct ResultsClassificationTests {
     func BDD_04_reviewAndEnvironmentFieldsAreIndependentGates() {
         let cases = Self.singleCaseCatalogue()
         let results = [
-            CaseResult(caseID: "BDD-03", testStatus: .pass),
+            CaseResult(caseID: "BDD-03", testStatus: .pass, reviewStatus: .pass),
             CaseResult(caseID: "BDD-04", testStatus: .pass, reviewStatus: .blockedReview),
         ]
         guard case .consistent(let report) = ResultsReconciler.reconcile(catalogue: cases, results: results) else {
@@ -47,6 +47,33 @@ struct ResultsClassificationTests {
         }
         #expect(report.satisfied == ["BDD-03"])
         #expect(report.unsatisfied == ["BDD-04"], "a blocked review cannot be overridden by a passing test")
+    }
+
+    @Test("BDD-03 a case requiring review evidence is unsatisfied without a review record")
+    func BDD_03_missingReviewEvidenceIsUnsatisfied() {
+        // The single-case catalogue requires the reviewProcess layer for
+        // BDD-03. A passing test with NO review record must not satisfy it:
+        // absent required evidence is never a pass.
+        let cases = Self.singleCaseCatalogue()
+        let results = [CaseResult(caseID: "BDD-03", testStatus: .pass)]
+        guard case .consistent(let report) = ResultsReconciler.reconcile(catalogue: cases, results: results) else {
+            Issue.record("expected consistent report"); return
+        }
+        #expect(report.satisfied.isEmpty, "absent review evidence must not satisfy BDD-03")
+        #expect(report.unsatisfied == ["BDD-03"])
+    }
+
+    @Test("BDD-03 placeholder-kind records cannot certify their own run (TESTING §11)")
+    func BDD_03_placeholderRecordsAreRejected() {
+        let cases = Self.singleCaseCatalogue()
+        let results = [
+            CaseResult(caseID: "BDD-03", testStatus: .pass, kind: "placeholder"),
+            CaseResult(caseID: "BDD-04", testStatus: .pass),
+        ]
+        guard case .invalid(let reason) = ResultsReconciler.reconcile(catalogue: cases, results: results) else {
+            Issue.record("expected invalid reconciliation for placeholder-kind records"); return
+        }
+        #expect(reason.contains("placeholder"), "reason must mention placeholder records: \(reason)")
     }
 
     @Test("BDD-04 an unqualified environment is reported, not hidden as a pass")

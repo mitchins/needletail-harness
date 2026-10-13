@@ -38,8 +38,14 @@ jobs:
 
       - name: Install the pinned Swift toolchain (swiftly)
         run: |
-          curl -fsSL https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz | tar -xz -C /tmp
-          /tmp/swiftly init --quiet-shell-followup 2>/dev/null || true
+          # Verified 13 Oct 2026 (HTTP 200; tarball holds `swiftly` +
+          # LICENSE.txt). If upstream re-rolls the archive, the checksum
+          # fails loudly: update the pin, do not delete it.
+          arch="$(uname -m)"
+          curl -fsSL -o /tmp/swiftly.tar.gz "https://download.swift.org/swiftly/linux/swiftly-${arch}.tar.gz"
+          echo "0b26b568811404374c7d7f07276b6aad4145db5d1893a45f307de6a94ca8d9c3  /tmp/swiftly.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/swiftly.tar.gz -C /tmp && rm -f /tmp/swiftly.tar.gz
+          /tmp/swiftly init --quiet-shell-followup
           . "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/env.sh" 2>/dev/null || true
           swiftly install 6.4 --assume-yes
           swiftly use 6.4 --global-default
@@ -93,6 +99,15 @@ jobs:
             exit 1
           fi
 
+      - name: Entry point works via a relative path from another directory
+        run: |
+          # Regression test for the relative-root_dir defect: invoked as
+          # `sh <relpath>/dev` from outside the repo, every log/bundle path
+          # must still resolve (a valid case must pass, not fail with a
+          # doubled path).
+          cd "$(dirname "$GITHUB_WORKSPACE")"
+          sh "$(basename "$GITHUB_WORKSPACE")/dev" test case BDD-01
+
       - name: Runner qualification (expected failure)
         run: ./dev test qualification
 
@@ -104,6 +119,39 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
           persist-credentials: false
+
+      # The release build needs the same pinned toolchain, SQLite headers
+      # and resolved graph as the offline job. (The first CI run passed
+      # here on the image's unpinned Swift; that accident is not a pin, so
+      # the setup is duplicated explicitly rather than assumed.)
+      - name: Install the pinned Swift toolchain (swiftly)
+        run: |
+          arch="$(uname -m)"
+          curl -fsSL -o /tmp/swiftly.tar.gz "https://download.swift.org/swiftly/linux/swiftly-${arch}.tar.gz"
+          echo "0b26b568811404374c7d7f07276b6aad4145db5d1893a45f307de6a94ca8d9c3  /tmp/swiftly.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/swiftly.tar.gz -C /tmp && rm -f /tmp/swiftly.tar.gz
+          /tmp/swiftly init --quiet-shell-followup
+          . "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/env.sh" 2>/dev/null || true
+          swiftly install 6.4 --assume-yes
+          swiftly use 6.4 --global-default
+          case "$(swift --version 2>&1)" in
+            *"Swift version 6.4"*) echo "toolchain pin satisfied" ;;
+            *) echo "FAIL: expected Swift 6.4"; exit 1 ;;
+          esac
+
+      - name: Provision SQLite headers (GRDB system-library requirement)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+          test -f /usr/include/sqlite3.h || { echo "FAIL: sqlite3.h missing after install"; exit 1; }
+
+      - name: Resolve the locked graph (pinned)
+        run: |
+          swift package resolve
+          git diff --exit-code Package.resolved || {
+            echo "FAIL: Package.resolved changed during resolve; the lock is authoritative."
+            exit 1
+          }
 
       - name: Release bundle
         run: ./dev release-bundle

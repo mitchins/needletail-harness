@@ -26,8 +26,9 @@ public struct CaseID: Sendable, Equatable, Hashable, CustomStringConvertible {
         let family = raw[..<separator]
         let suffix = raw[raw.index(after: separator)...]
         guard !family.isEmpty, !suffix.isEmpty else { return nil }
-        // Suffix must be plain digits; never coerced or re-formatted.
-        guard suffix.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+        // Suffix is exactly two plain digits; never coerced or re-formatted.
+        // A one-digit suffix (e.g. UX-UNDO-2) is malformed, not a valid ID.
+        guard suffix.count == 2, suffix.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
         guard Int(suffix) != nil else { return nil }
         // Family: uppercase alphanumeric words joined by single hyphens.
         guard family.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber || $0 == "_" || $0 == "-") }) else { return nil }
@@ -213,7 +214,8 @@ public enum CatalogueStore {
 /// One per-case result record, as a consumer (CI or `./dev coverage`) would
 /// hand to the reconciler. Multiple variants of one behaviour share the case
 /// ID and differ by `variantID`; duplicates of a (case, variant) pair are
-/// errors. `kind: "example"` records are rejected outright: a valid-looking
+/// errors. Only `kind: "evidence"` records can certify anything: any other
+/// kind (example, placeholder, …) invalidates the report — a valid-looking
 /// JSON object cannot certify its own run (TESTING §11).
 public struct CaseResult: Sendable, Equatable, Codable {
     public var caseID: String
@@ -243,10 +245,18 @@ public struct CaseResult: Sendable, Equatable, Codable {
         self.kind = kind
     }
 
-    /// A case is satisfied only when every required field is PASS.
-    public var satisfied: Bool {
+    /// A case is satisfied only when every required field is PASS and every
+    /// evidence layer the catalogue entry requires is backed by a passing
+    /// record: the test field always; the review field if and only if the
+    /// entry requires the `reviewProcess` layer; a present environment field
+    /// always. Absent required evidence never satisfies (BDD-03/BDD-04).
+    public func satisfied(for entry: CatalogueEntry) -> Bool {
         guard testStatus.isSatisfied else { return false }
-        if let reviewStatus, !reviewStatus.isSatisfied { return false }
+        if entry.evidenceLayers.contains(.reviewProcess) {
+            guard let reviewStatus, reviewStatus.isSatisfied else { return false }
+        } else if let reviewStatus, !reviewStatus.isSatisfied {
+            return false
+        }
         if let environmentStatus, !environmentStatus.isSatisfied { return false }
         return true
     }
@@ -278,15 +288,22 @@ public enum Reconciliation: Sendable, Equatable {
 
 /// Classifies a results report against the catalogue with the anti-inflation
 /// rules: unknown IDs fail; duplicate coverage keys fail; cases due now but
-/// absent from the report are reported missing, never assumed pass; example
-/// records cannot certify anything. A case's status is the least-satisfied
-/// status across its variants and across the test/review/environment fields,
-/// which are kept separate (DEVELOPMENT §6).
+/// absent from the report are reported missing, never assumed pass;
+/// non-evidence records invalidate the report. A case's status is the
+/// least-satisfied status across its variants and across the test/review/
+/// environment fields, which are kept separate (DEVELOPMENT §6). Variant
+/// requirements are registered independently of the reported results via
+/// `requiredVariants`: a case with a non-empty requirement is satisfied only
+/// when every required variant ID has a passing record (BDD-02/BDD-04).
 public enum ResultsReconciler {
-    public static func reconcile(catalogue: Catalogue, results: [CaseResult]) -> Reconciliation {
-        // 1. Example/placeholder records cannot certify anything.
-        if results.contains(where: { $0.kind == "example" }) {
-            return .invalid("example-kind result records are not evidence (TESTING §11)")
+    public static func reconcile(
+        catalogue: Catalogue,
+        results: [CaseResult],
+        requiredVariants: [String: Set<String>] = [:]
+    ) -> Reconciliation {
+        // 1. Only evidence-kind records can certify anything.
+        if let bogus = results.first(where: { $0.kind != "evidence" }) {
+            return .invalid("non-evidence result kind \"\(bogus.kind)\" for \(bogus.caseID)/\(bogus.variantID) is not evidence (TESTING §11)")
         }
 
         // 2. Unknown IDs are failures with the exact identifier.
@@ -315,7 +332,19 @@ public enum ResultsReconciler {
         var unsatisfied: [String] = []
         for caseID in reportedIDs.sorted() {
             let variants = results.filter { $0.caseID == caseID }
-            if variants.allSatisfy(\.satisfied) {
+            guard let entry = catalogue.entries.first(where: { $0.id == caseID }) else {
+                unsatisfied.append(caseID)
+                continue
+            }
+            let allReportedPass = variants.allSatisfy { $0.satisfied(for: entry) }
+            if let required = requiredVariants[caseID], !required.isEmpty {
+                let passingIDs = Set(variants.filter { $0.satisfied(for: entry) }.map(\.variantID))
+                if allReportedPass && required.isSubset(of: passingIDs) {
+                    satisfied.append(caseID)
+                } else {
+                    unsatisfied.append(caseID)
+                }
+            } else if allReportedPass {
                 satisfied.append(caseID)
             } else {
                 unsatisfied.append(caseID)

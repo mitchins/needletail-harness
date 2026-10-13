@@ -65,6 +65,19 @@ private func installSIGUSR1Handler() {
     nt_install_usr1_pipe(trigger.writeFD)
 }
 
+private func unblockSIGWINCH() {
+    // Defense in depth alongside the SIGUSR1 precedent (M0-C finding: the
+    // Swift Testing runner blocked job-control signals there). Measured
+    // 13 Oct 2026 on this runner, SigBlk is clear even without this call,
+    // so it is not load-bearing here — but a runner that blocks SIGWINCH
+    // would silently eat every resize, and the failure mode (no repaint,
+    // no error) is otherwise undebuggable.
+    var set = sigset_t()
+    sigemptyset(&set)
+    sigaddset(&set, SIGWINCH)
+    pthread_sigmask(SIG_UNBLOCK, &set, nil)
+}
+
 private func base64(_ text: String) -> String {
     Data(text.utf8).base64EncodedString()
 }
@@ -73,6 +86,14 @@ private func base64(_ text: String) -> String {
 struct NeedletailTypingProbe {
     static func main() {
         installSIGUSR1Handler()
+        unblockSIGWINCH()
+
+        // Become the foreground process group of the PTY. Without this,
+        // kernel TIOCSWINSZ changes update the winsize silently and no
+        // SIGWINCH is ever delivered, so replxx would never repaint on
+        // resize even with its window-change handler installed.
+        let foregroundResult = tcsetpgrp(STDIN_FILENO, getpgrp())
+        emitMarker("PROBE:fgpgrp:\(foregroundResult)")
 
         // Synthetic completion candidates: fixed, deterministic, and the
         // callback reports how many it registered so the driver can prove

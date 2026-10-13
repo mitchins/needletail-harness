@@ -7,10 +7,11 @@ C++ standard: C++11 (upstream CMakeLists); threads via libpthread.
 
 Files in `replxx/` are UNMODIFIED upstream sources from the pinned commit
 (headers, .cxx sources, ConvertUTF.cpp, wcwidth.cpp). Only these bridge
-files are Needletail's: `shim.h`, `include/module.modulemap`, this file.
+files are Needletail's: `include/shim.h`, `include/module.modulemap`,
+`SHA256SUMS-vendored`, this file.
 Integrity: `./dev vendor-check` compares per-file SHA-256 against the
 recorded manifest `SHA256SUMS-vendored`; upstream ref `ThirdParty/replxx`
 (a full clone used for the comparison) is gitignored and never committed.
 
 Swift boundary: `shim.h` exposes only the C API (`extern "C"` in
-include/replxx.h). C++ interoperability does not cross into Swift.
+replxx/replxx.h). C++ interoperability does not cross into Swift.

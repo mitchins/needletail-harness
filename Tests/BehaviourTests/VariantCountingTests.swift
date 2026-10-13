@@ -47,8 +47,7 @@ struct VariantCountingTests {
     }
 
     @Test("BDD-02 duplicate (case, variant) keys are rejected")
-    func BDD_02_duplicateVariantKeysAreRejected() throws {
-        let entry = CatalogueEntry(id: "WIRE-01", family: "WIRE", scenario: "byte splits", dueMilestone: "M1", evidenceLayers: [.integration])
+    func BDD_02_duplicateVariantKeysAreRejected() throws {        let entry = CatalogueEntry(id: "WIRE-01", family: "WIRE", scenario: "byte splits", dueMilestone: "M1", evidenceLayers: [.integration])
         let catalogue = Catalogue(entries: [entry])
         let results = [
             CaseResult(caseID: "WIRE-01", variantID: "byte-split-1", testStatus: .pass),
@@ -60,5 +59,40 @@ struct VariantCountingTests {
             return
         }
         #expect(reason.contains("WIRE-01/byte-split-1"), "reason must name the duplicate key: \(reason)")
+    }
+
+    @Test("BDD-02 one reported variant of ten required leaves the case unsatisfied")
+    func BDD_02_partialVariantReportIsUnsatisfied() throws {
+        // Ten variants are required; only one passing variant is reported.
+        // The other nine may have been filtered out or skipped without
+        // records — that must not satisfy the case. The requirement is
+        // registered independently of the reported results.
+        let entry = CatalogueEntry(id: "WIRE-01", family: "WIRE", scenario: "byte splits", dueMilestone: "M1", evidenceLayers: [.integration])
+        let catalogue = Catalogue(entries: [entry])
+        let required = Set((1...10).map { "byte-split-\($0)" })
+        let results = [CaseResult(caseID: "WIRE-01", variantID: "byte-split-1", testStatus: .pass)]
+        let reconciliation = ResultsReconciler.reconcile(catalogue: catalogue, results: results, requiredVariants: ["WIRE-01": required])
+        guard case .consistent(let report) = reconciliation else {
+            Issue.record("expected a consistent report, got \(reconciliation)")
+            return
+        }
+        #expect(report.unsatisfied == ["WIRE-01"], "nine absent required variants must not be assumed pass")
+        #expect(report.satisfied.isEmpty)
+    }
+
+    @Test("BDD-02 all required variants passing satisfies the case")
+    func BDD_02_allRequiredVariantsSatisfy() throws {
+        let entry = CatalogueEntry(id: "WIRE-01", family: "WIRE", scenario: "byte splits", dueMilestone: "M1", evidenceLayers: [.integration])
+        let catalogue = Catalogue(entries: [entry])
+        let required = Set((1...10).map { "byte-split-\($0)" })
+        let results = (1...10).map { seed in
+            CaseResult(caseID: "WIRE-01", variantID: "byte-split-\(seed)", testStatus: .pass)
+        }
+        let reconciliation = ResultsReconciler.reconcile(catalogue: catalogue, results: results, requiredVariants: ["WIRE-01": required])
+        guard case .consistent(let report) = reconciliation else {
+            Issue.record("expected a consistent report, got \(reconciliation)")
+            return
+        }
+        #expect(report.satisfied == ["WIRE-01"])
     }
 }

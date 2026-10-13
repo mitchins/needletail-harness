@@ -5,7 +5,10 @@
 # explicit, budgeted `--profile` (M5/release only).
 set -eu
 
-root_dir=$(dirname "$0")
+# Absolute repository root, resolved once: later branches must reuse it, not
+# re-derive it (a relative `dirname "$0"` breaks every log path after `cd`
+# when invoked as `sh path/to/dev` from another directory).
+root_dir=$(cd "$(dirname "$0")" && pwd)
 cd "$root_dir"
 
 # Toolchain driver override. The shared swiftly shim on this builder was
@@ -171,8 +174,6 @@ test)
         # toolchain. Asserts version/help/doctor run and that
         # swift/node/python3 are absent inside the container. Docker is a
         # LOCAL qualification aid; it is not a product dependency.
-        root_dir=$(dirname "$0")
-        mkdir -p "$root_dir/.needletail-dev/logs"
         bundle="$root_dir/.build/release-bundle"
         if [ ! -x "$bundle/needletail" ]; then
             echo "BLOCKED: $bundle/needletail missing; run ./dev release-bundle first."
@@ -239,7 +240,6 @@ vendor-check)
     # `sha256sum -c` verifies the vendored tree on any clean checkout
     # without a reference clone. The clone check (byte-for-byte against a
     # local full clone in ThirdParty/replxx) is an optional secondary.
-    root_dir=$(dirname "$0")
     status=0
     if (cd "$root_dir/Sources/CReplxx/replxx" && sha256sum -c ../SHA256SUMS-vendored >/dev/null 2>&1); then
         echo "VENDOR OK (offline): all vendored sources match the pinned upstream blob hashes"
@@ -248,13 +248,17 @@ vendor-check)
         (cd "$root_dir/Sources/CReplxx/replxx" && sha256sum -c ../SHA256SUMS-vendored 2>&1 | grep -v ': OK' | head -5)
         status=1
     fi
-    # Secondary check when a reference clone is present.
+    # Secondary check when a reference clone is present. The clone verdict
+    # has its own flag: the shared `status` may already be set by the
+    # offline check, so the OK message must not depend on it.
     upstream_dir="$root_dir/ThirdParty/replxx"
+    clone_ok=1
     if [ -d "$upstream_dir/.git" ]; then
         pinned=$(git -C "$upstream_dir" rev-parse HEAD 2>/dev/null || true)
         if [ "$pinned" != "1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2" ]; then
             echo "FAIL: reference clone at '$pinned', expected 1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2"
             status=1
+            clone_ok=0
         else
             for f in "$root_dir/Sources/CReplxx/replxx"/*; do
                 base=$(basename "$f")
@@ -265,14 +269,16 @@ vendor-check)
                 if [ ! -f "$upstream" ]; then
                     echo "FAIL: $base has no upstream counterpart at the pinned commit"
                     status=1
+                    clone_ok=0
                     continue
                 fi
                 if ! cmp -s "$f" "$upstream"; then
                     echo "FAIL: $base differs from the pinned upstream clone"
                     status=1
+                    clone_ok=0
                 fi
             done
-            echo "VENDOR OK (clone): byte-identical to the pinned upstream commit"
+            [ "$clone_ok" -eq 1 ] && echo "VENDOR OK (clone): byte-identical to the pinned upstream commit"
         fi
     else
         echo "NOTE: no reference clone at $upstream_dir (gitignored); offline manifest check is authoritative."
@@ -285,7 +291,6 @@ release-bundle)
     # back to a dynamic bundle with the toolchain runtime copied in and a
     # launcher that sets the library path. The choice, the ldd manifest and
     # the binary size are recorded under .needletail-dev/logs/.
-    root_dir=$(dirname "$0")
     bundle="$root_dir/.build/release-bundle"
     rm -rf "$bundle"
     mkdir -p "$bundle"
@@ -327,7 +332,6 @@ release-bundle)
             echo 'export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
             echo 'exec "$here/bin/needletail.real" "$@"'
         } > "$bundle/needletail"
-        chmod +x "$bundle/needletail"
         chmod +x "$bundle/needletail"
         echo "dynamic" > "$bundle/linkage-mode.txt"
         rm -f "$bundle/.runtime-libs.txt"
