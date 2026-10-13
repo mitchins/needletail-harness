@@ -148,6 +148,18 @@ private func bindThenCloseLoopbackPort() throws -> UInt16 {
     return port
 }
 
+/// Bounded readiness handshake: true once the server observes the request
+/// head, false on deadline. Never sleeps in place of readiness — the wait
+/// itself is the bounded gate, so a silent server fails fast instead of
+/// hanging the suite (an unbounded `for await` over the stream would wait
+/// forever when nothing ever yields nor finishes it).
+private func awaitRequestHead(_ server: SyntheticLoopbackServer, deadlineSeconds: Double) async -> Bool {
+    await raceToCompletion(produce: {
+        for await _ in server.requestReceived { return "ready" }
+        return "closed"
+    }, deadlineSeconds: deadlineSeconds) == "ready"
+}
+
 struct TransportCancellationTests {
 
     @Test("NET-04 cancelling an in-flight request completes bounded with no resend")
@@ -172,21 +184,8 @@ struct TransportCancellationTests {
 
         // Readiness handshake: never sleep in place of readiness; the wait
         // itself is bounded so a server regression fails fast.
-        enum Readiness { case ready, timedOut }
-        let readiness = await withTaskGroup(of: Readiness.self, returning: Readiness.self) { group in
-            group.addTask {
-                for await _ in server.requestReceived { return .ready }
-                return .timedOut
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                return .timedOut
-            }
-            let first = await group.next() ?? .timedOut
-            group.cancelAll()
-            return first
-        }
-        #expect(readiness == .ready, "synthetic server never received the request head")
+        let ready = await awaitRequestHead(server, deadlineSeconds: 10)
+        #expect(ready, "synthetic server never received the request head")
 
         requestTask.cancel()
 
@@ -282,11 +281,30 @@ struct TransportCancellationTests {
                 return classifyRequestError(error)
             }
         }
-        for await _ in server.requestReceived { break }
+        guard await awaitRequestHead(server, deadlineSeconds: 10) else {
+            server.stop()
+            try await client.shutdown()
+            return "failed: request head never arrived"
+        }
         requestTask.cancel()
         let outcome = await raceToCompletion(produce: { await requestTask.value }, deadlineSeconds: 10)
         server.stop()
         try await client.shutdown()
         return outcome
+    }
+
+    @Test("NET-04 a silent server fails readiness fast instead of hanging")
+    func NET_04_silentServerFailsReadinessFast() async throws {
+        // The server is never started, so no request head can arrive and
+        // the stream never finishes: an unbounded wait would hang (see
+        // cr-red-readiness-hang.log, killed by timeout). The bounded
+        // handshake must report false at ~the deadline instead.
+        let server = try SyntheticLoopbackServer()
+        let start = Date()
+        let ready = await awaitRequestHead(server, deadlineSeconds: 1)
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(!ready, "an unstarted server must not report readiness")
+        #expect(elapsed >= 1.0, "the full deadline must elapse, returned after \(elapsed)s")
+        #expect(elapsed < 5.0, "readiness must fail at ~1s, took \(elapsed)s")
     }
 }

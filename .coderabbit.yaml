@@ -48,9 +48,12 @@ reviews:
         readiness; no oracle regenerated from the code under test.
     - path: "Sources/CReplxx/**"
       instructions: |
-        Vendored third-party sources: changes must be limited to bridge
-        files (shim.h, include/module.modulemap). Upstream sources must
-        remain byte-identical to the pinned commit (`./dev vendor-check`).
+        Vendored third-party sources: files under `replxx/` are upstream
+        and must remain byte-identical to the pinned commit
+        (`./dev vendor-check`). The only permitted Needletail-owned files
+        here are the bridge (`include/shim.h`, `include/module.modulemap`)
+        and the vendoring records (`README.provenance`,
+        `SHA256SUMS-vendored`); `replxx/LICENSE.md` is upstream, unmodified.
   auto_review:
     enabled: true
     drafts: false
