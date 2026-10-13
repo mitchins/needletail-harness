@@ -172,6 +172,7 @@ test)
         # swift/node/python3 are absent inside the container. Docker is a
         # LOCAL qualification aid; it is not a product dependency.
         root_dir=$(dirname "$0")
+        mkdir -p "$root_dir/.needletail-dev/logs"
         bundle="$root_dir/.build/release-bundle"
         if [ ! -x "$bundle/needletail" ]; then
             echo "BLOCKED: $bundle/needletail missing; run ./dev release-bundle first."
@@ -288,6 +289,7 @@ release-bundle)
     bundle="$root_dir/.build/release-bundle"
     rm -rf "$bundle"
     mkdir -p "$bundle"
+    mkdir -p "$root_dir/.needletail-dev/logs"
     echo "== static Swift stdlib release build =="
     if "$NEEDLETAIL_SWIFT" build -c release -j 4 --static-swift-stdlib --product needletail > "$root_dir/.needletail-dev/logs/release-build-static.log" 2>&1; then
         mkdir -p "$bundle/bin"

@@ -1,8 +1,6 @@
-# Needletail Linux CI (M0-D, prepared locally — NOT ACTIVATED).
+# Needletail Linux CI (M0-D; activated on PR #1, 13 Oct 2026).
 #
-# Activation requires the maintainer's remote authorization (GitHub push
-# and the CodeRabbit installation); this file is the prepared gate, not a
-# running one. Guardrails per DEVELOPMENT §8 / REVIEW §5:
+# Guardrails per DEVELOPMENT §8 / REVIEW §5:
 #   - actions pinned to verified immutable revisions (no tags in `uses:`);
 #   - token permissions default to read-only (contents: read);
 #   - no pull_request_target; fork PRs receive no credentials;
@@ -40,7 +38,7 @@ jobs:
 
       - name: Install the pinned Swift toolchain (swiftly)
         run: |
-          curl -fsSL https://download.swift.org/install/linux/swiftly-$(uname -m).tar.gz | tar -xz -C /tmp
+          curl -fsSL https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz | tar -xz -C /tmp
           /tmp/swiftly init --quiet-shell-followup 2>/dev/null || true
           . "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/env.sh" 2>/dev/null || true
           swiftly install 6.4 --assume-yes
