@@ -1,0 +1,2121 @@
+{
+  "catalogue": "needletail-acceptance-v0.3",
+  "format_version": 1,
+  "current_milestone": "M0",
+  "case_count": 200,
+  "provenance": "Extracted 12 October 2026 from the ACCEPTANCE.md tables embedded in COMPLETE-SPEC.md Part 10 (the standalone ACCEPTANCE.md is absent from this workspace). Scenario text verbatim from the tables. due_milestone and evidence_layers are the implementer's assignment read from MILESTONES.md and the M0-M6 exit criteria; changing them requires slice review. status reflects the M0 baseline: NOT_IMPLEMENTED for cases due at M0, DEFERRED_BY_PLAN for cases due later. No entry is PASS without executed evidence. Per-case status_detail annotations record the M0 slice closeout (plans/m0-milestone-report.md); status field remains the visibility vocabulary, never a self-awarded pass. 12 Oct 2026 update: decisions D-1 (Swift 6.4.0 installed) and D-2 (libsqlite3-dev installed) resolved by the operator; the slice was re-qualified on Swift 6.4.0 and STORE-01 executed. Correction 12 Oct 2026 (final-review finding F-3): reassigned IDs carry DEFERRED_BY_PLAN per the catalog's status rule (due later than the current milestone); the report's claim now matches the frozen data. Vocabulary note 12 Oct 2026: status values are IMPLEMENTED (due at the current milestone with executed evidence recorded in status_detail), NOT_IMPLEMENTED (due at the current milestone, no evidence yet) and DEFERRED_BY_PLAN (due later than the current milestone). BehaviourTests enforce this rule against the data. 12 Oct 2026 M0-C/D update: status_detail annotations name local preparation only; no status changed value. The single Linux PTY feasibility scenario is development evidence, not a PTY-01..08 or TERM-* pass.",
+  "entries": [
+    {
+      "id": "BDD-01",
+      "family": "BDD",
+      "scenario": "Required behaviour test has no catalogue ID or an unknown ID",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (pure): Tests/BehaviourTests/CatalogReconciliationTests.swift"
+    },
+    {
+      "id": "BDD-02",
+      "family": "BDD",
+      "scenario": "Ten seeds and duplicate test functions exercise the same behaviour",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (pure): Tests/BehaviourTests/VariantCountingTests.swift"
+    },
+    {
+      "id": "BDD-03",
+      "family": "BDD",
+      "scenario": "A registered case has no executed test body or only a no-op assertion",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (pure): Tests/BehaviourTests/ResultsClassificationTests.swift"
+    },
+    {
+      "id": "BDD-04",
+      "family": "BDD",
+      "scenario": "A required variant is skipped, filtered out, pending or marked known issue",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (pure): Tests/BehaviourTests/ResultsClassificationTests.swift"
+    },
+    {
+      "id": "BDD-05",
+      "family": "BDD",
+      "scenario": "Only a pure mock passes for a case requiring native filesystem or PTY evidence",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "BDD-06",
+      "family": "BDD",
+      "scenario": "Deliberately remove a critical guard in a disposable wrong-implementation probe",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "BDD-07",
+      "family": "BDD",
+      "scenario": "Golden is regenerated from production output during the same run",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "BDD-08",
+      "family": "BDD",
+      "scenario": "Replay a failed interleaving with frozen clock, IDs and seed",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-01",
+      "family": "CACHE",
+      "scenario": "Ordinary appended turns with unchanged profile",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-02",
+      "family": "CACHE",
+      "scenario": "Timestamp, cwd metadata or git status changes",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-03",
+      "family": "CACHE",
+      "scenario": "Tool result first preview, then additional artifact range",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-04",
+      "family": "CACHE",
+      "scenario": "Same client prefix with server cache counters unavailable",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-05",
+      "family": "CACHE",
+      "scenario": "Warm checkpoint request",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-06",
+      "family": "CACHE",
+      "scenario": "Checkpoint malformed, references nonexistent receipts, cancels or exceeds quota",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-07",
+      "family": "CACHE",
+      "scenario": "New shorter epoch after successful checkpoint",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-08",
+      "family": "CACHE",
+      "scenario": "Constraint, failed attempt or unresolved command in long history",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-09",
+      "family": "CACHE",
+      "scenario": "Model/provider/tool-set switch",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-10",
+      "family": "CACHE",
+      "scenario": "Near-context limit with approximate tokenizer",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-11",
+      "family": "CACHE",
+      "scenario": "32K sealed consultant versus 262K main profile",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-12",
+      "family": "CACHE",
+      "scenario": "Model claims “tests passed” without evidence",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CACHE-13",
+      "family": "CACHE",
+      "scenario": "Main plus consultant contend on same endpoint",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CFG-01",
+      "family": "CFG",
+      "scenario": "Duplicate model IDs and duplicate JSON keys, including nested keys",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CFG-02",
+      "family": "CFG",
+      "scenario": "Unknown top-level/model field, bad numeric limit, missing alias reference",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CFG-03",
+      "family": "CFG",
+      "scenario": "Credential in env/file/Keychain",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CFG-04",
+      "family": "CFG",
+      "scenario": "Repo file attempts to register an endpoint or grant trusted execution",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CFG-05",
+      "family": "CFG",
+      "scenario": "Literal `001234`, huge integer-looking IDs, Unicode paths",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CFG-06",
+      "family": "CFG",
+      "scenario": "Reserved native request-options override (`model`, `tools`, `messages`, credentials)",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CLOUD-01",
+      "family": "CLOUD",
+      "scenario": "Responses native reasoning/tool sequence replay",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration",
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CLOUD-02",
+      "family": "CLOUD",
+      "scenario": "Messages signed thinking/tool blocks replay",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration",
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CLOUD-03",
+      "family": "CLOUD",
+      "scenario": "Different cache-read/write input conventions",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration",
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CLOUD-04",
+      "family": "CLOUD",
+      "scenario": "Pricing absent/stale and usage missing",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration",
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CLOUD-05",
+      "family": "CLOUD",
+      "scenario": "Sensitive local session requests cloud switch",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration",
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CONSULT-01",
+      "family": "CONSULT",
+      "scenario": "Worker packet omits main verdict and history",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CONSULT-02",
+      "family": "CONSULT",
+      "scenario": "Worker asks for a tool or recursively consults",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CONSULT-03",
+      "family": "CONSULT",
+      "scenario": "Large packet/output or main/worker endpoint ID collision",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CONSULT-04",
+      "family": "CONSULT",
+      "scenario": "Provisional label presented as adjudicated truth",
+      "due_milestone": "M5",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CORE-01",
+      "family": "CORE",
+      "scenario": "Scripted multi-turn read/edit/test/repair loop",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CORE-02",
+      "family": "CORE",
+      "scenario": "Cancellation at every active state",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CORE-03",
+      "family": "CORE",
+      "scenario": "Three identical invalid/denied attempts",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "CORE-04",
+      "family": "CORE",
+      "scenario": "Run wall-clock/turn budget exhaustion",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DEV-01",
+      "family": "DEV",
+      "scenario": "The free implementer route expires, rate-limits or starts requiring paid access",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (reviewProcess): implementer route availability verified from `opencode models`"
+    },
+    {
+      "id": "DEV-02",
+      "family": "DEV",
+      "scenario": "A review packet includes private corpus/source/credentials or implicit linked-repo context",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (reviewProcess): review packets contained only repo/spec files"
+    },
+    {
+      "id": "DEV-03",
+      "family": "DEV",
+      "scenario": "A fork PR or edited workflow attempts to read secrets or self-certify its own gate",
+      "due_milestone": "M0-D",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "workflow prepared locally with least-privilege and fork boundaries (persist-credentials false, no pull_request_target, contents: read); activation pending remote authorization (BLOCKED_REVIEW on the authorization itself)"
+    },
+    {
+      "id": "DEV-04",
+      "family": "DEV",
+      "scenario": "A test tries to evict serving workloads, alter model slots or kill generic processes",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (reviewProcess): tests spawn only test-owned children; no generic process kills"
+    },
+    {
+      "id": "DX-01",
+      "family": "DX",
+      "scenario": "Replay identical `UIAction`s twice with frozen clock and IDs",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DX-02",
+      "family": "DX",
+      "scenario": "Late async `@` candidate result after newer input",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DX-03",
+      "family": "DX",
+      "scenario": "UI requests queueing while SessionActor denies due to policy",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DX-04",
+      "family": "DX",
+      "scenario": "Mock provider emits every SSE byte as independent chunk",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DX-05",
+      "family": "DX",
+      "scenario": "Mock emits tool start/progress/failure/retry or cancellations",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DX-06",
+      "family": "DX",
+      "scenario": "Concurrent model/status/draft events in adversarial interleavings",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DX-07",
+      "family": "DX",
+      "scenario": "Snapshot golden intentionally changed by implementation",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DX-08",
+      "family": "DX",
+      "scenario": "`swift test` with network disabled and no Node/Python installed",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "packaging",
+        "integration"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS: ./dev test quick green offline on Swift 6.4.0 with proxy-blackholed network and minimal PATH; the CI workflow runs the same offline suites when activated"
+    },
+    {
+      "id": "DX-09",
+      "family": "DX",
+      "scenario": "UI frame test vs actual PTY disagree",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "DX-10",
+      "family": "DX",
+      "scenario": "Tests run repeatedly with stress seeds, no sleeps",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "HEAD-01",
+      "family": "HEAD",
+      "scenario": "JSONL mode with streamed tool output and errors",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "HEAD-02",
+      "family": "HEAD",
+      "scenario": "Consumer closes output pipe",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "HEAD-03",
+      "family": "HEAD",
+      "scenario": "Each terminal run outcome",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "NET-01",
+      "family": "NET",
+      "scenario": "Local-only profile plus cloud model selection",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "NET-02",
+      "family": "NET",
+      "scenario": "Authorized origin returns redirect to another origin",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "NET-03",
+      "family": "NET",
+      "scenario": "Proxy env vars and malicious CA/config environment",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "NET-04",
+      "family": "NET",
+      "scenario": "Very slow local prefill with transport heartbeats",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "NET-05",
+      "family": "NET",
+      "scenario": "Transient pre-stream error versus mid-stream disconnect",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "NET-06",
+      "family": "NET",
+      "scenario": "`doctor` versus `doctor --probe MODEL`",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PKG-01",
+      "family": "PKG",
+      "scenario": "Launch release on supported clean host without Node/npm/Bun/Python/Homebrew/Swift compiler",
+      "due_milestone": "M6",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "thin clean-host smoke executed locally 12 Oct 2026 (version/help/doctor on a digest-pinned ubuntu:24.04 with --network none; swift/node/python3 asserted absent); the mock-session run remains due"
+    },
+    {
+      "id": "PKG-02",
+      "family": "PKG",
+      "scenario": "Execute with all network blocked",
+      "due_milestone": "M6",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "network-blocked host matrix not run yet"
+    },
+    {
+      "id": "PKG-03",
+      "family": "PKG",
+      "scenario": "Rebuild locked graph in clean builder",
+      "due_milestone": "M6",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "workflow file prepared locally (pinned action revisions verified against the GitHub API); locked-graph rebuild executed only when the workflow is activated"
+    },
+    {
+      "id": "PKG-04",
+      "family": "PKG",
+      "scenario": "Inspect linked libraries and distributable",
+      "due_milestone": "M6",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "linkage manifest + notices produced for the local dynamic bundle; SBOM still due"
+    },
+    {
+      "id": "PKG-05",
+      "family": "PKG",
+      "scenario": "Missing git or rg",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "doctor capability machinery exists early (git/rg presence maps to capability text, verified under a restricted PATH)"
+    },
+    {
+      "id": "PKG-06",
+      "family": "PKG",
+      "scenario": "Unsupported OS/arch or missing dynamic runtime",
+      "due_milestone": "M6",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "unimplemented-architecture handling not built"
+    },
+    {
+      "id": "POLICY-01",
+      "family": "POLICY",
+      "scenario": "Observe mode receives an exec request",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "POLICY-02",
+      "family": "POLICY",
+      "scenario": "All permutations of `--sealed`, `--tools none`, config tool enables",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "POLICY-03",
+      "family": "POLICY",
+      "scenario": "Sealed prompt requests absolute-path read or emits tool JSON",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "POLICY-04",
+      "family": "POLICY",
+      "scenario": "Headless command requires approval",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "POLICY-05",
+      "family": "POLICY",
+      "scenario": "Workspace instruction requests cloud upload or permission mutation",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "POLICY-06",
+      "family": "POLICY",
+      "scenario": "Trusted exec accesses something denied to native `read`",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "POLICY-07",
+      "family": "POLICY",
+      "scenario": "Prior unknown-outcome command followed by automatic resume",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PORT-01",
+      "family": "PORT",
+      "scenario": "M0-M3 execute on provisioned Linux with no Apple host/toolchain",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (packaging): all M0 gates ran on Linux x86_64"
+    },
+    {
+      "id": "PORT-02",
+      "family": "PORT",
+      "scenario": "Apple-only or Linux-specific implementation imports leak into Core/Presentation",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PORT-03",
+      "family": "PORT",
+      "scenario": "Case-sensitive and Unicode-equivalent filenames differ across filesystems",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PORT-04",
+      "family": "PORT",
+      "scenario": "In-memory storage tests pass but native process-kill/reopen test fails",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PORT-05",
+      "family": "PORT",
+      "scenario": "Ubuntu-built bundle has undeclared runtime/glibc requirements on a claimed target",
+      "due_milestone": "M6",
+      "evidence_layers": [
+        "packaging"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PORT-06",
+      "family": "PORT",
+      "scenario": "A macOS portability patch regresses an existing Linux case",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PROC-01",
+      "family": "PROC",
+      "scenario": "Child floods stdout and stderr simultaneously",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PROC-02",
+      "family": "PROC",
+      "scenario": "Parent and grandchild in same process group ignore interrupt",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PROC-03",
+      "family": "PROC",
+      "scenario": "Repeated cancel/timeout cycles",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PROC-04",
+      "family": "PROC",
+      "scenario": "Child deliberately detaches into a new session",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PROC-05",
+      "family": "PROC",
+      "scenario": "Artifact cap/disk-full while child continues printing",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PROC-06",
+      "family": "PROC",
+      "scenario": "Existing Conda/compiler binary selected by absolute path",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "PTY-01",
+      "family": "PTY",
+      "scenario": "Real CLI opens/closes editor and receives Ctrl+C",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "PTY-driver seed plus ONE Linux feasibility scenario exist as development evidence (replxx bridge); not interactive acceptance"
+    },
+    {
+      "id": "PTY-02",
+      "family": "PTY",
+      "scenario": "Paste multi-line text while streaming; user submits after paste",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "PTY-driver seed plus ONE Linux feasibility scenario exist as development evidence; not interactive acceptance"
+    },
+    {
+      "id": "PTY-03",
+      "family": "PTY",
+      "scenario": "`@` candidates and bounded preview while model/tool writes output",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "PTY-driver seed plus ONE Linux feasibility scenario exist as development evidence; not interactive acceptance"
+    },
+    {
+      "id": "PTY-04",
+      "family": "PTY",
+      "scenario": "Queue message during 100s of streamed chunks; interrupt",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "PTY-driver seed plus ONE Linux feasibility scenario exist as development evidence; not interactive acceptance"
+    },
+    {
+      "id": "PTY-05",
+      "family": "PTY",
+      "scenario": "`TIOCSWINSZ` 40→120→80 while cursor in multi-line composer",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "PTY-driver seed plus ONE Linux feasibility scenario exist as development evidence; not interactive acceptance"
+    },
+    {
+      "id": "PTY-06",
+      "family": "PTY",
+      "scenario": "Stream malicious OSC title / cursor motion / control bytes",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "PTY-driver seed plus ONE Linux feasibility scenario exist as development evidence; not interactive acceptance"
+    },
+    {
+      "id": "PTY-07",
+      "family": "PTY",
+      "scenario": "Catchable SIGTERM/EOF versus SIGKILL or fatal crash while active",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "PTY-driver seed plus ONE Linux feasibility scenario exist as development evidence; not interactive acceptance"
+    },
+    {
+      "id": "PTY-08",
+      "family": "PTY",
+      "scenario": "macOS and Linux with tmux/SSH-like TERM capabilities",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "PTY-driver seed plus ONE Linux feasibility scenario exist as development evidence (Linux only); not interactive acceptance"
+    },
+    {
+      "id": "REAL-01",
+      "family": "REAL",
+      "scenario": "Synthetic probe on actual authorized local endpoint",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "REAL-02",
+      "family": "REAL",
+      "scenario": "Coding loop on scratch copy/worktree without altering baseline",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "REAL-03",
+      "family": "REAL",
+      "scenario": "Matched Pi comparison",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "REAL-04",
+      "family": "REAL",
+      "scenario": "Long-context and checkpoint transition",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "REAL-05",
+      "family": "REAL",
+      "scenario": "User endpoint already serving another session",
+      "due_milestone": "M3",
+      "evidence_layers": [
+        "liveProvider"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "REV-01",
+      "family": "REV",
+      "scenario": "Implementation begins before independent review of its required plan",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (reviewProcess): plan reviewed before implementation, plans/m0-a-b-receipt.md"
+    },
+    {
+      "id": "REV-02",
+      "family": "REV",
+      "scenario": "deepseek-reviewer is unavailable or resolves to the implementer under another name",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (reviewProcess): reviewer route independent of implementer, plans/m0-a-b-receipt.md"
+    },
+    {
+      "id": "REV-03",
+      "family": "REV",
+      "scenario": "Code, tests, fixture, lock or plan changes after the recorded review subject",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (reviewProcess): pre/post-disposition plan digests recorded; final review bound to frozen head"
+    },
+    {
+      "id": "REV-04",
+      "family": "REV",
+      "scenario": "A finding lacks evidence or reviewer cannot inspect a required boundary",
+      "due_milestone": "M0",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "IMPLEMENTED",
+      "status_detail": "executed PASS (reviewProcess): slice review returned NEEDS_EVIDENCE with uncertainty markers"
+    },
+    {
+      "id": "REV-05",
+      "family": "REV",
+      "scenario": "Two review cycles leave a substantive unresolved contradiction",
+      "due_milestone": "M0-D",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "requires the remote CodeRabbit/review path; not authorized"
+    },
+    {
+      "id": "REV-06",
+      "family": "REV",
+      "scenario": "CodeRabbit returns summary-only, failed, skipped or truncated epic review",
+      "due_milestone": "M0-D",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "requires CodeRabbit epic review on the authorized remote"
+    },
+    {
+      "id": "REV-07",
+      "family": "REV",
+      "scenario": "Aggregate epic review omits a risky file or sees only the last fix",
+      "due_milestone": "M0-D",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "requires CodeRabbit epic coverage on the authorized remote"
+    },
+    {
+      "id": "REV-08",
+      "family": "REV",
+      "scenario": "Author asks to resolve every finding or a bot proposes automatic code changes",
+      "due_milestone": "M0-D",
+      "evidence_layers": [
+        "reviewProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "requires bot-proposed-change review path on the authorized remote"
+    },
+    {
+      "id": "STATE-01",
+      "family": "STATE",
+      "scenario": "Late request/effect completion arrives after cancellation or new run revision",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STATE-02",
+      "family": "STATE",
+      "scenario": "Queue admission commits but its UI acknowledgement is lost and retried",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STATE-03",
+      "family": "STATE",
+      "scenario": "Provider may have processed a dispatched message before connection/crash",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STATE-04",
+      "family": "STATE",
+      "scenario": "Output buffers and durable artifact quota fill while user cancels",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STATE-05",
+      "family": "STATE",
+      "scenario": "Successful or partial native undo precedes the next model request",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STATE-06",
+      "family": "STATE",
+      "scenario": "Process receives an uncatchable signal while terminal is raw",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STORE-01",
+      "family": "STORE",
+      "scenario": "Transaction commit/reopen on native platform",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "executed PASS (nativeStorage) 12 Oct 2026 after decision D-2 resolved (libsqlite3-dev installed): SQLite reopen probe green on Swift 6.4.0; evidence .needletail-dev/logs/test-native-swift64-grdb.log"
+    },
+    {
+      "id": "STORE-02",
+      "family": "STORE",
+      "scenario": "Crash before intent, after intent, after side effect, before completion",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STORE-03",
+      "family": "STORE",
+      "scenario": "Artifact rename succeeds but DB transaction does not",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STORE-04",
+      "family": "STORE",
+      "scenario": "DB completion tries to refer to absent/uncommitted artifact",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STORE-05",
+      "family": "STORE",
+      "scenario": "Future schema version or corrupt database",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STORE-06",
+      "family": "STORE",
+      "scenario": "Two writers open same session",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STORE-07",
+      "family": "STORE",
+      "scenario": "Huge transcript resume/list",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STORE-08",
+      "family": "STORE",
+      "scenario": "Export and support diagnostics",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "STORE-09",
+      "family": "STORE",
+      "scenario": "Session/global quota reached",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeStorage",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TERM-01",
+      "family": "TERM",
+      "scenario": "Bracketed paste contains newlines and shell-looking text",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "terminalAdapter",
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "replxx bridge exists; full terminal adapter suite is M4"
+    },
+    {
+      "id": "TERM-02",
+      "family": "TERM",
+      "scenario": "Unicode, resize, long line, SSH and tmux",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "terminalAdapter",
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "replxx bridge exists; full terminal adapter suite is M4"
+    },
+    {
+      "id": "TERM-03",
+      "family": "TERM",
+      "scenario": "Ctrl-C during input, provider call and exec",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "terminalAdapter",
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "replxx bridge exists; full terminal adapter suite is M4"
+    },
+    {
+      "id": "TERM-04",
+      "family": "TERM",
+      "scenario": "Non-TTY/dumb terminal",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "terminalAdapter",
+        "pty"
+      ],
+      "status": "DEFERRED_BY_PLAN",
+      "status_detail": "replxx bridge exists; full terminal adapter suite is M4 (non-TTY fallback)"
+    },
+    {
+      "id": "TOOL-01",
+      "family": "TOOL",
+      "scenario": "`read` exceeds line/byte budget or sees binary data",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-02",
+      "family": "TOOL",
+      "scenario": "Search query begins with `-`, includes regex/glob metacharacters",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-03",
+      "family": "TOOL",
+      "scenario": "`RIPGREP_CONFIG_PATH`, `--pre`, symlinked external directory",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-04",
+      "family": "TOOL",
+      "scenario": "Exact edit with zero, one and multiple occurrences",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-05",
+      "family": "TOOL",
+      "scenario": "File changes after read and before final commit check",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-06",
+      "family": "TOOL",
+      "scenario": "CRLF, no final newline, combining characters, emoji",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-07",
+      "family": "TOOL",
+      "scenario": "Symlink/parent swap, hardlink/special file, `../` escape",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-08",
+      "family": "TOOL",
+      "scenario": "Create-new path already exists / stale overwrite hash",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-09",
+      "family": "TOOL",
+      "scenario": "Second file in a multi-file operation fails",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-10",
+      "family": "TOOL",
+      "scenario": "Diff in dirty worktree with user changes and external diff config",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-11",
+      "family": "TOOL",
+      "scenario": "Artifact ID belonging to another session",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "TOOL-12",
+      "family": "TOOL",
+      "scenario": "ANSI OSC/CSI/DCS, control characters and bidi controls in model/tool text",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-01",
+      "family": "UX-MENTION",
+      "scenario": "Typing `@` in allowed boundary and basename/path fragments",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-02",
+      "family": "UX-MENTION",
+      "scenario": "`foo@bar`, escaped `\\\\@`, code/paste literal and assistant/tool output",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-03",
+      "family": "UX-MENTION",
+      "scenario": "Tab choose Unicode/space-containing path and move cursor",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-04",
+      "family": "UX-MENTION",
+      "scenario": "Candidate changes from revision N+1 arrive before N",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-05",
+      "family": "UX-MENTION",
+      "scenario": "100K+ path synthetic catalogue, long basename and ignored secrets",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-06",
+      "family": "UX-MENTION",
+      "scenario": "Preview text with ANSI/OSC/bidi and 20 MiB file",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-07",
+      "family": "UX-MENTION",
+      "scenario": "Binary, symlink outside root, denied file and missing file",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-08",
+      "family": "UX-MENTION",
+      "scenario": "Selected range `#L10-L30`, reversed/out-of-bounds ranges",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-09",
+      "family": "UX-MENTION",
+      "scenario": "File modified during snapshot or before queued dispatch",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-10",
+      "family": "UX-MENTION",
+      "scenario": "2 MiB referenced file in tool-enabled vs sealed mode",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-11",
+      "family": "UX-MENTION",
+      "scenario": "Preview selected then cancelled or draft withdrawn",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-MENTION-12",
+      "family": "UX-MENTION",
+      "scenario": "Cloud switch before queued attachment dispatch",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-NAV-01",
+      "family": "UX-NAV",
+      "scenario": "`/agents` with active, idle, stale and unknown sessions",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-NAV-02",
+      "family": "UX-NAV",
+      "scenario": "`/agents` during a bounded consult",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-NAV-03",
+      "family": "UX-NAV",
+      "scenario": "`/models` vs `/sessions` vs `/agents`",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-NAV-04",
+      "family": "UX-NAV",
+      "scenario": "`/context` on profile with unavailable cache stats",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-NAV-05",
+      "family": "UX-NAV",
+      "scenario": "`/compact --dry-run` then cancel",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-NAV-06",
+      "family": "UX-NAV",
+      "scenario": "`/epochs` after failed and successful checkpoints",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-NAV-07",
+      "family": "UX-NAV",
+      "scenario": "`/diff` in dirty/staged/untracked tree with agent edits",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-01",
+      "family": "UX-QUEUE",
+      "scenario": "User types while streaming 500 model chunks",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-02",
+      "family": "UX-QUEUE",
+      "scenario": "Enter while busy",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-03",
+      "family": "UX-QUEUE",
+      "scenario": "`/steer` during streamed incomplete tool call",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-04",
+      "family": "UX-QUEUE",
+      "scenario": "Two steers and three follow-ups",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-05",
+      "family": "UX-QUEUE",
+      "scenario": "`/queue` edit/reorder/withdraw before dispatch",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-06",
+      "family": "UX-QUEUE",
+      "scenario": "Crash at queued, dispatched, delivered boundary",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-07",
+      "family": "UX-QUEUE",
+      "scenario": "Ctrl+C during active generation with pending queue",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-08",
+      "family": "UX-QUEUE",
+      "scenario": "Stale attachment or missing route grant at head of queue",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-09",
+      "family": "UX-QUEUE",
+      "scenario": "21st queue item / cumulative text exceeds 64 KiB",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "pure"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-10",
+      "family": "UX-QUEUE",
+      "scenario": "Model/endpoint epoch changed since enqueue",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-11",
+      "family": "UX-QUEUE",
+      "scenario": "Headless mode cannot request permission",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-QUEUE-12",
+      "family": "UX-QUEUE",
+      "scenario": "Busy stream ends in failure with queued items",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-RENDER-01",
+      "family": "UX-RENDER",
+      "scenario": "Markdown headings 1–6, nested ordered/unordered/task lists",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "terminalAdapter"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-RENDER-02",
+      "family": "UX-RENDER",
+      "scenario": "Inline code, bold, italic, blockquote, fence across split stream chunks",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "terminalAdapter"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-RENDER-03",
+      "family": "UX-RENDER",
+      "scenario": "Unified diff including `+`, `-`, `@@`, path, no-newline note",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "terminalAdapter"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-RENDER-04",
+      "family": "UX-RENDER",
+      "scenario": "C0/C1, ESC/OSC/DCS, bidi controls in source/model/tool streams",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "terminalAdapter"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-RENDER-05",
+      "family": "UX-RENDER",
+      "scenario": "Unicode combining/emoji paths at 40/80/120 widths",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "terminalAdapter"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-RENDER-06",
+      "family": "UX-RENDER",
+      "scenario": "`NO_COLOR`, `TERM=dumb`, non-TTY, narrow terminal",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "terminalAdapter"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-RENDER-07",
+      "family": "UX-RENDER",
+      "scenario": "Gigabyte-equivalent synthetic stream through bounded chunks",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "terminalAdapter"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-RENDER-08",
+      "family": "UX-RENDER",
+      "scenario": "Styled source is reparsed/reflowed for display",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "terminalAdapter"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-01",
+      "family": "UX-UNDO",
+      "scenario": "Edit/create native operations with durable preimages",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-02",
+      "family": "UX-UNDO",
+      "scenario": "Native edit followed by user edit of same file",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-03",
+      "family": "UX-UNDO",
+      "scenario": "Undo created file now modified or repurposed",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-04",
+      "family": "UX-UNDO",
+      "scenario": "Three-file change group with one preflight conflict",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-05",
+      "family": "UX-UNDO",
+      "scenario": "I/O failure after first inverse operation",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-06",
+      "family": "UX-UNDO",
+      "scenario": "Exec ran formatter and modified file",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-07",
+      "family": "UX-UNDO",
+      "scenario": "History compacted since original edit",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-08",
+      "family": "UX-UNDO",
+      "scenario": "`/rewind` to old turn with a dirty worktree",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-09",
+      "family": "UX-UNDO",
+      "scenario": "Duplicate undo request after success / interrupted reversal",
+      "due_milestone": "M4",
+      "evidence_layers": [
+        "pure",
+        "integration",
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-10",
+      "family": "UX-UNDO",
+      "scenario": "Unstored/missing preimage due to quota before native edit",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "UX-UNDO-11",
+      "family": "UX-UNDO",
+      "scenario": "Symlink/inode/permission change between preflight and restore",
+      "due_milestone": "M2",
+      "evidence_layers": [
+        "nativeProcess"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-01",
+      "family": "WIRE",
+      "scenario": "SSE input split at every byte boundary, including multi-byte UTF-8",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-02",
+      "family": "WIRE",
+      "scenario": "CRLF/LF, comments, heartbeat, multiline event, empty lines",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-03",
+      "family": "WIRE",
+      "scenario": "Over-limit unterminated SSE line/event and decompressed response expansion",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-04",
+      "family": "WIRE",
+      "scenario": "Two interleaved tool-call argument streams",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-05",
+      "family": "WIRE",
+      "scenario": "Malformed/incomplete/duplicate-ID tool call, missing final completion",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-06",
+      "family": "WIRE",
+      "scenario": "Unknown continuation-bearing block or signed/opaque reasoning",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-07",
+      "family": "WIRE",
+      "scenario": "Numeric-looking strings, CRLF source, Unicode-equivalent-but-different bytes",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-08",
+      "family": "WIRE",
+      "scenario": "Stream ends after tool data but before authoritative completion",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-09",
+      "family": "WIRE",
+      "scenario": "User instruction inserted mid-history",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    },
+    {
+      "id": "WIRE-10",
+      "family": "WIRE",
+      "scenario": "Slow consumer / fast provider",
+      "due_milestone": "M1",
+      "evidence_layers": [
+        "integration"
+      ],
+      "status": "DEFERRED_BY_PLAN"
+    }
+  ]
+}

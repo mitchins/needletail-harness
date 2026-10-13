@@ -1,0 +1,351 @@
+#!/bin/sh
+# Needletail developer entry points (TESTING §4). POSIX sh only: no Python,
+# Node or Bun is required by any command here. Swift Testing is toolchain
+# provided. Live suites are absent by default and must be enabled with an
+# explicit, budgeted `--profile` (M5/release only).
+set -eu
+
+# Absolute repository root, resolved once: later branches must reuse it, not
+# re-derive it (a relative `dirname "$0"` breaks every log path after `cd`
+# when invoked as `sh path/to/dev` from another directory).
+root_dir=$(cd "$(dirname "$0")" && pwd)
+cd "$root_dir"
+
+# Toolchain driver override. The shared swiftly shim on this builder was
+# replaced with a looping wrapper by another session on 12 Oct 2026 (see
+# STATUS.md), so the builder records a direct toolchain path here. Default
+# remains plain `swift` for a healthy swiftly install.
+NEEDLETAIL_SWIFT="${NEEDLETAIL_SWIFT:-swift}"
+
+usage() {
+    cat <<'EOF'
+Usage: ./dev <command>
+
+Build and offline tests (Linux first; no network, no provider calls):
+  build                     Build the package
+  test quick               Pure core/ledger/reporter tests              (target <=3 s)
+  test native              M0-B native primitive probes (SSE, cancellation, subprocess)
+  test qualification       Intentional fail/skip/parameterized/pass fixtures (NOT a gate)
+  test case CASE-ID        Run the deterministic tests registered for one case
+  test integration         Disabled until M2 (reason recorded)
+  test feasibility        M0-C bounded Linux PTY feasibility scenario (replxx bridge)
+  test terminal            Disabled until M4 (reason recorded)
+  test pty                 Disabled until M4 (reason recorded)
+  test live --profile NAME Disabled until M3 (reason recorded)
+  test offline             Disabled until M0-D aggregate gate (reason recorded)
+  coverage                 Reconcile catalogue IDs vs executed results
+  vendor-check             Verify vendored replxx sources match the pinned upstream commit
+  release-bundle           Build the release executable/bundle + linkage manifest
+  test packaging           Clean-host smoke (digest-pinned container, no network, no toolchain)
+  help                     Show this help
+EOF
+}
+
+FILTER_BEHAVIOUR="BehaviourTests"
+FILTER_PRIMITIVE="NeedletailPrimitiveTests"
+FILTER_QUALIFICATION="NeedletailQualificationProbes"
+
+swift_test() {
+    "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution "$@"
+}
+
+# False-pass guards (M0-D):
+# - require_test_result: a swift test invocation with NO "Test run with"
+#   line means the runner crashed or built nothing; that is never a pass.
+# - run_case: validates the exact catalogue ID first, then requires >=1
+#   matched test, so a bogus ID or a zero-match filter cannot be green.
+require_test_result() {
+    _log="$1"; _label="$2"
+    if ! grep -q "Test run with" "$_log"; then
+        echo "FAIL [$_label]: the test runner produced no result line (crash or no build). Not a pass."
+        echo "---- last output (evidence: $_log) ----"
+        tail -20 "$_log"
+        exit 1
+    fi
+}
+run_swift_test() {
+    _label="$1"; shift
+    _log="$root_dir/.needletail-dev/logs/dev-$_label.log"
+    mkdir -p "$root_dir/.needletail-dev/logs"
+    if swift_test "$@" > "$_log" 2>&1; then
+        _rc=0
+    else
+        _rc=$?
+    fi
+    cat "$_log"
+    if [ "$_rc" -ne 0 ]; then
+        echo "FAIL [$_label]: test runner exited $_rc (evidence: $_log). Not a pass."
+        exit "$_rc"
+    fi
+    require_test_result "$_log" "$_label"
+}
+
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+build)
+    "$NEEDLETAIL_SWIFT" build -j 4 --disable-automatic-resolution
+    ;;
+test)
+    sub="${1:-quick}"
+    shift || true
+    case "$sub" in
+    quick)
+        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE"
+        ;;
+    native)
+        run_swift_test native --filter "$FILTER_PRIMITIVE"
+        ;;
+    feasibility)
+        # M0-C: the ONE bounded Linux PTY feasibility scenario over the
+        # vendored replxx bridge. The full M4 terminal/PTY suites remain
+        # deferred; this runs only the feasibility driver. Guarded like
+        # every other swift test invocation: a zero-match or crashed runner
+        # is not a pass.
+        run_swift_test feasibility --filter NeedletailTerminalTests
+        ;;
+    qualification)
+        echo "== qualification fixtures: expect one failure and two skips; these are demonstrations, not gates =="
+        # The intentional failure is gated by NEEDLETAIL_QUALIFICATION (see
+        # Tests/NeedletailQualificationProbes): a bare `swift test` stays
+        # green by construction. A non-zero exit here is expected, but a
+        # runner CRASH is not: the output must show the intentional-failure
+        # test AND a runner result line before QUALIFICATION OK is printed.
+        _qual_log="$root_dir/.needletail-dev/logs/dev-qualification.log"
+        mkdir -p "$root_dir/.needletail-dev/logs"
+        if NEEDLETAIL_QUALIFICATION=1 swift_test --filter "$FILTER_QUALIFICATION" > "$_qual_log" 2>&1; then
+            cat "$_qual_log"
+            echo "UNEXPECTED: qualification suite passed. The intentional failure must fail (M0-A evidence void)."
+            exit 1
+        fi
+        cat "$_qual_log"
+        require_test_result "$_qual_log" qualification
+        if ! grep -q "qualification intentional failure must be reported as a failure" "$_qual_log"; then
+            echo "FAIL: qualification run failed without the intentional-failure test; the runner may have crashed (evidence: $_qual_log). Not a qualification pass."
+            exit 1
+        fi
+        echo "QUALIFICATION OK: runner reported the intentional failure and skipped cases distinctly."
+        ;;
+    case)
+        # TESTING §2: display names begin with the stable case ID. Swift
+        # Testing filters match the test ID path (module/type/function), so
+        # the case ID is embedded in function names with underscores;
+        # translate hyphens to underscores for the filter.
+        case_id="${1:?usage: ./dev test case CASE-ID}"
+        # The requested ID must be an exact catalogue member: a prefix like
+        # REV_0 or a typo must fail instead of matching another case.
+        if ! awk -F'"' -v id="$case_id" '$2 == "id" && $4 == id { found = 1 } END { exit found ? 0 : 1 }' "$root_dir/cases/catalog.json"; then
+            echo "FAIL: '$case_id' is not an exact case ID in cases/catalog.json. No test run, no pass."
+            exit 1
+        fi
+        case_filter=$(printf '%s' "$case_id" | sed 's/-/_/g')
+        _case_log="$root_dir/.needletail-dev/logs/dev-case-$(printf '%s' "$case_id" | tr -c 'A-Za-z0-9_-' '_').log"
+        mkdir -p "$root_dir/.needletail-dev/logs"
+        if swift_test --filter "$case_filter" > "$_case_log" 2>&1; then
+            _case_rc=0
+        else
+            _case_rc=$?
+        fi
+        cat "$_case_log"
+        if [ "$_case_rc" -ne 0 ]; then
+            echo "FAIL: tests for $case_id exited $_case_rc (evidence: $_case_log)."
+            exit "$_case_rc"
+        fi
+        require_test_result "$_case_log" "case $case_id"
+        # Zero matched tests is a runner green with nothing run: refuse it.
+        _ran=$(grep -o "Test run with [0-9]* tests" "$_case_log" | grep -o "[0-9]*" | head -1 || true)
+        if [ "${_ran:-0}" = "0" ]; then
+            echo "FAIL: no tests matched case $case_id (filter '$case_filter', evidence: $_case_log). A zero-match run is not a pass."
+            exit 1
+        fi
+        ;;
+    integration|terminal|pty)
+        echo "DEFERRED_BY_PLAN: '$sub' is scheduled at a later milestone (integration M2, terminal/pty M4). Not run, not passed."
+        exit 2
+        ;;
+    live)
+        echo "DEFERRED_BY_PLAN: 'live' provider qualification is M3/M5/release only and requires an explicit --profile and budget."
+        exit 2
+        ;;
+    packaging)
+        # Clean-host smoke (M0-D): digest-pinned image, no network, no
+        # toolchain. Asserts version/help/doctor run and that
+        # swift/node/python3 are absent inside the container. Docker is a
+        # LOCAL qualification aid; it is not a product dependency.
+        bundle="$root_dir/.build/release-bundle"
+        if [ ! -x "$bundle/needletail" ]; then
+            echo "BLOCKED: $bundle/needletail missing; run ./dev release-bundle first."
+            exit 2
+        fi
+        image_ref="${1:-ubuntu:24.04}"
+        digest=$(docker image inspect "$image_ref" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)
+        if [ -z "$digest" ]; then
+            docker pull --quiet "$image_ref" > "$root_dir/.needletail-dev/logs/packaging-pull.log" 2>&1
+            digest=$(docker image inspect "$image_ref" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)
+        fi
+        if [ -z "$digest" ]; then
+            echo "BLOCKED: no repo digest available for $image_ref; refusing to smoke an unpinned image."
+            exit 2
+        fi
+        smoke_rc=0
+        {
+            echo "clean-host image: $digest"
+            echo "network: none"
+            if docker run --rm --network none -v "$bundle:/bundle:ro" "$digest" sh -c '
+                set -e
+                command -v swift >/dev/null 2>&1 && { echo "UNEXPECTED: swift present"; exit 1; } || echo "absent: swift"
+                command -v node >/dev/null 2>&1 && { echo "UNEXPECTED: node present"; exit 1; } || echo "absent: node"
+                command -v python3 >/dev/null 2>&1 && { echo "UNEXPECTED: python3 present"; exit 1; } || echo "absent: python3"
+                /bundle/needletail --version
+                /bundle/needletail --help >/dev/null
+                /bundle/needletail doctor
+            '; then
+                echo "smoke: PASS"
+            else
+                smoke_rc=1
+                echo "smoke: FAIL"
+            fi
+        } > "$root_dir/.needletail-dev/logs/cleanhost-smoke.log" 2>&1
+        if [ "$smoke_rc" -eq 0 ]; then
+            echo "CLEAN-HOST SMOKE OK (evidence: .needletail-dev/logs/cleanhost-smoke.log)"
+        else
+            echo "FAIL: clean-host smoke failed; see .needletail-dev/logs/cleanhost-smoke.log"
+            exit 1
+        fi
+        ;;
+    offline)
+        echo "DEFERRED_BY_PLAN: 'offline' aggregate gate is due at M0-D."
+        exit 2
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+    esac
+    ;;
+coverage)
+    # M0 scope: reconcile the frozen catalogue against executed evidence.
+    # The full TESTING §4 reconciliation (results ingestion, tier and due
+    # matching, skip/pending-gate reporting) lands with results ingestion;
+    # today this runs the catalogue reconciliation suite and never reports a
+    # missing/skipped/unexecuted case as a pass.
+    echo "Reconciling cases/catalog.json against cases/expected-index.json and the spec inventory (M0 scope)."
+    run_swift_test coverage --filter "$FILTER_BEHAVIOUR"
+    ;;
+vendor-check)
+    # Vendored integrity. OFFLINE FIRST: SHA256SUMS-vendored records the
+    # blob hashes of the pinned upstream commit (1f149bfe...), so
+    # `sha256sum -c` verifies the vendored tree on any clean checkout
+    # without a reference clone. The clone check (byte-for-byte against a
+    # local full clone in ThirdParty/replxx) is an optional secondary.
+    status=0
+    if (cd "$root_dir/Sources/CReplxx/replxx" && sha256sum -c ../SHA256SUMS-vendored >/dev/null 2>&1); then
+        echo "VENDOR OK (offline): all vendored sources match the pinned upstream blob hashes"
+    else
+        echo "FAIL: vendored sources do not match SHA256SUMS-vendored"
+        (cd "$root_dir/Sources/CReplxx/replxx" && sha256sum -c ../SHA256SUMS-vendored 2>&1 | grep -v ': OK' | head -5)
+        status=1
+    fi
+    # Secondary check when a reference clone is present. The clone verdict
+    # has its own flag: the shared `status` may already be set by the
+    # offline check, so the OK message must not depend on it.
+    upstream_dir="$root_dir/ThirdParty/replxx"
+    clone_ok=1
+    if [ -d "$upstream_dir/.git" ]; then
+        pinned=$(git -C "$upstream_dir" rev-parse HEAD 2>/dev/null || true)
+        if [ "$pinned" != "1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2" ]; then
+            echo "FAIL: reference clone at '$pinned', expected 1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2"
+            status=1
+            clone_ok=0
+        else
+            for f in "$root_dir/Sources/CReplxx/replxx"/*; do
+                base=$(basename "$f")
+                [ "$base" = "LICENSE.md" ] && upstream="$upstream_dir/LICENSE.md" || {
+                    upstream="$upstream_dir/src/$base"
+                    [ -f "$upstream" ] || upstream="$upstream_dir/include/$base"
+                }
+                if [ ! -f "$upstream" ]; then
+                    echo "FAIL: $base has no upstream counterpart at the pinned commit"
+                    status=1
+                    clone_ok=0
+                    continue
+                fi
+                if ! cmp -s "$f" "$upstream"; then
+                    echo "FAIL: $base differs from the pinned upstream clone"
+                    status=1
+                    clone_ok=0
+                fi
+            done
+            [ "$clone_ok" -eq 1 ] && echo "VENDOR OK (clone): byte-identical to the pinned upstream commit"
+        fi
+    else
+        echo "NOTE: no reference clone at $upstream_dir (gitignored); offline manifest check is authoritative."
+    fi
+    exit "$status"
+    ;;
+release-bundle)
+    # Release bundle with declared native linkage (M0-D). Prefer the static
+    # Swift stdlib; if the NIO/GRDB graph fails to link statically, fall
+    # back to a dynamic bundle with the toolchain runtime copied in and a
+    # launcher that sets the library path. The choice, the ldd manifest and
+    # the binary size are recorded under .needletail-dev/logs/.
+    bundle="$root_dir/.build/release-bundle"
+    rm -rf "$bundle"
+    mkdir -p "$bundle"
+    mkdir -p "$root_dir/.needletail-dev/logs"
+    echo "== static Swift stdlib release build =="
+    if "$NEEDLETAIL_SWIFT" build -c release -j 4 --static-swift-stdlib --product needletail > "$root_dir/.needletail-dev/logs/release-build-static.log" 2>&1; then
+        mkdir -p "$bundle/bin"
+        cp "$root_dir/.build/release/needletail" "$bundle/bin/needletail.real"
+        cp "$root_dir/.build/release/needletail" "$bundle/needletail"
+        echo "static-stdlib" > "$bundle/linkage-mode.txt"
+    else
+        echo "static build failed; recording the failure and falling back to a dynamic bundle"
+        cp "$root_dir/.needletail-dev/logs/release-build-static.log" "$root_dir/.needletail-dev/logs/release-build-static-FAILED.log" 2>/dev/null || true
+        echo "== dynamic release build =="
+        "$NEEDLETAIL_SWIFT" build -c release -j 4 --product needletail > "$root_dir/.needletail-dev/logs/release-build-dynamic.log" 2>&1
+        mkdir -p "$bundle/bin"
+        cp "$root_dir/.build/release/needletail" "$bundle/bin/needletail.real"
+        # Bundle the declared Swift runtime libraries (the manifest lists
+        # every non-system .so) and launcher that sets the loader path.
+        mkdir -p "$bundle/lib"
+        # Match Swift runtime libraries by BASENAME (toolchain-path
+        # independent), so the bundle works for any swiftly/toolchain path.
+        ldd "$bundle/bin/needletail.real" | awk '/=> \// {print $1, $3}' \
+            | awk '$1 ~ /^(libswift|libdispatch|libFoundation|libFoundationEssentials|libFoundationInternationalization|libBlocksRuntime|lib_FoundationICU|lib_FoundationCURL)/ {print $2}' \
+            | sort -u > "$bundle/.runtime-libs.txt"
+        while read -r lib; do
+            [ -n "$lib" ] && cp "$lib" "$bundle/lib/"
+        done < "$bundle/.runtime-libs.txt"
+        # Pure-shell launcher: no external tools (readlink/dirname may be
+        # absent on a minimal target PATH); the bundle is invoked by path.
+        {
+            echo '#!/bin/sh'
+            echo '# Launcher for the dynamic release bundle: the Swift runtime'
+            echo '# ships in ./lib and is NOT resolved from a toolchain.'
+            echo 'case "$0" in'
+            echo '  */*) here=${0%/*} ;;'
+            echo '  *)   here=. ;;'
+            echo 'esac'
+            echo 'export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+            echo 'exec "$here/bin/needletail.real" "$@"'
+        } > "$bundle/needletail"
+        chmod +x "$bundle/needletail"
+        echo "dynamic" > "$bundle/linkage-mode.txt"
+        rm -f "$bundle/.runtime-libs.txt"
+    fi
+    ldd "$bundle/bin/needletail.real" > "$bundle/linkage-manifest.txt" 2>&1 || true
+    ls -l "$bundle/bin/needletail.real" | awk '{print "binary bytes:", $5}' | tee "$bundle/size.txt"
+    echo "linkage mode: $(cat "$bundle/linkage-mode.txt")"
+    echo "bundle: $bundle"
+    ;;
+help|-h|--help)
+    usage
+    ;;
+*)
+    usage
+    exit 2
+    ;;
+esac

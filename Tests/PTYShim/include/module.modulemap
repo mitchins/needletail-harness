@@ -1,0 +1,4 @@
+module PTYShim [system] {
+    header "nt_pty.h"
+    export *
+}

@@ -1,0 +1,17 @@
+# CReplxx — vendored replxx
+
+Upstream: https://github.com/AmokHuginnsson/replxx
+Pinned commit: 1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2 (DEPENDENCIES.md candidate [S09])
+Licence: replxx/LICENSE.md (BSD-style, copyright retained, unmodified)
+C++ standard: C++11 (upstream CMakeLists); threads via libpthread.
+
+Files in `replxx/` are UNMODIFIED upstream sources from the pinned commit
+(headers, .cxx sources, ConvertUTF.cpp, wcwidth.cpp). Only these bridge
+files are Needletail's: `include/shim.h`, `include/module.modulemap`,
+`SHA256SUMS-vendored`, this file.
+Integrity: `./dev vendor-check` compares per-file SHA-256 against the
+recorded manifest `SHA256SUMS-vendored`; upstream ref `ThirdParty/replxx`
+(a full clone used for the comparison) is gitignored and never committed.
+
+Swift boundary: `shim.h` exposes only the C API (`extern "C"` in
+replxx/replxx.h). C++ interoperability does not cross into Swift.

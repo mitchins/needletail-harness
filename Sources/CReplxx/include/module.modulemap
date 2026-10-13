@@ -1,0 +1,6 @@
+module CReplxx [system] {
+    header "shim.h"
+    link "stdc++"
+    link "pthread"
+    export *
+}
