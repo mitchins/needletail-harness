@@ -116,3 +116,18 @@ particular repaint shape or prompt string.
 | 4256088549 (producer orphan) | Timed-out producer lingers on stream | FIXED in `0adc0aa`: `abandon()` finishes the stream on timeout; weak-ref test (pre-fix red: 5 s drain fails) |
 
 All 29 threads (25 + 4) replied with dispositions and resolved via API (0 unresolved, verified). CI green on every pushed head (`38332572896`, `38363687465`, `38365442453`, `38366662916`). DeepSeek: batch + three delta rounds, all READY TO PUSH, no blockers. CodeRabbit full re-review requested for the updated disposition; queued behind the hourly allowance at last check.
+
+## Round 4 — thread 30 (listener accept lifecycle)
+
+Finding 4257001044 (Minor, credible, confirmed against source): the
+detached thread blocks in bare `accept()`; `abandon()` finishes the
+stream but the thread lingers; `stop()` signals a semaphore reachable
+only post-accept; `close()` does not reliably wake `accept()` on Linux
+(Codereview's own Python experiment agrees).
+Disposition: FIXED in `df6dcc9` — test-only wakeup pipe + bounded
+`poll(100ms)`; `stop()`/`abandon()` wake; `ListenerLifetime` latch on
+every exit path (box captured, never the server); regression test
+(started-idle-timeout-release; red pre-fix 5 s drain, green ~1 s).
+DeepSeek delta review READY TO PUSH (2 nits applied in the pushed head).
+CI `38389157383` green. Thread replied + resolved. All 30 threads now
+resolved (0 unresolved).
