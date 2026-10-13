@@ -105,3 +105,14 @@ Note on ANSI coupling: `[23G`/`[63G` are asserted as cursor-geometry
 facts (end column of a full-line render ⟺ wrapped-or-not, uniqueness
 shown above), not as incidental repaint bytes; the test never requires a
 particular repaint shape or prompt string.
+
+## Follow-up rounds (incremental reviews 2–4)
+
+| Thread | Finding | Disposition |
+|---|---|---|
+| 4255977262 (provenance move) | Move SHA256SUMS-vendored out of Sources/CReplxx | REJECT_WITH_EVIDENCE: location load-bearing for `sha256sum -c`; root cause (ambiguous "bridge files" instruction) fixed instead in `9a2c56d` by enumerating permitted files |
+| 4255977268 (STATUS.md stale) | Update triage note | ALREADY FIXED: packaging setup + asserts in pushed head `2d35c12`, CI green; STATUS.md is the local tracker |
+| 4255977278 (readiness bound) | Unbounded `for await` in runCancelledRequest | FIXED in `9a2c56d`: `awaitRequestHead` bounded via raceToCompletion; silent-server test (pre-fix: hung, shell-timeout kill exit 124) |
+| 4256088549 (producer orphan) | Timed-out producer lingers on stream | FIXED in `0adc0aa`: `abandon()` finishes the stream on timeout; weak-ref test (pre-fix red: 5 s drain fails) |
+
+All 29 threads (25 + 4) replied with dispositions and resolved via API (0 unresolved, verified). CI green on every pushed head (`38332572896`, `38363687465`, `38365442453`, `38366662916`). DeepSeek: batch + three delta rounds, all READY TO PUSH, no blockers. CodeRabbit full re-review requested for the updated disposition; queued behind the hourly allowance at last check.
