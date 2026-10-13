@@ -4,7 +4,7 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 
 ## Current position
 
-- **Milestone:** M0 — M0-A/M0-B CLOSED at `07e0269` (DeepSeek READY TO CLOSE); M0-C/M0-D implemented and evidenced, slice review pending (plan reviewed READY at plan revision 2; completed-slice review due at closeout). M0-C replxx feasibility: PASS; M0-D local scope (bundle, clean-host smoke, `doctor`, CI/CodeRabbit preparation, `./dev` hardening) DONE and slice-closed (DeepSeek READY TO CLOSE at `188bb47`). Remote gates (push/PR, CodeRabbit activation and the M0 epic review) await explicit authorization (BLOCKED_REVIEW).
+- **Milestone:** M0 — M0-A/M0-B CLOSED at `07e0269` (DeepSeek READY TO CLOSE); M0-C/M0-D implemented and evidenced, slice review pending (plan reviewed READY at plan revision 2; completed-slice review due at closeout). M0-C replxx feasibility: PASS; M0-D local scope (bundle, clean-host smoke, `doctor`, CI/CodeRabbit preparation, `./dev` hardening) DONE and slice-closed (DeepSeek READY TO CLOSE at `188bb47`); swiftly launcher restored and all local gates re-verified without override 13 Oct 2026 (see F-4). Remote gates (push/PR, CodeRabbit review, M0 epic disposition) authorized conditionally 13 Oct 2026 — executed as branch `m0-epic` + PR, no merge; **M0 is not claimed closed until GitHub CI and CodeRabbit produce their actual dispositions.**
 - **Plan:** `plans/m0-a-b-plan.md` — reviewed by `deepseek-reviewer` (route `opencode-go/deepseek-v4.1-flash`), disposition READY, receipts in `plans/m0-a-b-receipt.md`. REV-01 satisfied before implementation.
 - **Closeout:** `plans/m0-milestone-report.md`.
 - **Scope guard:** M0–M3 only, Linux x86_64/Ubuntu 24.04. No remote writes (push/PR not authorized; GitHub remote configured). No macOS work.
@@ -16,7 +16,7 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 | Host | Ubuntu 24.04.4 LTS x86_64, kernel 7.0.0-31-generic, 24 cores, 80 GiB RAM (`/` 93% full; build under `/data`) |
 | Git | repo `needletail-harness`, baseline commit `86a717b`; untracked packet: COMPLETE-SPEC.md, DEPENDENCIES.md (AppleDouble `._*` files gitignored) |
 | Remote | `git@github.com:mitchins/needletail-harness.git` configured; **push/PR NOT authorized this session** |
-| Swift | **6.4.0** (swift-6.4-RELEASE, swiftly global default since 12 Oct 2026) — spec pin satisfied; 6.3.3 retained locally |
+| Swift | **6.4.0** (swift-6.4-RELEASE, swiftly global default since 12 Oct 2026) — spec pin satisfied; 6.3.3 retained locally. **13 Oct 2026:** the swiftly launcher binary (replaced 12 Oct, see F-4) was restored from the official `download.swift.org` tarball — version **1.2.0**, matching `config.json`; both toolchains verified runnable afterwards |
 | Implementer route | `opencode-go/step-5-preview-free` (verified from `opencode models`, opencode 1.18.35) |
 | Reviewer route | `deepseek-reviewer` → `opencode-go/deepseek-v4.1-flash` (subagent, edit deny; independent; no secrets copied) |
 | Tools | rg 14.1.0, git 2.43.0, sqlite3 CLI 3.45.1; **libsqlite3-dev 3.45.1-1ubuntu2.8 installed** (`/usr/include/sqlite3.h` present) |
@@ -28,6 +28,7 @@ Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all p
 - **F-2 (D-1, RESOLVED 12 Oct 2026 by operator):** Swift 6.4.0 installed via swiftly and set as the global default. The whole slice was re-qualified on the spec-pinned toolchain: full rebuild + 21 tests green (16 behaviour + 5 primitive) (cold 1:43.20 on toolchain switch; warm ≤4 s), DX-08 offline re-executed green, bare `swift test` exit 0, qualification detection re-verified. The earlier `swiftly install 6.4` 404 was transient/route-specific and is recorded as a historical note only; the current state satisfies the SPEC §3 toolchain pin.
 - **F-3 (dependency shape):** replxx revision `1f149bfe…` has no `Package.swift` at that ref → not a SwiftPM dependency; must be vendored C/C++ bridge (M0-C, matches DEPENDENCIES.md).
 - **D-1, D-2:** see F-1/F-2. Rulings recorded; implementation proceeds on unaffected work.
+- **F-5 (implementer route, RECORDED 13 Oct 2026):** the agreed implementer route is `opencode-go/step-5-preview-free` (`opencode models` confirms it exists, as does reviewer route `opencode-go/deepseek-v4.1-flash`). This continuation session runs as **Muse Spark** (`muse-spark-1.3-contributor`), not the agreed route. Recorded explicitly per the 13 Oct direction; the session executed only the authorized mechanical steps (toolchain restore, gate re-run, conditional remote gates) with no dependency, architecture or scope changes.
 
 ## Dependency evidence (M0-B, recorded; superseded historical rows are labeled)
 
@@ -48,6 +49,8 @@ Handling (DEV-01 discipline: record the blocker, do not "fix" shared infrastruct
 - The shared swiftly installation was NOT modified — it is outside this session's ownership and another actor is active on the builder.
 - `./dev` gained a documented toolchain override: `NEEDLETAIL_SWIFT` (defaults to `swift`). This session builds with `NEEDLETAIL_SWIFT=/home/mitch/.local/share/swiftly/toolchains/6.4.0/usr/bin/swift` (the pinned 6.4 toolchain).
 - Restoring the shared shim (or confirming the replacement is intentional) is the maintainer's call; it is a named gate for CI activation.
+
+**F-4 RESOLUTION (13 Oct 2026, authorized by maintainer direction):** ownership established — a neighbouring session's `cmake` configure (started ~15:19 +1100 12 Oct, ~8 min after the replacement) was itself stuck in the exec loop (compiler-ID probe spinning one core at ~99% for 18 h), i.e. a victim, not an owner; nothing can functionally depend on an infinite loop, and no live process was killed. Restored via the verified method: official `https://download.swift.org/swiftly/linux/swiftly-x86_64.tar.gz` (29,503,856 bytes; tarball lists `swiftly` + `LICENSE.txt`; extracted binary is swiftly **1.2.0**, matching `config.json`). Pre-restore backups: broken 65-byte script + `config.json` in `.needletail-dev/logs/`; both toolchain dirs copied to gitignored `.needletail-dev/swiftly-toolchain-backup/` (removed after verification). Post-restore: `swiftly --version` 1.2.0, `swiftly list` shows 6.4.0 (in use, default) + 6.3.3, `config.json` byte-identical, plain-`swift --version` → 6.4, shim `clang++ --version` → clang 21 exit 0, both toolchain `swift` binaries run directly, no spinner processes remain, and the neighbour's stuck probe drained on its own. Full M0 gate set re-executed **without** `NEEDLETAIL_SWIFT` (build, quick 5+16, native 5, feasibility 1, qualification OK, coverage 16, vendor offline+clone, bundle dynamic 3,646,992 bytes — identical byte count, packaging smoke OK, DX-08 offline 5+16, four guard probes red/red/red/green) — evidence `*-postrestore.log`. The `NEEDLETAIL_SWIFT` override is retained as an optional supported mechanism.
 
 ## M0-C / M0-D progress (12 October 2026)
 
