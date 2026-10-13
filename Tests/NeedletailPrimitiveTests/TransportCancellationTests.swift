@@ -88,6 +88,13 @@ private final class SyntheticLoopbackServer: @unchecked Sendable {
         holdSemaphore.signal()
     }
 
+    /// Finishes the readiness stream so a waiter suspended on it
+    /// terminates instead of lingering. Test-only cleanup for the timeout
+    /// path; finishing an already-finished stream is a no-op.
+    func abandon() {
+        requestReceivedContinuation.finish()
+    }
+
     deinit { close(listenFD) }
 }
 
@@ -152,12 +159,18 @@ private func bindThenCloseLoopbackPort() throws -> UInt16 {
 /// head, false on deadline. Never sleeps in place of readiness — the wait
 /// itself is the bounded gate, so a silent server fails fast instead of
 /// hanging the suite (an unbounded `for await` over the stream would wait
-/// forever when nothing ever yields nor finishes it).
+/// forever when nothing ever yields nor finishes it). On timeout the
+/// stream is finished so the producer task terminates and releases the
+/// server instead of lingering suspended.
 private func awaitRequestHead(_ server: SyntheticLoopbackServer, deadlineSeconds: Double) async -> Bool {
-    await raceToCompletion(produce: {
+    let outcome = await raceToCompletion(produce: {
         for await _ in server.requestReceived { return "ready" }
         return "closed"
-    }, deadlineSeconds: deadlineSeconds) == "ready"
+    }, deadlineSeconds: deadlineSeconds)
+    if outcome == "timeout" {
+        server.abandon()
+    }
+    return outcome == "ready"
 }
 
 struct TransportCancellationTests {
@@ -306,5 +319,25 @@ struct TransportCancellationTests {
         #expect(!ready, "an unstarted server must not report readiness")
         #expect(elapsed >= 1.0, "the full deadline must elapse, returned after \(elapsed)s")
         #expect(elapsed < 5.0, "readiness must fail at ~1s, took \(elapsed)s")
+    }
+
+    @Test("NET-04 a timed-out readiness wait releases the server")
+    func NET_04_timedOutReadinessReleasesServer() async throws {
+        // The timed-out producer must terminate (via abandon) instead of
+        // lingering suspended on the unfinished stream while retaining the
+        // server. A weak reference proves the release: it must drain once
+        // the waiter finishes.
+        weak var weakServer: SyntheticLoopbackServer?
+        do {
+            let server = try SyntheticLoopbackServer()
+            weakServer = server
+            let ready = await awaitRequestHead(server, deadlineSeconds: 1)
+            #expect(!ready, "an unstarted server must not report readiness")
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while weakServer != nil && Date() < deadline {
+            await Task.yield()
+        }
+        #expect(weakServer == nil, "timed-out producer must terminate and release the server")
     }
 }
