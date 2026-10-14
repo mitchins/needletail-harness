@@ -28,6 +28,13 @@ Per the READY disposition, these Minor/Suggestion rows resolve during implementa
 - M1B4-3: merge duplicate admitting×transportFailed-preSend rows (165 ∩ 187); state transportFailed outside admitting/requesting/streaming is stale-drop.
 - M1B4-4: explicit no-op rows for (failed, tick) + (cancelling, pre-deadline tick) (or state timers cancel on terminal transitions).
 
+## Completed-slice review history
+
+- Implementation `bf4708b`: NEEDS-EVIDENCE — M1B-S1 Blocker (unbounded markers) + S2–S4 Majors (pump order, DX-06 coverage, probe-count reconciliation) + S5–S11 minors/suggestions.
+- Fix commit `a5dd9d7` (S1–S11) + integrity-recovery `231743c` (validation-pump restore, snapshot-epoch suite reconstruction, approval-test sync after workspace churn; no committed content ever lost — see report).
+- Final verifications on `c011a0f` then `be9ebd6` (report-only): all S-items CLOSED except an F3 doc count → fixed in `b9a558e` (1 file, 1 line) → **READY TO CLOSE** bound to `b9a558e`.
+- Reviewer throughout: `deepseek-reviewer` / `opencode-go/deepseek-v4.1-flash`; tree clean at every binding; `origin/main` unmoved (local-only).
+
 ## Disposition
 
-**M1-B PLAN REVIEWED — READY for implementation planning; NOT IMPLEMENTED.** Implementation waits for its own authorization. Next authorized step only on operator approval: implement per rev4 plan (+ M1B4 follow-ups) with red-before/green-after evidence (compilable stubs first per R20, never compile-failure-as-RED), then DeepSeek completed-slice review.
+**M1-B CLOSED locally.** No push/PR (M1-epic CodeRabbit is the later aggregate gate). Next: M1-C per the tranche authorization (short delta + plan review first).
