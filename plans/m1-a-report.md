@@ -8,7 +8,7 @@
 
 - Milestone / slice: M1-A implementation (first M1 minor).
 - Base SHA: `e3c0527` (M0-merged `main`; working tree at slice start held only the prior planning files).
-- Head SHA: (implementation commit hash — filled at commit; slice review binds it).
+- Head SHA: implementation `f7f2628` + this report (`33d4858` at write time; re-bound exactly before slice review — review binds the final HEAD SHA recorded in `plans/m1-a-receipt.md`).
 - Plan digest (`plans/m1-a-plan.md` sha256, rev5): `71d91dacde132077a6ffb8e5a2f1d4320c417e79387983184d6e6a5ec89659e0` (381 lines).
 - Dependency-lock digest (`Package.resolved` sha256): `de95226ee800ecb7609e5d8083d7c14dc4bc1f1ddbb2deabf1b23f1d7a8689cc` (unchanged — no dependency delta).
 - OS / toolchain / architecture: Linux 7.0.0-31-generic x86_64, Swift 6.4.0 (swift-6.4-RELEASE), SwiftPM `-j 4 --disable-automatic-resolution`.
