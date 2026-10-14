@@ -12,7 +12,14 @@ struct Doctor: ParsableCommand {
         abstract: "Offline local checks only; no network requests."
     )
 
+    @Option(name: .long, help: "Validate one model alias and route purely, then defer (M1-C sends traffic; this flag never does).")
+    var probe: String?
+
     mutating func run() throws {
+        if let alias = probe {
+            try DoctorProbe.run(alias: alias)
+            return
+        }
         print("needletail \(NeedletailVersion(major: 0, minor: 3, patch: 0))")
         print("platform: \(hostPlatform())")
 

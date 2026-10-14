@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "default_model": "local-coder",
+  "allow_http_origins": ["http://127.0.0.1:11434"],
+  "models": [
+    {
+      "alias": "local-coder",
+      "protocol": "openai-chat-completions",
+      "base_url": "http://127.0.0.1:11434",
+      "model": "example-local-model",
+      "context_window": 262144,
+      "max_output": 4096,
+      "locality": "local",
+      "credential": {"env": "NEEDLETAIL_EXAMPLE_KEY"},
+      "connect_timeout_s": 10,
+      "read_idle_timeout_s": 300,
+      "request_timeout_s": 1800,
+      "max_in_flight": 1,
+      "request_options": {"temperature": 0.2}
+    }
+  ],
+  "tools": {"read": true, "search": true, "edit": true, "write": true, "exec": "ask", "consult": false}
+}

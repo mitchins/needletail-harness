@@ -23,7 +23,7 @@ Usage: ./dev <command>
 
 Build and offline tests (Linux first; no network, no provider calls):
   build                     Build the package
-  test quick               Pure core/ledger/reporter tests              (target <=3 s)
+  test quick               Pure core/ledger/reporter/config tests        (target <=3 s)
   test native              M0-B native primitive probes (SSE, cancellation, subprocess)
   test qualification       Intentional fail/skip/parameterized/pass fixtures (NOT a gate)
   test case CASE-ID        Run the deterministic tests registered for one case
@@ -32,7 +32,7 @@ Build and offline tests (Linux first; no network, no provider calls):
   test terminal            Disabled until M4 (reason recorded)
   test pty                 Disabled until M4 (reason recorded)
   test live --profile NAME Disabled until M3 (reason recorded)
-  test offline             Disabled until M0-D aggregate gate (reason recorded)
+  test offline             Aggregate gate over all scheduled offline layers
   coverage                 Reconcile catalogue IDs vs executed results
   vendor-check             Verify vendored replxx sources match the pinned upstream commit
   release-bundle           Build the release executable/bundle + linkage manifest
@@ -44,6 +44,7 @@ EOF
 FILTER_BEHAVIOUR="BehaviourTests"
 FILTER_PRIMITIVE="NeedletailPrimitiveTests"
 FILTER_QUALIFICATION="NeedletailQualificationProbes"
+FILTER_CONFIG_PURE="NeedletailConfigTests"
 
 swift_test() {
     "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution "$@"
@@ -81,6 +82,50 @@ run_swift_test() {
 }
 
 
+# M1-A: deterministic per-case runner shared by `test case` and the
+# `test offline` aggregate. Builds the `needletail` product first
+# (incremental when warm) so spawn-binary integration tests have an exact
+# binary at NEEDLETAIL_BIN; pure tests do not depend on it.
+run_case() {
+    case_id="$1"
+    # TESTING §2: display names begin with the stable case ID. Swift
+    # Testing filters match the test ID path (module/type/function), so
+    # the case ID is embedded in function names with underscores;
+    # translate hyphens to underscores for the filter.
+    # The requested ID must be an exact catalogue member: a prefix like
+    # REV_0 or a typo must fail instead of matching another case.
+    if ! awk -F'"' -v id="$case_id" '$2 == "id" && $4 == id { found = 1 } END { exit found ? 0 : 1 }' "$root_dir/cases/catalog.json"; then
+        echo "FAIL: '$case_id' is not an exact case ID in cases/catalog.json. No test run, no pass."
+        exit 1
+    fi
+    if ! "$NEEDLETAIL_SWIFT" build -j 4 --disable-automatic-resolution --product needletail > "$root_dir/.needletail-dev/logs/dev-case-build.log" 2>&1; then
+        echo "FAIL: product build for spawn-binary integration failed (evidence: $root_dir/.needletail-dev/logs/dev-case-build.log)."
+        exit 1
+    fi
+    NEEDLETAIL_BIN="$root_dir/.build/debug/needletail"
+    export NEEDLETAIL_BIN
+    case_filter=$(printf '%s' "$case_id" | sed 's/-/_/g')
+    _case_log="$root_dir/.needletail-dev/logs/dev-case-$(printf '%s' "$case_id" | tr -c 'A-Za-z0-9_-' '_').log"
+    mkdir -p "$root_dir/.needletail-dev/logs"
+    if swift_test --filter "$case_filter" > "$_case_log" 2>&1; then
+        _case_rc=0
+    else
+        _case_rc=$?
+    fi
+    cat "$_case_log"
+    if [ "$_case_rc" -ne 0 ]; then
+        echo "FAIL: tests for $case_id exited $_case_rc (evidence: $_case_log)."
+        exit "$_case_rc"
+    fi
+    require_test_result "$_case_log" "case $case_id"
+    # Zero matched tests is a runner green with nothing run: refuse it.
+    _ran=$(grep -o "Test run with [0-9]* tests" "$_case_log" | grep -o "[0-9]*" | head -1 || true)
+    if [ "${_ran:-0}" = "0" ]; then
+        echo "FAIL: no tests matched case $case_id (filter '$case_filter', evidence: $_case_log). A zero-match run is not a pass."
+        exit 1
+    fi
+}
+
 cmd="${1:-help}"
 shift || true
 
@@ -93,7 +138,7 @@ test)
     shift || true
     case "$sub" in
     quick)
-        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE"
+        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE"
         ;;
     native)
         run_swift_test native --filter "$FILTER_PRIMITIVE"
@@ -129,37 +174,7 @@ test)
         echo "QUALIFICATION OK: runner reported the intentional failure and skipped cases distinctly."
         ;;
     case)
-        # TESTING §2: display names begin with the stable case ID. Swift
-        # Testing filters match the test ID path (module/type/function), so
-        # the case ID is embedded in function names with underscores;
-        # translate hyphens to underscores for the filter.
-        case_id="${1:?usage: ./dev test case CASE-ID}"
-        # The requested ID must be an exact catalogue member: a prefix like
-        # REV_0 or a typo must fail instead of matching another case.
-        if ! awk -F'"' -v id="$case_id" '$2 == "id" && $4 == id { found = 1 } END { exit found ? 0 : 1 }' "$root_dir/cases/catalog.json"; then
-            echo "FAIL: '$case_id' is not an exact case ID in cases/catalog.json. No test run, no pass."
-            exit 1
-        fi
-        case_filter=$(printf '%s' "$case_id" | sed 's/-/_/g')
-        _case_log="$root_dir/.needletail-dev/logs/dev-case-$(printf '%s' "$case_id" | tr -c 'A-Za-z0-9_-' '_').log"
-        mkdir -p "$root_dir/.needletail-dev/logs"
-        if swift_test --filter "$case_filter" > "$_case_log" 2>&1; then
-            _case_rc=0
-        else
-            _case_rc=$?
-        fi
-        cat "$_case_log"
-        if [ "$_case_rc" -ne 0 ]; then
-            echo "FAIL: tests for $case_id exited $_case_rc (evidence: $_case_log)."
-            exit "$_case_rc"
-        fi
-        require_test_result "$_case_log" "case $case_id"
-        # Zero matched tests is a runner green with nothing run: refuse it.
-        _ran=$(grep -o "Test run with [0-9]* tests" "$_case_log" | grep -o "[0-9]*" | head -1 || true)
-        if [ "${_ran:-0}" = "0" ]; then
-            echo "FAIL: no tests matched case $case_id (filter '$case_filter', evidence: $_case_log). A zero-match run is not a pass."
-            exit 1
-        fi
+        run_case "${1:?usage: ./dev test case CASE-ID}"
         ;;
     integration|terminal|pty)
         echo "DEFERRED_BY_PLAN: '$sub' is scheduled at a later milestone (integration M2, terminal/pty M4). Not run, not passed."
@@ -216,8 +231,25 @@ test)
         fi
         ;;
     offline)
-        echo "DEFERRED_BY_PLAN: 'offline' aggregate gate is due at M0-D."
-        exit 2
+        # M1-A aggregate gate over every scheduled offline layer: fast pure
+        # suites, native primitive probes, the bounded PTY feasibility
+        # scenario, catalogue reconciliation, and the ten M1-A case filters
+        # (pure + spawn-binary integration). No live provider, no PTY
+        # product suite, no packaging container. Each stage reuses the
+        # guarded runners above, so a crash/zero-match anywhere fails here.
+        echo "== offline aggregate: quick =="
+        "$0" test quick
+        echo "== offline aggregate: native =="
+        "$0" test native
+        echo "== offline aggregate: feasibility =="
+        "$0" test feasibility
+        echo "== offline aggregate: coverage =="
+        "$0" coverage
+        for _m1a_case in CFG-01 CFG-02 CFG-03 CFG-04 CFG-05 CFG-06 POLICY-02 POLICY-05 NET-01 NET-06; do
+            echo "== offline aggregate: case $_m1a_case =="
+            run_case "$_m1a_case"
+        done
+        echo "OFFLINE OK: all scheduled offline layers passed."
         ;;
     *)
         usage

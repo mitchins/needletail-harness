@@ -105,5 +105,23 @@ let package = Package(
             name: "NeedletailQualificationProbes",
             dependencies: ["NeedletailCore", "NeedletailTestSupport"]
         ),
+        // M1-A: pure configuration/capability/profile suites (fast; joins
+        // `./dev test quick`). No filesystem, environment, network or clock.
+        .testTarget(
+            name: "NeedletailConfigTests",
+            dependencies: ["NeedletailCore"]
+        ),
+        // M1-A: spawn-binary + temp-filesystem integration (offline; runs
+        // under `./dev test case <ID>` and `./dev test offline`, never quick).
+        .testTarget(
+            name: "NeedletailConfigIntegrationTests",
+            dependencies: [
+                "NeedletailCore",
+                "NeedletailRuntime",
+                "NeedletailProviders",
+                .product(name: "Subprocess", package: "swift-subprocess"),
+                .product(name: "SystemPackage", package: "swift-system"),
+            ]
+        ),
     ]
 )

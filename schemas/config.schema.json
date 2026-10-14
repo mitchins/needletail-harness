@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://needletail.local/schemas/config.schema.json",
+  "title": "Needletail strict configuration (M1-A, version 1)",
+  "description": "Informative editor schema only. The Swift codec (bounded duplicate preflight plus strict typed validation) is the normative validator; it additionally rejects duplicate keys at every level, enforces byte bounds, and freezes unknown-field and reserved-key rules. No YAML, templating, or executable configuration.",
+  "type": "object",
+  "required": ["version", "default_model", "allow_http_origins", "models", "tools"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Configuration format version. Exactly 1; newer versions fail closed."
+    },
+    "default_model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Alias of the default profile; must reference models[].alias."
+    },
+    "allow_http_origins": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "pattern": "^https?://[^/@?#\\s]+(:[0-9]{1,5})?$",
+        "description": "Origin only: scheme://host[:port]. No path, credentials, query or fragment."
+      }
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["alias", "protocol", "base_url", "model", "context_window", "max_output", "locality", "connect_timeout_s", "read_idle_timeout_s", "request_timeout_s", "max_in_flight"],
+        "additionalProperties": false,
+        "properties": {
+          "alias": {"type": "string", "minLength": 1},
+          "protocol": {"enum": ["openai-chat-completions", "openai-responses", "anthropic-messages"]},
+          "base_url": {
+            "type": "string",
+            "description": "scheme://host[:port] plus an optional explicit path prefix such as /v1. No credentials, query, fragment, traversal or double suffix."
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque served model ID. Strings only: numeric-looking IDs are never coerced."
+          },
+          "context_window": {"type": "integer", "minimum": 1, "maximum": 16777216},
+          "max_output": {"type": "integer", "minimum": 1, "maximum": 131072},
+          "locality": {"enum": ["local", "cloud"]},
+          "credential": {
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 1,
+            "properties": {
+              "env": {"type": "string", "minLength": 1},
+              "file": {"type": "string", "minLength": 1},
+              "keychain": {"type": "string", "minLength": 1}
+            },
+            "description": "Exactly one reference kind: variable name, 0600 file path, or keychain account. Never a secret value."
+          },
+          "connect_timeout_s": {"type": "integer", "minimum": 1, "maximum": 120},
+          "read_idle_timeout_s": {"type": "integer", "minimum": 1, "maximum": 1800},
+          "request_timeout_s": {"type": "integer", "minimum": 1, "maximum": 1800},
+          "max_in_flight": {"type": "integer", "minimum": 1, "maximum": 16},
+          "request_options": {
+            "type": "object",
+            "description": "Inert operator-owned native JSON (max 64 KiB serialized). Reserved harness-owned keys are rejected; other keys are unqualified until exercised."
+          }
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "read": {"type": "boolean"},
+        "search": {"type": "boolean"},
+        "edit": {"type": "boolean"},
+        "write": {"type": "boolean"},
+        "exec": {"type": ["boolean", "string"], "description": "true, false, or ask. Absent means denied."},
+        "consult": {"type": "boolean"}
+      }
+    }
+  }
+}
