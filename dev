@@ -23,7 +23,7 @@ Usage: ./dev <command>
 
 Build and offline tests (Linux first; no network, no provider calls):
   build                     Build the package
-  test quick               Pure core/ledger/reporter/config tests        (target <=3 s)
+  test quick               Pure core/ledger/config/state/render tests    (target <=3 s)
   test native              M0-B native primitive probes (SSE, cancellation, subprocess)
   test qualification       Intentional fail/skip/parameterized/pass fixtures (NOT a gate)
   test case CASE-ID        Run the deterministic tests registered for one case
@@ -45,6 +45,8 @@ FILTER_BEHAVIOUR="BehaviourTests"
 FILTER_PRIMITIVE="NeedletailPrimitiveTests"
 FILTER_QUALIFICATION="NeedletailQualificationProbes"
 FILTER_CONFIG_PURE="NeedletailConfigTests"
+FILTER_STATE_PURE="NeedletailStateTests"
+FILTER_PRESENTATION_PURE="NeedletailPresentationTests"
 
 swift_test() {
     "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution "$@"
@@ -117,13 +119,16 @@ run_case() {
         echo "FAIL: tests for $case_id exited $_case_rc (evidence: $_case_log)."
         exit "$_case_rc"
     fi
-    require_test_result "$_case_log" "case $case_id"
-    # Zero matched tests is a runner green with nothing run: refuse it.
-    _ran=$(grep -o "Test run with [0-9]* tests" "$_case_log" | grep -o "[0-9]*" | head -1 || true)
-    if [ "${_ran:-0}" = "0" ]; then
-        echo "FAIL: no tests matched case $case_id (filter '$case_filter', evidence: $_case_log). A zero-match run is not a pass."
-        exit 1
-    fi
+        require_test_result "$_case_log" "case $case_id"
+        # Zero matched tests is a runner green with nothing run: refuse it.
+        # Count singular ("1 test") and plural runs across ALL targets and
+        # sum them (M1-B PORT-02: single-test runs per target tripped the
+        # old plural-only first-match check — a false negative).
+        _ran=$(grep -o "Test run with [0-9]* tests\?" "$_case_log" | grep -o "[0-9]*" | awk '{s+=$1} END {print s+0}' || true)
+        if [ "${_ran:-0}" = "0" ]; then
+            echo "FAIL: no tests matched case $case_id (filter '$case_filter', evidence: $_case_log). A zero-match run is not a pass."
+            exit 1
+        fi
 }
 
 cmd="${1:-help}"
@@ -138,7 +143,7 @@ test)
     shift || true
     case "$sub" in
     quick)
-        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE"
+        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE"
         ;;
     native)
         run_swift_test native --filter "$FILTER_PRIMITIVE"
@@ -248,6 +253,10 @@ test)
         for _m1a_case in CFG-01 CFG-02 CFG-03 CFG-04 CFG-05 CFG-06 POLICY-02 POLICY-05 NET-01 NET-06; do
             echo "== offline aggregate: case $_m1a_case =="
             run_case "$_m1a_case"
+        done
+        for _m1b_case in CORE-02 CORE-03 CORE-04 POLICY-03 POLICY-04 STATE-01 STATE-04 PORT-02 DX-01 DX-02 DX-03 DX-06 DX-07; do
+            echo "== offline aggregate: case $_m1b_case =="
+            run_case "$_m1b_case"
         done
         echo "OFFLINE OK: all scheduled offline layers passed."
         ;;

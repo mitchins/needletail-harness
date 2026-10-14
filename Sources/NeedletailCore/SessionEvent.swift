@@ -1,0 +1,136 @@
+/// M1-B session events (ARCH §§1–3). Every event is a value carrying
+/// EXPLICIT stamped IDs and timestamps — the actor stamps before the
+/// transition runs, so replay needs nothing but the event log plus the ID
+/// counter. Model text travels ONLY in input/response payloads, which have
+/// no path to grants, routes or epochs (I12, enforced by type: those fields
+/// exist solely on epoch/operator-trust events).
+
+public enum SessionEvent: Sendable, Equatable {
+    // Operator input (stamped: commandID, revision, sealed mode, enqueuedAtMillis).
+    // `sealed` comes from invocation flags (M1-D CLI); sealed batches never reach authorising.
+    case operatorInput(commandID: CommandID, text: String, kind: QueueKind, revision: UInt64, sealed: Bool, atMillis: UInt64)
+    case queueEdit(entryID: String, newText: String, baseRevision: UInt64, atMillis: UInt64)
+    case queueWithdraw(entryID: String, atMillis: UInt64)
+    case queueResume(atMillis: UInt64)
+    case approvalGrant(requestID: RequestID, generation: Revision, atMillis: UInt64)
+    case approvalDeny(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
+    case approvalUnavailable(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
+    case switchModel(alias: String, atMillis: UInt64)
+    case checkpointRequested(atMillis: UInt64)
+    case checkpointCommitted(newEpoch: EpochDescriptor?, atMillis: UInt64)
+    case checkpointFailed(reason: String, atMillis: UInt64)
+    case cancelRequested(atMillis: UInt64)
+    case dismissRun(atMillis: UInt64)
+    case invalidInput(fingerprint: String, cause: String, atMillis: UInt64)
+    // Actor-internal + provider/transport (stamped pre-await or scripted)
+    case requestDispatched(requestID: RequestID, atMillis: UInt64)
+    case requestStarted(requestID: RequestID, generation: Revision, atMillis: UInt64)
+    case providerResponse(requestID: RequestID, generation: Revision, response: ProviderResponse, atMillis: UInt64)
+    case transportFailed(requestID: RequestID, generation: Revision, phase: TransportPhase, error: String, atMillis: UInt64)
+    case validationCompleted(requestID: RequestID, generation: Revision, batch: ToolBatch, atMillis: UInt64)
+    case effectCompleted(effectID: EffectID, runID: RunID, generation: Revision, expectedRevision: Revision, mutating: Bool, outcome: EffectOutcome, atMillis: UInt64)
+    case effectFailed(effectID: EffectID, runID: RunID, generation: Revision, expectedRevision: Revision, mutating: Bool, error: String, atMillis: UInt64)
+    case tick(nowMillis: UInt64)
+}
+
+public enum TransportPhase: Sendable, Equatable {
+    /// No byte of this request left the process.
+    case preSend
+    /// Streamed content was produced (partial evidence may exist).
+    case postContent
+    /// Bytes may or may not have been sent — hold for reconciliation, never auto-resend.
+    case ambiguous
+}
+
+public enum EffectOutcome: Sendable, Equatable {
+    case success(String)
+    case failureReceipt(String)
+}
+
+/// Minimal M1-C handoff (detail deferred to M1-C): the completion boundary
+/// plus generation binding. `isFinal` comes from native completion signals:
+/// proposals → validatingTools; final text → completed; interim → requesting.
+public struct ProviderResponse: Sendable, Equatable {
+    public let requestID: RequestID
+    public let generation: Revision
+    public let outcome: ProviderOutcome
+    public let usageInput: Int?
+    public let usageOutput: Int?
+
+    public init(requestID: RequestID, generation: Revision, outcome: ProviderOutcome, usageInput: Int? = nil, usageOutput: Int? = nil) {
+        self.requestID = requestID
+        self.generation = generation
+        self.outcome = outcome
+        self.usageInput = usageInput
+        self.usageOutput = usageOutput
+    }
+}
+
+public enum ProviderOutcome: Sendable, Equatable {
+    case textDeltaComplete(text: String, toolProposals: [ToolProposal], isFinal: Bool)
+    case failed(String)
+    case interrupted
+}
+
+/// Validated-shape tool proposal. Field names/types only — a proposal is
+/// DATA (never an effect) until authorising + approval + reservation (M2
+/// executes; M1-B records the intent).
+public struct ToolProposal: Sendable, Equatable {
+    public let callID: String
+    public let tool: String
+    public let argumentsDigest: String
+
+    public init(callID: String, tool: String, argumentsDigest: String) {
+        self.callID = callID
+        self.tool = tool
+        self.argumentsDigest = argumentsDigest
+    }
+}
+
+public struct ToolBatch: Sendable, Equatable {
+    public let proposals: [ToolProposal]
+    public init(_ proposals: [ToolProposal] = []) {
+        self.proposals = proposals
+    }
+}
+
+/// Terminal run outcomes. Exit-code mapping is M1-D's; the vocabulary is M1-B's.
+public enum RunOutcome: Sendable, Equatable {
+    case completed(RunReceipt)
+    case failed(RunFailure)
+    case interrupted
+    case approvalRequired(ApprovalRequest)
+}
+
+/// Typed projection of session occurrences for UI + future JSONL — ONE
+/// shared vocabulary, never a second output semantics (UX-DX §3.1).
+/// Constructible ONLY inside Core (`internal` init): Presentation can carry
+/// projections but never mint them (R21, pinned by a construction-site gate).
+public struct SessionEventProjection: Sendable, Equatable {
+    public let kind: String
+    public let detail: String
+
+    internal init(kind: String, detail: String) {
+        self.kind = kind
+        self.detail = detail
+    }
+
+    public static func admitted(commandID: CommandID, revision: UInt64) -> SessionEventProjection {
+        SessionEventProjection(kind: "admitted", detail: "\(commandID.raw):\(revision)")
+    }
+
+    public static func denied(cause: String) -> SessionEventProjection {
+        SessionEventProjection(kind: "denied", detail: terminalSafe(cause))
+    }
+
+    public static func runUpdate(phase: String, detail: String) -> SessionEventProjection {
+        SessionEventProjection(kind: "run:\(phase)", detail: terminalSafe(detail))
+    }
+
+    /// Agent-activity projection. Fields join with newlines (never commas —
+    /// aliases may contain them); the reducer splits leniently and ignores
+    /// malformed payloads instead of crashing.
+    public static func agent(alias: String, locality: String, phase: String) -> SessionEventProjection {
+        SessionEventProjection(kind: "agent", detail: "\(alias)\n\(locality)\n\(phase)")
+    }
+}

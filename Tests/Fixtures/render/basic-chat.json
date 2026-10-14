@@ -1,0 +1,8 @@
+{
+  "width": 80,
+  "lines": [
+    {"id": "status-busy", "runs": [{"text": "admitted q-1:1", "role": "status"}]},
+    {"id": "agent", "runs": [{"text": "local-coder · local · requesting", "role": "status"}]},
+    {"id": "candidate-0", "runs": [{"text": "src/main.swift", "role": "candidateSelected"}]}
+  ]
+}

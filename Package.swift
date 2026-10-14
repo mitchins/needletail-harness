@@ -20,6 +20,7 @@ let package = Package(
         .library(name: "NeedletailProviders", targets: ["NeedletailProviders"]),
         .library(name: "NeedletailRuntime", targets: ["NeedletailRuntime"]),
         .library(name: "NeedletailTestSupport", targets: ["NeedletailTestSupport"]),
+        .library(name: "NeedletailPresentation", targets: ["NeedletailPresentation"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.8.2"),
@@ -48,6 +49,10 @@ let package = Package(
         ),
         .target(
             name: "NeedletailTestSupport",
+            dependencies: ["NeedletailCore"]
+        ),
+        .target(
+            name: "NeedletailPresentation",
             dependencies: ["NeedletailCore"]
         ),
         .target(
@@ -111,6 +116,27 @@ let package = Package(
         .testTarget(
             name: "NeedletailConfigTests",
             dependencies: ["NeedletailCore"]
+        ),
+        // M1-B: pure transition/state/queue/budget/sealed/channel suites.
+        .testTarget(
+            name: "NeedletailStateTests",
+            dependencies: ["NeedletailCore", "NeedletailTestSupport"]
+        ),
+        // M1-B: actor + scripted seams (fast, no I/O; layer=integration by
+        // seam). Runs under `test case` + `test offline`, not quick.
+        .testTarget(
+            name: "NeedletailActorTests",
+            dependencies: ["NeedletailCore", "NeedletailTestSupport"]
+        ),
+        // M1-B: pure reducer/render/golden suites (Crypto for golden
+        // manifest hashes only — never in product targets).
+        .testTarget(
+            name: "NeedletailPresentationTests",
+            dependencies: [
+                "NeedletailPresentation",
+                "NeedletailCore",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
         ),
         // M1-A: spawn-binary + temp-filesystem integration (offline; runs
         // under `./dev test case <ID>` and `./dev test offline`, never quick).
