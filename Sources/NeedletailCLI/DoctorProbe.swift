@@ -30,9 +30,10 @@ enum DoctorProbe {
         }
         switch selectRoute(snapshot: snapshot, requestedAlias: alias, sealed: false) {
         case .allowed(let endpoint, _):
-            print("probe \(alias): route allowed → \(endpoint) (tool-free, sealed-capable)")
+            // H2: the alias is operator-supplied; the endpoint is validated ASCII.
+            print("probe \(terminalSafe(alias)): route allowed → \(endpoint) (tool-free, sealed-capable)")
         case .denied(let denial):
-            print("probe \(alias): route denied (\(denial.kind)): \(denial.message)")
+            print("probe \(terminalSafe(alias)): route denied (\(denial.kind)): \(denial.message)")
         }
         // Deliberate exit-4 reuse (no SPEC deferral code): deferred, not failed.
         print("probeDeferredToM1C: synthetic bounded-input probe arrives in M1-C; no traffic sent.")

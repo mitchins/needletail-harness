@@ -10,7 +10,7 @@ public struct CredentialReference: Sendable, Equatable {
         case keychain(account: String)
     }
 
-    public var kind: Kind
+    public let kind: Kind
 
     public init(kind: Kind) {
         self.kind = kind
@@ -30,12 +30,13 @@ public struct CredentialReference: Sendable, Equatable {
     }
 
     /// Reference-only rendering for every diagnostic path. The secret value
-    /// can never appear here because it is never stored in this type.
+    /// can never appear here because it is never stored in this type. The
+    /// reference itself renders through `terminalSafe` (H2).
     public var redactedDescription: String {
         switch kind {
-        case .env(let name): return "env:\(name)"
-        case .file(let path): return "file:\(path)"
-        case .keychain(let account): return "keychain:\(account)"
+        case .env(let name): return "env:\(terminalSafe(name))"
+        case .file(let path): return "file:\(terminalSafe(path))"
+        case .keychain(let account): return "keychain:\(terminalSafe(account))"
         }
     }
 }

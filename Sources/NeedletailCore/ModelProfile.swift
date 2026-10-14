@@ -31,46 +31,80 @@ public enum Locality: String, Sendable, Equatable {
 }
 
 public struct ModelProfile: Sendable, Equatable {
-    public var alias: String
-    public var wireProtocol: WireProtocol
+    public let alias: String
+    public let wireProtocol: WireProtocol
     /// Normalized base: trailing slash stripped, otherwise verbatim
     /// (explicit `/v1`-style prefixes preserved).
-    public var baseURL: String
-    /// Origin derived by discarding the path prefix
+    public let baseURL: String
+    /// Origin derived from `baseURL` at construction
     /// (`scheme://host[:port]`, lowercased host, default port omitted).
-    public var origin: String
-    /// The preserved path prefix (`""` when the base is a bare origin).
-    public var pathPrefix: String
+    /// Diagnostics only — authorization re-derives from `baseURL` at the
+    /// security boundary and never trusts this field (H1).
+    public let origin: String
+    /// The preserved path prefix (`""` for a bare origin).
+    public let pathPrefix: String
     /// Opaque served model ID: stored and compared as a string, never
     /// coerced, never normalized.
-    public var modelID: String
-    public var contextWindow: Int
-    public var maxOutput: Int
-    public var locality: Locality
-    public var credential: CredentialReference?
-    public var connectTimeout: Int
-    public var readIdleTimeout: Int
-    public var requestTimeout: Int
-    public var maxInFlight: Int
-    public var requestOptions: [String: JSONValue]
+    public let modelID: String
+    public let contextWindow: Int
+    public let maxOutput: Int
+    public let locality: Locality
+    public let credential: CredentialReference?
+    public let connectTimeout: Int
+    public let readIdleTimeout: Int
+    public let requestTimeout: Int
+    public let maxInFlight: Int
+    public let requestOptions: [String: JSONValue]
     /// Verbatim source bytes of the `request_options` object for lossless
     /// epoch comparison (never `Dictionary` iteration order).
-    public var requestOptionsRaw: Data
-    public var unqualifiedOptions: [String]
+    public let requestOptionsRaw: Data
+    public let unqualifiedOptions: [String]
 
+    /// The only construction path (H1): the origin and prefix are derived
+    /// from `baseURL` here, so a profile can never hold a base URL that
+    /// disagrees with its stored origin. Post-construction mutation is
+    /// impossible (`let` throughout) — the stale-origin bypass has no
+    /// expression in this API. Range checks mirror the loader's so a
+    /// hand-built profile cannot smuggle invalid limits either.
     public init(
-        alias: String, wireProtocol: WireProtocol, baseURL: String, origin: String,
-        pathPrefix: String, modelID: String, contextWindow: Int, maxOutput: Int,
+        alias: String, wireProtocol: WireProtocol, baseURL: String,
+        modelID: String, contextWindow: Int, maxOutput: Int,
         locality: Locality, credential: CredentialReference?,
         connectTimeout: Int, readIdleTimeout: Int, requestTimeout: Int,
         maxInFlight: Int, requestOptions: [String: JSONValue],
-        requestOptionsRaw: Data, unqualifiedOptions: [String]
-    ) {
+        requestOptionsRaw: Data, unqualifiedOptions: [String] = [],
+        path: String = "$.profile"
+    ) throws {
+        guard !alias.isEmpty else {
+            throw ConfigError(
+                path: "\(path).alias", kind: .typeMismatch,
+                message: "alias must not be empty.",
+                hint: "give the profile a short unique handle.")
+        }
+        guard !modelID.isEmpty else {
+            throw ConfigError(
+                path: "\(path).model", kind: .typeMismatch,
+                message: "served model ID must not be empty.",
+                hint: "use the exact served ID as a string.")
+        }
+        let parsed = try parseBaseURL(baseURL, path: "\(path).base_url")
+        try Self.checkRange(contextWindow, range: ConfigLimits.contextWindow, path: "\(path).context_window")
+        try Self.checkRange(maxOutput, range: ConfigLimits.maxOutput, path: "\(path).max_output")
+        try Self.checkRange(connectTimeout, range: ConfigLimits.connectTimeout, path: "\(path).connect_timeout_s")
+        try Self.checkRange(readIdleTimeout, range: ConfigLimits.readIdleTimeout, path: "\(path).read_idle_timeout_s")
+        try Self.checkRange(requestTimeout, range: ConfigLimits.requestTimeout, path: "\(path).request_timeout_s")
+        try Self.checkRange(maxInFlight, range: ConfigLimits.maxInFlight, path: "\(path).max_in_flight")
+        guard connectTimeout <= readIdleTimeout, readIdleTimeout <= requestTimeout else {
+            throw ConfigError(
+                path: path, kind: .unsupportedCombination,
+                message: "timeouts must satisfy connect ≤ read_idle ≤ request.",
+                hint: "raise the outer deadlines or lower the inner ones.")
+        }
         self.alias = alias
         self.wireProtocol = wireProtocol
-        self.baseURL = baseURL
-        self.origin = origin
-        self.pathPrefix = pathPrefix
+        self.baseURL = parsed.base
+        self.origin = parsed.origin
+        self.pathPrefix = parsed.prefix
         self.modelID = modelID
         self.contextWindow = contextWindow
         self.maxOutput = maxOutput
@@ -85,20 +119,31 @@ public struct ModelProfile: Sendable, Equatable {
         self.unqualifiedOptions = unqualifiedOptions
     }
 
+    private static func checkRange(_ value: Int, range: ClosedRange<Int>, path: String) throws {
+        guard range.contains(value) else {
+            throw ConfigError(
+                path: path, kind: .limitExceeded,
+                message: "value \(value) is outside \(range.lowerBound)...\(range.upperBound).",
+                hint: "set a value inside the documented range.")
+        }
+    }
+
     /// Reference-only rendering: origins and references, never secret
-    /// values and never `request_options` values.
+    /// values and never `request_options` values. Operator-supplied
+    /// identity fields render through `terminalSafe` (H2); the stored
+    /// values keep their exact bytes.
     public var redactedDescription: String {
         let credential = credential?.redactedDescription ?? "none"
-        return "profile \(alias) \(wireProtocol.rawValue) \(origin) \(locality.rawValue) model \(modelID) ctx \(contextWindow) out \(maxOutput) credential \(credential) unqualified:\(unqualifiedOptions.count)"
+        return "profile \(terminalSafe(alias)) \(wireProtocol.rawValue) \(origin) \(locality.rawValue) model \(terminalSafe(modelID)) ctx \(contextWindow) out \(maxOutput) credential \(credential) unqualified:\(unqualifiedOptions.count)"
     }
 }
 
 public struct ConfigSnapshot: Sendable, Equatable {
-    public var version: Int
-    public var profiles: [String: ModelProfile]
-    public var defaultAlias: String
-    public var allowHTTPOrigins: [String]
-    public var tools: ToolCapabilities
+    public let version: Int
+    public let profiles: [String: ModelProfile]
+    public let defaultAlias: String
+    public let allowHTTPOrigins: [String]
+    public let tools: ToolCapabilities
 
     public init(version: Int, profiles: [String: ModelProfile], defaultAlias: String, allowHTTPOrigins: [String], tools: ToolCapabilities) {
         self.version = version
@@ -109,13 +154,13 @@ public struct ConfigSnapshot: Sendable, Equatable {
     }
 
     public var redactedDescription: String {
-        "config version \(version) default \(defaultAlias) models \(profiles.count) origins \(allowHTTPOrigins.count)"
+        "config version \(version) default \(terminalSafe(defaultAlias)) models \(profiles.count) origins \(allowHTTPOrigins.count)"
     }
 }
 
 public struct ProfileSnapshot: Sendable, Equatable {
-    public var profile: ModelProfile
-    public var effectiveCaps: EffectiveCapabilities
+    public let profile: ModelProfile
+    public let effectiveCaps: EffectiveCapabilities
 
     public init(profile: ModelProfile, effectiveCaps: EffectiveCapabilities) {
         self.profile = profile

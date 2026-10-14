@@ -112,3 +112,33 @@ one targeted delta review (no full re-review):
   `opencode-go/deepseek-v4.1-flash`; tree clean; 10-case coverage and S1
   closure confirmed). No push/PR/merge — M1-epic CodeRabbit is the later
   aggregate gate.
+
+## Final hardening H1/H2 (external-inspection defects, slice still local)
+
+- H1 (stale-origin bypass, reproduced): post-load mutation of `baseURL`
+  against a retained allowed `origin` returned `allowed`. RED:
+  `m1a-h1-red.log` (`NET-01 mutated profile state…` fails, route
+  allowed for `https://evil.example:443/admin`). GREEN: immutable
+  `let` state throughout; single validating `ModelProfile` initializer
+  (origin/prefix derived, inconsistency unconstructible);
+  `selectRoute` re-derives from the effective `baseURL` (+ new
+  `malformedDestination` denial; stored `origin` diagnostics-only);
+  `authorizeRequestDestination` re-verifies endpoint bytes for M1-C
+  call-before-dispatch. Evidence: `m1a-h-green-pure.log` (67),
+  `m1a-h-green-int-2.log` (20), full `m1a-h-ev-*.log` series + offline
+  aggregate green; bundle 6175248 bytes dynamic, packaging smoke OK.
+- H2 (ESC in diagnostics, reproduced): unknown `default_model` with
+  `\u001b[2J` rendered raw ESC. RED: `m1a-h2-red-pure.log` (raw
+  controls in `description`/redacted strings). GREEN: pure
+  `terminalSafe` at every display boundary; stored bytes untouched;
+  exact paths/kinds preserved; CLI byte assertions (0 ESC/BEL/secret
+  bytes: `m1a-h-noleak.log` shows the brief's exact input rendering
+  `ghost-\u{1b}[2J`). New tests: `TerminalSafetyTests`
+  (CFG-02 ×2, CFG-05 ×1) + 2 spawn tests; no catalogue renumbering.
+- Plan rev7 (`44995364…5bf9b33`, 422 lines): §16 documents H1/H2.
+- Workspace note (recurring, environmental): tracked `Archive.zip`
+  again found deleted mid-session by unknown cause; restored
+  byte-identical from HEAD (1405926 bytes, matches blob). Unrelated.
+- Targeted H1/H2 review: (below).
+- Restored-file check: `git status` clean except intended files; no
+  push performed at any point.

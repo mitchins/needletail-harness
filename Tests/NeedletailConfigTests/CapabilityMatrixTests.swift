@@ -58,8 +58,7 @@ struct CapabilityMatrixTests {
             sealed: SealedRestrictions(sealed: false))
         #expect(toolsNone.tools == .allDenied)
         // Single-tool narrowing keeps exactly that tool.
-        var readOnly = ToolCapabilities.allDenied
-        readOnly.read = true
+        let readOnly = ToolCapabilities(read: true, search: false, edit: false, write: false, exec: .denied, consult: false)
         let read = effectiveCapabilities(
             build: .allAllowed, userConfig: snapshot.tools,
             workspaceGrant: .allAllowed, invocationMask: readOnly,

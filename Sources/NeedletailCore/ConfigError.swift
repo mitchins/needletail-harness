@@ -34,8 +34,11 @@ public struct ConfigError: Error, Sendable, Equatable, CustomStringConvertible {
         self.hint = hint
     }
 
+    /// Display boundary (H2): path, message and hint may carry
+    /// operator-supplied names with smuggled controls; all three render
+    /// through `terminalSafe`. The stored fields keep the exact bytes.
     public var description: String {
-        "error \(path): \(kind.rawValue) — \(message) Fix: \(hint)"
+        "error \(terminalSafe(path)): \(kind.rawValue) — \(terminalSafe(message)) Fix: \(terminalSafe(hint))"
     }
 }
 

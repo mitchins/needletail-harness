@@ -129,8 +129,14 @@ struct CredentialIntegrationTests {
         let snapshot = try validateConfig(ConfigTestHelpersData.localConfig())
         let profile = try #require(snapshot.profiles["local-coder"])
         #expect(try validateLocalChatProfile(profile) == profile)
-        var cloudy = profile
-        cloudy.locality = .cloud
+        let cloudy = try ModelProfile(
+            alias: profile.alias, wireProtocol: profile.wireProtocol, baseURL: profile.baseURL,
+            modelID: profile.modelID, contextWindow: profile.contextWindow, maxOutput: profile.maxOutput,
+            locality: .cloud, credential: profile.credential,
+            connectTimeout: profile.connectTimeout, readIdleTimeout: profile.readIdleTimeout,
+            requestTimeout: profile.requestTimeout, maxInFlight: profile.maxInFlight,
+            requestOptions: profile.requestOptions, requestOptionsRaw: profile.requestOptionsRaw,
+            unqualifiedOptions: profile.unqualifiedOptions)
         do {
             _ = try validateLocalChatProfile(cloudy)
             Issue.record("cloud profile must not validate as a local chat profile")

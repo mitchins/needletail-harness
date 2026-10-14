@@ -61,6 +61,36 @@ struct ConfigValidateSpawnTests {
         #expect(err.contains("reservedOverride"))
     }
 
+    @Test("CFG-02 spawned diagnostics carry no executable bytes")
+    func CFG_02_spawnDiagnosticsTerminalSafe() async throws {
+        // H2: an unknown default_model smuggling a JSON-escaped CSI clear
+        // sequence must fail with visible escapes, never raw ESC bytes.
+        // (A valid model is present so resolution reaches the alias check.)
+        let config = """
+        {"version":1,"default_model":"ghost-\\u001b[2J","allow_http_origins":["http://127.0.0.1:11434"],"models":[\(Self.goodModel)],"tools":{}}
+        """
+        let path = try SpawnHelpers.writeTempFile(named: "cfg.json", contents: Data(config.utf8))
+        let (code, out, err) = try await SpawnHelpers.run(["config", "validate", "--config", path])
+        #expect(code == 2, "unknown alias must exit 2")
+        let combined = out + err
+        #expect(!combined.utf8.contains(0x1B), "no raw ESC in CLI bytes")
+        #expect(combined.contains("missingReference"), "kind stays machine-readable: \(combined)")
+        #expect(combined.contains("\\u{1b}[2J"), "sequence renders visibly: \(combined)")
+    }
+
+    @Test("CFG-05 spawned profile lines escape hostile identities")
+    func CFG_05_spawnProfileLineEscaped() async throws {
+        let model = Self.goodModel
+            .replacingOccurrences(of: "\"alias\":\"local-coder\"", with: "\"alias\":\"m\\u001b[2Jodel\"")
+        let text = String(decoding: Self.baseConfig(models: model), as: UTF8.self)
+            .replacingOccurrences(of: "\"default_model\":\"local-coder\"", with: "\"default_model\":\"m\\u001b[2Jodel\"")
+        let path = try SpawnHelpers.writeTempFile(named: "cfg.json", contents: Data(text.utf8))
+        let (code, out, err) = try await SpawnHelpers.run(["config", "validate", "--config", path])
+        #expect(code == 0, "escaped alias is a legal identity: \(out) \(err)")
+        #expect(!(out + err).utf8.contains(0x1B), "no raw ESC in CLI bytes")
+        #expect(out.contains("m\\u{1b}[2Jodel"), "identity renders visibly: \(out)")
+    }
+
     @Test("POLICY-02 spawned flag conflicts reject through the real parser")
     func POLICY_02_spawnFlagConflictsRejected() async throws {
         // S7: the production CLI feeds the same pure checker the unit

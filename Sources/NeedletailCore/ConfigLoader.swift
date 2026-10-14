@@ -101,12 +101,6 @@ private func validateModel(
     _ model: ConfigModel, path: String, origins: [String],
     preflight: PreflightResult, bytes: [UInt8]
 ) throws -> ModelProfile {
-    guard !model.alias.isEmpty else {
-        throw ConfigError(
-            path: "\(path).alias", kind: .typeMismatch,
-            message: "alias must not be empty.",
-            hint: "give the profile a short unique handle.")
-    }
     guard let wire = WireProtocol(rawValue: model.proto) else {
         throw ConfigError(
             path: "\(path).protocol", kind: .typeMismatch,
@@ -119,34 +113,15 @@ private func validateModel(
             message: "unknown locality '\(model.locality)'.",
             hint: "use \"local\" or \"cloud\"; the label is an operator trust assertion.")
     }
-    guard !model.model.isEmpty else {
-        throw ConfigError(
-            path: "\(path).model", kind: .typeMismatch,
-            message: "served model ID must not be empty.",
-            hint: "use the exact served ID as a string; \"001234\" stays \"001234\".")
-    }
-    try checkRange(model.contextWindow, range: ConfigLimits.contextWindow, path: "\(path).context_window")
-    try checkRange(model.maxOutput, range: ConfigLimits.maxOutput, path: "\(path).max_output")
-    try checkRange(model.connectTimeout, range: ConfigLimits.connectTimeout, path: "\(path).connect_timeout_s")
-    try checkRange(model.readIdleTimeout, range: ConfigLimits.readIdleTimeout, path: "\(path).read_idle_timeout_s")
-    try checkRange(model.requestTimeout, range: ConfigLimits.requestTimeout, path: "\(path).request_timeout_s")
-    try checkRange(model.maxInFlight, range: ConfigLimits.maxInFlight, path: "\(path).max_in_flight")
-    guard model.connectTimeout <= model.readIdleTimeout, model.readIdleTimeout <= model.requestTimeout else {
-        throw ConfigError(
-            path: path, kind: .unsupportedCombination,
-            message: "timeouts must satisfy connect ≤ read_idle ≤ request.",
-            hint: "raise the outer deadlines or lower the inner ones.")
-    }
-    let parsed = try parseBaseURL(model.baseURL, path: "\(path).base_url")
-    guard origins.contains(parsed.origin) else {
-        throw ConfigError(
-            path: "\(path).base_url", kind: .originNotAllowlisted,
-            message: "origin \(parsed.origin) is not allow-listed.",
-            hint: "add exactly this origin to allow_http_origins, or fix the base URL.")
-    }
-    var credential: CredentialReference?
+    // URL consistency, emptiness and ranges are enforced by the single
+    // construction choke point with this model's exact path (H1). Only the
+    // raw-bytes attachment and reserved-namespace check happen here, after
+    // which the profile is rebuilt with its verbatim evidence attached.
+    let credential: CredentialReference?
     if let descriptor = model.credential {
         credential = try CredentialReference(descriptor: descriptor)
+    } else {
+        credential = nil
     }
     let optionsPath = "\(path).request_options"
     let raw: Data
@@ -168,24 +143,21 @@ private func validateModel(
             hint: "shrink native options; the namespace stays inert and bounded.")
     }
     try checkReservedKeys(model.requestOptions, path: optionsPath)
-    return ModelProfile(
-        alias: model.alias, wireProtocol: wire, baseURL: parsed.base,
-        origin: parsed.origin, pathPrefix: parsed.prefix, modelID: model.model,
-        contextWindow: model.contextWindow, maxOutput: model.maxOutput,
-        locality: locality, credential: credential,
+    let profile = try ModelProfile(
+        alias: model.alias, wireProtocol: wire, baseURL: model.baseURL,
+        modelID: model.model, contextWindow: model.contextWindow,
+        maxOutput: model.maxOutput, locality: locality, credential: credential,
         connectTimeout: model.connectTimeout, readIdleTimeout: model.readIdleTimeout,
         requestTimeout: model.requestTimeout, maxInFlight: model.maxInFlight,
         requestOptions: model.requestOptions, requestOptionsRaw: raw,
-        unqualifiedOptions: model.requestOptions.keys.sorted())
-}
-
-private func checkRange(_ value: Int, range: ClosedRange<Int>, path: String) throws {
-    guard range.contains(value) else {
+        unqualifiedOptions: model.requestOptions.keys.sorted(), path: path)
+    guard origins.contains(profile.origin) else {
         throw ConfigError(
-            path: path, kind: .limitExceeded,
-            message: "value \(value) is outside \(range.lowerBound)...\(range.upperBound).",
-            hint: "set a value inside the documented range; negative and zero limits are rejected.")
+            path: "\(path).base_url", kind: .originNotAllowlisted,
+            message: "origin \(profile.origin) is not allow-listed.",
+            hint: "add exactly this origin to allow_http_origins, or fix the base URL.")
     }
+    return profile
 }
 
 private func mapTools(_ tools: ConfigTools) -> ToolCapabilities {

@@ -7,11 +7,11 @@ import Foundation // Value types only (Data, JSONDecoder): no platform I/O.
 /// Duplicate keys cannot reach this layer: the bounded preflight runs first
 /// on the same bytes. No filesystem, network or clock access.
 public struct ConfigDocument: Sendable, Equatable, Decodable {
-    public var version: Int
-    public var defaultModel: String
-    public var allowHTTPOrigins: [String]
-    public var models: [ConfigModel]
-    public var tools: ConfigTools
+    public let version: Int
+    public let defaultModel: String
+    public let allowHTTPOrigins: [String]
+    public let models: [ConfigModel]
+    public let tools: ConfigTools
 
     enum Known: String, CaseIterable {
         case version, default_model, allow_http_origins, models, tools
@@ -34,8 +34,8 @@ public struct ConfigDocument: Sendable, Equatable, Decodable {
 
 /// A dynamic coding key for strict shape checks.
 public struct StrictKey: CodingKey, Sendable, Hashable {
-    public var stringValue: String
-    public var intValue: Int?
+    public let stringValue: String
+    public let intValue: Int?
 
     public init(_ string: String) { stringValue = string; intValue = nil }
     public init?(stringValue: String) { self.init(stringValue) }
@@ -54,19 +54,19 @@ public struct StrictKey: CodingKey, Sendable, Hashable {
 }
 
 public struct ConfigModel: Sendable, Equatable, Decodable {
-    public var alias: String
-    public var proto: String
-    public var baseURL: String
-    public var model: String
-    public var contextWindow: Int
-    public var maxOutput: Int
-    public var locality: String
-    public var credential: CredentialDescriptor?
-    public var connectTimeout: Int
-    public var readIdleTimeout: Int
-    public var requestTimeout: Int
-    public var maxInFlight: Int
-    public var requestOptions: [String: JSONValue]
+    public let alias: String
+    public let proto: String
+    public let baseURL: String
+    public let model: String
+    public let contextWindow: Int
+    public let maxOutput: Int
+    public let locality: String
+    public let credential: CredentialDescriptor?
+    public let connectTimeout: Int
+    public let readIdleTimeout: Int
+    public let requestTimeout: Int
+    public let maxInFlight: Int
+    public let requestOptions: [String: JSONValue]
 
     enum Known: String, CaseIterable {
         case alias, `protocol`, base_url, model, context_window, max_output
@@ -102,8 +102,8 @@ public struct ConfigModel: Sendable, Equatable, Decodable {
 /// Exactly one credential reference kind; zero, two or unknown keys fail.
 /// The value is a reference (name/path/account), never a secret.
 public struct CredentialDescriptor: Sendable, Equatable, Decodable {
-    public var kind: String
-    public var value: String
+    public let kind: String
+    public let value: String
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: StrictKey.self)
@@ -139,12 +139,12 @@ public struct CredentialDescriptor: Sendable, Equatable, Decodable {
 }
 
 public struct ConfigTools: Sendable, Equatable, Decodable {
-    public var read: Bool
-    public var search: Bool
-    public var edit: Bool
-    public var write: Bool
-    public var exec: ExecPolicy
-    public var consult: Bool
+    public let read: Bool
+    public let search: Bool
+    public let edit: Bool
+    public let write: Bool
+    public let exec: ExecPolicy
+    public let consult: Bool
 
     enum Known: String, CaseIterable {
         case read, search, edit, write, exec, consult

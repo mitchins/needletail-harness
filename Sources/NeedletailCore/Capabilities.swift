@@ -5,12 +5,12 @@
 /// cannot enlarge the result. `--sealed` and `--tools none` deny **tools
 /// only** — route authorization is independent (`RouteDecision`).
 public struct ToolCapabilities: Sendable, Equatable {
-    public var read: Bool
-    public var search: Bool
-    public var edit: Bool
-    public var write: Bool
-    public var exec: ExecPolicy
-    public var consult: Bool
+    public let read: Bool
+    public let search: Bool
+    public let edit: Bool
+    public let write: Bool
+    public let exec: ExecPolicy
+    public let consult: Bool
 
     public init(read: Bool, search: Bool, edit: Bool, write: Bool, exec: ExecPolicy, consult: Bool) {
         self.read = read
@@ -71,18 +71,18 @@ public enum RoutePolicy: String, Sendable, Equatable {
 /// Sealed mode carries no tool content — only the bit — so last-flag-wins
 /// over tools is unrepresentable in the signature.
 public struct SealedRestrictions: Sendable, Equatable {
-    public var sealed: Bool
+    public let sealed: Bool
     public init(sealed: Bool) { self.sealed = sealed }
 }
 
 public struct EffectiveCapabilities: Sendable, Equatable {
-    public var tools: ToolCapabilities
+    public let tools: ToolCapabilities
     /// M1-A routes local-only or denies per request (`selectRoute`); the
     /// policy field records the only routable class and never varies with
     /// sealing (rev4-B: tools/route independence).
-    public var route: RoutePolicy
+    public let route: RoutePolicy
     /// Layers that denied at least one tool, for actionable diagnostics.
-    public var deniedBy: [String]
+    public let deniedBy: [String]
 
     public init(tools: ToolCapabilities, route: RoutePolicy, deniedBy: [String]) {
         self.tools = tools
@@ -134,8 +134,8 @@ private extension ToolCapabilities {
 /// always allowed here. Returns the sealed bit and the folded mask (`nil`
 /// when no `--tools` directive was passed).
 public struct CLIToolsDecision: Sendable, Equatable {
-    public var sealed: Bool
-    public var mask: ToolCapabilities?
+    public let sealed: Bool
+    public let mask: ToolCapabilities?
 
     public init(sealed: Bool, mask: ToolCapabilities?) {
         self.sealed = sealed
@@ -148,7 +148,7 @@ public func checkCLIDirectives(sealedCount: Int, toolsValues: [String]) throws -
     for value in toolsValues where !knownTools.contains(value) {
         throw ConfigError(
             path: "$.cli.--tools", kind: .unsupportedCombination,
-            message: "unknown --tools value '\(value)'.",
+            message: "unknown --tools value '\(terminalSafe(value))'.",
             hint: "use one of: \(knownTools.joined(separator: ", ")). Repeat a value to confirm it; differing values reject.")
     }
     let distinct = Set(toolsValues)

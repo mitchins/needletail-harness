@@ -388,6 +388,31 @@ Mechanical hardening only; no contract direction changes:
 - D-c SUPERSEDED: §5's "`models: []` is the only valid tool-less shape" is withdrawn — empty `models` is rejected (`missingField`), because R13 requires `default_model` to reference a configured alias and a dangling reference would fail open. Tool-less operation stays possible via deny-all tools with a configured profile.
 - Counts: CFG-02 24→31 variants (S3/S5/S8 additions), POLICY-02 +3 spawn-flag tests (S7), NET-01 unchanged at 8.
 
+## 16. Revision log (rev6 → rev7; external-inspection hardening H1/H2)
+
+- H1 (route authorization consistency): validated state is immutable
+  (`let` throughout: profiles, snapshots, capabilities, documents — the
+  stale-origin bypass no longer compiles); `ModelProfile` has one
+  validating initializer that derives origin/prefix from `baseURL`, so an
+  inconsistent (base, origin) pair cannot be constructed;
+  `selectRoute` re-derives the destination from the effective `baseURL`
+  and checks the DERIVED origin (new `malformedDestination` denial; the
+  stored `origin` field is diagnostics-only); new
+  `authorizeRequestDestination` entry point re-verifies the exact endpoint
+  bytes — M1-C transport must call it immediately before dispatch and
+  never cache the endpoint across an `await`. New NET-01 variant
+  (`mutated-profile-denied` + stale-list + authorize-agrees) with
+  red→green evidence. Prefixes, local-only rules and valid routing
+  unchanged.
+- H2 (terminal-safe diagnostics): new pure `terminalSafe` (controls →
+  visible `\u{hex}`); applied at every display boundary
+  (`ConfigError.description`, credential/profile/snapshot redacted
+  descriptions, CLI profile/default-model/probe lines, route-denial and
+  flag-value messages). Stored values keep exact bytes. New CFG-02/CFG-05
+  pure variants (ESC/CSI/OSC/CR/BS/LF/DEL/C1 table) + spawned-CLI byte
+  assertions (no `0x1B` in stdout/stderr). No catalogue renumbering.
+- Counts: NET-01 +1 test, CFG-02 +1, CFG-05 +2 pure / +2 spawn.
+
 ---
 
 ## Review ask (for `deepseek-reviewer` — TARGETED DELTA ONLY)

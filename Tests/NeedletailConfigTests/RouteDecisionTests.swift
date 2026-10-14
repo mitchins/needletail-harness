@@ -75,6 +75,59 @@ struct RouteDecisionTests {
         #expect(denial.message.contains("ghost"))
     }
 
+    @Test("NET-01 mutated profile state cannot smuggle an unapproved destination")
+    func NET_01_mutatedProfileDenied() throws {
+        // H1: the old mutable API let post-load state retarget baseURL at
+        // an unapproved origin while the stored origin still claimed the
+        // allow-list (RED: selectRoute returned allowed). Profiles are now
+        // immutable with origin derived at construction, and the decision
+        // re-derives from the effective baseURL — inconsistency has no
+        // expression left, and every live variant below denies.
+        let snapshot = try Self.localSnapshot()
+        let local = try #require(snapshot.profiles["local-coder"])
+        // A profile retargeted at an unapproved origin is denied even when
+        // the snapshot's allow-list is otherwise intact ...
+        let retargeted = try ModelProfile(
+            alias: local.alias, wireProtocol: local.wireProtocol,
+            baseURL: "https://evil.example:443/admin", modelID: local.modelID,
+            contextWindow: local.contextWindow, maxOutput: local.maxOutput,
+            locality: local.locality, credential: local.credential,
+            connectTimeout: local.connectTimeout, readIdleTimeout: local.readIdleTimeout,
+            requestTimeout: local.requestTimeout, maxInFlight: local.maxInFlight,
+            requestOptions: local.requestOptions, requestOptionsRaw: local.requestOptionsRaw,
+            unqualifiedOptions: local.unqualifiedOptions)
+        #expect(retargeted.origin == "https://evil.example", "origin derives from the effective base")
+        let poisoned = ConfigSnapshot(
+            version: snapshot.version, profiles: ["local-coder": retargeted],
+            defaultAlias: snapshot.defaultAlias, allowHTTPOrigins: snapshot.allowHTTPOrigins,
+            tools: snapshot.tools)
+        guard case .denied(let denial) = selectRoute(snapshot: poisoned, requestedAlias: "local-coder", sealed: false) else {
+            Issue.record("H1: unapproved effective destination must deny, never route")
+            return
+        }
+        #expect(denial.kind == .originNotAllowlisted, "derived-origin check must fail closed, got \(denial.kind)")
+        // ... the dispatch-time entry point agrees ...
+        guard case .denied = authorizeRequestDestination(snapshot: poisoned, requestedAlias: "local-coder", sealed: false) else {
+            Issue.record("H1: authorizeRequestDestination must agree with selectRoute")
+            return
+        }
+        // ... a snapshot whose allow-list no longer covers the profile
+        // denies too (no stale-list routing) ...
+        let staleList = ConfigSnapshot(
+            version: snapshot.version, profiles: snapshot.profiles,
+            defaultAlias: snapshot.defaultAlias, allowHTTPOrigins: [],
+            tools: snapshot.tools)
+        guard case .denied = selectRoute(snapshot: staleList, requestedAlias: "local-coder", sealed: false) else {
+            Issue.record("H1: emptied allow-list must deny")
+            return
+        }
+        // ... while an explicitly approved destination still routes.
+        guard case .allowed = selectRoute(snapshot: snapshot, requestedAlias: "local-coder", sealed: false) else {
+            Issue.record("H1: approved destinations must keep routing")
+            return
+        }
+    }
+
     @Test("NET-01 prefixed base keeps its prefix with the origin allowed")
     func NET_01_prefixedBaseEndpointPreserved() throws {
         let snapshot = try Self.localSnapshot(extraModels: [

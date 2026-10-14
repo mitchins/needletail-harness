@@ -106,17 +106,19 @@ func defaultConfigPath() -> String? {
 
 /// Redacted one-line-per-fact summary. Origins and references only.
 func renderSummary(_ snapshot: ConfigSnapshot, decision: CLIToolsDecision) -> String {
+    // H2: defaultAlias is operator-supplied; render it escaped.
     var lines = [
         "needletail config OK",
         "version: \(snapshot.version)",
-        "default_model: \(snapshot.defaultAlias)",
+        "default_model: \(terminalSafe(snapshot.defaultAlias))",
         "models: \(snapshot.profiles.count)",
     ]
     for alias in snapshot.profiles.keys.sorted() {
         let profile = snapshot.profiles[alias]!
+        // H2: identity fields are operator-supplied; render them escaped.
         lines.append(
-            "profile \(profile.alias) \(profile.wireProtocol.rawValue) \(profile.origin) \(profile.locality.rawValue)"
-                + " model \(profile.modelID) ctx \(profile.contextWindow) out \(profile.maxOutput)"
+            "profile \(terminalSafe(profile.alias)) \(profile.wireProtocol.rawValue) \(profile.origin) \(profile.locality.rawValue)"
+                + " model \(terminalSafe(profile.modelID)) ctx \(profile.contextWindow) out \(profile.maxOutput)"
                 + " credential \(profile.credential?.redactedDescription ?? "none")"
                 + " unqualified:\(profile.unqualifiedOptions.count)")
     }
