@@ -6,7 +6,7 @@
 
 - Milestone / slice: M1-B implementation (second M1 minor).
 - Authorized baseline: `fc6ef5e` (M1-A closed locally). Subject base for this slice: `ee0b36a` (M1-B planning closeout, planning files only — no source delta).
-- Head SHA: `bc73f26` (local-only implementation commit; slice review binds it).
+- Head SHA: `c011a0f` (local-only ledger tip; implementation `bf4708b`, S-fixes `a5dd9d7`, recovery `231743c`; final review binds `c011a0f`).
 - Plan digest (`plans/m1-b-plan.md` sha256, rev4): `a60997aaedabfce59094f885dbf3d49ff3fc2b0884a30d959bc52f3457e10e25` (407 lines).
 - Dependency-lock digest (`Package.resolved` sha256): `de95226e…cc` (unchanged — no dependency delta; Crypto product reused in ONE test target only).
 - OS / toolchain / architecture: Linux x86_64, Swift 6.4.0, SwiftPM `-j 4 --disable-automatic-resolution`.
@@ -26,14 +26,14 @@
 ## Evidence (verbatim commands; logs under `.needletail-dev/`)
 
 - `./dev build` rc=0.
-- `./dev test quick` → `m1b-final-quick.log`, rc=0: StateTests 52, PrimitiveTests 14, PresentationTests 19, ConfigTests 69, BehaviourTests 20 (= 174 tests; slowest suite ~2.08 s ≤ 3 s warm).
+- `./dev test quick` → `m1b-precommit-quick.log`, rc=0: StateTests 52, PrimitiveTests 14, PresentationTests 19, ConfigTests 69, BehaviourTests 20 (= 174 tests; slowest suite ~2.08 s ≤ 3 s warm). (An earlier `m1b-final-quick.log` run predates the reconstructed snapshot suite at 49 state tests and is superseded — not cited as evidence.)
 - `./dev test case` ×13 (+BDD-08) → `m1b-final-case-*.log`, all rc=0 with zero-match guards (BDD-08 via frozen replay; BDD-06 correctly refuses — review-process evidence below, never a pass).
 - Actor suites: 18 tests (gated transport, scripted approvals/executor, yield barriers — zero sleeps).
 - `./dev coverage` rc=0 (catalogue untouched per BDD-04 M0-vocabulary pin).
 - `./dev test native` rc=0 (14 tests — M0 regression).
 - `./dev test feasibility` rc=0 (6 tests × 4 consecutive green runs; one PTY-05 resize failure mid-day under box load 43+ — see Limitations).
 - `./dev vendor-check` rc=0.
-- `./dev test offline` → `m1b-final-offline.log`, OFFLINE OK (all stages incl. 13 M1-B cases).
+- `./dev test offline` → `m1b-final2-offline.log`, OFFLINE OK (all stages incl. 13 M1-B cases at 52 state tests; supersedes the 49-state `m1b-final-offline.log`).
 - `./dev release-bundle` rc=0 (dynamic, 7790776 bytes) + `./dev test packaging` clean-host smoke OK (`m1b-final-bundle.log`, `m1b-final-packaging.log`).
 - RED: stub-phase assertion failures (retained) + 5 BDD-06 guard-removal probes, each RED then verified restore (no PROBE markers remain; Transition/SealedInput digests match pre-probe snapshots).
 - BDD-06 probe→guard→oracle mapping with DISTINCT FAILING TESTS per probe (S4 reconciled — units are failing test functions, counted once each):
@@ -42,7 +42,7 @@
   - ack-dedup removal → `CORE-02 queue admission is idempotent per commandID` + `CORE-02 queue withdraw tombstones` (2 tests; `m1b-probe-bdd06-ack.log`).
   - sealed-denial removal → `POLICY-03 whole-message tool JSON denies as an action` + `POLICY-03 sealed tool-JSON denies with no reservation` (2 tests; `m1b-probe-bdd06-sealed.log`).
   - stale-revision acceptance → `CORE-02 queue edits bump revisions` (1 test; `m1b-probe-bdd06-revision.log`).
-- GREEN: state 49 + presentation 19 + actor 18 + DX-06 40-seed harness clean (BDD-08 uses the labeled authored fallback per R13).
+- GREEN: state 52 + presentation 19 + actor 19 (incl. S2 order test) + DX-06 40-seed harness clean (BDD-08 uses the labeled authored fallback per R13).
 
 ## Results by evidence layer and platform
 
@@ -66,7 +66,7 @@ STATE-02: PARTIAL (in-memory idempotence proven; durable exactly-once due M2). N
 ## Workspace integrity incident + recovery (recorded honestly)
 
 During the S-fix round, two uncommitted artifacts were lost: `Tests/NeedletailStateTests/SnapshotEpochTests.swift` vanished from disk (never staged — authoring oversight in an explicit-path `git add`), and the validation-pump block + S2 reorder in `SessionActor.swift` regressed (an edit replaced the region without re-emitting the tail). A third loss class (tracked `Archive.zip` rewritten/deleted mid-session, twice) points at environmental churn on this shared box rather than any single tool call. No committed content was ever lost or altered (`git` objects intact throughout).
-Recovery: reconstructed the test file from retained history, re-applied the pump + reorder with read-back verification, added an S2 store-order actor test (which would have caught the pump loss — the pre-existing suite passed without it because no test asserted cross-transition record order), re-ran the full suite green, and committed immediately (`231743c`). Prevention: commit after every green evidence run; verify structural edits by read-back, not by tool receipt. The slice reviewer is explicitly asked to confirm the recovered files match their specified behavior via the test evidence, not via provenance claims.
+Recovery: reconstructed the test file from retained history, re-applied the pump + reorder with read-back verification, added an S2 store-order actor test, re-ran the full suite green, and committed immediately (`231743c`). Correction to an earlier draft of this note: the pre-existing suite did NOT pass without the pump — `m1b-audit-green-3.log` shows 16/18 actor tests failing in that state. The S2 order test's unique value is catching record-order inversions specifically (cause-before-consequence), which no prior test asserted. Prevention: commit after every green evidence run; verify structural edits by read-back, not by tool receipt. The slice reviewer confirmed the recovered files via test evidence (`m1b-precommit-quick.log`, `m1b-actor-final.log`), not provenance.
 
 ## Limitations and gate status
 
