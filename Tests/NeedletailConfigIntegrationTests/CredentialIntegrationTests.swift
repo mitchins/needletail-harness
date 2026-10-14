@@ -169,6 +169,22 @@ struct CredentialIntegrationTests {
         let (code2, out2, _) = try await SpawnHelpers.run(["doctor", "--probe", "ghost"], environment: env)
         #expect(code2 == 2, "unknown probe alias is a config error: \(out2)")
     }
+
+    @Test("NET-06 probe of a hostile unknown alias escapes diagnostics")
+    func NET_06_probeHostileAliasEscaped() async throws {
+        // H2-1: the unknown-alias diagnostic interpolates the requested
+        // alias directly — it must render escaped, never raw.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("needletail-m1a-\(UUID().uuidString)", isDirectory: true)
+        let cfgDir = dir.appendingPathComponent("needletail", isDirectory: true)
+        try FileManager.default.createDirectory(at: cfgDir, withIntermediateDirectories: true)
+        try ConfigTestHelpersData.localConfig().write(to: cfgDir.appendingPathComponent("config.json"))
+        let env = Environment.custom(["PATH": "/usr/bin:/bin", "XDG_CONFIG_HOME": dir.path])
+        let (code, out, err) = try await SpawnHelpers.run(["doctor", "--probe", "ghost-\u{1B}[2J"], environment: env)
+        #expect(code == 2, "unknown hostile alias is a config error")
+        #expect(!(out + err).utf8.contains(0x1B), "no raw ESC in probe bytes")
+        #expect((out + err).contains("\\u{1b}[2J"), "sequence renders visibly")
+    }
 }
 
 /// Byte fixtures shared by integration tests (kept here so the pure target

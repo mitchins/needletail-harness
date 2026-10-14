@@ -48,18 +48,21 @@ public enum CredentialError: Error, Sendable, Equatable, CustomStringConvertible
     case unsupportedOnLinux(what: String)
     case credentialTooLarge(path: String)
 
+    /// Display boundary (S-2): names and paths are operator-supplied and
+    /// render escaped, so a hostile variable name cannot smuggle terminal
+    /// controls into a future diagnostic that prints this error.
     public var description: String {
         switch self {
         case .missingEnv(let name):
-            return "missingEnv: environment variable '\(name)' is not set for this operation."
+            return "missingEnv: environment variable '\(terminalSafe(name))' is not set for this operation."
         case .unreadableFile(let path, let reason):
-            return "unreadableFile: credential file '\(path)' cannot be read (\(reason))."
+            return "unreadableFile: credential file '\(terminalSafe(path))' cannot be read (\(reason))."
         case .insecurePermissions(let path, let actual):
-            return "insecurePermissions: credential file '\(path)' has mode \(actual); require owner-only (0600)."
+            return "insecurePermissions: credential file '\(terminalSafe(path))' has mode \(actual); require owner-only (0600)."
         case .unsupportedOnLinux(let what):
-            return "unsupportedOnLinux: '\(what)' needs macOS Keychain; unavailable on this host."
+            return "unsupportedOnLinux: '\(terminalSafe(what))' needs macOS Keychain; unavailable on this host."
         case .credentialTooLarge(let path):
-            return "credentialTooLarge: credential file '\(path)' exceeds \(ConfigLimits.maxCredentialBytes) bytes."
+            return "credentialTooLarge: credential file '\(terminalSafe(path))' exceeds \(ConfigLimits.maxCredentialBytes) bytes."
         }
     }
 }

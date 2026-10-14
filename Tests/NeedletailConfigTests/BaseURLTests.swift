@@ -57,11 +57,21 @@ struct BaseURLTests {
             "http://127.0.0.1:11434/v1#x",
             "http://127.0.0.1:11434/v1?x=1",
             "http://127.0.0.1:11434/v1 withspace",
+            "http://127.0.0.1:11434/v1%20x",
         ] {
             try ConfigTestHelpers.expectFailure(
                 ConfigTestHelpers.configJSON(models: [ConfigTestHelpers.modelJSON(base: bad)]),
                 kind: .malformedOrigin, pathFragment: "base_url")
         }
+    }
+
+    @Test("CFG-02 C1 controls in hosts are rejected at load")
+    func CFG_02_c1HostRejected() throws {
+        // H2-2: U+0085 (NEL) in a host must fail closed at parse, never
+        // reach origin/endpoint display strings.
+        try ConfigTestHelpers.expectFailure(
+            ConfigTestHelpers.configJSON(models: [ConfigTestHelpers.modelJSON(base: "http://ex\\u0085ample.com:11434")]),
+            kind: .malformedOrigin, pathFragment: "base_url")
     }
 
     @Test("CFG-02 credentials in base URLs are rejected")

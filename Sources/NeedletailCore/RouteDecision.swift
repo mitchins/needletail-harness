@@ -44,6 +44,10 @@ public func selectRoute(snapshot: ConfigSnapshot, requestedAlias: String, sealed
             kind: .localOnlyViolation,
             message: "alias '\(terminalSafe(requestedAlias))' is a cloud profile; M1-A routes local-only with no fallback."))
     }
+    // Defense in depth (H1-2): every constructed profile already parses
+    // (the deriving initializer rejects malformed bases), so this catch is
+    // currently unreachable through validated snapshots — it exists so a
+    // future caller can never route an unparseable destination.
     let destination: ParsedBaseURL
     do {
         destination = try parseBaseURL(profile.baseURL, path: "$.models[\(terminalSafe(requestedAlias))].base_url")
@@ -63,20 +67,25 @@ public func selectRoute(snapshot: ConfigSnapshot, requestedAlias: String, sealed
 /// M1-C transport entry point (H1): call this — not `selectRoute` —
 /// immediately before dispatch, with the snapshot live at that moment, and
 /// dial ONLY the returned endpoint. It re-runs selection and then
-/// re-verifies the exact endpoint bytes against the allow-list, so a
-/// destination smuggled between selection and dispatch still fails closed.
-/// M1-C must never cache the endpoint across an `await`.
+/// re-verifies consistency from the profile's effective `baseURL` (parsed
+/// origin membership plus endpoint-equals-fresh-join), so a destination
+/// smuggled between selection and dispatch still fails closed. M1-C must
+/// never cache the endpoint across an `await`.
 public func authorizeRequestDestination(snapshot: ConfigSnapshot, requestedAlias: String, sealed: Bool) -> Route {
     let route = selectRoute(snapshot: snapshot, requestedAlias: requestedAlias, sealed: sealed)
-    guard case .allowed(let endpoint, _) = route else { return route }
-    let lowered = endpoint.lowercased()
-    let covered = snapshot.allowHTTPOrigins.contains(where: { origin in
-        lowered == origin.lowercased() || lowered.hasPrefix(origin.lowercased() + "/")
-    })
-    guard covered else {
-        return .denied(RouteDenial(
-            kind: .originNotAllowlisted,
-            message: "final destination check refused the endpoint for alias '\(terminalSafe(requestedAlias))'."))
+    guard case .allowed(let endpoint, _) = route,
+          let profile = snapshot.profiles[requestedAlias],
+          let destination = try? parseBaseURL(profile.baseURL, path: "$"),
+          snapshot.allowHTTPOrigins.contains(destination.origin),
+          endpoint == destination.base + profile.wireProtocol.endpointSuffix
+    else {
+        switch route {
+        case .denied: return route
+        case .allowed:
+            return .denied(RouteDenial(
+                kind: .originNotAllowlisted,
+                message: "final destination check refused the endpoint for alias '\(terminalSafe(requestedAlias))'."))
+        }
     }
     return route
 }

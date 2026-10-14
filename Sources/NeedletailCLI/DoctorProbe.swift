@@ -25,7 +25,9 @@ enum DoctorProbe {
             throw ExitCode(2)
         }
         guard snapshot.profiles[alias] != nil else {
-            eprint("error $.models: missingReference — unknown model alias '\(alias)'. Fix: probe one of: \(snapshot.profiles.keys.sorted().joined(separator: ", ")).")
+            // H2-1: the requested alias and every configured key render
+            // escaped — this direct print bypasses ConfigError.description.
+            eprint("error $.models: missingReference — unknown model alias '\(terminalSafe(alias))'. Fix: probe one of: \(snapshot.profiles.keys.sorted().map(terminalSafe).joined(separator: ", ")).")
             throw ExitCode(2)
         }
         switch selectRoute(snapshot: snapshot, requestedAlias: alias, sealed: false) {

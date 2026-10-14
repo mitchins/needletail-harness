@@ -128,6 +128,23 @@ struct RouteDecisionTests {
         }
     }
 
+    @Test("NET-01 dispatch entry point agrees on explicit default ports")
+    func NET_01_authorizeAgreesOnDefaultPort() throws {
+        // H1-1: base http://127.0.0.1:80 ≡ origin http://127.0.0.1 — both
+        // gates must allow, never disagree.
+        let snapshot = try ConfigTestHelpers.validateData(ConfigTestHelpers.configJSON(
+            models: [ConfigTestHelpers.modelJSON(base: "http://127.0.0.1:80")],
+            origins: #"["http://127.0.0.1"]"#))
+        guard case .allowed = selectRoute(snapshot: snapshot, requestedAlias: "local-coder", sealed: false) else {
+            Issue.record("H1-1: default-port base must select"); return
+        }
+        guard case .allowed(let endpoint, _) = authorizeRequestDestination(snapshot: snapshot, requestedAlias: "local-coder", sealed: false) else {
+            Issue.record("H1-1: dispatch gate must agree with selection")
+            return
+        }
+        #expect(endpoint == "http://127.0.0.1:80/chat/completions")
+    }
+
     @Test("NET-01 prefixed base keeps its prefix with the origin allowed")
     func NET_01_prefixedBaseEndpointPreserved() throws {
         let snapshot = try Self.localSnapshot(extraModels: [

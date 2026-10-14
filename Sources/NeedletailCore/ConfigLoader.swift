@@ -251,7 +251,11 @@ public func parseBaseURL(_ string: String, path: String) throws -> ParsedBaseURL
     guard !host.isEmpty else {
         throw malformed("empty host in '\(string)'.", "name the loopback or LAN host explicitly.")
     }
-    for scalar in host.unicodeScalars where scalar.value < 0x21 || scalar.value == 0x7F || scalar == "\\" {
+    // H2-2: reject every control (C0, DEL and C1 alike — not just ASCII)
+    // and every whitespace separator (space is Zs, not Cc), so no
+    // ambiguous byte can reach origin/endpoint display strings.
+    for scalar in host.unicodeScalars
+        where scalar.properties.generalCategory == .control || scalar.properties.isWhitespace || scalar == "\\" {
         throw malformed("host contains whitespace, controls or a backslash.", "use a plain hostname or IP literal.")
     }
     let lowerHost = host.lowercased()
@@ -287,7 +291,7 @@ public func parseBaseURL(_ string: String, path: String) throws -> ParsedBaseURL
                 throw malformed("empty path segments (\"//\") are ambiguous.", "write each prefix segment once.")
             }
             for scalar in rawSegment.unicodeScalars
-                where scalar.value < 0x21 || scalar.value == 0x7F || scalar == "\\" {
+                where scalar.properties.generalCategory == .control || scalar.properties.isWhitespace || scalar == "\\" {
                 throw malformed("whitespace, controls or backslashes cannot appear in a base URL.",
                                 "write the literal prefix without spaces or escapes.")
             }
@@ -378,7 +382,8 @@ private func decodePathSegment(
     guard let decoded = String(bytes: bytes, encoding: .utf8) else {
         throw malformed("path segment is not valid UTF-8.", "re-encode the base URL.")
     }
-    for scalar in decoded.unicodeScalars where scalar.value < 0x21 || scalar.value == 0x7F {
+    for scalar in decoded.unicodeScalars
+        where scalar.properties.generalCategory == .control || scalar.properties.isWhitespace {
         throw malformed("whitespace or controls cannot appear in a base URL, encoded or not.",
                         "write the literal prefix without spaces or escapes.")
     }
