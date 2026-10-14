@@ -61,6 +61,23 @@ struct ConfigValidateSpawnTests {
         #expect(err.contains("reservedOverride"))
     }
 
+    @Test("POLICY-02 spawned flag conflicts reject through the real parser")
+    func POLICY_02_spawnFlagConflictsRejected() async throws {
+        // S7: the production CLI feeds the same pure checker the unit
+        // matrix exercises — conflicting directives exit 2 with the exact
+        // kind, in both orders.
+        let path = try SpawnHelpers.writeTempFile(named: "cfg.json", contents: Self.baseConfig(models: Self.goodModel))
+        for argv in [["--sealed", "--tools", "read"], ["--tools", "read", "--sealed"], ["--tools", "none", "--tools", "read"]] {
+            let (code, _, err) = try await SpawnHelpers.run(["config", "validate", "--config", path] + argv)
+            #expect(code == 2, "\(argv): got \(code)")
+            #expect(err.contains("contradictoryFlags"), "\(argv): \(err)")
+        }
+        let (code, out, _) = try await SpawnHelpers.run(["config", "validate", "--config", path, "--sealed"])
+        #expect(code == 0)
+        #expect(out.contains("invocation: sealed"), "folded directives echoed: \(out)")
+        #expect(out.contains("tools-effective: none"))
+    }
+
     @Test("POLICY-02 spawned validate shows narrowing, never grants")
     func POLICY_02_spawnShowsNarrowing() async throws {
         let path = try SpawnHelpers.writeTempFile(named: "cfg.json", contents: Self.baseConfig(models: Self.goodModel))

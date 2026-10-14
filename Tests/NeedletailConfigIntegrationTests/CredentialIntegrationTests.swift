@@ -5,6 +5,12 @@ import NeedletailCore
 import NeedletailRuntime
 import NeedletailProviders
 
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
 /// CFG-03 (integration half) + NET-06 (offline half): real mode-0600 files,
 /// controlled process environment, child-process environment scrubbing, the
 /// Keychain stub over the real protocol, offline doctor, deferred probe, and
@@ -48,6 +54,37 @@ struct CredentialIntegrationTests {
         }
     }
 
+    @Test("CFG-03 non-regular files are refused without hanging or following")
+    func CFG_03_nonRegularFilesRefused() throws {
+        // S1: a writer-less FIFO must fail closed (O_NONBLOCK + S_ISREG),
+        // never hang the open and never be read as config/credential input.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("needletail-m1a-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fifo = dir.appendingPathComponent("blocked.fifo").path
+        #expect(mkfifo(fifo, 0o600) == 0, "fixture: mkfifo must succeed")
+        do {
+            _ = try readBoundedFile(fifo)
+            Issue.record("FIFO must be refused")
+        } catch let error as ConfigError {
+            #expect(error.kind == .unsupportedFormat, "FIFO refusal, got \(error.kind)")
+        }
+        // A symlink to a valid file is likewise refused (never followed).
+        let target = dir.appendingPathComponent("real.json").path
+        try Data(ConfigTestHelpersData.localConfig()).write(to: URL(fileURLWithPath: target))
+        let link = dir.appendingPathComponent("link.json").path
+        #expect(symlink(target, link) == 0, "fixture: symlink must succeed")
+        do {
+            _ = try readBoundedFile(link)
+            Issue.record("symlink must be refused")
+        } catch let error as ConfigError {
+            #expect(error.kind == .unsupportedFormat || error.kind == .configNotFound,
+                    "symlink refusal, got \(error.kind)")
+        }
+        // Control: the regular target itself reads fine.
+        #expect(try readBoundedFile(target).count == ConfigTestHelpersData.localConfig().count)
+    }
+
     @Test("CFG-03 controlled environment resolves only the named variable")
     func CFG_03_controlledEnvResolution() throws {
         setenv("NT_M1A_INT_A", "env-canary-aaa", 1)
@@ -87,6 +124,8 @@ struct CredentialIntegrationTests {
         let coreNames = Set(WireProtocol.allCases.map(\.rawValue))
         let providerNames = Set(NativeProtocol.allCases.map(\.rawValue))
         #expect(coreNames == providerNames, "Core/Providers protocol strings must agree: \(coreNames) vs \(providerNames)")
+        #expect(Set([Locality.local.rawValue, Locality.cloud.rawValue]) == Set([LocalityClass.local.rawValue, LocalityClass.cloud.rawValue]),
+                "Core/Providers locality strings must agree (S11)")
         let snapshot = try validateConfig(ConfigTestHelpersData.localConfig())
         let profile = try #require(snapshot.profiles["local-coder"])
         #expect(try validateLocalChatProfile(profile) == profile)

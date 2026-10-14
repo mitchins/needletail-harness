@@ -136,3 +136,18 @@ public func requiresNewEpoch(old: ModelProfile, new: ModelProfile) -> Bool {
         || old.maxOutput != new.maxOutput
         || old.requestOptionsRaw != new.requestOptionsRaw
 }
+
+/// Snapshot-level epoch predicate (S2): the tool-set lives on the
+/// snapshot, not the profile, so a tools-config change must also force a
+/// new epoch. M1-B compares snapshot tools itself where finer granularity
+/// helps; this predicate is the coarse gate.
+public func requiresNewEpoch(old: ConfigSnapshot, new: ConfigSnapshot) -> Bool {
+    old.defaultAlias != new.defaultAlias
+        || old.tools != new.tools
+        || old.allowHTTPOrigins != new.allowHTTPOrigins
+        || old.profiles.keys != new.profiles.keys
+        || old.profiles.keys.contains(where: { key in
+            guard let a = old.profiles[key], let b = new.profiles[key] else { return true }
+            return requiresNewEpoch(old: a, new: b)
+        })
+}

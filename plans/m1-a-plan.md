@@ -372,6 +372,22 @@ M1-A planning is done when: this plan has an independent DeepSeek **plan-review 
 - Nothing else changed; all rev3 READY dispositions and §10/§13 stand.
 - Rev5 (delta-review D1–D4, NEEDS-EVIDENCE → fix before implementation): D1 `base-prefix-already-suffix-rejected` variant (all three suffixes); D2 encoded-traversal (both cases + mixed), empty-segment, backslash, fragment, whitespace, default-port-equality variants + decode-before-compare rule; D3 `sealed` outcome-inert invariant + `sealed-route-identical` test; D4 raw-argv-before-folding rule + §3.1 argv-only scope. Counts: CFG-02 17→24 variants, NET-01 7→8, POLICY-02 unchanged at 12 rows.
 
+## 15. Revision log (rev5 → rev6; completed-slice review S1–S11)
+
+Mechanical hardening only; no contract direction changes:
+
+- S1: `readBoundedConfigFile` replaced by Runtime `readBoundedFile` (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK` + `fstat` `S_ISREG` before any read; FIFO/symlink red-green tests); `O_NONBLOCK` added to the credential-file open.
+- S2: snapshot-level `requiresNewEpoch(old:new: ConfigSnapshot)` overload (tools/default/origins/profiles) alongside the profile predicate.
+- S3: `surrogate-dup` oracle now uses a real `\uD83D\uDE00` escape plus lone-surrogate rejections.
+- S5: duplicate-endpoint identity compares normalized `origin + pathPrefix` (host-case/default-port spellings collide).
+- S6: pure-loader size gate is `<= maxFileBytes` (off-by-one fixed).
+- S7: `config validate` wires `--sealed`/`--tools` through `checkCLIDirectives` (conflicts exit 2; folded directives echoed as `invocation:`) — the real production caller for the conflict oracle; full observability awaits M2 trust.
+- S8: decoded backslashes rejected in path segments.
+- S9: `grant(fromUntrustedSource:)` reports byte length, never echoes input.
+- S11: locality vocabulary cross-check added.
+- D-c SUPERSEDED: §5's "`models: []` is the only valid tool-less shape" is withdrawn — empty `models` is rejected (`missingField`), because R13 requires `default_model` to reference a configured alias and a dangling reference would fail open. Tool-less operation stays possible via deny-all tools with a configured profile.
+- Counts: CFG-02 24→31 variants (S3/S5/S8 additions), POLICY-02 +3 spawn-flag tests (S7), NET-01 unchanged at 8.
+
 ---
 
 ## Review ask (for `deepseek-reviewer` — TARGETED DELTA ONLY)

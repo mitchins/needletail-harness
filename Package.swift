@@ -68,6 +68,7 @@ let package = Package(
             name: "NeedletailCLI",
             dependencies: [
                 "NeedletailCore",
+                "NeedletailRuntime",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),

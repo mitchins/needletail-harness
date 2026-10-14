@@ -40,9 +40,23 @@ struct ConfigPreflightTests {
 
     @Test("CFG-01 surrogate-pair versus literal duplicate keys are rejected")
     func CFG_01_surrogateDuplicateKeysRejected() throws {
-        let model = #"{"😀":1,"😀":2,"alias":"a","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11434","model":"m","context_window":100,"max_output":10,"locality":"local","connect_timeout_s":1,"read_idle_timeout_s":2,"request_timeout_s":3,"max_in_flight":1}"#
+        // S3: one key is the literal emoji, the other the \uD83D\uDE00
+        // escape — this exercises pair combination, not literal equality.
+        let model = "{\"😀\":1,\"\\uD83D\\uDE00\":2,\"alias\":\"a\",\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11434\",\"model\":\"m\",\"context_window\":100,\"max_output\":10,\"locality\":\"local\",\"connect_timeout_s\":1,\"read_idle_timeout_s\":2,\"request_timeout_s\":3,\"max_in_flight\":1}"
         let data = ConfigTestHelpers.configJSON(models: [model])
         try ConfigTestHelpers.expectFailure(data, kind: .duplicateKey)
+    }
+
+    @Test("CFG-01 lone surrogates are malformed, never keys")
+    func CFG_01_loneSurrogateRejected() throws {
+        for text in ["{\"\\uD83D\":1}", "{\"\\uDE00\":1}", "{\"\\uD83D\\u0041\":1}"] {
+            do {
+                _ = try scanJSONStructure(Array(text.utf8))
+                Issue.record("lone surrogate must fail: \(text)")
+            } catch let error as ConfigError {
+                #expect(error.kind == .malformedJSON, "\(text): got \(error.kind)")
+            }
+        }
     }
 
     @Test("CFG-01 duplicate model aliases are rejected")
@@ -62,6 +76,21 @@ struct ConfigPreflightTests {
                 ConfigTestHelpers.modelJSON(alias: "b", model: "same-id"),
             ],
             defaultModel: "a"
+        )
+        try ConfigTestHelpers.expectFailure(data, kind: .duplicateKey, pathFragment: "models[1]")
+    }
+
+    @Test("CFG-01 endpoint identity is origin-normalized, not string-compared")
+    func CFG_01_duplicateEndpointNormalized() throws {
+        // S5: host case differs in the verbatim base but normalizes to one
+        // origin — a string-compared identity would miss this duplicate.
+        let data = ConfigTestHelpers.configJSON(
+            models: [
+                ConfigTestHelpers.modelJSON(alias: "a", base: "http://Example.COM:11434", model: "same-id"),
+                ConfigTestHelpers.modelJSON(alias: "b", base: "http://example.com:11434", model: "same-id"),
+            ],
+            defaultModel: "a",
+            origins: #"["http://example.com:11434"]"#
         )
         try ConfigTestHelpers.expectFailure(data, kind: .duplicateKey, pathFragment: "models[1]")
     }

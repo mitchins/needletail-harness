@@ -64,7 +64,40 @@ one targeted delta review (no full re-review):
   earlier `M` was a stat artifact). No content lost; unrelated to M1-A.
 - Raw delta output: `.needletail-dev/logs/m1a-plan-review-r4-delta.md`.
 
-## Completed-slice review (filled after implementation)
+## Completed-slice review
 
-See `plans/m1-a-report.md` for the implementation SHA, evidence map,
-findings and final disposition.
+- Subject: base `e3c0527` → head `0ec46ed` (implementation `f7f2628` +
+  report amend). Working tree clean at review time; `cases/` and
+  `Package.resolved` untouched; no PROBE markers remain.
+- Reviewer: `deepseek-reviewer` → `opencode-go/deepseek-v4.1-flash`
+  (static review — no builds/tests run by the reviewer; evidence from
+  retained logs). Raw: `.needletail-dev/logs/m1a-slice-review.md`.
+- Confirmed clean: no permission widening, no secret leakage, opaque
+  identities (P4 genuine), sealed inference + value snapshots (D3 test
+  real), 7 wrong-impl probes genuine production patches, scope held
+  (9 full + NET-06 partial; BDD-04 intact).
+- Disposition: **NEEDS-EVIDENCE** — M1A-S1 Major (FIFO `--config` hangs:
+  `readBoundedConfigFile` checks only `isDirectory`; plan R6 requires
+  `S_ISREG`) + S2–S7 Minor + S8–S11 Suggestions. Deviations D-a..D-i
+  all ACCEPTED (D-c with required plan correction).
+- Minimal fixes demanded: S1 non-regular rejection (+O_NONBLOCK,
+  FIFO red/green log); S4 correct 16-test evidence citation; S2 tool-set
+  epoch gap or D-deviation; S3 real `\uD83D\uDE00` oracle; S5 normalized
+  identity; S6 size-guard off-by-one; S7 real CLI caller or downgrade;
+  S8–S11 hardening/notes; D-c plan amendment.
+
+## Final review (filled after S-fixes)
+
+- Plan rev6 (`eb322bee…73041d`, 397 lines): §15 documents S1–S11 fixes
+  and supersedes the §5 empty-models sentence (D-c).
+- Implementation fixes: Runtime `readBoundedFile` (O_NONBLOCK +
+  S_ISREG) wired into `config validate`/`doctor --probe` + O_NONBLOCK
+  credential open; snapshot-level `requiresNewEpoch` overload;
+  `\uD83D\uDE00` + lone-surrogate oracles; normalized endpoint identity;
+  `<= maxFileBytes`; `config validate --sealed/--tools` production
+  caller with `invocation:` echo; decoded-backslash rejection;
+  snippet-free refusal; locality cross-check.
+- Evidence deltas: pure 60→63, integration 16→18; `m1a-fix-*.log`
+  series; FIFO/conflict probes run live (exit 2, no hang).
+- Final review binding + disposition: (below; receipt + STATUS updated
+  in the same local-only commit series, no push).

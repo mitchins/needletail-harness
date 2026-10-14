@@ -41,4 +41,18 @@ struct SnapshotEpochTests {
         let twin = try Self.profile()
         #expect(!requiresNewEpoch(old: base, new: twin))
     }
+
+    @Test("CFG-02 snapshot-level epoch fires on tool-set and alias changes")
+    func CFG_02_snapshotEpochIncludesTools() throws {
+        // S2: the tool-set lives on the snapshot, so the predicate has a
+        // snapshot-level overload — profile-only comparison cannot see it.
+        let a = try ConfigTestHelpers.validateData(ConfigTestHelpers.configJSON())
+        var b = a
+        #expect(!requiresNewEpoch(old: a, new: b))
+        b.tools = ToolCapabilities.allDenied
+        #expect(requiresNewEpoch(old: a, new: b), "tool-set change must force an epoch")
+        b = a
+        b.defaultAlias = "ghost"
+        #expect(requiresNewEpoch(old: a, new: b), "default-alias change must force an epoch")
+    }
 }

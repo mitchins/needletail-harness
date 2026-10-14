@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import NeedletailCore
+import NeedletailRuntime
 
 /// `needletail doctor --probe MODEL` (M1-A, NET-06 offline half): validates
 /// the alias and route purely against the explicit user configuration, then
@@ -15,7 +16,7 @@ enum DoctorProbe {
         }
         let snapshot: ConfigSnapshot
         do {
-            snapshot = try validateConfig(readBoundedConfigFile(path))
+            snapshot = try validateConfig(readBoundedFile(path))
         } catch let error as ConfigError {
             eprint("\(error)")
             throw ExitCode(2)

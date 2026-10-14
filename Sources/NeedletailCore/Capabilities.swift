@@ -38,11 +38,13 @@ public struct ToolCapabilities: Sendable, Equatable {
 
     /// Minting a grant from workspace/repo text is refused at the call
     /// site (R9): the only M1-A workspace source is the deny-all operator
-    /// default until the M2 `trust` command gates its origin.
+    /// default until the M2 `trust` command gates its origin. The refused
+    /// text is described by length only (S9) — never echoed, so secret
+    /// bearing input cannot reach diagnostics through this path.
     public static func grant(fromUntrustedSource text: String) throws -> ToolCapabilities {
         throw ConfigError(
             path: "$.workspace", kind: .unsupportedCombination,
-            message: "workspace content cannot mint capability grants (\(text.prefix(48))).",
+            message: "workspace content (\(text.count) bytes) cannot mint capability grants.",
             hint: "grants come only from the operator trust action (M2); repo text is task data.")
     }
 }

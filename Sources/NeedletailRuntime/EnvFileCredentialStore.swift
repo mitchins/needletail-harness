@@ -36,7 +36,10 @@ public struct EnvFileCredentialStore: CredentialStore, Sendable {
     }
 
     private func readCredentialFile(_ path: String) throws -> String {
-        let fd = path.withCString { open($0, O_RDONLY | O_NOFOLLOW) }
+        // O_NONBLOCK (S1): opening a FIFO without a writer must not hang;
+        // the S_ISREG check below then refuses it. Regular files are
+        // unaffected by O_NONBLOCK.
+        let fd = path.withCString { open($0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) }
         guard fd >= 0 else {
             throw CredentialError.unreadableFile(path: path, reason: "open failed")
         }

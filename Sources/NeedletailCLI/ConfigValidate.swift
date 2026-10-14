@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import NeedletailCore
+import NeedletailRuntime
 
 /// `needletail config validate` (M1-A): strict offline configuration
 /// inspection. Reads at most 1 MiB + 1 byte, validates the full pipeline,
@@ -22,7 +23,25 @@ struct ConfigValidate: ParsableCommand {
     @Option(name: .long, help: "Explicit configuration file path.")
     var config: String?
 
+    // S7: real production caller for the CLI-directive checker. These flags
+    // only narrow the *displayed* effective tools for inspection (the M1-A
+    // workspace default stays deny-all until M2 trust); the headless
+    // chat/run surface that enforces them arrives in M1-D and reuses the
+    // same pure function. Conflicting directives reject here, identically.
+    @Flag(name: .long, help: "Deny all tools for the inspected state (routes stay independent).")
+    var sealed: Bool = false
+
+    @Option(name: .long, help: "Restrict inspected tools to one value: none, read, search, edit, write, exec or consult. Repeat to confirm; differing values reject.")
+    var tools: [String] = []
+
     mutating func run() throws {
+        let decision: CLIToolsDecision
+        do {
+            decision = try checkCLIDirectives(sealedCount: sealed ? 1 : 0, toolsValues: tools)
+        } catch let error as ConfigError {
+            eprint("\(error)")
+            throw ExitCode(2)
+        }
         let path: String
         if let explicit = config {
             path = explicit
@@ -34,7 +53,7 @@ struct ConfigValidate: ParsableCommand {
         }
         let data: Data
         do {
-            data = try readBoundedConfigFile(path)
+            data = try readBoundedFile(path)
         } catch let error as ConfigError {
             eprint("\(error)")
             throw ExitCode(2)
@@ -49,7 +68,7 @@ struct ConfigValidate: ParsableCommand {
             eprint("error $: malformedJSON — \(error). Fix: validate the file as strict JSON first.")
             throw ExitCode(2)
         }
-        print(renderSummary(snapshot))
+        print(renderSummary(snapshot, decision: decision))
     }
 }
 
@@ -85,48 +104,8 @@ func defaultConfigPath() -> String? {
     return nil
 }
 
-/// Bounded file read shared by `config validate` and `doctor --probe`:
-/// refuses directories, reads at most `limit + 1` bytes, and fails closed
-/// with `fileTooLarge` instead of allocating an unbounded file.
-func readBoundedConfigFile(_ path: String, limit: Int = ConfigLimits.maxFileBytes) throws -> Data {
-    var isDirectory: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
-        throw ConfigError(
-            path: "$", kind: .configNotFound,
-            message: "configuration file '\(path)' does not exist.",
-            hint: "pass an existing --config PATH.")
-    }
-    guard !isDirectory.boolValue else {
-        throw ConfigError(
-            path: "$", kind: .unsupportedFormat,
-            message: "'\(path)' is a directory, not a configuration file.",
-            hint: "point --config at a versioned JSON file.")
-    }
-    guard let handle = FileHandle(forReadingAtPath: path) else {
-        throw ConfigError(
-            path: "$", kind: .configNotFound,
-            message: "configuration file '\(path)' cannot be opened.",
-            hint: "check permissions and pass a readable --config PATH.")
-    }
-    defer { try? handle.close() }
-    guard let data = try? handle.read(upToCount: limit + 1) else {
-        throw ConfigError(
-            path: "$", kind: .malformedJSON,
-            message: "configuration file '\(path)' cannot be read.",
-            hint: "check the file is a readable regular file.")
-    }
-    let bytes = data ?? Data()
-    guard bytes.count <= limit else {
-        throw ConfigError(
-            path: "$", kind: .fileTooLarge,
-            message: "configuration exceeds \(limit) bytes.",
-            hint: "split native options out or shrink the file; files are rejected before decoding.")
-    }
-    return bytes
-}
-
 /// Redacted one-line-per-fact summary. Origins and references only.
-func renderSummary(_ snapshot: ConfigSnapshot) -> String {
+func renderSummary(_ snapshot: ConfigSnapshot, decision: CLIToolsDecision) -> String {
     var lines = [
         "needletail config OK",
         "version: \(snapshot.version)",
@@ -142,10 +121,11 @@ func renderSummary(_ snapshot: ConfigSnapshot) -> String {
                 + " unqualified:\(profile.unqualifiedOptions.count)")
     }
     lines.append("tools-configured: \(renderTools(snapshot.tools))")
+    lines.append("invocation: \(renderInvocation(decision))")
     let effective = effectiveCapabilities(
         build: .allAllowed, userConfig: snapshot.tools,
-        workspaceGrant: .allDenied, invocationMask: .allAllowed,
-        sealed: SealedRestrictions(sealed: false))
+        workspaceGrant: .allDenied, invocationMask: decision.mask ?? .allAllowed,
+        sealed: SealedRestrictions(sealed: decision.sealed))
     if effective.tools == .allDenied {
         lines.append("tools-effective: none (workspace: default deny-all until M2 trust)")
     } else {
@@ -158,6 +138,17 @@ func renderSummary(_ snapshot: ConfigSnapshot) -> String {
         lines.append("default-route: denied (\(denial.kind)) \(denial.message)")
     }
     return lines.joined(separator: "\n")
+}
+
+/// Echo of the folded CLI directives (S7): proves the production parser
+/// feeds the same pure checker the tests exercise.
+func renderInvocation(_ decision: CLIToolsDecision) -> String {
+    var parts: [String] = []
+    if decision.sealed { parts.append("sealed") }
+    if let mask = decision.mask {
+        parts.append(mask == .allDenied ? "tools=none" : "tools=\(renderTools(mask))")
+    }
+    return parts.isEmpty ? "default" : parts.joined(separator: " ")
 }
 
 func renderTools(_ tools: ToolCapabilities) -> String {

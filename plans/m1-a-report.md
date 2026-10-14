@@ -8,7 +8,7 @@
 
 - Milestone / slice: M1-A implementation (first M1 minor).
 - Base SHA: `e3c0527` (M0-merged `main`; working tree at slice start held only the prior planning files).
-- Head SHA: implementation `f7f2628` + this report (`33d4858` at write time; re-bound exactly before slice review — review binds the final HEAD SHA recorded in `plans/m1-a-receipt.md`).
+- Head SHA: (S-fix commit hash — filled at commit; final review binds it; recorded in `plans/m1-a-receipt.md`).
 - Plan digest (`plans/m1-a-plan.md` sha256, rev5): `71d91dacde132077a6ffb8e5a2f1d4320c417e79387983184d6e6a5ec89659e0` (381 lines).
 - Dependency-lock digest (`Package.resolved` sha256): `de95226ee800ecb7609e5d8083d7c14dc4bc1f1ddbb2deabf1b23f1d7a8689cc` (unchanged — no dependency delta).
 - OS / toolchain / architecture: Linux 7.0.0-31-generic x86_64, Swift 6.4.0 (swift-6.4-RELEASE), SwiftPM `-j 4 --disable-automatic-resolution`.
@@ -27,9 +27,9 @@
 ## Evidence (verbatim commands; logs under `.needletail-dev/logs/`)
 
 - `./dev build` → `m1a-ev-build.log`, rc=0 (3.5 s incremental; full-graph cold build not re-measured — graph unchanged since M0).
-- `./dev test quick` → `m1a-ev-quick.log`, rc=0: PrimitiveTests 14/5 suites 2.066 s, ConfigTests 60/11 suites 0.021 s, BehaviourTests 20/3 suites 0.013 s. Quick stays ≤3 s warm.
-- `./dev test case CFG-01|CFG-02|CFG-03|CFG-04|CFG-05|CFG-06|POLICY-02|POLICY-05|NET-01|NET-06` → `m1a-ev-case-<ID>.log`, all rc=0, zero-match guard satisfied (13/18/9/3/6/6/6/3/8/2 tests).
-- Spawn integration: `m1a-green-int-1.log`, 16 tests, all green (binary `.build/debug/needletail`, 6373352 bytes).
+- `./dev test quick` → `m1a-fix-quick.log`, rc=0: PrimitiveTests 14/5 suites 2.071 s, ConfigTests 63/11 suites 0.024 s, BehaviourTests 20/3 suites 0.013 s. Quick stays ≤3 s warm.
+- `./dev test case CFG-01|CFG-02|CFG-03|CFG-04|CFG-05|CFG-06|POLICY-02|POLICY-05|NET-01|NET-06` → `m1a-fix-case-<ID>.log`, all rc=0, zero-match guard satisfied (15/19/10/3/7/6/7/3/8/2 test executions; CFG-05 includes the M0 `VersionIdentityTests.CFG-05` precedent oracle).
+- Spawn integration: `m1a-fix-int.log`, 18 tests in 2 suites, all green (binary `.build/debug/needletail`).
 - `./dev coverage` → `m1a-ev-coverage.log`, rc=0 (catalogue untouched: BDD-04 pins M0 vocabulary until the M1 epic).
 - `./dev test native` → `m1a-ev-native.log`, 14 tests green (M0 regression).
 - `./dev test feasibility` → `m1a-ev-feasibility.log`, 6 tests green (M0 regression).
@@ -37,7 +37,8 @@
 - `./dev release-bundle` → `m1a-ev-bundle.log`, dynamic bundle, 4497432 bytes (larger than M0's 3646992 — new M1-A code, expected).
 - `./dev test packaging` → clean-host smoke OK (digest-pinned ubuntu, `--network none`).
 - `./dev test offline` → `m1a-ev-offline.log`, OFFLINE OK (new aggregate: quick+native+feasibility+coverage+10 cases).
-- No-leak: canary-laden `config validate` → 0 canary hits on stdout+stderr (`m1a-noleak-validate.log/.err`); release binary in `--network none` container runs validate+doctor cleanly with 0 canary hits and `NONET-OK` (`m1a-noleak-nonet.log`).
+- No-leak: canary-laden `config validate [--sealed]` → 0 canary hits on stdout+stderr (`m1a-fix-noleak.log`); release binary in `--network none` container runs validate+doctor cleanly with 0 canary hits and `NONET-OK` (`m1a-noleak-nonet.log`); live FIFO/conflict probes exit 2 with exact kinds, no hang.
+- S-fix series (`m1a-fix-*.log`): pure 63/63, integration 18/18, quick/coverage/native/feasibility green, bundle dynamic, packaging smoke OK, offline aggregate OFFLINE OK.
 - RED: `m1a-red-compile.log` + `m1a-red-pure.log` (tests reference absent APIs — compile failure, recorded as such, not an assertion pass); `m1a-green-pure-*.log` assertion failures drove fixes (optional-port rendering, path whitespace, byte-exact dup checks, toolchain JSONError quirk, test-literal bugs — each fixed, none waived).
 - GREEN: `m1a-green-pure-9.log` (60/60), integration 16/16.
 - Wrong-impl probes (disposable production patches, each RED then byte-identical restore; no PROBE markers remain): P1 union-grant (14 failures), P2 strip-reserved (13), P3 cloud-fallback (8), P4 zero-strip IDs (10), P5 unconditional-/v1-prepend (10), P6 prefix-drop (6), P8 last-flag-wins (7). Logs `m1a-probe-p*.log`.
@@ -70,8 +71,10 @@ One passing variant never satisfies all variants: per-variant IDs, G/W/T, forbid
 
 ## Review
 
-- Plan reviews: rev1 NEEDS-EVIDENCE (15 findings) → rev2 NEEDS-EVIDENCE (3 minor residuals) → rev3 READY → rev4 targeted delta NEEDS-EVIDENCE (D1 Major + D2–D4) → rev5 corrections implemented (D1/D2 variants + D3/D4 docs; rev5 covered by this slice review). Receipt: `plans/m1-a-receipt.md`; raw: `.needletail-dev/logs/m1a-plan-review-*.md`.
-- Completed-slice review: (pending — packet: this report + implementation SHA diff + logs above + rev5 plan + coverage).
+- Plan reviews: rev1 NEEDS-EVIDENCE (15 findings) → rev2 NEEDS-EVIDENCE (3 minor residuals) → rev3 READY → rev4 targeted delta NEEDS-EVIDENCE (D1 Major + D2–D4) → rev5 corrections implemented. Receipt: `plans/m1-a-receipt.md`; raw: `.needletail-dev/logs/m1a-plan-review-*.md`.
+- Completed-slice review (head `0ec46ed`): NEEDS-EVIDENCE — S1 Major (FIFO hang) + S2–S7 Minor + S8–S11 Suggestions; D-a..D-i all ACCEPTED (D-c with plan correction). Raw: `.needletail-dev/logs/m1a-slice-review.md`.
+- S-fix implementation: S1 Runtime `readBoundedFile` + O_NONBLOCK credential open + FIFO/symlink tests; S2 snapshot `requiresNewEpoch` overload + tests; S3 real-escape + lone-surrogate oracles; S4 (this series re-runs the full 18-test integration target); S5 normalized identity + test; S6 `<= maxFileBytes`; S7 `validate --sealed/--tools` production caller + `invocation:` echo + spawn conflict tests; S8 decoded-backslash rejection + tests; S9 snippet-free refusal; S11 locality assertion. Plan rev6 (`eb322bee…73041d`) documents all of the above and supersedes the empty-models sentence.
+- Final review: (pending — binds the S-fix commit below).
 
 ## Limitations and gate status
 

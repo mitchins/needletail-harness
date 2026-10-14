@@ -6,7 +6,7 @@ import Foundation
 /// namespace). Everything is pure over the input bytes; file reading stays
 /// in the CLI. No network, no credential resolution, no secret output.
 public func validateConfig(_ data: Data) throws -> ConfigSnapshot {
-    guard data.count <= ConfigLimits.maxFileBytes + 1 else {
+    guard data.count <= ConfigLimits.maxFileBytes else {
         throw ConfigError(
             path: "$", kind: .fileTooLarge,
             message: "configuration exceeds \(ConfigLimits.maxFileBytes) bytes.",
@@ -73,7 +73,10 @@ private func validateDocument(_ document: ConfigDocument, preflight: PreflightRe
                 hint: "the two names differ only by normalization and cannot coexist in one file; rename to differ beyond normalization.")
         }
         canonicalAliases[profile.alias] = profile.alias
-        let identity = Array("\(profile.baseURL)\n\(profile.wireProtocol.rawValue)\n\(profile.modelID)".utf8)
+        // Normalized identity (S5): origin (lowercased host, default port
+        // omitted) plus the preserved prefix, so host-case or explicit
+        // default-port spellings of one endpoint still collide.
+        let identity = Array("\(profile.origin)\n\(profile.pathPrefix)\n\(profile.wireProtocol.rawValue)\n\(profile.modelID)".utf8)
         if !identities.insert(identity).inserted {
             throw ConfigError(
                 path: base, kind: .duplicateKey,
@@ -406,6 +409,12 @@ private func decodePathSegment(
     for scalar in decoded.unicodeScalars where scalar.value < 0x21 || scalar.value == 0x7F {
         throw malformed("whitespace or controls cannot appear in a base URL, encoded or not.",
                         "write the literal prefix without spaces or escapes.")
+    }
+    // Defense in depth (S8): a decoded backslash would survive the raw-text
+    // check above, so reject it here too.
+    if decoded.contains("\\") {
+        throw malformed("backslashes cannot appear in a base URL, encoded or not.",
+                        "use forward slashes.")
     }
     return decoded
 }
