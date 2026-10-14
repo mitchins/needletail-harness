@@ -26,7 +26,7 @@
 ## Evidence (verbatim commands; logs under `.needletail-dev/`)
 
 - `./dev build` rc=0.
-- `./dev test quick` → `m1b-final-quick.log`, rc=0: StateTests 49, PrimitiveTests 14, PresentationTests 19, ConfigTests 69, BehaviourTests 20 (= 171 tests; slowest suite 2.077 s ≤ 3 s warm).
+- `./dev test quick` → `m1b-final-quick.log`, rc=0: StateTests 52, PrimitiveTests 14, PresentationTests 19, ConfigTests 69, BehaviourTests 20 (= 174 tests; slowest suite ~2.08 s ≤ 3 s warm).
 - `./dev test case` ×13 (+BDD-08) → `m1b-final-case-*.log`, all rc=0 with zero-match guards (BDD-08 via frozen replay; BDD-06 correctly refuses — review-process evidence below, never a pass).
 - Actor suites: 18 tests (gated transport, scripted approvals/executor, yield barriers — zero sleeps).
 - `./dev coverage` rc=0 (catalogue untouched per BDD-04 M0-vocabulary pin).
@@ -62,6 +62,11 @@ STATE-02: PARTIAL (in-memory idempotence proven; durable exactly-once due M2). N
 - Completed-slice review: NEEDS-EVIDENCE at `bf4708b` (M1B-S1 Blocker + S2–S4 Majors + S5–S11 minors/suggestions) → all fixed below → final verification pending.
 - S-fix implementation: `appendUnresolved` cap helper + integrity stop (S1); records-before-pump reorder (S2); DX-06 full five-invariant assertions (S3); probe recount above (S4); withdraw ack tracking (S5); sealed QueueEntry + auto-dispatch inheritance (S6); cancelling transportFailed carve-out (S7); continuation marker guard (S9); factory-use gate extension (S10); S8 recorded as M1-C handoff; S11 doc fixes in this report.
 - Final review: (pending — binds the S-fix commit below).
+
+## Workspace integrity incident + recovery (recorded honestly)
+
+During the S-fix round, two uncommitted artifacts were lost: `Tests/NeedletailStateTests/SnapshotEpochTests.swift` vanished from disk (never staged — authoring oversight in an explicit-path `git add`), and the validation-pump block + S2 reorder in `SessionActor.swift` regressed (an edit replaced the region without re-emitting the tail). A third loss class (tracked `Archive.zip` rewritten/deleted mid-session, twice) points at environmental churn on this shared box rather than any single tool call. No committed content was ever lost or altered (`git` objects intact throughout).
+Recovery: reconstructed the test file from retained history, re-applied the pump + reorder with read-back verification, added an S2 store-order actor test (which would have caught the pump loss — the pre-existing suite passed without it because no test asserted cross-transition record order), re-ran the full suite green, and committed immediately (`231743c`). Prevention: commit after every green evidence run; verify structural edits by read-back, not by tool receipt. The slice reviewer is explicitly asked to confirm the recovered files match their specified behavior via the test evidence, not via provenance claims.
 
 ## Limitations and gate status
 
