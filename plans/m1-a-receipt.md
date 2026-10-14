@@ -139,6 +139,26 @@ one targeted delta review (no full re-review):
 - Workspace note (recurring, environmental): tracked `Archive.zip`
   again found deleted mid-session by unknown cause; restored
   byte-identical from HEAD (1405926 bytes, matches blob). Unrelated.
-- Targeted H1/H2 review: (below).
+- Targeted H1/H2 review (head `88e4acd`): NEEDS-EVIDENCE —
+  H2-1 (probe unknown-alias raw echo), H2-2 (C1 host accepted),
+  H1-1 (dispatch-gate default-port disagreement), H1-2 (unreachable
+  denial claim), S-2 (raw credential-error fields); +3 speculations
+  (S-1 bidi follow-up for M4, S-3 ambiguity note). Raw:
+  `.needletail-dev/logs/m1a-h-review.md` (retained below as final).
+- Residual fixes (commit `778ca89`, 7 files): escaped probe
+  diagnostic + hostile-alias spawn test; control-or-whitespace
+  rejection at all three URL sites (S8 retained; whitespace regress
+  caught by the traversal oracle); dispatch gate via parsed origin +
+  fresh-join equality + parity test; defense-in-depth doc;
+  sanitized credential errors. Evidence: quick 14+69+20, integration
+  21, 10/10 cases, offline aggregate — all green.
+- S-1 bidi/zero-width visual spoofing: recorded follow-up for M4
+  terminal-safety work (outside the M1-A C0/C1 table); S-3 `\u{hex}`
+  literal ambiguity: noted, no change.
+- Final review: **READY TO CLOSE**, bound to head `778ca89` on
+  baseline `e3c0527` (reviewer `deepseek-reviewer` /
+  `opencode-go/deepseek-v4.1-flash`; 7-file diff confirmed; tree
+  clean; `origin/main` unmoved — 7 local-only commits, no push).
+  M1-A closes locally; M1-B planning authorized.
 - Restored-file check: `git status` clean except intended files; no
   push performed at any point.
