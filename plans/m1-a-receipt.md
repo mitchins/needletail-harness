@@ -99,5 +99,16 @@ one targeted delta review (no full re-review):
   snippet-free refusal; locality cross-check.
 - Evidence deltas: pure 60→63, integration 16→18; `m1a-fix-*.log`
   series; FIFO/conflict probes run live (exit 2, no hang).
-- Final review binding + disposition: (below; receipt + STATUS updated
-  in the same local-only commit series, no push).
+- Slice review (head `0ec46ed`): NEEDS-EVIDENCE — S1 Major (FIFO hang)
+  + S2–S7 Minor + S8–S11 Suggestions; D-a..D-i ACCEPTED (D-c with plan
+  correction). Raw: `.needletail-dev/logs/m1a-slice-review.md`.
+- S-fix commit `130176e`: all S1–S11 fixes; final narrow verification
+  found S8 test-only gap (production rejection present, no `%5C` input).
+- S8 commit `a76022c` (1 file, +2 lines): `%5Cx` variants added;
+  `m1a-final-case-CFG-02.log` (18+1 green) + `m1a-final-quick.log`
+  (14+63+20 green) retained.
+- Final review: **READY TO CLOSE**, bound to head `a76022c` on baseline
+  `e3c0527` (reviewer `deepseek-reviewer` /
+  `opencode-go/deepseek-v4.1-flash`; tree clean; 10-case coverage and S1
+  closure confirmed). No push/PR/merge — M1-epic CodeRabbit is the later
+  aggregate gate.

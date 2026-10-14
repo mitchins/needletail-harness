@@ -74,7 +74,7 @@ One passing variant never satisfies all variants: per-variant IDs, G/W/T, forbid
 - Plan reviews: rev1 NEEDS-EVIDENCE (15 findings) → rev2 NEEDS-EVIDENCE (3 minor residuals) → rev3 READY → rev4 targeted delta NEEDS-EVIDENCE (D1 Major + D2–D4) → rev5 corrections implemented. Receipt: `plans/m1-a-receipt.md`; raw: `.needletail-dev/logs/m1a-plan-review-*.md`.
 - Completed-slice review (head `0ec46ed`): NEEDS-EVIDENCE — S1 Major (FIFO hang) + S2–S7 Minor + S8–S11 Suggestions; D-a..D-i all ACCEPTED (D-c with plan correction). Raw: `.needletail-dev/logs/m1a-slice-review.md`.
 - S-fix implementation: S1 Runtime `readBoundedFile` + O_NONBLOCK credential open + FIFO/symlink tests; S2 snapshot `requiresNewEpoch` overload + tests; S3 real-escape + lone-surrogate oracles; S4 (this series re-runs the full 18-test integration target); S5 normalized identity + test; S6 `<= maxFileBytes`; S7 `validate --sealed/--tools` production caller + `invocation:` echo + spawn conflict tests; S8 decoded-backslash rejection + tests; S9 snippet-free refusal; S11 locality assertion. Plan rev6 (`eb322bee…73041d`) documents all of the above and supersedes the empty-models sentence.
-- Final review: (pending — binds the S-fix commit below).
+- Final review: **READY TO CLOSE** bound to head `a76022c` on baseline `e3c0527` (S8-only delta verified: two `%5C` inputs, 18+1 CFG-02 green, 97-test quick green; S1 Major stays closed; tree clean). Implementation commits: `f7f2628` (slice) + `0ec46ed` (report) + `130176e` (S-fixes) + `a76022c` (S8 test). No push/PR/merge.
 
 ## Limitations and gate status
 
