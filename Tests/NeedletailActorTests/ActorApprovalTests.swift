@@ -17,28 +17,18 @@ struct ActorApprovalTests {
         batch: [ToolProposal] = [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d")]
     ) async throws -> (
         SessionActor<ScriptedTransport, ScriptedExecutor, InMemorySessionStore, ScriptedApprovals, VirtualClock, DeterministicIDSource>,
-        ApprovalRequest
+        ScriptedTransport,
+        InMemorySessionStore
     ) {
         let transport = ScriptedTransport()
-        let (actor, _) = try ActorFixtures.makeActor(mode: .workspace, permissive: true, transport: transport, approvals: approvals)
-        let request = try await driveToAuthorising(actor: actor, transport: transport, batch: batch)
-        return (actor, request)
-    }
-
-    static func driveToAuthorising(
-        actor: SessionActor<ScriptedTransport, ScriptedExecutor, InMemorySessionStore, ScriptedApprovals, VirtualClock, DeterministicIDSource>,
-        transport: ScriptedTransport,
-        batch: [ToolProposal]
-    ) async throws -> ApprovalRequest {
+        let (actor, store) = try ActorFixtures.makeActor(mode: .workspace, permissive: true, transport: transport, executor: ScriptedExecutor(), approvals: approvals)
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: batch.map {
                 ToolProposal(callID: $0.callID, tool: $0.tool, argumentsDigest: "d")
             }, isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
-        try await ActorFixtures.awaitPhase(actor, { $0.phase == .authorising }, "authorising")
-        let state = await actor.currentState()
-        return try #require(state.pendingApproval, "approval must be pending")
+        return (actor, transport, store)
     }
 
     @Test("POLICY-04 silent gateway pends; release decides; ticks never decide")
@@ -46,7 +36,11 @@ struct ActorApprovalTests {
         let approvals = ScriptedApprovals()
         let (stream, continuation) = AsyncStream<ApprovalDecision>.makeStream()
         approvals.gate = stream
-        let (actor, request) = try await Self.authorisingActor(approvals: approvals)
+        let (actor, _, _) = try await Self.authorisingActor(approvals: approvals)
+        // The closed gate blocks progress, so the authorising barrier is
+        // stable here (unlike instant scripted decisions, which blow past).
+        try await ActorFixtures.awaitPhase(actor, { $0.phase == .authorising }, "authorising")
+        let request = try #require((await actor.currentState()).pendingApproval)
         #expect(approvals.requests.count == 1, "exactly one approval request emitted")
         // Ticks while suspended: still pending, nothing decided, test moving.
         await actor.tick(at: 9_999_999)
@@ -68,12 +62,42 @@ struct ActorApprovalTests {
     func POLICY_04_grantContinues() async throws {
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
-        let (actor, request) = try await Self.authorisingActor(approvals: approvals)
+        let (actor, _, _) = try await Self.authorisingActor(approvals: approvals)
+        // Instant decisions blow past the transient authorising phase, so
+        // await the STABLE end state: executing + exactly one emitted
+        // approval request proves authorising happened with intent first.
         try await ActorFixtures.awaitPhase(actor, { $0.phase == .executing }, "executing after grant")
         let state = await actor.currentState()
         #expect(state.pendingApproval == nil)
         #expect(state.liveReservations.count == 1, "grant reserves before dispatch")
-        _ = request
+        #expect(approvals.requests.count == 1, "one approval requested on the way through")
+    }
+
+    @Test("S2 store order: cause records precede pump consequences")
+    func storeOrderCauseBeforeConsequence() async throws {
+        // The outer transition's records must append BEFORE the pump-driven
+        // validation records — M2 replays this log in order.
+        let approvals = ScriptedApprovals()
+        approvals.script = [.deny("stop here")]
+        let (actor, _, store) = try await Self.authorisingActor(approvals: approvals)
+        // Instant scripted decisions blow past transient authorising, so
+        // await the STABLE end state; the store retains every record for
+        // the order assertion below.
+        try await ActorFixtures.awaitPhase(actor, {
+            if case .failed = $0.phase { return true }
+            return false
+        }, "failed after deny")
+        #expect(approvals.requests.count == 1, "one approval requested on the way through")
+        let (entries, _) = try store.records(since: 0, limit: 100)
+        let kinds = entries.map { entry -> String in
+            if case .eventAppended(_, let kind, _) = entry.record { return kind }
+            return "other"
+        }
+        guard let validating = kinds.firstIndex(of: "validating"),
+              let authorising = kinds.firstIndex(of: "authorising") else {
+            Issue.record("expected validating then authorising records, got \(kinds)"); return
+        }
+        #expect(validating < authorising, "cause precedes consequence: \(kinds)")
     }
 
     @Test("POLICY-04 trustedExec auto-allows; observe denies upfront")

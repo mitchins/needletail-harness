@@ -107,18 +107,9 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         let prior = state
         let result = transition(state, event, &ids)
         state = result.state
-        // Pump pure follow-ups: a validatingTools landing carries its batch
-        // in state, so validation completes deterministically without a new
-        // async edge (bounded — validationCompleted always leaves the phase).
-        for _ in 0..<4 {
-            guard case .validatingTools = state.phase,
-                  let batch = state.pendingBatch,
-                  let run = state.activeRun
-            else { break }
-            await apply(.validationCompleted(
-                requestID: run.requestID, generation: run.revision,
-                batch: batch, atMillis: clock.nowMillis()))
-        }
+        // S2: the outer transition's records append BEFORE any pump-driven
+        // follow-up — cause precedes consequence in the store log (M2 replays
+        // this order).
         do {
             for record in result.records {
                 try store.append(record)
@@ -143,6 +134,18 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         }
         for effect in result.effects {
             await perform(effect)
+        }
+        // Pump pure follow-ups: a validatingTools landing carries its batch
+        // in state, so validation completes deterministically without a new
+        // async edge (bounded — validationCompleted always leaves the phase).
+        for _ in 0..<4 {
+            guard case .validatingTools = state.phase,
+                  let batch = state.pendingBatch,
+                  let run = state.activeRun
+            else { break }
+            await apply(.validationCompleted(
+                requestID: run.requestID, generation: run.revision,
+                batch: batch, atMillis: clock.nowMillis()))
         }
     }
 
