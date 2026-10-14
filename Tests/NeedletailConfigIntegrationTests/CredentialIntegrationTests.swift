@@ -153,19 +153,23 @@ struct CredentialIntegrationTests {
         SpawnHelpers.assertNoCanary(out + err, canary: "child-canary-zzz", where: "doctor output")
     }
 
-    @Test("NET-06 probe validates the route purely, then defers without traffic")
-    func NET_06_probeDeferred() async throws {
-        // Probe uses the default config location; point XDG at a temp dir.
+    @Test("NET-06 probe dials once and reports refusal honestly")
+    func NET_06_probeRefusedHonestly() async throws {
+        // M1-C: the deferral placeholder is gone — the probe really dials.
+        // Nothing listens on :11434 here, so the loopback dial is refused;
+        // the CLI must report the typed failure (exit 4), never success,
+        // never a guess, and never echo the credential.
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("needletail-m1a-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("needletail-m1c-\(UUID().uuidString)", isDirectory: true)
         let cfgDir = dir.appendingPathComponent("needletail", isDirectory: true)
         try FileManager.default.createDirectory(at: cfgDir, withIntermediateDirectories: true)
         try ConfigTestHelpersData.localConfig().write(to: cfgDir.appendingPathComponent("config.json"))
-        let env = Environment.custom(["PATH": "/usr/bin:/bin", "XDG_CONFIG_HOME": dir.path])
-        let (code, out, _) = try await SpawnHelpers.run(["doctor", "--probe", "local-coder"], environment: env)
-        #expect(code == 4, "probe defers with exit 4, got \(code): \(out)")
-        #expect(out.contains("probeDeferredToM1C"), "deferral must be explicit: \(out)")
-        #expect(out.contains("http://127.0.0.1:11434/chat/completions"), "validated endpoint shown: \(out)")
+        let secret = "m1c-probe-test-secret"
+        let env = Environment.custom(["PATH": "/usr/bin:/bin", "XDG_CONFIG_HOME": dir.path, "NT_M1A_KEY": secret])
+        let (code, out, err) = try await SpawnHelpers.run(["doctor", "--probe", "local-coder"], environment: env)
+        #expect(code == 4, "refused probe fails honest with exit 4, got \(code): \(out) \(err)")
+        #expect((out + err).contains("provider failure"), "typed failure, not silence: \(out) \(err)")
+        #expect(!(out + err).contains(secret), "CLI failure output never echoes the credential")
         let (code2, out2, _) = try await SpawnHelpers.run(["doctor", "--probe", "ghost"], environment: env)
         #expect(code2 == 2, "unknown probe alias is a config error: \(out2)")
     }

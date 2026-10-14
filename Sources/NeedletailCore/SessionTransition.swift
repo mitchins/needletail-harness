@@ -127,6 +127,20 @@ public protocol ApprovalGateway: Sendable {
     func decide(_ request: ApprovalRequest) async -> ApprovalDecision
 }
 
+/// Classified transport failure (M1-C carrier, R2): the ADAPTER classifies
+/// every failure at its site and throws this — it never retries. The actor
+/// maps it to a classified `transportFailed` event; anything else becomes
+/// ambiguous. Pure value, no transport import (Core stays dependency-free).
+public struct TransportFailure: Error, Sendable, Equatable {
+    public let phase: TransportPhase
+    public let message: String
+
+    public init(phase: TransportPhase, message: String) {
+        self.phase = phase
+        self.message = message
+    }
+}
+
 /// Approval rule (M1B2-5 matrix): sealed batches never reach authorising
 /// (denied at admission); observe admits read/search only (mutating denied
 /// at caps); workspace asks for anything mutating; trustedExec asks only
@@ -148,6 +162,11 @@ public func batchNeedsApproval(toolNames: [String], execPolicy: ExecPolicy, mode
 // MARK: - Transition
 
 public let cancelGraceMillis: UInt64 = 5_000
+/// Backoff delays per pre-stream retry attempt (SPEC §11): 1s, then 2s.
+/// Deterministic under tick scripting — no wall sleeps anywhere.
+public func retryBackoffMillis(attempt: Int) -> UInt64 {
+    UInt64(1 << min(attempt, 10)) * 1_000
+}
 public let maxQueueEntries = 20
 public let maxQueueTextBytes = 64 * 1_024
 public let maxAdmittedCommands = 512
@@ -533,6 +552,7 @@ private func admitFreshRun<I: IDSource>(
         admittedCommands: index, consumedEffects: Set<EffectID>(),
         turnsUsed: 0, runDeadlineMillis: atMillis + defaultRunDeadlineMillis,
         preSendRetries: 0, invalidTracker: InvalidTracker(),
+        retryDeadlineMillis: .some(nil),
         liveReservations: state.liveReservations + [reservation],
         generation: generation, lastSequence: seq.value)
     return Transition(
@@ -956,7 +976,8 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
         phase: .admitting, activeRun: .some(run), activeRequest: .some(nil),
         queue: queue, consumedEffects: Set<EffectID>(),
         turnsUsed: 0, runDeadlineMillis: atMillis + defaultRunDeadlineMillis,
-        preSendRetries: 0, liveReservations: state.liveReservations + [reservation],
+        preSendRetries: 0, retryDeadlineMillis: .some(nil),
+        liveReservations: state.liveReservations + [reservation],
         generation: generation, lastSequence: seq.value)
     return Transition(
         state: next,
@@ -980,7 +1001,8 @@ private func failRun<I: IDSource>(
         phase: .failed(failure), activeRun: .some(nil), activeRequest: .some(nil),
         queueHeld: hold ? true : s1.queueHeld,
         heldReason: hold ? .error("run failed") : s1.heldReason,
-        pendingApproval: .some(nil), pendingBatch: .some(nil), liveReservations: [])
+        pendingApproval: .some(nil), pendingBatch: .some(nil),
+        retryDeadlineMillis: .some(nil), liveReservations: [])
     return Transition(
         state: next,
         effects: [.emitUI(.runUpdate(phase: "failed", detail: "run failed"))],
@@ -992,7 +1014,8 @@ private func interruptRun<I: IDSource>(_ state: SessionState, note: String, atMi
     let (s1, prefix) = sequenced(state, kind: "interrupted", digest: eventDigest("interrupted", note), ids: &ids)
     let next = s1.replacing(
         phase: .interrupted, activeRun: .some(nil), activeRequest: .some(nil),
-        pendingApproval: .some(nil), pendingBatch: .some(nil), liveReservations: [])
+        pendingApproval: .some(nil), pendingBatch: .some(nil),
+        retryDeadlineMillis: .some(nil), liveReservations: [])
     return Transition(
         state: next,
         effects: [.emitUI(.runUpdate(phase: "interrupted", detail: note))],
@@ -1007,36 +1030,22 @@ private func failTransport<I: IDSource>(
     _ = atMillis
     switch phase {
     case .preSend:
+        // M1-C backoff: arm the deadline here; the tick row dispatches.
+        // No inline resend exists anywhere (single policy path).
         guard state.preSendRetries < 2 else {
             return failRun(state, failure: .providerError("pre-send failures exhausted retries: \(terminalSafe(error))"), hold: true, atMillis: atMillis, ids: &ids)
-        }
-        guard state.turnsUsed < state.turnLimit else {
-            return failRun(state, failure: .budgetExhausted("turn budget exhausted during retry"), hold: true, atMillis: atMillis, ids: &ids)
         }
         guard let run = state.activeRun else {
             return failRun(state, failure: .providerError(terminalSafe(error)), hold: true, atMillis: atMillis, ids: &ids)
         }
-        let effectID = ids.nextEffectID()
-        let seq = ids.nextSequence()
-        let reservation = EffectReservation(
-            effectID: effectID, runID: run.runID, requestID: run.requestID,
-            generation: run.revision, revision: run.revision, mutating: false)
-        let invocation = ProviderInvocation(
-            effectID: effectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
-            alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,
-            turnsLeft: state.turnLimit - state.turnsUsed, deadlineMillis: state.runDeadlineMillis,
-            historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):retry"))
-        let (s1, prefix) = sequenced(state, kind: "retrying", digest: eventDigest("retry", run.requestID.raw), ids: &ids)
+        let deadline = atMillis + retryBackoffMillis(attempt: state.preSendRetries)
+        let (s1, prefix) = sequenced(state, kind: "retry-armed", digest: eventDigest("retry", run.requestID.raw), ids: &ids)
         let next = s1.replacing(
-            turnsUsed: state.turnsUsed + 1, preSendRetries: state.preSendRetries + 1,
-            liveReservations: state.liveReservations + [reservation], lastSequence: seq.value)
+            preSendRetries: state.preSendRetries + 1, retryDeadlineMillis: .some(deadline))
         return Transition(
             state: next,
-            effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
-            records: prefix + [
-                .eventAppended(seq: seq, kind: "retrying", digest: eventDigest("retry", run.requestID.raw)),
-                .operationIntent(OperationRef(operationID: ids.nextOperationID(), state: .intent, mutating: false)),
-            ])
+            effects: [.startTimer(deadlineMillis: deadline, purpose: "retry-backoff", runID: run.runID)],
+            records: prefix)
     case .postContent:
         return interruptRun(state, note: "provider stream interrupted: \(terminalSafe(error)) (partial evidence kept; never merged)", atMillis: atMillis, ids: &ids)
     case .ambiguous:
@@ -1301,7 +1310,8 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
     let next = s1.replacing(
         phase: .cancelling, activeRequest: active,
         queueHeld: true, heldReason: .cancelled(sinceMillis: atMillis),
-        pendingApproval: .some(nil), pendingBatch: .some(nil), liveReservations: [],
+        pendingApproval: .some(nil), pendingBatch: .some(nil),
+        retryDeadlineMillis: .some(nil), liveReservations: [],
         generation: state.generation + 1,
         unresolvedOperations: unresolved)
     var effects: [Effect] = [.emitUI(.runUpdate(phase: "cancelling", detail: "cancelled; queue held"))]
@@ -1347,7 +1357,49 @@ private func refuseBusyMeta<I: IDSource>(
         records: prefix)
 }
 
+/// Tick dispatch for armed retries (M1C3-2/M1C4-1): the ONLY consumer of
+/// `retryDeadlineMillis`. Fires iff a deadline is armed, the phase is
+/// requesting, and the deadline has passed; every other combination is an
+/// explicit no-op (stale ticks can never dispatch, double-fire, or leak).
+private func consumeRetryDeadline<I: IDSource>(_ state: SessionState, nowMillis: UInt64, ids: inout I) -> Transition? {
+    guard let deadline = state.retryDeadlineMillis,
+          state.phase == .requesting,
+          nowMillis >= deadline,
+          let run = state.activeRun
+    else {
+        return nil
+    }
+    guard state.turnsUsed < state.turnLimit else {
+        return failRun(state, failure: .budgetExhausted("turn budget exhausted at retry dispatch"), hold: true, atMillis: nowMillis, ids: &ids)
+    }
+    let effectID = ids.nextEffectID()
+    let seq = ids.nextSequence()
+    let reservation = EffectReservation(
+        effectID: effectID, runID: run.runID, requestID: run.requestID,
+        generation: run.revision, revision: run.revision, mutating: false)
+    let invocation = ProviderInvocation(
+        effectID: effectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
+        alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,
+        turnsLeft: state.turnLimit - state.turnsUsed, deadlineMillis: state.runDeadlineMillis,
+        historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):retry-tick"))
+    let (s1, prefix) = sequenced(state, kind: "retrying", digest: eventDigest("retry-tick", run.requestID.raw), ids: &ids)
+    let next = s1.replacing(
+        turnsUsed: state.turnsUsed + 1,
+        retryDeadlineMillis: .some(nil),
+        liveReservations: state.liveReservations + [reservation], lastSequence: seq.value)
+    return Transition(
+        state: next,
+        effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
+        records: prefix + [
+            .eventAppended(seq: seq, kind: "retrying", digest: eventDigest("retry-tick", run.requestID.raw)),
+            .operationIntent(OperationRef(operationID: ids.nextOperationID(), state: .intent, mutating: false)),
+        ])
+}
+
 private func checkDeadline<I: IDSource>(_ state: SessionState, nowMillis: UInt64, ids: inout I) -> Transition {
+    if let retry = consumeRetryDeadline(state, nowMillis: nowMillis, ids: &ids) {
+        return retry
+    }
     guard state.phase.hasActiveRun || state.phase == .admitting,
           let deadline = state.runDeadlineMillis,
           nowMillis >= deadline

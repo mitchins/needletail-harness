@@ -284,6 +284,7 @@ extension SessionState {
         turnLimit: Int? = nil, runDeadlineMillis: UInt64?? = nil,
         preSendRetries: Int? = nil, invalidTracker: InvalidTracker? = nil,
         pendingApproval: ApprovalRequest?? = nil, pendingBatch: ToolBatch?? = nil,
+        retryDeadlineMillis: UInt64?? = nil,
         liveReservations: [EffectReservation]? = nil, generation: UInt64? = nil,
         unresolvedOperations: [OperationRef]? = nil,
         droppedStaleCount: Int? = nil, lastSequence: UInt64? = nil
@@ -303,6 +304,7 @@ extension SessionState {
             invalidTracker: invalidTracker ?? self.invalidTracker,
             pendingApproval: pendingApproval ?? self.pendingApproval,
             pendingBatch: pendingBatch ?? self.pendingBatch,
+            retryDeadlineMillis: retryDeadlineMillis ?? self.retryDeadlineMillis,
             liveReservations: liveReservations ?? self.liveReservations,
             generation: generation ?? self.generation,
             unresolvedOperations: unresolvedOperations ?? self.unresolvedOperations,
@@ -380,6 +382,10 @@ public struct SessionState: Sendable, Equatable {
     /// authorising, cleared on grant/deny/cancel). Empty batch short-
     /// circuits back to requesting without approval.
     public let pendingBatch: ToolBatch?
+    /// Armed retry deadline (M1-C backoff): set by the preSend-retry arm,
+    /// consumed ONLY by the `tick` row in requesting phase, cleared on
+    /// cancel/epoch/dispatch. Nil normally.
+    public let retryDeadlineMillis: UInt64?
     /// Live effect reservations (source of truth; the actor mirrors for
     /// pairing). Cancel retention (C3) and consumption checks read this —
     /// never actor-side memory alone.
@@ -401,6 +407,7 @@ public struct SessionState: Sendable, Equatable {
         turnsUsed: Int = 0, turnLimit: Int = 80, runDeadlineMillis: UInt64? = nil,
         preSendRetries: Int = 0, invalidTracker: InvalidTracker = InvalidTracker(),
         pendingApproval: ApprovalRequest? = nil, pendingBatch: ToolBatch? = nil,
+        retryDeadlineMillis: UInt64? = nil,
         liveReservations: [EffectReservation] = [],
         generation: UInt64 = 0, unresolvedOperations: [OperationRef] = [],
         droppedStaleCount: Int = 0, lastSequence: UInt64 = 0
@@ -423,6 +430,7 @@ public struct SessionState: Sendable, Equatable {
         self.invalidTracker = invalidTracker
         self.pendingApproval = pendingApproval
         self.pendingBatch = pendingBatch
+        self.retryDeadlineMillis = retryDeadlineMillis
         self.liveReservations = liveReservations
         self.generation = generation
         self.unresolvedOperations = unresolvedOperations

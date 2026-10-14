@@ -26,6 +26,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.8.2"),
         .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.36.2"),
         .package(url: "https://github.com/apple/swift-openapi-runtime.git", from: "1.13.0"),
+        // M1-C: NIOCore becomes a DIRECT edge (already resolved at 2.104.0
+        // via AsyncHTTPClient — no version change) because bounded
+        // incremental consumption names ByteBuffer/EventLoopFuture/NIODeadline.
+        // No new package, no new code, no version churn; disclosed + reviewed.
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.104.0"),
         .package(url: "https://github.com/swiftlang/swift-subprocess.git", from: "1.0.1"),
         .package(url: "https://github.com/apple/swift-system.git", from: "1.8.1"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "5.0.0"),
@@ -38,7 +43,13 @@ let package = Package(
         ),
         .target(
             name: "NeedletailProviders",
-            dependencies: ["NeedletailCore"]
+            dependencies: [
+                "NeedletailCore",
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ]
         ),
         .target(
             name: "NeedletailRuntime",
@@ -74,6 +85,7 @@ let package = Package(
             dependencies: [
                 "NeedletailCore",
                 "NeedletailRuntime",
+                "NeedletailProviders",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
@@ -136,6 +148,31 @@ let package = Package(
                 "NeedletailPresentation",
                 "NeedletailCore",
                 .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+        // M1-C: pure adapter mapping/assembly/bounds suites (fast; joins
+        // `./dev test quick`). No sockets, no processes, no network.
+        .testTarget(
+            name: "NeedletailProviderTests",
+            dependencies: [
+                "NeedletailCore",
+                "NeedletailProviders",
+                .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
+            ]
+        ),
+        // M1-C: loopback integration (synthetic endpoints, real HTTP over
+        // POSIX loopback; runs under `./dev test case` + `test offline`).
+        .testTarget(
+            name: "NeedletailProviderIntegrationTests",
+            dependencies: [
+                "NeedletailCore",
+                "NeedletailRuntime",
+                "NeedletailProviders",
+                "NeedletailTestSupport",
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "Subprocess", package: "swift-subprocess"),
+                .product(name: "SystemPackage", package: "swift-system"),
+                .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
             ]
         ),
         // M1-A: spawn-binary + temp-filesystem integration (offline; runs

@@ -281,7 +281,7 @@ struct TransportCancellationTests {
         server.stop()
         #expect(outcome == "cancelled", "expected a cancellation error, got \(outcome)")
 
-        try await client.shutdown()
+        try await client.shutdown().get() /* M1-C: await the future, not the call */
     }
 
     @Test("NET-04 cancellation errors classify as cancelled")
@@ -346,7 +346,7 @@ struct TransportCancellationTests {
         } catch {
             outcome = classifyRequestError(error)
         }
-        try await client.shutdown()
+        try await client.shutdown().get() /* M1-C: await the future, not the call */
         return outcome
     }
 
@@ -366,13 +366,13 @@ struct TransportCancellationTests {
         }
         guard await awaitRequestHead(server, deadlineSeconds: 10) else {
             server.stop()
-            try await client.shutdown()
+            try await client.shutdown().get() /* M1-C: await the future, not the call */
             return "failed: request head never arrived"
         }
         requestTask.cancel()
         let outcome = await raceToCompletion(produce: { await requestTask.value }, deadlineSeconds: 10)
         server.stop()
-        try await client.shutdown()
+        try await client.shutdown().get() /* M1-C: await the future, not the call */
         return outcome
     }
 

@@ -12,7 +12,7 @@ struct Doctor: ParsableCommand {
         abstract: "Offline local checks only; no network requests."
     )
 
-    @Option(name: .long, help: "Validate one model alias and route purely, then defer (M1-C sends traffic; this flag never does).")
+    @Option(name: .long, help: "Validate one model alias and route, then send exactly one synthetic probe request to the authorized endpoint (loopback or configured origin only; fixed literals, never workspace bytes).")
     var probe: String?
 
     mutating func run() throws {

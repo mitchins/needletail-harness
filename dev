@@ -238,7 +238,7 @@ test)
     offline)
         # M1-A aggregate gate over every scheduled offline layer: fast pure
         # suites, native primitive probes, the bounded PTY feasibility
-        # scenario, catalogue reconciliation, and the ten M1-A case filters
+        # scenario, catalogue reconciliation, and the nine M1-A case filters
         # (pure + spawn-binary integration). No live provider, no PTY
         # product suite, no packaging container. Each stage reuses the
         # guarded runners above, so a crash/zero-match anywhere fails here.
@@ -250,13 +250,17 @@ test)
         "$0" test feasibility
         echo "== offline aggregate: coverage =="
         "$0" coverage
-        for _m1a_case in CFG-01 CFG-02 CFG-03 CFG-04 CFG-05 CFG-06 POLICY-02 POLICY-05 NET-01 NET-06; do
+        for _m1a_case in CFG-01 CFG-02 CFG-03 CFG-04 CFG-05 CFG-06 POLICY-02 POLICY-05 NET-01; do
             echo "== offline aggregate: case $_m1a_case =="
             run_case "$_m1a_case"
         done
         for _m1b_case in CORE-02 CORE-03 CORE-04 POLICY-03 POLICY-04 STATE-01 STATE-04 PORT-02 DX-01 DX-02 DX-03 DX-06 DX-07; do
             echo "== offline aggregate: case $_m1b_case =="
             run_case "$_m1b_case"
+        done
+        for _m1c_case in WIRE-01 WIRE-02 WIRE-03 WIRE-04 WIRE-05 WIRE-06 WIRE-07 WIRE-08 WIRE-09 WIRE-10 NET-02 NET-03 NET-04 NET-05 NET-06 DX-04 DX-05; do
+            echo "== offline aggregate: case $_m1c_case =="
+            run_case "$_m1c_case"
         done
         echo "OFFLINE OK: all scheduled offline layers passed."
         ;;

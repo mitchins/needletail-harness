@@ -56,13 +56,18 @@ public struct ProviderResponse: Sendable, Equatable {
     public let outcome: ProviderOutcome
     public let usageInput: Int?
     public let usageOutput: Int?
+    /// Served model identity as returned on the wire (M1-C additive: exact
+    /// passthrough for probe/usage records; mismatch is a diagnostic flag,
+    /// never a failure or coercion).
+    public let returnedModel: String?
 
-    public init(requestID: RequestID, generation: Revision, outcome: ProviderOutcome, usageInput: Int? = nil, usageOutput: Int? = nil) {
+    public init(requestID: RequestID, generation: Revision, outcome: ProviderOutcome, usageInput: Int? = nil, usageOutput: Int? = nil, returnedModel: String? = nil) {
         self.requestID = requestID
         self.generation = generation
         self.outcome = outcome
         self.usageInput = usageInput
         self.usageOutput = usageOutput
+        self.returnedModel = returnedModel
     }
 }
 

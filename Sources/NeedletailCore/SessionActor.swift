@@ -185,6 +185,12 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             await pairTransportResult(result, reservation: reservation)
         } catch is CancellationError {
             return // Generation invalidation already dropped this run; nothing to pair.
+        } catch let failure as TransportFailure {
+            // Classified at the failure site by the adapter (R2); the
+            // transition policy stays the sole retry authority.
+            await apply(.transportFailed(
+                requestID: invocation.requestID, generation: invocation.generation,
+                phase: failure.phase, error: failure.message, atMillis: clock.nowMillis()))
         } catch {
             await apply(.transportFailed(
                 requestID: invocation.requestID, generation: invocation.generation,
