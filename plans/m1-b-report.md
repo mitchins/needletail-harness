@@ -5,7 +5,7 @@
 ## Identity
 
 - Milestone / slice: M1-B implementation (second M1 minor).
-- Base SHA: `fc6ef5e` (M1-A closed locally).
+- Authorized baseline: `fc6ef5e` (M1-A closed locally). Subject base for this slice: `ee0b36a` (M1-B planning closeout, planning files only — no source delta).
 - Head SHA: `bc73f26` (local-only implementation commit; slice review binds it).
 - Plan digest (`plans/m1-b-plan.md` sha256, rev4): `a60997aaedabfce59094f885dbf3d49ff3fc2b0884a30d959bc52f3457e10e25` (407 lines).
 - Dependency-lock digest (`Package.resolved` sha256): `de95226e…cc` (unchanged — no dependency delta; Crypto product reused in ONE test target only).
@@ -17,7 +17,7 @@
 - Cases in scope (15): CORE-02, CORE-03, CORE-04, POLICY-03, POLICY-04, STATE-01, STATE-04, PORT-02, BDD-06, BDD-08, DX-01, DX-02, DX-03, DX-06, DX-07. DX-04/05 stay M1-C. BDD-06 review-process only (no runner tests by design); BDD-08 committed frozen replay. STATE-02 marked PARTIAL (in-memory now, durable M2).
 - Invariants touched: I03 (epoch stability), I05 (grants gate tools), I06 (sealed/tools-none), I07 (no auto-retry), I09 (local-only), I12 (no grant mutation), I13 (draft preservation), I14 (queue idempotence), I21 (no resurrection), I24 (bounded queues).
 - Changed files:
-  - Added: `Sources/NeedletailCore/{SessionIDs,SessionState,SessionEvent,SessionTransition,SessionStore,SealedInput,SessionActor}.swift` (7), `Sources/NeedletailPresentation/{UIState,UIAction,UIReducer,Render}.swift` (4), `Sources/NeedletailTestSupport/InMemorySessionStore.swift` (1), `Tests/{NeedletailStateTests (10 files),NeedletailActorTests (6 files),NeedletailPresentationTests (7 files)}`, `Tests/Fixtures/render/{basic-chat.json,manifest.json}`.
+  - Added: `Sources/NeedletailCore/{SessionIDs,SessionState,SessionEvent,SessionTransition,SessionStore,SealedInput,SessionActor}.swift` (7), `Sources/NeedletailPresentation/{UIState,UIAction,UIReducer,Render}.swift` (4), `Sources/NeedletailTestSupport/InMemorySessionStore.swift` (1), `Tests/{NeedletailStateTests (11 files),NeedletailActorTests (7 files),NeedletailPresentationTests (7 files)}`, `Tests/Fixtures/render/{basic-chat.json,manifest.json}`.
   - Modified: `Package.swift` (Presentation target+product, 3 test targets, Crypto product in presentation tests only), `dev` (quick filters, offline +13 cases, case-guard singular/plural+sum fix), `Sources/NeedletailCore/SessionEvent.swift` (approvalUnavailable event — part of this slice, not M1-A drift).
   - Deleted: none.
 - Authorization corrections honored: C1 (mentions admit, actions deny — pinned both sides), C2 (512-cap + epoch prune + full-scale honest-boundary test), C3 (unknown-retention before table clear — transition + actor order).
@@ -26,17 +26,23 @@
 ## Evidence (verbatim commands; logs under `.needletail-dev/`)
 
 - `./dev build` rc=0.
-- `./dev test quick` rc=0: State 44, Primitive 14, Presentation 19, Config 69, Behaviour 20 (= 166 tests; slowest suite 2.058 s ≤ 3 s).
-- `./dev test case` ×13 (+BDD-08): all rc=0 with zero-match guards (per-case logs `m1b-ev-case-*.log`; BDD-08 via frozen replay; BDD-06 correctly refuses — review-process evidence in report, never a pass).
+- `./dev test quick` → `m1b-final-quick.log`, rc=0: StateTests 49, PrimitiveTests 14, PresentationTests 19, ConfigTests 69, BehaviourTests 20 (= 171 tests; slowest suite 2.077 s ≤ 3 s warm).
+- `./dev test case` ×13 (+BDD-08) → `m1b-final-case-*.log`, all rc=0 with zero-match guards (BDD-08 via frozen replay; BDD-06 correctly refuses — review-process evidence below, never a pass).
 - Actor suites: 18 tests (gated transport, scripted approvals/executor, yield barriers — zero sleeps).
 - `./dev coverage` rc=0 (catalogue untouched per BDD-04 M0-vocabulary pin).
 - `./dev test native` rc=0 (14 tests — M0 regression).
-- `./dev test feasibility` rc=0 (6 tests × 4 consecutive green runs `m1b-ev-feas{,-2,-3,-4,-5}.log`; one PTY-05 resize failure mid-day under box load 43+ — see Limitations).
+- `./dev test feasibility` rc=0 (6 tests × 4 consecutive green runs; one PTY-05 resize failure mid-day under box load 43+ — see Limitations).
 - `./dev vendor-check` rc=0.
-- `./dev test offline` rc=0 EXCEPT the feasibility stage during the load spike (all other stages green; re-run pending a quiet window).
-- `./dev release-bundle` rc=0 (dynamic, 7729672 bytes — CLI/product unchanged by this slice; size delta from M1-A is toolchain/graph noise, recorded not claimed) + `./dev test packaging` clean-host smoke OK (`m1b-ev-bundle.log`, `m1b-ev-packaging.log`).
-- RED: stub-phase assertion failures (retained) + 5 BDD-06 guard-removal probes, each RED then byte-identical restore (union-grant 14, no-bump-cancel 6, ack-dedup 9, sealed-admit 12, stale-revision 4).
-- GREEN: state 44 + presentation 19 + actor 18 + DX-06 40-seed harness clean (BDD-08 uses the labeled authored fallback per R13).
+- `./dev test offline` → `m1b-final-offline.log`, OFFLINE OK (all stages incl. 13 M1-B cases).
+- `./dev release-bundle` rc=0 (dynamic, 7790776 bytes) + `./dev test packaging` clean-host smoke OK (`m1b-final-bundle.log`, `m1b-final-packaging.log`).
+- RED: stub-phase assertion failures (retained) + 5 BDD-06 guard-removal probes, each RED then verified restore (no PROBE markers remain; Transition/SealedInput digests match pre-probe snapshots).
+- BDD-06 probe→guard→oracle mapping with DISTINCT FAILING TESTS per probe (S4 reconciled — units are failing test functions, counted once each):
+  - generation-check removal → `STATE-01 old-generation and post-cancel completions drop` (1 test; `m1b-probe-bdd06-gen.log` + wide re-run `m1b-probe-gen-wide.log`).
+  - cancel-invalidation removal → `CORE-02 cancel in requesting, streaming, admitting holds and bumps` (1 test; `m1b-probe-bdd06-cancel.log` + wide re-run `m1b-probe-cancel-wide.log`, which additionally proves the phase gate holds post-cancel drops as defense-in-depth).
+  - ack-dedup removal → `CORE-02 queue admission is idempotent per commandID` + `CORE-02 queue withdraw tombstones` (2 tests; `m1b-probe-bdd06-ack.log`).
+  - sealed-denial removal → `POLICY-03 whole-message tool JSON denies as an action` + `POLICY-03 sealed tool-JSON denies with no reservation` (2 tests; `m1b-probe-bdd06-sealed.log`).
+  - stale-revision acceptance → `CORE-02 queue edits bump revisions` (1 test; `m1b-probe-bdd06-revision.log`).
+- GREEN: state 49 + presentation 19 + actor 18 + DX-06 40-seed harness clean (BDD-08 uses the labeled authored fallback per R13).
 
 ## Results by evidence layer and platform
 
@@ -53,7 +59,9 @@ STATE-02: PARTIAL (in-memory idempotence proven; durable exactly-once due M2). N
 ## Review
 
 - Plan reviews: rev1 NEEDS-EVIDENCE (4 Blockers + 10 Majors) → rev2 NEEDS-EVIDENCE (9 new) → rev3 NEEDS-EVIDENCE (1 Blocker + 9) → rev4 READY. Receipt: `plans/m1-b-receipt.md` (to be extended).
-- Completed-slice review: (pending — packet: this report + implementation SHA diff + logs + rev4 plan + coverage).
+- Completed-slice review: NEEDS-EVIDENCE at `bf4708b` (M1B-S1 Blocker + S2–S4 Majors + S5–S11 minors/suggestions) → all fixed below → final verification pending.
+- S-fix implementation: `appendUnresolved` cap helper + integrity stop (S1); records-before-pump reorder (S2); DX-06 full five-invariant assertions (S3); probe recount above (S4); withdraw ack tracking (S5); sealed QueueEntry + auto-dispatch inheritance (S6); cancelling transportFailed carve-out (S7); continuation marker guard (S9); factory-use gate extension (S10); S8 recorded as M1-C handoff; S11 doc fixes in this report.
+- Final review: (pending — binds the S-fix commit below).
 
 ## Limitations and gate status
 

@@ -28,6 +28,6 @@ struct BDD08ReplayTests {
         let result = PermutationTests.replay(trace)
         #expect(result.violations.isEmpty, "frozen trace must hold: \(result.violations)")
         #expect(result.draft == "do not lose me + more", "draft exact after replay")
-        #expect(result.effects == 0, "this trace emits no effects (completions all stale, no queue ops)")
+        #expect(result.effects == 1, "exactly the appended queue probe effect (completions all stale)")
     }
 }

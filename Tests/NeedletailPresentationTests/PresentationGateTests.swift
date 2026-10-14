@@ -35,19 +35,28 @@ struct PresentationGateTests {
 
     @Test("DX-03 projection construction sites stay inside Core")
     func projectionConstructionSiteGate() throws {
-        // R21: SessionEventProjection has an internal init, so only Core
-        // constructs it. This static check fails any future minting site
-        // outside Sources/NeedletailCore/ (tests may only CONSUME).
+        // R21+S10: SessionEventProjection has an internal init, so only
+        // Core constructs it — including via the static factories. This
+        // static check fails any future minting site outside
+        // Sources/NeedletailCore/ (tests may only CONSUME).
         let root = try Self.sourcesRoot()
         let manager = FileManager.default
         var offenders: [String] = []
+        // NOTE: bare type references (e.g. `case session(SessionEventProjection)`)
+        // are consumption, not construction — only factory calls are gated.
+        // Direct `SessionEventProjection(kind:` construction outside Core
+        // fails to compile (internal init), so no grep needed for it.
+        let markers = [
+            ".admitted(commandID:", ".denied(cause:", ".runUpdate(phase:",
+            ".agent(alias:",
+        ]
         for target in ["NeedletailPresentation", "NeedletailCLI", "NeedletailRuntime", "NeedletailProviders"] {
             let dir = root + target
             guard manager.fileExists(atPath: dir) else { continue }
             for file in try manager.contentsOfDirectory(atPath: dir).filter({ $0.hasSuffix(".swift") }) {
                 let text = try String(contentsOfFile: dir + "/" + file, encoding: .utf8)
-                if text.contains("SessionEventProjection(") {
-                    offenders.append("\(target)/\(file)")
+                for marker in markers where text.contains(marker) {
+                    offenders.append("\(target)/\(file):\(marker)")
                 }
             }
         }

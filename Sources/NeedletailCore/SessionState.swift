@@ -138,8 +138,11 @@ public struct QueueEntry: Sendable, Equatable {
     public let targetEpochID: EpochID
     /// Reserved for M2-D reorder flows; M1-B never reorders (no code path assigns order).
     public let orderKey: UInt64
+    /// Sealing travels WITH the entry (S6): a sealed submission queued
+    /// behind a non-sealed run keeps its own flag into its own run.
+    public let sealed: Bool
 
-    public init(entryID: String, commandID: CommandID, kind: QueueKind, state: QueueEntryState, revision: UInt64, text: String, targetEpochID: EpochID, orderKey: UInt64) {
+    public init(entryID: String, commandID: CommandID, kind: QueueKind, state: QueueEntryState, revision: UInt64, text: String, targetEpochID: EpochID, orderKey: UInt64, sealed: Bool = false) {
         self.entryID = entryID
         self.commandID = commandID
         self.kind = kind
@@ -148,6 +151,21 @@ public struct QueueEntry: Sendable, Equatable {
         self.text = text
         self.targetEpochID = targetEpochID
         self.orderKey = orderKey
+        self.sealed = sealed
+    }
+
+    public func withState(_ state: QueueEntryState) -> QueueEntry {
+        QueueEntry(
+            entryID: entryID, commandID: commandID, kind: kind,
+            state: state, revision: revision, text: text,
+            targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed)
+    }
+
+    public func withRevision(_ revision: UInt64, text: String) -> QueueEntry {
+        QueueEntry(
+            entryID: entryID, commandID: commandID, kind: kind,
+            state: state, revision: revision, text: text,
+            targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed)
     }
 }
 

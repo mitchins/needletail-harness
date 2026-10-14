@@ -155,6 +155,28 @@ public let maxUnresolvedOperations = 64
 public let defaultTurnLimit = 80
 public let defaultRunDeadlineMillis: UInt64 = 4 * 3_600 * 1_000
 
+/// Appends an unresolved marker, enforcing the bound (S1/R19/I24).
+/// Returns the new marker list plus an overflow flag: on overflow the
+/// CALLER fails the run visibly (`failed(.integrityStopped)` + hold) —
+/// markers are never silently dropped and never grow unbounded.
+private func appendUnresolved(_ markers: [OperationRef], _ ref: OperationRef) -> (markers: [OperationRef], overflow: Bool) {
+    if markers.count >= maxUnresolvedOperations {
+        return (markers, true)
+    }
+    return (markers + [ref], false)
+}
+
+private func integrityStop<I: IDSource>(_ state: SessionState, ids: inout I) -> Transition {
+    let (s1, prefix) = sequenced(state, kind: "integrity-stopped", digest: "marker-bound", ids: &ids)
+    let next = s1.replacing(
+        phase: .failed(.integrityStopped("unresolved marker bound (\(maxUnresolvedOperations)) exceeded")),
+        queueHeld: true, heldReason: .error("integrity stop"))
+    return Transition(
+        state: next,
+        effects: [.emitUI(.denied(cause: "integrity stop: recovery ledger overflowed; explicit operator reset required"))],
+        records: prefix)
+}
+
 public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent, _ ids: inout I) -> Transition {
     // Universal stale-drop for async events mismatching the live run
     // (R1/R3/M1B2-4): runID, requestID, generation, revision AND effect
@@ -192,7 +214,7 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
     case (.admitting, .transportFailed(_, _, let phase, let error, let at)):
         return failAdmissionTransport(state, phase: phase, error: error, atMillis: at, ids: &ids)
     case (.admitting, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
-        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, atMillis: at, ids: &ids)
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.checkpointing, .checkpointCommitted(let newEpoch, let at)):
         return commitCheckpoint(state, newEpoch: newEpoch, atMillis: at, ids: &ids)
     case (.checkpointing, .checkpointFailed(let reason, let at)):
@@ -206,7 +228,7 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
     case (.requesting, .transportFailed(_, _, let phase, let error, let at)):
         return failTransport(state, phase: phase, error: error, atMillis: at, ids: &ids)
     case (.requesting, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
-        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, atMillis: at, ids: &ids)
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.requesting, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.streaming, .providerResponse(_, _, let response, let at)):
@@ -214,13 +236,13 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
     case (.streaming, .transportFailed(_, _, let phase, let error, let at)):
         return failTransport(state, phase: phase, error: error, atMillis: at, ids: &ids)
     case (.streaming, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
-        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, atMillis: at, ids: &ids)
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.streaming, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.validatingTools, .validationCompleted(_, _, let batch, let at)):
         return enterAuthorising(state, batch: batch, atMillis: at, ids: &ids)
     case (.validatingTools, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
-        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, atMillis: at, ids: &ids)
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.validatingTools, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.authorising, .approvalGrant(let requestID, _, _)):
@@ -230,7 +252,7 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
     case (.authorising, .approvalUnavailable(let requestID, _, let reason, let at)):
         return holdForApproval(state, requestID: requestID, reason: reason, atMillis: at, ids: &ids)
     case (.authorising, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
-        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, atMillis: at, ids: &ids)
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.authorising, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.executing, .effectCompleted(let effectID, _, _, _, _, let outcome, _)):
@@ -238,7 +260,7 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
     case (.executing, .effectFailed(let effectID, _, _, _, _, _, _)):
         return failEffect(state, effectID: effectID, ids: &ids)
     case (.executing, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
-        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, atMillis: at, ids: &ids)
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.executing, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.cancelling, .tick(let now)):
@@ -317,6 +339,12 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
         }
         return nil
     case .transportFailed(let requestID, let generation, _, _, _):
+        // S7: a transport confirmation for the cancelled run short-circuits
+        // the grace deadline (matched on runID — generation already bumped).
+        if state.phase == .cancelling,
+           let run = state.activeRun, run.requestID == requestID {
+            return nil
+        }
         guard state.phase == .admitting || state.phase == .requesting || state.phase == .streaming,
               let run = state.activeRun,
               run.requestID == requestID, run.revision == generation
@@ -402,13 +430,15 @@ private func dropRetaining<I: IDSource>(_ state: SessionState, effectID: EffectI
     let ref = OperationRef(
         operationID: ids.nextOperationID(), callID: effectID.raw,
         state: .unknown, mutating: true)
-    var unresolved = state.unresolvedOperations
-    unresolved.append(ref)
+    let (markers, overflow) = appendUnresolved(state.unresolvedOperations, ref)
+    if overflow {
+        return integrityStop(state, ids: &ids)
+    }
     var live = state.liveReservations
     live.removeAll(where: { $0.effectID == effectID })
     let record = DurableRecord.operationResult(ref, outcome: "unknown")
     return Transition(
-        state: bumped(state, unresolved: unresolved, live: live),
+        state: bumped(state, unresolved: markers, live: live),
         effects: [], records: [record])
 }
 
@@ -448,7 +478,7 @@ private func admitFreshRun<I: IDSource>(
     if !state.unresolvedOperations.isEmpty {
         let preHeld = state.replacing(
             queueHeld: true, heldReason: .error("unresolved operations block new runs"))
-        let queued = admitToQueueState(preHeld, commandID: commandID, text: text, kind: kind, atMillis: atMillis, ids: &ids)
+        let queued = admitToQueueState(preHeld, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: atMillis, ids: &ids)
         return Transition(
             state: queued.state,
             effects: queued.effects + [.emitUI(.denied(cause: "blocked: reconcile \(state.unresolvedOperations.count) unknown outcome(s) first"))],
@@ -533,10 +563,12 @@ private func refuseCaps<I: IDSource>(
 
 private func admitToQueueState<I: IDSource>(
     _ state: SessionState, commandID: CommandID, text: String, kind: QueueKind,
-    atMillis: UInt64, ids: inout I
+    sealed: Bool, atMillis: UInt64, ids: inout I
 ) -> Transition {
     _ = atMillis
-    if sealedContext(state) {
+    // S6: the EVENT's sealed flag governs (a sealed submission queued
+    // behind a non-sealed run keeps its own sealing into its own run).
+    if sealed || sealedContext(state) {
         switch validateSealedInput(text) {
         case .deniedToolShape(let why), .deniedPathScope(let why):
             return stepInvalid(state, fingerprint: "sealed-denial", cause: why, atMillis: atMillis, ids: &ids)
@@ -569,7 +601,7 @@ private func admitToQueueState<I: IDSource>(
     let entry = QueueEntry(
         entryID: "q-\(seq.value)", commandID: commandID, kind: kind,
         state: state.queueHeld ? .held : .queued, revision: 1, text: text,
-        targetEpochID: state.epoch.epochID, orderKey: seq.value)
+        targetEpochID: state.epoch.epochID, orderKey: seq.value, sealed: sealed)
     let ack = QueueAck(commandID: commandID, entryID: entry.entryID, sequence: seq, revision: 1, state: entry.state)
     index[commandID] = ack
     let next = state.replacing(
@@ -614,7 +646,7 @@ private func editEntry<I: IDSource>(
     let updated = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: entry.state, revision: entry.revision + 1, text: newText,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey)
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
     queue[position] = updated
     var index = state.admittedCommands
     let priorSequence = index[entry.commandID]?.sequence ?? SequenceNumber(0)
@@ -643,10 +675,18 @@ private func withdrawEntry<I: IDSource>(_ state: SessionState, entryID: String, 
     let tombstone = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .withdrawn, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey)
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
     queue[position] = tombstone
+    // S5: the ack index tracks the tombstone (a retry replays the withdrawn
+    // ack — same entryID/sequence — instead of a stale queued one).
+    var index = state.admittedCommands
+    if let prior = index[entry.commandID] {
+        index[entry.commandID] = QueueAck(
+            commandID: prior.commandID, entryID: prior.entryID,
+            sequence: prior.sequence, revision: prior.revision, state: .withdrawn)
+    }
     let (s1, prefix) = sequenced(state, kind: "queue-withdrawn", digest: eventDigest("withdraw", entryID), ids: &ids)
-    let next = s1.replacing(queue: queue)
+    let next = s1.replacing(queue: queue, admittedCommands: index)
     return Transition(
         state: next,
         effects: [.emitUI(.admitted(commandID: entry.commandID, revision: entry.revision))],
@@ -672,7 +712,7 @@ private func resumeQueue<I: IDSource>(_ state: SessionState, atMillis: UInt64, i
         return QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .queued, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey)
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
     }
     let (s1, prefix) = sequenced(state, kind: "queue-resumed", digest: "resumed", ids: &ids)
     let next = s1.replacing(queue: queue, queueHeld: false, heldReason: .some(nil))
@@ -712,7 +752,7 @@ private func switchModel<I: IDSource>(_ state: SessionState, alias: String, atMi
         queue[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .held, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey)
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
     }
     let (s1, prefix) = sequenced(state, kind: "epoch-opened", digest: eventDigest("epoch", alias), ids: &ids)
     let next = s1.replacing(epoch: epoch, queue: queue, admittedCommands: [:])
@@ -862,7 +902,7 @@ private func finishRunWithQueue<I: IDSource>(
             let dispatched = QueueEntry(
                 entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
                 state: .dispatched, revision: entry.revision, text: entry.text,
-                targetEpochID: entry.targetEpochID, orderKey: entry.orderKey)
+                targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
             queue[position] = dispatched
             let mid = state.replacing(
                 phase: .completed(receiptValue), activeRun: .some(nil), activeRequest: .some(nil),
@@ -895,19 +935,19 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
     let seq = ids.nextSequence()
     let generation = state.generation + 1
     let revision = Revision(generation)
-    let run = RunDescriptor(runID: runID, requestID: requestID, revision: revision, startedAtMillis: atMillis, sealed: false)
+    let run = RunDescriptor(runID: runID, requestID: requestID, revision: revision, startedAtMillis: atMillis, sealed: entry.sealed)
     let reservation = EffectReservation(
         effectID: effectID, runID: runID, requestID: requestID,
         generation: revision, revision: revision, mutating: false)
     let invocation = ProviderInvocation(
         effectID: effectID, requestID: requestID, runID: runID, generation: revision,
-        alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: false,
+        alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: entry.sealed,
         turnsLeft: state.turnLimit, deadlineMillis: atMillis + defaultRunDeadlineMillis,
         historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value)"))
     let history = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .admittedToHistory, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey)
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
     var queue = state.queue
     if let position = queue.firstIndex(where: { $0.entryID == entry.entryID }) {
         queue[position] = history
@@ -1002,9 +1042,13 @@ private func failTransport<I: IDSource>(
     case .ambiguous:
         let (s1, prefix) = sequenced(state, kind: "delivery-unknown", digest: "ambiguous", ids: &ids)
         let ref = OperationRef(operationID: ids.nextOperationID(), state: .unknown, mutating: false)
+        let (markers, overflow) = appendUnresolved(state.unresolvedOperations, ref)
+        if overflow {
+            return integrityStop(s1, ids: &ids)
+        }
         let next = s1.replacing(
             queueHeld: true, heldReason: .error("ambiguous delivery; explicit reconciliation required"),
-            unresolvedOperations: state.unresolvedOperations + [ref])
+            unresolvedOperations: markers)
         var active: ActiveRequest? = nil
         if let request = state.activeRequest {
             active = ActiveRequest(requestID: request.requestID, runID: request.runID, generation: request.generation, delivery: .deliveryUnknown, bytesOut: request.bytesOut)
@@ -1028,9 +1072,13 @@ private func failAdmissionTransport<I: IDSource>(
     case .ambiguous:
         let (s1, prefix) = sequenced(state, kind: "delivery-unknown", digest: "ambiguous", ids: &ids)
         let ref = OperationRef(operationID: ids.nextOperationID(), state: .unknown, mutating: false)
+        let (markers, overflow) = appendUnresolved(state.unresolvedOperations, ref)
+        if overflow {
+            return integrityStop(s1, ids: &ids)
+        }
         let next = s1.replacing(
             queueHeld: true, heldReason: .error("ambiguous delivery; explicit reconciliation required"),
-            unresolvedOperations: state.unresolvedOperations + [ref])
+            unresolvedOperations: markers)
         return Transition(
             state: next,
             effects: [.emitUI(.denied(cause: "ambiguous delivery held for reconciliation"))],
@@ -1164,6 +1212,16 @@ private func continueAfterEffect<I: IDSource>(
 ) -> Transition {
     _ = effectID
     _ = atMillis
+    // S9: a mismatched mutating completion may have left markers while a
+    // run nominally continues — continuation re-checks before dispatching.
+    if !state.unresolvedOperations.isEmpty {
+        let (s1, prefix) = sequenced(state, kind: "continuation-blocked", digest: "markers", ids: &ids)
+        let next = s1.replacing(queueHeld: true, heldReason: .error("unresolved operations block continuation"))
+        return Transition(
+            state: next,
+            effects: [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))],
+            records: prefix)
+    }
     guard state.turnsUsed < state.turnLimit else {
         return failRun(state, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: atMillis, ids: &ids)
     }
@@ -1224,7 +1282,11 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
         let ref = OperationRef(
             operationID: ids.nextOperationID(), callID: reservation.effectID.raw,
             state: .unknown, mutating: true)
-        unresolved.append(ref)
+        let (markers, overflow) = appendUnresolved(unresolved, ref)
+        unresolved = markers
+        if overflow {
+            return integrityStop(state, ids: &ids)
+        }
         records.append(.operationResult(ref, outcome: "unknown"))
     }
     let (s1, prefix) = sequenced(state, kind: "cancelling", digest: "cancel", ids: &ids)
