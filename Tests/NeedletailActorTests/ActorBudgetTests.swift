@@ -49,17 +49,24 @@ struct ActorBudgetTests {
         await actor.tick(at: 1_000_000 + cancelGraceMillis)
         await actor.dismissRun()
         await actor.submitText(commandID: CommandID("c-2"), text: "tools", kind: .followUp, sealed: false)
-        try await ActorFixtures.awaitPhase(actor, { $0.phase == .executing }, "executing via trustedExec")
+        // M1-D: reserveEffect now auto-executes (exactly once per batch via
+        // ScriptedToolBackend/ScriptedExecutor). The `executing` phase is
+        // transient — the executor completes immediately and the loop
+        // re-dispatches. Wait for the post-tool re-request, not the
+        // transient executing.
+        try await ActorFixtures.awaitPhase(actor, { $0.phase == .requesting && $0.turnsUsed == 2 }, "requesting after tool round (auto-executed)")
+        // The transition reaches the requesting phase before the follow-up
+        // provider invocation has necessarily landed; pin it explicitly.
+        for _ in 0..<10_000 where transport.invocations.count < 3 {
+            await Task.yield()
+        }
+        for _ in 0..<500 where transport.invocations.count < 3 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
         state = await actor.currentState()
-        #expect(state.liveReservations.count == 1, "tool batch reserved")
-        // Scripted executor completion continues the loop with a re-request.
-        let effectID = try #require(state.liveReservations.first?.effectID)
-        await actor.completeEffect(effectID, outcome: .success("read ok"))
-        try await ActorFixtures.awaitPhase(actor, { $0.phase == .requesting }, "requesting after tool round")
-        state = await actor.currentState()
-        // Initial dispatch consumed turn 1; the post-tool re-request
-        // consumes turn 2 — every requestProvider dispatch counts.
-        #expect(state.turnsUsed == 2, "turns count dispatches, got \(state.turnsUsed)")
+        // The tool batch was auto-executed (no manual completeEffect needed);
+        // the executor's success is already paired and a new provider
+        // request dispatched.
         #expect(transport.invocations.count == 3, "three provider dispatches total, got \(transport.invocations.count)")
     }
 

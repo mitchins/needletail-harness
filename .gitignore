@@ -20,3 +20,8 @@ ThirdParty/
 # Editor/OS scratch
 *.swp
 *~
+
+# M1-D demo scratch and archived spec packets
+Archive*.zip
+Archive *zip
+demo/__pycache__/

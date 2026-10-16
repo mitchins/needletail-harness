@@ -9,23 +9,56 @@
 /// reservation table (R9). Swift Task cancellation is delivery only:
 /// invalidation is the generation bump. Effect tasks are NEVER awaited
 /// inline — `handle` always returns promptly so `cancel` can interleave.
+public struct RawProviderRecord: Sendable, Equatable {
+    public let requestID: RequestID
+    public let rawBody: [UInt8]
+    public let returnedModel: String?
+    public let usageInput: Int?
+    public let usageOutput: Int?
+
+    public init(requestID: RequestID, rawBody: [UInt8], returnedModel: String? = nil, usageInput: Int? = nil, usageOutput: Int? = nil) {
+        self.requestID = requestID
+        self.rawBody = rawBody
+        self.returnedModel = returnedModel
+        self.usageInput = usageInput
+        self.usageOutput = usageOutput
+    }
+}
+
 public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Store: SessionStore, Approvals: ApprovalGateway, ClockType: Clock, IDs: IDSource> {
     private var state: SessionState
     private var ids: IDs
     private let clock: ClockType
-    private let transport: Transport
+    private var transport: Transport
     private let executor: Executor
     private let store: Store
     private let approvals: Approvals
+    private let sink: any UISink
     /// Reservation table (effectID → reservation), captured pre-await.
     /// An entry is removed when its run is cancelled (after C3 retention
     /// records) or when its completion is first accepted (R3).
     private var reservations: [EffectID: EffectReservation] = [:]
     private var inFlight: Task<Void, Never>?
+    private var deltaDelivery: DeltaDeliveryQueue?
+    private var deltaDeliveryTask: Task<Void, Never>?
+    /// Live deadline timers keyed by purpose + run (M1-D real scheduling).
+    /// Separate from inFlight: the cancel-grace timer must SURVIVE cancel()
+    /// (it implements the grace), while provider/approval flights die.
+    /// Fired-or-cancelled entries are removed; stale fires drop on the
+    /// generation check, so overwrites can never double-dispatch.
+    private var timerTasks: [String: Task<Void, Never>] = [:]
+    /// Session-scoped raw provider ring (M1-D D5, M1C3-4). Bounded by count
+    /// (8) and bytes (16 MiB); evict-oldest on overflow. Native fidelity,
+    /// separate from display output, never logged.
+    private var rawRing: [RawProviderRecord] = []
+    private var rawRingBytes: Int = 0
+    private var rawRingMaxCount: Int { 8 }
+    private var rawRingMaxBytes: Int { 16 * 1024 * 1024 }
 
     public init(
         state: SessionState, ids: IDs, clock: ClockType,
-        transport: Transport, executor: Executor, store: Store, approvals: Approvals
+        transport: Transport, executor: Executor, store: Store, approvals: Approvals,
+        sink: any UISink = NoopUISink()
     ) {
         self.state = state
         self.ids = ids
@@ -34,6 +67,22 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         self.executor = executor
         self.store = store
         self.approvals = approvals
+        self.sink = sink
+    }
+
+    public var rawRecords: [RawProviderRecord] { rawRing }
+
+    private func appendRawRecord(_ record: RawProviderRecord) {
+        rawRing.append(record)
+        rawRingBytes += record.rawBody.count
+        while rawRing.count > rawRingMaxCount || rawRingBytes > rawRingMaxBytes {
+            guard let removed = rawRing.first else { break }
+            rawRingBytes -= removed.rawBody.count
+            rawRing.removeFirst()
+            // Single record larger than the byte cap is kept (already
+            // bounded by SSE stream cap 16 MiB); eviction stops after it.
+            if rawRing.count == 1 && rawRingBytes <= rawRingMaxBytes { break }
+        }
     }
 
     public func currentState() -> SessionState { state }
@@ -151,10 +200,26 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
 
     private func perform(_ effect: Effect) async {
         switch effect {
-        case .reserveEffect:
-            break // Recorded above; no I/O. Dispatch happens in later effects.
-        case .emitUI:
-            break // M1-B: projections terminate here (M1-D wires JSONL/CLI sinks).
+        case .reserveEffect(let reservation):
+            // Recorded above (no I/O). A NON-EMPTY batch is a dispatchable
+            // tool batch (M1-D): exactly one executor call under the
+            // generation/revision check, paired through completeEffect /
+            // failEffect. Empty-batch reservations (provider retries) stay
+            // record-only. The executing phase admits no transport flight,
+            // so the inFlight slot is free here — and cancelRequested drops
+            // whichever action is live through the same slot.
+            guard !reservation.batch.proposals.isEmpty else { break }
+            guard reservations[reservation.effectID] != nil else { return }
+            inFlight?.cancel()
+            inFlight = Task {
+                await self.invokeExecutor(reservation: reservation)
+            }
+        case .emitUI(let projection):
+            do {
+                try await sink.emit(projection)
+            } catch {
+                await handleSinkError(error)
+            }
         case .requestProvider(let invocation):
             guard reservations[invocation.effectID] != nil else { return }
             // Pinned order (M1B3-3): requestDispatched applies when the
@@ -173,25 +238,98 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             }
         case .cancelInFlight:
             inFlight?.cancel()
-        case .startTimer, .cancelTimer:
-            break // M1-B: deadlines evaluate on stamped ticks (scripted in tests; M1-D wires timers).
+        case .startTimer(let deadlineMillis, let purpose, let runID):
+            scheduleTimer(deadlineMillis: deadlineMillis, purpose: purpose, runID: runID)
+        case .cancelTimer(let purpose, let runID):
+            cancelTimer(purpose: purpose, runID: runID)
         }
+    }
+
+    /// Display deltas (D4) leave the actor as fire-and-forget tasks so the
+    /// NIO delegate never blocks. A sink failure must still be observed by
+    /// the session — never swallowed — so the SAME recovery path used for
+    /// authoritative projections applies.
+    private func emitDeltaProjection(_ projection: SessionEventProjection) async {
+        do {
+            try await sink.emit(projection)
+        } catch {
+            await handleSinkError(error)
+        }
+    }
+
+    /// Closed consumer → cancel the run (§12.2 exit 130). Bounded overflow
+    /// or any underlying sink failure → honest integrity stop; display
+    /// deltas are hints and must never silently replace authoritative events.
+    private func handleSinkError(_ error: Error) async {
+        if case UISinkError.brokenPipe = error {
+            await apply(.cancelRequested(atMillis: clock.nowMillis()))
+            inFlight?.cancel()
+            return
+        }
+        state = state.replacing(phase: .failed(.integrityStopped("sink emit failed: \(error)")))
     }
 
     private func invokeTransport(invocation: ProviderInvocation, reservation: EffectReservation) async {
         let intake = BoundedChannelState<ProviderResponse>(itemCap: 512, byteCap: 4 << 20)
+        // Wire incremental deltas through a single bounded delivery queue
+        // (H1): ordered by arrival, one consumer emits through the sink,
+        // overflow is an honest UISinkError rather than unbounded tasks.
+        let deliveryQueue = DeltaDeliveryQueue(
+            itemCap: 512, byteCap: 4 << 20, onDeliver: { item in
+                await self.emitDeltaProjection(.delta(requestID: item.outcome, text: item.text))
+            })
+        deltaDelivery = deliveryQueue
+        deltaDeliveryTask = Task { @Sendable in
+            await deliveryQueue.run()
+        }
+        var activeTransport: Transport = transport
+        if var deltaTransport = transport as? any DeltaStreamingTransport {
+            let requestID = invocation.requestID
+            deltaTransport.deltaSink = { text in
+                switch deliveryQueue.enqueue(DeltaDeliveryQueue.Item(requestID: requestID, text: text)) {
+                case .overflow(let itemCount, let byteCount):
+                    deliveryQueue.finish()
+                    Task { await self.handleSinkError(UISinkError.overflow(itemCount: itemCount, byteCount: byteCount)) }
+                case .accepted:
+                    break
+                }
+            }
+            if let cast = deltaTransport as? Transport {
+                activeTransport = cast
+            }
+        }
         do {
-            let result = try await transport.invoke(invocation, intake: intake)
+            let result = try await activeTransport.invoke(invocation, intake: intake)
+            // Raw ring (D5): bounded, native-fidelity, separate from display
+            if let raw = result.rawBody {
+                appendRawRecord(RawProviderRecord(
+                    requestID: invocation.requestID, rawBody: raw,
+                    returnedModel: result.response.returnedModel,
+                    usageInput: result.response.usageInput,
+                    usageOutput: result.response.usageOutput))
+            }
+            deliveryQueue.finish()
+            await deltaDeliveryTask?.value
+            deltaDelivery = nil
             await pairTransportResult(result, reservation: reservation)
         } catch is CancellationError {
+            deliveryQueue.finish()
+            await deltaDeliveryTask?.value
+            deltaDelivery = nil
             return // Generation invalidation already dropped this run; nothing to pair.
         } catch let failure as TransportFailure {
+            deliveryQueue.finish()
+            await deltaDeliveryTask?.value
+            deltaDelivery = nil
             // Classified at the failure site by the adapter (R2); the
             // transition policy stays the sole retry authority.
             await apply(.transportFailed(
                 requestID: invocation.requestID, generation: invocation.generation,
                 phase: failure.phase, error: failure.message, atMillis: clock.nowMillis()))
         } catch {
+            deliveryQueue.finish()
+            await deltaDeliveryTask?.value
+            deltaDelivery = nil
             await apply(.transportFailed(
                 requestID: invocation.requestID, generation: invocation.generation,
                 phase: .ambiguous, error: String(describing: error), atMillis: clock.nowMillis()))
@@ -212,10 +350,72 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             response: result.response, atMillis: clock.nowMillis()))
     }
 
+    private func timerKey(purpose: String, runID: RunID) -> String {
+        "\(purpose)#\(runID.raw)"
+    }
+
+    /// Real deadline scheduling (M1-D): sleeps until the deadline, then
+    /// applies a stamped tick ONLY if the same run generation is still
+    /// active (stale fires drop — overwrites and completions can never
+    /// double-dispatch; deadline evaluation itself stays in the pure
+    /// transition via checkDeadline). Virtual-clock tests see real-time
+    /// delays derived from frozen stamps; the tick is stamped at the
+    /// DEADLINE (not the frozen now) so the deadline check `now >= deadline`
+    /// actually fires. Explicit tick(at:) tests remain deterministic because
+    /// deadline consumption is state-idempotent.
+    private func scheduleTimer(deadlineMillis: UInt64, purpose: String, runID: RunID) {
+        let key = timerKey(purpose: purpose, runID: runID)
+        timerTasks[key]?.cancel()
+        let generation = state.activeRun?.revision
+        // Cap the sleep: far-future deadlines must not overflow the
+        // nanosecond conversion, and a stale task must not sleep forever.
+        let now = clock.nowMillis()
+        let delayMillis = min(deadlineMillis > now ? deadlineMillis - now : 0, 3_600_000)
+        timerTasks[key] = Task {
+            try? await Task.sleep(nanoseconds: delayMillis * 1_000_000)
+            guard !Task.isCancelled else { return }
+            let current = await self.currentGeneration(runID: runID)
+            guard !Task.isCancelled, current == generation else { return }
+            await self.applyTick(at: deadlineMillis)
+        }
+    }
+
+    private func cancelTimer(purpose: String, runID: RunID) {
+        let key = timerKey(purpose: purpose, runID: runID)
+        timerTasks[key]?.cancel()
+        timerTasks.removeValue(forKey: key)
+    }
+
+    private func currentGeneration(runID: RunID) -> Revision? {
+        guard let run = state.activeRun, run.runID == runID else { return nil }
+        return run.revision
+    }
+
+    private func applyTick(at millis: UInt64? = nil) async {
+        let now = millis.map { max(clock.nowMillis(), $0) } ?? clock.nowMillis()
+        await apply(.tick(nowMillis: now))
+    }
+
+    /// Production executor dispatch (M1-D): exactly one `execute` call per
+    /// batch reservation. Generation/revision pairing happens in
+    /// completeEffect/failEffect (stale outcomes drop); CancellationError
+    /// drops silently (cancelRequested already invalidated the run).
+    private func invokeExecutor(reservation: EffectReservation) async {
+        do {
+            let result = try await executor.execute(batch: reservation.batch, reservation: reservation)
+            await self.completeEffect(reservation.effectID, outcome: .success(result.receipt.summary))
+        } catch is CancellationError {
+            return
+        } catch {
+            await self.failEffect(reservation.effectID, error: String(describing: error))
+        }
+    }
+
     /// Executor completion entry point. M1-B tests pair explicitly (calling
     /// this directly) to control cancel-vs-completion orderings
-    /// deterministically; scripted fakes never auto-complete. M2 wires real
-    /// execution through the same entry point.
+    /// deterministically; scripted fakes never auto-complete. M1-D wires
+    /// production execution through `invokeExecutor` above, pairing through
+    /// this same entry point.
     public func completeEffect(_ effectID: EffectID, outcome: EffectOutcome) async {
         guard let reservation = reservations[effectID] else { return }
         await apply(.effectCompleted(

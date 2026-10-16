@@ -66,9 +66,17 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
     /// instead of classifying the echo.
     private var deadlineVerdict: TransportFailure?
     var lastActivity: NIODeadline
+    /// Incremental streaming (M1-D D4): rolling buffer for SSE decoder
+    /// state across arbitrary chunk boundaries. `deltaOffset` marks the
+    /// start of the next undecoded event; `deltaSink` is called
+    /// synchronously from the NIO thread for each complete `content`
+    /// delta (text only, tool proposals stay atomic at finish).
+    private var deltaOffset: Int = 0
+    var deltaSink: (@Sendable (String) -> Void)?
 
-    init(now: NIODeadline) {
+    init(now: NIODeadline, deltaSink: (@Sendable (String) -> Void)? = nil) {
         self.lastActivity = now
+        self.deltaSink = deltaSink
     }
 
     private func headerValue(_ name: String) -> String? {
@@ -108,6 +116,7 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
     }
 
     func didReceiveBodyPart(task: HTTPClient.Task<Response>, _ buffer: ByteBuffer) -> EventLoopFuture<Void> {
+        var deltasToEmit: [String] = []
         lock.withLock {
             lastActivity = .now()
             var chunk = buffer
@@ -128,9 +137,81 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
                     return
                 }
                 body.append(contentsOf: bytes)
+                // Incremental SSE decode: scan for complete events
+                // (blank line = \n\n) and extract text deltas via the
+                // PRODUCTION JSON shape, preserving decoder state across
+                // arbitrary chunk boundaries.
+                if deltaSink != nil {
+                    deltasToEmit = extractNewDeltasLocked()
+                }
+            }
+        }
+        // Emit outside the lock (sink is thread-safe, may do file I/O).
+        // Deltas are hints only; final assembly remains authoritative.
+        if let sink = deltaSink {
+            for text in deltasToEmit where !text.isEmpty {
+                sink(text)
             }
         }
         return task.eventLoop.makeSucceededVoidFuture()
+    }
+
+    /// Scans `body[deltaOffset...]` for complete SSE events (delimited by
+    /// `\n\n`), parses each event's `data:` JSON, and returns any
+    /// `content` deltas. Malformed events emit nothing (final assembly
+    /// still fails closed). Must be called with lock held; advances
+    /// `deltaOffset` past decoded events only.
+    private func extractNewDeltasLocked() -> [String] {
+        var deltas: [String] = []
+        while deltaOffset < body.count {
+            // Find next "\n\n" delimiter from deltaOffset
+            var found: Int? = nil
+            for i in deltaOffset..<(body.count - 1) {
+                if body[i] == 0x0A && body[i + 1] == 0x0A {
+                    found = i
+                    break
+                }
+                // Also handle "\r\n\r\n" (0x0D 0x0A 0x0D 0x0A)
+                if i + 3 < body.count,
+                   body[i] == 0x0D, body[i + 1] == 0x0A,
+                   body[i + 2] == 0x0D, body[i + 3] == 0x0A {
+                    found = i
+                    break
+                }
+            }
+            guard let delimiter = found else { break }
+            let isCRLF = body[delimiter] == 0x0D
+            let eventEnd = delimiter + (isCRLF ? 4 : 2)
+            let eventBytes = Array(body[deltaOffset..<delimiter])
+            deltaOffset = eventEnd
+            guard let eventString = String(bytes: eventBytes, encoding: .utf8),
+                  !eventString.isEmpty else { continue }
+            // Collect "data:" lines (SSE spec: each event may have multiple)
+            var dataPayload = ""
+            var hasData = false
+            for line in eventString.split(separator: "\n", omittingEmptySubsequences: false) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("data:") {
+                    hasData = true
+                    let after = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                    if !dataPayload.isEmpty { dataPayload += "\n" }
+                    dataPayload += after
+                } else if trimmed == "data" {
+                    hasData = true
+                }
+            }
+            guard hasData, !dataPayload.isEmpty, dataPayload != "[DONE]" else { continue }
+            guard let jsonData = dataPayload.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let choices = object["choices"] as? [[String: Any]],
+                  let first = choices.first,
+                  let delta = first["delta"] as? [String: Any],
+                  let content = delta["content"] as? String, !content.isEmpty
+            else { continue }
+            // Terminal-safe already, but ensure no control bytes leak
+            deltas.append(terminalSafe(content))
+        }
+        return deltas
     }
 
     func didReceiveError(task: HTTPClient.Task<Response>, _ error: Error) {}
@@ -213,25 +294,31 @@ public struct ChatRequestOverride: Sendable, Equatable {
 /// message/credential/snapshot suppliers. Session wiring (M1-D) replaces
 /// the suppliers — never the transport. Conforms to ModelTransport so the
 /// production actor drives it; tests inject scripted suppliers.
-public struct ChatCompletionsTransport: ModelTransport, Sendable {
+public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
     public var client: HTTPClient
-    public var messageProvider: @Sendable (ProviderInvocation) async -> [ChatMessage]
+    public var messageProvider: @Sendable (ProviderInvocation) async throws -> [ChatMessage]
     public var credentialProvider: @Sendable (CredentialReference, String) async throws -> String?
     public var snapshotProvider: @Sendable () -> ConfigSnapshot
     public var requestOverride: ChatRequestOverride?
+    /// Incremental streaming sink (M1-D D4): called synchronously from the
+    /// NIO delegate for each `content` delta before final assembly.
+    /// Actor wires it to `UISink.emit(.delta)`; tests inject InMemory sink.
+    public var deltaSink: (@Sendable (String) -> Void)?
 
     public init(
         client: HTTPClient,
-        messageProvider: @Sendable @escaping (ProviderInvocation) async -> [ChatMessage],
+        messageProvider: @Sendable @escaping (ProviderInvocation) async throws -> [ChatMessage],
         credentialProvider: @Sendable @escaping (CredentialReference, String) async throws -> String?,
         snapshotProvider: @Sendable @escaping () -> ConfigSnapshot,
-        requestOverride: ChatRequestOverride? = nil
+        requestOverride: ChatRequestOverride? = nil,
+        deltaSink: (@Sendable (String) -> Void)? = nil
     ) {
         self.client = client
         self.messageProvider = messageProvider
         self.credentialProvider = credentialProvider
         self.snapshotProvider = snapshotProvider
         self.requestOverride = requestOverride
+        self.deltaSink = deltaSink
     }
 
     public func invoke(_ invocation: ProviderInvocation, intake: BoundedChannelState<ProviderResponse>) async throws -> TransportResult {
@@ -239,7 +326,12 @@ public struct ChatCompletionsTransport: ModelTransport, Sendable {
         // Every failure below this line is pre-dial (nothing sent), so every
         // one classifies preSend HERE — the actor must never see an
         // ambiguous verdict for a request that never left the process.
-        let messages = await messageProvider(invocation)
+        let messages: [ChatMessage]
+        do {
+            messages = try await messageProvider(invocation)
+        } catch {
+            throw TransportFailure(phase: .preSend, message: "transcript paging failed: \(error)")
+        }
         guard !messages.isEmpty else {
             throw TransportFailure(phase: .preSend, message: ChatTransportError.emptyMessages.description)
         }
@@ -276,7 +368,7 @@ public struct ChatCompletionsTransport: ModelTransport, Sendable {
         }
         let started = NIODeadline.now()
         let wholeDeadline = started + .seconds(Int64(profile.requestTimeout))
-        let delegate = BoundedStreamDelegate(now: started)
+        let delegate = BoundedStreamDelegate(now: started, deltaSink: deltaSink)
         // Legacy request type: delegate-based execute only accepts
         // HTTPClient.Request (the new HTTPClientRequest has no delegate
         // overload in AsyncHTTPClient 1.36).
@@ -432,7 +524,7 @@ public struct ChatCompletionsTransport: ModelTransport, Sendable {
         // (M1-B-frozen shape); the `modelMismatch` case names the condition
         // for future session records. No separate signal at this layer.
         let response = providerResponseForTurn(turn, requestID: invocation.requestID, generation: invocation.generation)
-        return TransportResult(response: response)
+        return TransportResult(response: response, rawBody: collected.body)
     }
 
     /// Decodes bounded wire bytes through the production SSE parser.

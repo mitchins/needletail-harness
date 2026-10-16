@@ -87,6 +87,8 @@ let package = Package(
                 "NeedletailRuntime",
                 "NeedletailProviders",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "NIOCore", package: "swift-nio"),
             ]
         ),
         .testTarget(

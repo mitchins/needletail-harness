@@ -78,17 +78,22 @@ public enum ProviderOutcome: Sendable, Equatable {
 }
 
 /// Validated-shape tool proposal. Field names/types only — a proposal is
-/// DATA (never an effect) until authorising + approval + reservation (M2
-/// executes; M1-B records the intent).
+/// DATA (never an effect) until authorising + approval + reservation.
+/// `arguments` carries the VERBATIM native arguments for the executor
+/// (M1-D scripted backend reads this — digests must never feed execution);
+/// `argumentsDigest` stays for secret-safe records and logs. Defaulted so
+/// every pre-M1-D construction site keeps compiling.
 public struct ToolProposal: Sendable, Equatable {
     public let callID: String
     public let tool: String
     public let argumentsDigest: String
+    public let arguments: String?
 
-    public init(callID: String, tool: String, argumentsDigest: String) {
+    public init(callID: String, tool: String, argumentsDigest: String, arguments: String? = nil) {
         self.callID = callID
         self.tool = tool
         self.argumentsDigest = argumentsDigest
+        self.arguments = arguments
     }
 }
 
@@ -114,10 +119,14 @@ public enum RunOutcome: Sendable, Equatable {
 public struct SessionEventProjection: Sendable, Equatable {
     public let kind: String
     public let detail: String
+    /// Structured terminal outcome for `run_finished` envelopes (optional;
+    /// other kinds leave it `nil`).
+    public let outcome: String?
 
-    internal init(kind: String, detail: String) {
+    internal init(kind: String, detail: String, outcome: String? = nil) {
         self.kind = kind
         self.detail = detail
+        self.outcome = outcome
     }
 
     public static func admitted(commandID: CommandID, revision: UInt64) -> SessionEventProjection {
@@ -137,5 +146,17 @@ public struct SessionEventProjection: Sendable, Equatable {
     /// malformed payloads instead of crashing.
     public static func agent(alias: String, locality: String, phase: String) -> SessionEventProjection {
         SessionEventProjection(kind: "agent", detail: "\(alias)\n\(locality)\n\(phase)")
+    }
+
+    /// Incremental streaming delta (M1-D): the provider produced `text`
+    /// for `requestID` before final completion. Display-hint only (never
+    /// state); terminalSafe preserved. Kind is "delta" per envelope spec.
+    public static func delta(requestID: RequestID, text: String) -> SessionEventProjection {
+        SessionEventProjection(kind: "delta", detail: "\(requestID.raw)\n\(terminalSafe(text))")
+    }
+
+    /// Terminal `run_finished` envelope payload carrier (M1-D JSONL).
+    public static func runFinished(outcome: String, detail: String) -> SessionEventProjection {
+        SessionEventProjection(kind: "run_finished", detail: terminalSafe(detail), outcome: outcome)
     }
 }

@@ -84,7 +84,13 @@ public struct EffectReservation: Sendable, Equatable {
 /// a resumed value can never stamp itself current.
 public struct TransportResult: Sendable, Equatable {
     public let response: ProviderResponse
-    public init(response: ProviderResponse) { self.response = response }
+    /// Bounded verbatim wire bytes (M1-D raw ring, M1C3-4). Nil for fakes;
+    /// real transports set the collected body (already bounded at 16 MiB).
+    public let rawBody: [UInt8]?
+    public init(response: ProviderResponse, rawBody: [UInt8]? = nil) {
+        self.response = response
+        self.rawBody = rawBody
+    }
 }
 
 public struct ExecutorReceipt: Sendable, Equatable {
@@ -106,6 +112,14 @@ public struct ExecutorResult: Sendable, Equatable {
 public protocol ModelTransport: Sendable {
     /// Intake is a BoundedChannel, never an unbounded AsyncStream (R6).
     func invoke(_ invocation: ProviderInvocation, intake: BoundedChannelState<ProviderResponse>) async throws -> TransportResult
+}
+
+/// Optional incremental streaming (M1-D D4): transports that can emit
+/// `content` deltas before final assembly expose a sink. The actor wires
+/// it to the JSONL `UISink`; the delegate preserves SSE decoder state
+/// across arbitrary chunk boundaries. Default nil → single-shot.
+public protocol DeltaStreamingTransport: ModelTransport {
+    var deltaSink: (@Sendable (String) -> Void)? { get set }
 }
 
 public protocol ToolExecutor: Sendable {
@@ -276,8 +290,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.executing, .effectCompleted(let effectID, _, _, _, _, let outcome, _)):
         return completeEffect(state, effectID: effectID, outcome: outcome, ids: &ids)
-    case (.executing, .effectFailed(let effectID, _, _, _, _, _, _)):
-        return failEffect(state, effectID: effectID, ids: &ids)
+    case (.executing, .effectFailed(let effectID, _, _, _, _, let error, _)):
+        return failEffect(state, effectID: effectID, error: error, ids: &ids)
     case (.executing, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.executing, .cancelRequested(let at)):
@@ -565,6 +579,8 @@ private func admitFreshRun<I: IDSource>(
         records: [
             .eventAppended(seq: seq, kind: "run-admitted", digest: eventDigest("admit", commandID.raw)),
             .operationIntent(OperationRef(operationID: ids.nextOperationID(), state: .intent, mutating: false)),
+            // The dispatched operator text opens the transcript (D1).
+            .transcriptAppended(.user(text)),
         ])
 }
 
@@ -862,7 +878,19 @@ private func handleProviderResponse<I: IDSource>(
     _ = atMillis
     switch response.outcome {
     case .textDeltaComplete(let text, let proposals, let isFinal):
-        _ = text
+        // Transcript (D1): assistant text and verbatim tool calls join the
+        // ordered conversation. Nil arguments only occur on scripted/fake
+        // proposals (production assembly always fills them); "" keeps the
+        // transcript consistent with the batch the run actually validates.
+        var transcript: [DurableRecord] = []
+        if !text.isEmpty {
+            transcript.append(.transcriptAppended(.assistantText(text)))
+        }
+        for proposal in proposals {
+            transcript.append(.transcriptAppended(.toolCall(NativeToolCall(
+                callID: proposal.callID, tool: proposal.tool,
+                arguments: proposal.arguments ?? ""))))
+        }
         if !proposals.isEmpty {
             let (s1, prefix) = sequenced(state, kind: "validating", digest: eventDigest("proposals", "\(proposals.count)"), ids: &ids)
             let batch = ToolBatch(proposals)
@@ -877,13 +905,16 @@ private func handleProviderResponse<I: IDSource>(
                 live.removeAll(where: { $0.requestID == run.requestID && !$0.mutating })
             }
             let next = s1.replacing(phase: .validatingTools, consumedEffects: consumed, pendingBatch: .some(batch), liveReservations: live)
-            return Transition(state: next, effects: [], records: prefix)
+            return Transition(state: next, effects: [], records: prefix + transcript)
         }
         if isFinal {
-            return finishRunWithQueue(state, receipt: { run, at in RunReceipt(runID: run.runID, completedAtMillis: at, turnsUsed: state.turnsUsed, toolCallCount: 0) }, atMillis: atMillis, ids: &ids)
+            let finished = finishRunWithQueue(state, receipt: { run, at in RunReceipt(runID: run.runID, completedAtMillis: at, turnsUsed: state.turnsUsed, toolCallCount: 0) }, atMillis: atMillis, ids: &ids)
+            return Transition(
+                state: finished.state, effects: finished.effects,
+                records: transcript + finished.records)
         }
         let (s1, prefix) = sequenced(state, kind: "requesting", digest: "interim", ids: &ids)
-        return Transition(state: s1.replacing(phase: .requesting), effects: [], records: prefix)
+        return Transition(state: s1.replacing(phase: .requesting), effects: [], records: prefix + transcript)
     case .failed(let error):
         return failRun(state, failure: .providerError(terminalSafe(error)), hold: true, atMillis: atMillis, ids: &ids)
     case .interrupted:
@@ -989,6 +1020,8 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
             .eventAppended(seq: seq, kind: "run-admitted", digest: eventDigest("admit", entry.commandID.raw)),
             .operationIntent(OperationRef(operationID: ids.nextOperationID(), state: .intent, mutating: false)),
             .queueUpdated(history),
+            // The dispatched queued text opens the transcript (D1).
+            .transcriptAppended(.user(entry.text)),
         ])
 }
 
@@ -1047,7 +1080,9 @@ private func failTransport<I: IDSource>(
             effects: [.startTimer(deadlineMillis: deadline, purpose: "retry-backoff", runID: run.runID)],
             records: prefix)
     case .postContent:
-        return interruptRun(state, note: "provider stream interrupted: \(terminalSafe(error)) (partial evidence kept; never merged)", atMillis: atMillis, ids: &ids)
+        // Bytes demonstrably flowed: this is a provider/protocol failure
+        // (SPEC §12.2 exit 4), not an operator cancellation (130).
+        return failRun(state, failure: .providerError("provider stream failed: \(terminalSafe(error))"), hold: true, atMillis: atMillis, ids: &ids)
     case .ambiguous:
         let (s1, prefix) = sequenced(state, kind: "delivery-unknown", digest: "ambiguous", ids: &ids)
         let ref = OperationRef(operationID: ids.nextOperationID(), state: .unknown, mutating: false)
@@ -1097,7 +1132,10 @@ private func failAdmissionTransport<I: IDSource>(
 
 // MARK: Authorising
 
-private func toolAllowed(_ tool: String, caps: ToolCapabilities) -> Bool {
+/// Single capability rule shared by the transition authoriser and the
+/// M1-D scripted executor (one definition — the backend enforces the same
+/// grants the transition checked, defense in depth, never a second table).
+public func toolAllowed(_ tool: String, caps: ToolCapabilities) -> Bool {
     switch tool {
     case "read": return caps.read
     case "search": return caps.search
@@ -1130,11 +1168,41 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
     if !denied.isEmpty {
         let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("denied-tools", denied.joined(separator: ",")), ids: &ids)
         let ref = OperationRef(operationID: ids.nextOperationID(), state: .done, mutating: false)
-        let next = s1.replacing(phase: .requesting, pendingBatch: .some(nil))
+        guard let run = s1.activeRun else {
+            return failRun(state, failure: .providerError("tool denial without a run"), hold: true, atMillis: atMillis, ids: &ids)
+        }
+        guard s1.turnsUsed < s1.turnLimit else {
+            return failRun(state, failure: .budgetExhausted("turn budget exhausted after denied tools"), hold: true, atMillis: atMillis, ids: &ids)
+        }
+        let nextEffectID = ids.nextEffectID()
+        let seq = ids.nextSequence()
+        let reservation = EffectReservation(
+            effectID: nextEffectID, runID: run.runID, requestID: run.requestID,
+            generation: run.revision, revision: run.revision, mutating: false)
+        let invocation = ProviderInvocation(
+            effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
+            alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,
+            turnsLeft: state.turnLimit - s1.turnsUsed, deadlineMillis: state.runDeadlineMillis,
+            historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):denied"))
+        let next = s1.replacing(
+            phase: .requesting, activeRequest: .some(nil),
+            turnsUsed: s1.turnsUsed + 1, pendingBatch: .some(nil),
+            liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+        // The denial joins the transcript as tool responses: without it the
+        // model re-proposes the same tools forever. Never executed, never
+        // silently dropped (I05).
+        let denial = "tools denied by effective capabilities: \(denied.joined(separator: ", "))"
+        let responses = batch.proposals.map {
+            DurableRecord.transcriptAppended(.toolResponse(callID: $0.callID, text: "denied: \(denial)"))
+        }
         return Transition(
             state: next,
-            effects: [.emitUI(.denied(cause: "tools denied by effective capabilities: \(denied.joined(separator: ", "))"))],
-            records: prefix + [.operationResult(ref, outcome: "denied")])
+            effects: [
+                .reserveEffect(reservation),
+                .requestProvider(invocation: invocation),
+                .emitUI(.denied(cause: denial)),
+            ],
+            records: prefix + [.operationResult(ref, outcome: "denied")] + responses)
     }
     if batch.proposals.isEmpty {
         let (s1, prefix) = sequenced(state, kind: "requesting", digest: "empty-batch", ids: &ids)
@@ -1256,13 +1324,19 @@ private func continueAfterEffect<I: IDSource>(
     let next = s1.replacing(
         phase: .requesting, consumedEffects: consumed,
         turnsUsed: state.turnsUsed + 1, liveReservations: live, lastSequence: seq.value)
+    // Each proposal in the completed batch gets its tool response carrying
+    // the receipt text — pairing is callID-keyed, so multi-call batches
+    // stay exact. Stale completions (reservation gone) record nothing.
+    let responses = (state.liveReservations.first(where: { $0.effectID == effectID })?.batch.proposals ?? []).map {
+        DurableRecord.transcriptAppended(.toolResponse(callID: $0.callID, text: receipt))
+    }
     return Transition(
         state: next,
         effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
         records: prefix + [
             .eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw)),
             .operationResult(ref, outcome: receipt),
-        ])
+        ] + responses)
 }
 
 private func completeEffect<I: IDSource>(
@@ -1276,8 +1350,10 @@ private func completeEffect<I: IDSource>(
     }
 }
 
-private func failEffect<I: IDSource>(_ state: SessionState, effectID: EffectID, ids: inout I) -> Transition {
-    continueAfterEffect(state, effectID: effectID, receipt: "executor-failure", atMillis: 0, ids: &ids)
+private func failEffect<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, ids: inout I) -> Transition {
+    // The carried error text reaches the transcript (tool-failure receipt)
+    // so the model sees WHAT failed — a fixed string would blind the loop.
+    continueAfterEffect(state, effectID: effectID, receipt: "tool-failure: \(terminalSafe(error))", atMillis: 0, ids: &ids)
 }
 
 // MARK: Cancellation (C3: retention BEFORE invalidation)

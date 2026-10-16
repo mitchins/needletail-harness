@@ -1,0 +1,236 @@
+probe: p11-transcript-bypass
+command: swift test --filter TranscriptEmissionTests
+exit: 1
+seconds: 18.20
+output (retained, not summarized):
+Building for debugging...
+[Computing dependencies]
+[Using on-disk description]
+[3 / 6] NeedletailCore
+[7 / 8] NeedletailCore
+[9 / 81] _AtomicsShims
+[9 / 76] NIOHTTP1
+[21 / 67] NeedletailRuntime-product
+[21 / 67] NeedletailProviders
+[43 / 83] NeedletailStateTests-test-runner
+[47 / 87] NeedletailActorTests-test-runner
+[64 / 93] NeedletailStateTests-test-runner
+[71 / 94] NeedletailProviders
+[78 / 100] NeedletailPresentationTests-test-runner
+[88 / 102] NeedletailPresentationTests-test-runner
+[89 / 103] NeedletailPrimitiveTests-product
+[91 / 104] NeedletailPrimitiveTests-test-runner
+[95 / 110] NeedletailProviderIntegrationTests-product
+[101 / 115] NeedletailConfigIntegrationTests-test-runner
+[102 / 115] NeedletailPrimitiveTests-test-runner
+[103 / 115] NeedletailPrimitiveTests-test-runner
+[108 / 120] NeedletailProviderTests-test-runner
+[111 / 120] NeedletailProviderTests-test-runner
+[113 / 119] NeedletailConfigIntegrationTests-test-runner
+[113 / 119] NeedletailProviderTests-test-runner
+[113 / 119] NeedletailPrimitiveTests-test-runner
+[122 / 127] NeedletailConfigTests-test-runner
+[122 / 127] NeedletailProviderIntegrationTests-test-runner
+[127 / 130] NeedletailPresentationTests-test-runner
+[132 / 132] NeedletailConfigIntegrationTests-test-runner
+[132 / 132]
+[132 / 132] NeedletailPresentationTests-test-runner
+[132 / 132] NeedletailActorTests-test-runner
+[132 / 132] NeedletailConfigIntegrationTests-test-runner
+Build complete! (14.28 secs)
+◇ Test run started.
+↳ Testing Library Version: 6.4 (efd8d65801f569d)
+↳ Target Platform: x86_64-unknown-linux-gnu
+◇ Suite TranscriptEmissionTests started.
+◇ Test "full text-plus-tool turn emits the ordered transcript" started.
+◇ Test "denied proposals join the transcript as refusals" started.
+✔ Test "denied proposals join the transcript as refusals" passed after 0.007 seconds.
+✘ Test "full text-plus-tool turn emits the ordered transcript" recorded an issue at TranscriptEmissionTests.swift:61:9: Expectation failed: messages.count == 3
+↳ user + assistant-with-call + tool response: [NeedletailCore.ChatMessage(role: NeedletailCore.ChatRole.assistant, text: "reading now", toolCalls: Optional([NeedletailCore.NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]), toolCallID: nil), NeedletailCore.ChatMessage(role: NeedletailCore.ChatRole.tool, text: "file-bytes", toolCalls: nil, toolCallID: Optional("c1"))]
+↳ messages.count == 3 → false
+↳   messages.count → 2
+✘ Test "full text-plus-tool turn emits the ordered transcript" recorded an issue at TranscriptEmissionTests.swift:62:9: Expectation failed: messages[0] == ChatMessage(role: .user, text: "read the file")
+↳ messages[0] == ChatMessage(role: .user, text: "read the file") → false
+↳   messages[0] → ChatMessage(role: NeedletailCore.ChatRole.assistant, text: "reading now", toolCalls: Optional([NeedletailCore.NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]), toolCallID: nil)
+↳     role → .assistant
+↳     text → "reading now"
+↳     toolCalls → [NeedletailCore.NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]
+↳       some → [NeedletailCore.NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]
+↳     toolCallID → nil
+↳   ChatMessage(role: .user, text: "read the file") → ChatMessage(role: NeedletailCore.ChatRole.user, text: "read the file", toolCalls: nil, toolCallID: nil)
+↳     role → .user
+↳     text → "read the file"
+↳     toolCalls → nil
+↳     toolCallID → nil
+✘ Test "full text-plus-tool turn emits the ordered transcript" recorded an issue at TranscriptEmissionTests.swift:63:9: Expectation failed: messages[1] == ChatMessage(
+            role: .assistant, text: "reading now",
+            toolCalls: [NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")])
+↳ messages[1] == ChatMessage(
+              role: .assistant, text: "reading now",
+              toolCalls: [NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]) → false
+↳   messages[1] → ChatMessage(role: NeedletailCore.ChatRole.tool, text: "file-bytes", toolCalls: nil, toolCallID: Optional("c1"))
+↳     role → .tool
+↳     text → "file-bytes"
+↳     toolCalls → nil
+↳     toolCallID → "c1"
+↳       some → "c1"
+↳   ChatMessage(
+                role: .assistant, text: "reading now",
+                toolCalls: [NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]) → ChatMessage(role: NeedletailCore.ChatRole.assistant, text: "reading now", toolCalls: Optional([NeedletailCore.NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]), toolCallID: nil)
+↳     role → .assistant
+↳     text → "reading now"
+↳     toolCalls → [NeedletailCore.NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]
+↳       some → [NeedletailCore.NativeToolCall(callID: "c1", tool: "read", arguments: "{\"path\":\"f\"}")]
+↳     toolCallID → nil
+Swift/ContiguousArrayBuffer.swift:695: Fatal error: Index out of range
+
+*** Signal 4: Backtracing from 0x7612489731ef... done ***
+
+*** Program crashed: Illegal instruction at 0x00007612489731ef ***
+
+Platform: x86_64 Linux (Ubuntu 24.04.4 LTS)
+
+Thread 6 "DispatchWorker" crashed:
+
+ 0                  0x00007612489731ef closure #1 in closure #1 in _assertionFailure(_:_:file:line:flags:) + 623 in libswiftCore.so
+ 1 [ra]             0x0000761248b0a2cc _assertionFailure(_:_:file:line:flags:) + 283 in libswiftCore.so
+ 2 [ra]             0x000076124899188d Array.subscript.getter + 124 in libswiftCore.so
+ 3 [ra] [inlined]   0x00007612490cbbf9 freestanding macro expansion #4 of expect in module NeedletailStateTests file TranscriptEmissionTests.swift line 66 column 9 in NeedletailStateTests.so at /tmp/swift-generated-sources/@__swiftmacro_20NeedletailStateTests0034TranscriptEmissionTestsswift_oeBCkfMX65_8_6expectfMf2_.swift:1:40
+ 4 [ra]             0x00007612490cbbf9 TranscriptEmissionTests.fullTurnEmitsTranscript() + 11160 in NeedletailStateTests.so at /data/coding/needletail/Tests/NeedletailStateTests/TranscriptEmissionTests.swift:66:9
+ 5 [ra]             0x00007612490c0e33 $s20NeedletailStateTests018TranscriptEmissionC0V013fullTurnEmitsD04TestfMp_7__localfMu0_ #1 @Sendable (_:) in static TranscriptEmissionTests.$s20NeedletailStateTests018TranscriptEmissionC0V013fullTurnEmitsD04TestfMp_17Z30d4c9b0a82097e2fMu_@Sendable () + 114 in NeedletailStateTests.so at /tmp/swift-generated-sources/@__swiftmacro_20NeedletailStateTests018TranscriptEmissionC0V013fullTurnEmitsD04TestfMp_.swift:5:188
+ 6 [async]          0x00007612490c0b10 static TranscriptEmissionTests.$s20NeedletailStateTests018TranscriptEmissionC0V013fullTurnEmitsD04TestfMp_17Z30d4c9b0a82097e2fMu_@Sendable () in NeedletailStateTests.so at /tmp/swift-generated-sources/@__swiftmacro_20NeedletailStateTests018TranscriptEmissionC0V013fullTurnEmitsD04TestfMp_.swift:7
+ 7 [async] [system] 0x00007612490c12d0 implicit closure #1 in static TranscriptEmissionTests.$s20NeedletailStateTests018TranscriptEmissionC0V013fullTurnEmitsD04TestfMp_25generator30d4c9b0a82097e2fMu_@Sendable () in NeedletailStateTests.so at /tmp/swift-generated-sources/@__swiftmacro_20NeedletailStateTests018TranscriptEmissionC0V013fullTurnEmitsD04TestfMp_.swift
+ 8 [async] [thunk]  0x00007612490c6e60 partial apply for implicit closure #1 in static TranscriptEmissionTests.$s20NeedletailStateTests018TranscriptEmissionC0V013fullTurnEmitsD04TestfMp_25generator30d4c9b0a82097e2fMu_@Sendable () in NeedletailStateTests.so at //<compiler-generated>
+ 9 [async]          0x0000761247350c20 specialized static Runner._applyScopingTraits(for:testCase:_:) in libTesting.so
+10 [async]          0x00007612473526e0 specialized closure #1 in closure #1 in closure #1 in static Runner._runSingleTestCaseIteration(_:within:) in libTesting.so
+11 [async]          0x0000761247343fe0 closure #1 in closure #1 in static Runner._runSingleTestCaseIteration(_:within:) in libTesting.so
+12 [async] [thunk]  0x00007612473537c0 partial apply for closure #1 in closure #1 in static Runner._runSingleTestCaseIteration(_:within:) in libTesting.so
+13 [async]          0x0000761247303d20 specialized static Issue.withErrorRecording(at:configuration:isolation:_:) in libTesting.so
+14 [async]          0x0000761247343b30 closure #1 in static Runner._runSingleTestCaseIteration(_:within:) in libTesting.so
+15 [async] [thunk]  0x00007612473537b0 partial apply for closure #1 in static Runner._runSingleTestCaseIteration(_:within:) in libTesting.so
+16 [async]          0x000076124732f000 specialized closure #1 in TestCancellable.withCancellationHandling<A>(_:) in libTesting.so
+17 [async]          0x000076124732ee00 specialized TestCancellable.withCancellationHandling<A>(_:) in libTesting.so
+18 [async]          0x0000761247339b50 specialized static Test.Case.withCurrent<A>(_:perform:) in libTesting.so
+19 [async]          0x0000761247343730 static Runner._runSingleTestCaseIteration(_:within:) in libTesting.so
+20 [async]          0x0000761247352120 specialized static Runner._runTestCase(_:within:in:) in libTesting.so
+21 [async]          0x0000761247343170 closure #4 in static Runner._runTestCases<A>(_:within:context:) in libTesting.so
+22 [async] [thunk]  0x0000761247353900 partial apply for closure #4 in static Runner._runTestCases<A>(_:within:context:) in libTesting.so
+23 [async] [thunk]  0x00007612473538c0 thunk for @escaping @callee_guaranteed @Sendable @async (@unowned Int, @in_guaranteed Test.Case) -> () in libTesting.so
+24 [async] [thunk]  0x0000761247353790 partial apply for thunk for @escaping @callee_guaranteed @Sendable @async (@unowned Int, @in_guaranteed Test.Case) -> () in libTesting.so
+25 [async]          0x000076124734f580 specialized closure #1 in closure #1 in static Runner._forEach<A, B>(in:namingTasksWith:_:) in libTesting.so
+26 [async] [thunk]  0x00007612473537a0 partial apply for specialized closure #1 in closure #1 in static Runner._forEach<A, B>(in:namingTasksWith:_:) in libTesting.so
+27 [async] [system] 0x00007612487acf50 completeTaskWithClosure(swift::AsyncContext*, swift::SwiftError*) in libswift_Concurrency.so
+
+Thread 0 "NeedletailState":
+
+0      0x0000761246e455eb <unknown> in libc.so.6
+1 [ra] 0x0000761248541788 _dispatch_sigsuspend + 23 in libdispatch.so
+2 [ra] 0x000076124853ec59 _dispatch_sig_thread + 8 in libdispatch.so
+3 [ra] 0x0000761246e99420 <unknown> in libc.so.6
+4 [ra] 0x0000761246e2a1d6 <unknown> in libc.so.6
+5 [ra] 0x0000761246e2a28b <unknown> in libc.so.6
+
+Thread 1 "DispatchWorker":
+
+0      0x0000761246e98e51 <unknown> in libc.so.6
+1 [ra] 0x0000761246ea4e73 <unknown> in libc.so.6
+2 [ra] 0x0000761248548d21 _dispatch_sema4_timedwait + 80 in libdispatch.so
+3 [ra] 0x0000761248541a21 _dispatch_semaphore_wait_slow + 32 in libdispatch.so
+4 [ra] 0x000076124854134e _dispatch_worker_thread + 1069 in libdispatch.so
+5 [ra] 0x0000761246e9cb84 <unknown> in libc.so.6
+
+Thread 2 "DispatchWorker":
+
+0      0x0000761246e98e51 <unknown> in libc.so.6
+1 [ra] 0x0000761246ea4e73 <unknown> in libc.so.6
+2 [ra] 0x0000761248548d21 _dispatch_sema4_timedwait + 80 in libdispatch.so
+3 [ra] 0x0000761248541a21 _dispatch_semaphore_wait_slow + 32 in libdispatch.so
+4 [ra] 0x000076124854134e _dispatch_worker_thread + 1069 in libdispatch.so
+5 [ra] 0x0000761246e9cb84 <unknown> in libc.so.6
+
+Thread 3 "DispatchWorker":
+
+0      0x0000761246f2a2d2 <unknown> in libc.so.6
+1 [ra] 0x0000761248548537 _dispatch_event_loop_drain + 54 in libdispatch.so
+2 [ra] 0x000076124853e022 _dispatch_mgr_invoke + 129 in libdispatch.so
+3 [ra] 0x000076124853df8d _dispatch_mgr_thread + 108 in libdispatch.so
+4 [ra] 0x00007612485411b5 _dispatch_worker_thread + 660 in libdispatch.so
+5 [ra] 0x0000761246e9cb84 <unknown> in libc.so.6
+
+Thread 4 "DispatchWorker":
+
+0      0x0000761246e98e51 <unknown> in libc.so.6
+1 [ra] 0x0000761246ea4e73 <unknown> in libc.so.6
+2 [ra] 0x0000761248548d21 _dispatch_sema4_timedwait + 80 in libdispatch.so
+3 [ra] 0x0000761248541a21 _dispatch_semaphore_wait_slow + 32 in libdispatch.so
+4 [ra] 0x000076124854134e _dispatch_worker_thread + 1069 in libdispatch.so
+5 [ra] 0x0000761246e9cb84 <unknown> in libc.so.6
+
+Thread 5 "DispatchWorker":
+
+0      0x0000761246e98e51 <unknown> in libc.so.6
+1 [ra] 0x0000761246ea4e73 <unknown> in libc.so.6
+2 [ra] 0x0000761248548d21 _dispatch_sema4_timedwait + 80 in libdispatch.so
+3 [ra] 0x0000761248541a21 _dispatch_semaphore_wait_slow + 32 in libdispatch.so
+4 [ra] 0x000076124854134e _dispatch_worker_thread + 1069 in libdispatch.so
+5 [ra] 0x0000761246e9cb84 <unknown> in libc.so.6
+
+Thread 7 "DispatchWorker":
+
+0      0x0000761246e98e51 <unknown> in libc.so.6
+1 [ra] 0x0000761246ea4e73 <unknown> in libc.so.6
+2 [ra] 0x0000761248548d21 _dispatch_sema4_timedwait + 80 in libdispatch.so
+3 [ra] 0x0000761248541a21 _dispatch_semaphore_wait_slow + 32 in libdispatch.so
+4 [ra] 0x000076124854134e _dispatch_worker_thread + 1069 in libdispatch.so
+5 [ra] 0x0000761246e9cb84 <unknown> in libc.so.6
+
+Thread 8 "DispatchWorker":
+
+0      0x0000761246e98e51 <unknown> in libc.so.6
+1 [ra] 0x0000761246ea4e73 <unknown> in libc.so.6
+2 [ra] 0x0000761248548d21 _dispatch_sema4_timedwait + 80 in libdispatch.so
+3 [ra] 0x0000761248541a21 _dispatch_semaphore_wait_slow + 32 in libdispatch.so
+4 [ra] 0x000076124854134e _dispatch_worker_thread + 1069 in libdispatch.so
+5 [ra] 0x0000761246e9cb84 <unknown> in libc.so.6
+
+
+Registers:
+
+rax 0x0000000000000001  1
+rdx 0x00000000000002b7  695
+rcx 0x0000000000000003  3
+rbx 0x000076154523ebaa  129833726372778
+rsi 0x0000000000000002  2
+rdi 0x000076122401acc0  00 00 00 00 00 00 00 00 35 00 00 00 00 00 00 00  ········5·······
+rbp 0x0000761241bf5fd0  80 60 bf 41 12 76 00 00 cc a2 b0 48 error: Process '/data/coding/needletail/.build/out/Products/Debug-linux-x86_64/NeedletailStateTests-test-runner --filter TranscriptEmissionTests --testing-library swift-testing' exited with unexpected signal code 4
+12 76 00 00  ·`¿A·v··Ì¢°H·v··
+rsp 0x0000761241bf5fb0  00 00 00 00 00 00 00 00 70 02 01 24 12 76 00 00  ········p··$·v··
+ r8 0x00007612240008e0  07 00 03 00 07 00 06 00 05 00 05 00 03 00 05 00  ················
+ r9 0x0000000000000007  7
+r10 0x000076122401acd0  aa eb 23 45 15 76 00 00 27 a4 1b b1 c3 32 17 da  ªë#E·v··'¤·±Ã2·Ú
+r11 0xda1732c3b11ba427  15715085240804025383
+r12 0x0000000000000000  0
+r13 0x0000761241bf7178  50 02 01 24 12 76 00 00 01 00 00 00 00 00 00 00  P··$·v··········
+r14 0x0000000000000001  1
+r15 0x000000000000000b  11
+rip 0x00007612489731ef  0f 0b 48 83 ec 08 48 8d 05 24 78 49 00 48 8d 3d  ··H·ì·H··$xI·H·=
+
+rflags 0x0000000000010202  
+
+cs 0x0033  fs 0x0000  gs 0x0000
+
+
+Images (20 omitted):
+
+0x0000761246e00000–0x0000761246fb0039 a4a7992a8e66555c8141ab2a08a8465ff6e0ea65 libc.so.6               /usr/lib/x86_64-linux-gnu/libc.so.6
+0x0000761247200000–0x00007612473e29e0 0a291f4a1c8126793e4a741726bd1fafd0bd9e0c libTesting.so           /home/mitch/.local/share/swiftly/toolchains/6.4.0/usr/lib/swift/linux/libTesting.so
+0x000076124850c000–0x00007612485541c0 2b9f2cbd82b6faadd96d59dc5a557b13bf00cc37 libdispatch.so          /home/mitch/.local/share/swiftly/toolchains/6.4.0/usr/lib/swift/linux/libdispatch.so
+0x0000761248736000–0x00007612487ca2a8 5f4c3d5327018bfa6d1c8f29df46f9b053b8382e libswift_Concurrency.so /home/mitch/.local/share/swiftly/toolchains/6.4.0/usr/lib/swift/linux/libswift_Concurrency.so
+0x0000761248800000–0x0000761248dd9b30 f70852ee81d96aac072c6c1bc001ed36c6b555b9 libswiftCore.so         /home/mitch/.local/share/swiftly/toolchains/6.4.0/usr/lib/swift/linux/libswiftCore.so
+0x0000761248f78000–0x0000761249257418 26f0f425119618307fed38be3072d4d91aa80a72 NeedletailStateTests.so /data/coding/needletail/.build/out/Products/Debug-linux-x86_64/NeedletailStateTests.so
+
+Backtrace took 0.11s
+
+Note: Some test targets reported failures:
+  - NeedletailStateTests (Swift Testing)
+

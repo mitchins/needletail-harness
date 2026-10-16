@@ -74,10 +74,12 @@ enum ActorLoopback {
         _ check: @Sendable @escaping (SessionState) -> Bool, _ label: String,
         actor: SessionActor<FlakyTransport<ChatCompletionsTransport>, TrivialExecutor, InMemorySessionStore, TrivialApprovals, VirtualClock, DeterministicIDSource>
     ) async throws -> SessionState {
-        for _ in 0..<10_000 {
+        for _ in 0..<200 {
             let state = await actor.currentState()
             if check(state) { return state }
-            await Task.yield()
+            // Bounded paced poll: yields alone exhaust before the actor's
+            // network task runs when the host runs other suites in parallel.
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
         Issue.record("actor never reached \(label)")
         throw LoopbackCheckFailed.unreached

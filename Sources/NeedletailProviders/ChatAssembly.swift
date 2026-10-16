@@ -221,7 +221,7 @@ public func providerResponseForTurn(
             returnedModel: turn.returnedModel)
     }
     let proposals = turn.toolCalls.map {
-        ToolProposal(callID: $0.callID, tool: $0.name, argumentsDigest: fnv1aHex($0.arguments))
+        ToolProposal(callID: $0.callID, tool: $0.name, argumentsDigest: fnv1aHex($0.arguments), arguments: $0.arguments)
     }
     return ProviderResponse(
         requestID: requestID, generation: generation,

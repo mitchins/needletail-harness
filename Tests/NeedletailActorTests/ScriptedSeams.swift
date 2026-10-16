@@ -95,15 +95,21 @@ final class ScriptedApprovals: ApprovalGateway, @unchecked Sendable {
 }
 
 /// Scripted executor: describes canned text; `execute` records and returns
-/// a canned receipt WITHOUT calling back — tests pair completions
-/// explicitly via `completeEffect` to control orderings deterministically.
-/// (M1-B wires no production executor; M2 drives this entry point.)
+/// a canned receipt. M1-D wires production execution through the actor, so
+/// the executor auto-completes unless a test installs an explicit release
+/// gate to hold the `executing` phase observable.
 final class ScriptedExecutor: ToolExecutor, @unchecked Sendable {
     private let lock = NSLock()
     private var _calls: [(batch: ToolBatch, reservation: EffectReservation)] = []
+    private var _gate: AsyncStream<Void>? = nil
 
     var calls: [(batch: ToolBatch, reservation: EffectReservation)] {
         lock.withLock { _calls }
+    }
+
+    var gate: AsyncStream<Void>? {
+        get { lock.withLock { _gate } }
+        set { lock.withLock { _gate = newValue } }
     }
 
     func describe(batch: ToolBatch) -> String {
@@ -112,6 +118,10 @@ final class ScriptedExecutor: ToolExecutor, @unchecked Sendable {
 
     func execute(batch: ToolBatch, reservation: EffectReservation) async throws -> ExecutorResult {
         lock.withLock { _calls.append((batch, reservation)) }
+        if let gate = lock.withLock({ _gate }) {
+            for await _ in gate { break }
+            // A closed gate releases execution exactly once; the loop exits.
+        }
         return ExecutorResult(receipt: ExecutorReceipt(callID: "scripted", status: "ok", summary: "scripted"))
     }
 }
@@ -180,9 +190,15 @@ enum ActorFixtures {
         _ label: String,
         sourceLocation: SourceLocation = #_sourceLocation
     ) async throws {
-        for _ in 0..<10_000 {
+        for _ in 0..<2_000 {
             if check(await actor.currentState()) { return }
             await Task.yield()
+        }
+        // Under heavier scheduling (offline aggregate), actor effect tasks
+        // need a short concrete wait to make progress past 10k yields.
+        for _ in 0..<500 {
+            if check(await actor.currentState()) { return }
+            try? await Task.sleep(nanoseconds: 5_000_000)
         }
         Issue.record("actor never reached \(label)", sourceLocation: sourceLocation)
         throw ScriptedError.outOfScript

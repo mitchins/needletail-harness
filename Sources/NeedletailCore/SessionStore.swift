@@ -12,6 +12,8 @@ public enum DurableRecord: Sendable, Equatable {
     case queueAdmitted(QueueEntry)
     case queueUpdated(QueueEntry)
     case checkpointCommitted(EpochDescriptor)
+    /// Authoritative conversation element (M1-D transcript, ARCH §1).
+    case transcriptAppended(TranscriptEntry)
 }
 
 public struct SequencedRecord: Sendable, Equatable {

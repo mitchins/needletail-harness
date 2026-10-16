@@ -14,21 +14,25 @@ struct ActorApprovalTests {
     /// tool-proposing response; validation is inline in the transition.
     static func authorisingActor(
         approvals: ScriptedApprovals,
+        executorGate: AsyncStream<Void>? = nil,
         batch: [ToolProposal] = [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d")]
     ) async throws -> (
         SessionActor<ScriptedTransport, ScriptedExecutor, InMemorySessionStore, ScriptedApprovals, VirtualClock, DeterministicIDSource>,
         ScriptedTransport,
-        InMemorySessionStore
+        InMemorySessionStore,
+        ScriptedExecutor
     ) {
         let transport = ScriptedTransport()
-        let (actor, store) = try ActorFixtures.makeActor(mode: .workspace, permissive: true, transport: transport, executor: ScriptedExecutor(), approvals: approvals)
+        let executor = ScriptedExecutor()
+        executor.gate = executorGate
+        let (actor, store) = try ActorFixtures.makeActor(mode: .workspace, permissive: true, transport: transport, executor: executor, approvals: approvals)
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: batch.map {
                 ToolProposal(callID: $0.callID, tool: $0.tool, argumentsDigest: "d")
             }, isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
-        return (actor, transport, store)
+        return (actor, transport, store, executor)
     }
 
     @Test("POLICY-04 silent gateway pends; release decides; ticks never decide")
@@ -36,7 +40,7 @@ struct ActorApprovalTests {
         let approvals = ScriptedApprovals()
         let (stream, continuation) = AsyncStream<ApprovalDecision>.makeStream()
         approvals.gate = stream
-        let (actor, _, _) = try await Self.authorisingActor(approvals: approvals)
+        let (actor, _, _, _) = try await Self.authorisingActor(approvals: approvals)
         // The closed gate blocks progress, so the authorising barrier is
         // stable here (unlike instant scripted decisions, which blow past).
         try await ActorFixtures.awaitPhase(actor, { $0.phase == .authorising }, "authorising")
@@ -62,15 +66,27 @@ struct ActorApprovalTests {
     func POLICY_04_grantContinues() async throws {
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
-        let (actor, _, _) = try await Self.authorisingActor(approvals: approvals)
+        // Hold the executor gate open: M1-D wiring auto-completes effects, so
+        // the release gate keeps `executing` observable without sleeps.
+        let (gateStream, releaseGate) = AsyncStream<Void>.makeStream()
+        let (actor, _, _, executor) = try await Self.authorisingActor(
+            approvals: approvals, executorGate: gateStream)
         // Instant decisions blow past the transient authorising phase, so
         // await the STABLE end state: executing + exactly one emitted
         // approval request proves authorising happened with intent first.
         try await ActorFixtures.awaitPhase(actor, { $0.phase == .executing }, "executing after grant")
+        // The executing phase is set before the actor's effect task records
+        // the call, so bound-poll for the recorded dispatch rather than
+        // assuming the scheduler ran the task first.
+        for _ in 0..<2_000 where executor.calls.isEmpty {
+            await Task.yield()
+        }
         let state = await actor.currentState()
         #expect(state.pendingApproval == nil)
         #expect(state.liveReservations.count == 1, "grant reserves before dispatch")
+        #expect(executor.calls.count == 1, "grant dispatches exactly one execution")
         #expect(approvals.requests.count == 1, "one approval requested on the way through")
+        releaseGate.finish()
     }
 
     @Test("S2 store order: cause records precede pump consequences")
@@ -79,7 +95,7 @@ struct ActorApprovalTests {
         // validation records — M2 replays this log in order.
         let approvals = ScriptedApprovals()
         approvals.script = [.deny("stop here")]
-        let (actor, _, store) = try await Self.authorisingActor(approvals: approvals)
+        let (actor, _, store, _) = try await Self.authorisingActor(approvals: approvals)
         // Instant scripted decisions blow past transient authorising, so
         // await the STABLE end state; the store retains every record for
         // the order assertion below.

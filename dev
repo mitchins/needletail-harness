@@ -49,7 +49,10 @@ FILTER_STATE_PURE="NeedletailStateTests"
 FILTER_PRESENTATION_PURE="NeedletailPresentationTests"
 
 swift_test() {
-    "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution "$@"
+    # One test worker at a time: loopback suites share process/OS
+    # resources, and multi-worker Swift Testing showed cross-suite
+    # connection flakes on this Linux builder. Filter semantics stay exact.
+    "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"
 }
 
 # False-pass guards (M0-D):
@@ -261,6 +264,14 @@ test)
         for _m1c_case in WIRE-01 WIRE-02 WIRE-03 WIRE-04 WIRE-05 WIRE-06 WIRE-07 WIRE-08 WIRE-09 WIRE-10 NET-02 NET-03 NET-04 NET-05 NET-06 DX-04 DX-05; do
             echo "== offline aggregate: case $_m1c_case =="
             run_case "$_m1c_case"
+        done
+        # M1-D deterministic headless integration cases. BDD-06 remains
+        # review-process evidence (probe→guard→oracle logs + receipt) and
+        # BDD-08 remains the committed frozen replay, both reconciled by the
+        # slice report rather than counted by this aggregate runner.
+        for _m1d_case in CORE-01 HEAD-01 HEAD-02 HEAD-03; do
+            echo "== offline aggregate: case $_m1d_case =="
+            run_case "$_m1d_case"
         done
         echo "OFFLINE OK: all scheduled offline layers passed."
         ;;
