@@ -65,9 +65,14 @@ public func transcriptMessages(_ records: [SequencedRecord]) throws -> [ChatMess
 /// honest (never silent truncation — unreachable at M1 turn budgets; the
 /// bound exists so growth can never silently drop history).
 public func loadTranscript(from store: SessionStore, limit: Int = 1024) throws -> [ChatMessage] {
-    let (page, next) = try store.records(since: 0, limit: limit)
-    if next != nil {
-        throw TranscriptError.pageOverflow(limit: limit)
+    var cursor: UInt64 = 0
+    var records: [SequencedRecord] = []
+    while true {
+        let (page, next) = try store.records(since: cursor, limit: limit)
+        records.append(contentsOf: page.filter { if case .transcriptAppended = $0.record { return true } else { return false } })
+        guard records.count <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
+        guard let following = next else { break }
+        cursor = following
     }
-    return try transcriptMessages(page)
+    return try transcriptMessages(records)
 }

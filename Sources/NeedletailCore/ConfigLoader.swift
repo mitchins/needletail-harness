@@ -266,7 +266,8 @@ public func parseBaseURL(_ string: String, path: String) throws -> ParsedBaseURL
     } else {
         portSuffix = ""
     }
-    let origin = "\(scheme.lowercased())://\(lowerHost)\(portSuffix)"
+    let hostForOrigin = authority.hasPrefix("[") ? "[\(lowerHost)]" : lowerHost
+    let origin = "\(scheme.lowercased())://\(hostForOrigin)\(portSuffix)"
     // Path validation on the raw text first (structural), then decoded.
     if rawPath.contains("\\") {
         throw malformed("backslashes are not path separators.", "use forward slashes.")

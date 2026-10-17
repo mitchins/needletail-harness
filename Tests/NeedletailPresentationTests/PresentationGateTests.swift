@@ -48,7 +48,8 @@ struct PresentationGateTests {
         // fails to compile (internal init), so no grep needed for it.
         let markers = [
             ".admitted(commandID:", ".denied(cause:", ".runUpdate(phase:",
-            ".agent(alias:",
+            ".agent(alias:", ".delta(requestID:", ".runFinished(outcome:",
+            ".terminalSignal(outcome:",
         ]
         for target in ["NeedletailPresentation", "NeedletailCLI", "NeedletailRuntime", "NeedletailProviders"] {
             let dir = root + target

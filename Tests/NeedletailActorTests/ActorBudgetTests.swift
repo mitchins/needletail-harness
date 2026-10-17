@@ -29,45 +29,41 @@ struct ActorBudgetTests {
     @Test("CORE-04 turns count across post-tool re-requests")
     func CORE_04_turnsCountAcrossReRequests() async throws {
         let transport = ScriptedTransport()
-        let (actor, _) = try ActorFixtures.makeActor(mode: .trustedExec, permissive: true, transport: transport)
-        // Turn 1: interim response (no tools) → requesting, turnsUsed still 1.
-        transport.script = [ProviderResponse(
-            requestID: RequestID("s"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "part", toolProposals: [], isFinal: false))]
-        await actor.submitText(commandID: CommandID("c-1"), text: "work", kind: .followUp, sealed: false)
-        try await ActorFixtures.awaitPhase(actor, { $0.phase == .requesting }, "requesting after interim")
-        var state = await actor.currentState()
-        #expect(state.turnsUsed == 1, "one dispatch consumed one turn")
-        // Turn 2 via tool loop: proposals → trustedExec auto → executing.
-        // A fresh run is needed (interim responses don't re-dispatch).
-        transport.script = [ProviderResponse(
-            requestID: RequestID("s"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d"),
-            ], isFinal: false))]
-        await actor.cancel()
-        await actor.tick(at: 1_000_000 + cancelGraceMillis)
-        await actor.dismissRun()
-        await actor.submitText(commandID: CommandID("c-2"), text: "tools", kind: .followUp, sealed: false)
-        // M1-D: reserveEffect now auto-executes (exactly once per batch via
-        // ScriptedToolBackend/ScriptedExecutor). The `executing` phase is
-        // transient — the executor completes immediately and the loop
-        // re-dispatches. Wait for the post-tool re-request, not the
-        // transient executing.
-        try await ActorFixtures.awaitPhase(actor, { $0.phase == .requesting && $0.turnsUsed == 2 }, "requesting after tool round (auto-executed)")
-        // The transition reaches the requesting phase before the follow-up
-        // provider invocation has necessarily landed; pin it explicitly.
-        for _ in 0..<10_000 where transport.invocations.count < 3 {
+        let executor = ScriptedExecutor()
+        let (actor, store) = try ActorFixtures.makeActor(
+            mode: .trustedExec, permissive: true, transport: transport, executor: executor)
+        transport.script = [
+            ProviderResponse(
+                requestID: RequestID("s"), generation: Revision(0),
+                outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                    ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d"),
+                ], isFinal: false)),
+            ProviderResponse(
+                requestID: RequestID("s"), generation: Revision(0),
+                outcome: .textDeltaComplete(text: "done", toolProposals: [], isFinal: true)),
+        ]
+        await actor.submitText(commandID: CommandID("c-1"), text: "tools", kind: .followUp, sealed: false)
+
+        for _ in 0..<100_000 where transport.invocations.count < 2 {
             await Task.yield()
         }
-        for _ in 0..<500 where transport.invocations.count < 3 {
-            try? await Task.sleep(nanoseconds: 5_000_000)
+        #expect(transport.invocations.count == 2, "two provider dispatches total, got \(transport.invocations.count)")
+
+        try await ActorFixtures.awaitPhase(actor, { state in
+            if case .completed = state.phase { return true }
+            return false
+        }, "completed after tool round")
+        let state = await actor.currentState()
+        #expect(state.turnsUsed == 2, "tool round consumes one additional turn, got \(state.turnsUsed)")
+        #expect(executor.calls.count == 1, "grant dispatches exactly one execution")
+        #expect(state.pendingApproval == nil, "trusted execution asks no approval")
+
+        let (entries, _) = try store.records(since: 0, limit: 100)
+        let toolResponses = entries.compactMap { entry -> String? in
+            guard case .transcriptAppended(.toolResponse(let callID, let text)) = entry.record else { return nil }
+            return "\(callID):\(text)"
         }
-        state = await actor.currentState()
-        // The tool batch was auto-executed (no manual completeEffect needed);
-        // the executor's success is already paired and a new provider
-        // request dispatched.
-        #expect(transport.invocations.count == 3, "three provider dispatches total, got \(transport.invocations.count)")
+        #expect(toolResponses.contains("c1:scripted"), "tool result is paired by call ID, got \(toolResponses)")
     }
 
     @Test("CORE-04 wall-clock deadline stops via explicit ticks")

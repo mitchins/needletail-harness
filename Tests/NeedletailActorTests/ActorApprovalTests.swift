@@ -44,6 +44,9 @@ struct ActorApprovalTests {
         // The closed gate blocks progress, so the authorising barrier is
         // stable here (unlike instant scripted decisions, which blow past).
         try await ActorFixtures.awaitPhase(actor, { $0.phase == .authorising }, "authorising")
+        for _ in 0..<100_000 where approvals.requests.count < 1 {
+            await Task.yield()
+        }
         let request = try #require((await actor.currentState()).pendingApproval)
         #expect(approvals.requests.count == 1, "exactly one approval request emitted")
         // Ticks while suspended: still pending, nothing decided, test moving.

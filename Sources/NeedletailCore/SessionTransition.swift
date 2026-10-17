@@ -539,9 +539,6 @@ private func admitFreshRun<I: IDSource>(
     guard undispatchedBytes + text.utf8.count <= maxQueueTextBytes else {
         return refuseCaps(state, commandID: commandID, cause: "queue text budget exceeded", atMillis: atMillis, ids: &ids)
     }
-    guard state.admittedCommands.count < maxAdmittedCommands else {
-        return refuseCaps(state, commandID: commandID, cause: "admission index full (oldest pruned at epoch change)", atMillis: atMillis, ids: &ids)
-    }
     // Reserve the new run (generation+1; run-scoped counters reset — M1B3-6).
     let runID = ids.nextRunID()
     let requestID = ids.nextRequestID()
@@ -560,6 +557,10 @@ private func admitFreshRun<I: IDSource>(
         historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value)"))
     let ack = QueueAck(commandID: commandID, entryID: "run-\(requestID.raw)", sequence: seq, revision: revision.value, state: .dispatched)
     var index = state.admittedCommands
+    if index.count >= maxAdmittedCommands, index[commandID] == nil,
+       let oldest = index.values.min(by: { $0.sequence.value < $1.sequence.value }) {
+        index.removeValue(forKey: oldest.commandID)
+    }
     index[commandID] = ack
     let next = state.replacing(
         phase: .admitting, activeRun: run, activeRequest: .some(nil),
@@ -832,6 +833,14 @@ private func stepInvalid<I: IDSource>(
     let count = state.invalidTracker.fingerprint == fingerprint ? state.invalidTracker.count + 1 : 1
     let tracker = InvalidTracker(fingerprint: fingerprint, count: count)
     if count >= InvalidTracker.limit {
+        if state.phase.hasActiveRun || state.phase == .admitting {
+            let cancelled = cancelActive(state, atMillis: atMillis, ids: &ids)
+            let failed = failRun(cancelled.state, failure: .invalidStopped("three identical invalid/denied attempts: \(terminalSafe(cause))"), hold: true, atMillis: atMillis, ids: &ids)
+            return Transition(
+                state: failed.state.replacing(invalidTracker: tracker),
+                effects: cancelled.effects + failed.effects,
+                records: cancelled.records + failed.records)
+        }
         let (s1, prefix) = sequenced(state, kind: "invalid-stopped", digest: eventDigest("invalid", fingerprint), ids: &ids)
         let next = s1.replacing(
             phase: .failed(.invalidStopped("three identical invalid/denied attempts: \(terminalSafe(cause))")),
@@ -1260,14 +1269,11 @@ private func grantApproval<I: IDSource>(_ state: SessionState, requestID: Reques
 }
 
 private func denyApproval<I: IDSource>(_ state: SessionState, ids: inout I) -> Transition {
-    let (s1, prefix) = sequenced(state, kind: "failed", digest: "approval-denied", ids: &ids)
-    let next = s1.replacing(
-        phase: .failed(.approvalDenied("operator denied the tool batch")),
-        pendingApproval: .some(nil), pendingBatch: .some(nil))
+    let failed = failRun(state, failure: .approvalDenied("operator denied the tool batch"), hold: true, atMillis: 0, ids: &ids)
     return Transition(
-        state: next,
-        effects: [.emitUI(.denied(cause: "tool batch denied by operator"))],
-        records: prefix)
+        state: failed.state,
+        effects: [.emitUI(.denied(cause: "tool batch denied by operator"))] + failed.effects,
+        records: failed.records)
 }
 
 private func holdForApproval<I: IDSource>(

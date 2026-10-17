@@ -12,6 +12,8 @@ struct ImportGateTests {
         "AsyncHTTPClient", "OpenAPIRuntime", "Subprocess", "SystemPackage",
         "GRDB", "Crypto", "ArgumentParser",
         "Darwin", "Glibc", "Security", "AppKit", "SwiftUI", "Combine",
+        "NIOCore", "NIOHTTP1", "FoundationNetworking", "SQLite3",
+        "CReplxx", "PTYShim",
     ]
 
     private static func coreSources() throws -> [String] {
@@ -30,7 +32,9 @@ struct ImportGateTests {
             for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 guard trimmed.hasPrefix("import ") else { continue }
-                let module = trimmed.dropFirst(7).split(separator: " ", maxSplits: 1).first.map(String.init) ?? ""
+                let trimmedImport = trimmed.dropFirst(7).trimmingCharacters(in: .whitespaces)
+                let pieces = trimmedImport.split(whereSeparator: { $0.isWhitespace })
+                let module = pieces.last { !$0.isEmpty && !["struct", "class", "enum", "actor", "protocol", "typealias", "let", "var"].contains(String($0)) }?.trimmingCharacters(in: CharacterSet(charactersIn: " \";")) ?? ""
                 #expect(!Self.forbiddenImports.contains(module),
                         "\(path): forbidden import '\(module)' — Core performs no I/O")
             }

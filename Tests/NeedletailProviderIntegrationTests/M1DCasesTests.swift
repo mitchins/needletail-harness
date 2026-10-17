@@ -141,10 +141,18 @@ private enum M1DCases {
         process.standardOutput = outPipe
         process.standardError = errPipe
         try process.run()
-        let out = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let err = errPipe.fileHandleForReading.readDataToEndOfFile()
+        final class DataBox: @unchecked Sendable { var value = Data() }
+        let errBox = DataBox()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async {
+            errBox.value = errPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        group.wait()
         process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: out, as: UTF8.self), String(decoding: err, as: UTF8.self))
+        return (process.terminationStatus, String(decoding: outData, as: UTF8.self), String(decoding: errBox.value, as: UTF8.self))
     }
 
     static func runArguments(

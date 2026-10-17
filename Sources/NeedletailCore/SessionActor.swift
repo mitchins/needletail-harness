@@ -222,9 +222,11 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             }
         case .requestProvider(let invocation):
             guard reservations[invocation.effectID] != nil else { return }
-            // Pinned order (M1B3-3): requestDispatched applies when the
-            // actor BEGINS performing — records stored, no byte flowed yet.
-            await apply(.requestDispatched(requestID: invocation.requestID, atMillis: clock.nowMillis()))
+            // Only admission requests count busy work; stale/denial dispatches
+            // must not increment requesting latency or be treated as drops.
+            if case .admitting = state.phase {
+                await apply(.requestDispatched(requestID: invocation.requestID, atMillis: clock.nowMillis()))
+            }
             guard let reservation = reservations[invocation.effectID] else { return }
             inFlight?.cancel()
             inFlight = Task {
@@ -266,6 +268,9 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             inFlight?.cancel()
             return
         }
+        await apply(.cancelRequested(atMillis: clock.nowMillis()))
+        inFlight?.cancel()
+        reservations = [:]
         state = state.replacing(phase: .failed(.integrityStopped("sink emit failed: \(error)")))
     }
 
@@ -276,17 +281,20 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         // overflow is an honest UISinkError rather than unbounded tasks.
         let deliveryQueue = DeltaDeliveryQueue(
             itemCap: 512, byteCap: 4 << 20, onDeliver: { item in
-                await self.emitDeltaProjection(.delta(requestID: item.outcome, text: item.text))
+                await self.emitDeltaProjection(.delta(requestID: item.requestID, text: item.text))
             })
         deltaDelivery = deliveryQueue
-        deltaDeliveryTask = Task { @Sendable in
+        let deliveryTask = Task { @Sendable in
             await deliveryQueue.run()
         }
+        deltaDeliveryTask = deliveryTask
         var activeTransport: Transport = transport
         if var deltaTransport = transport as? any DeltaStreamingTransport {
             let requestID = invocation.requestID
             deltaTransport.deltaSink = { text in
                 switch deliveryQueue.enqueue(DeltaDeliveryQueue.Item(requestID: requestID, text: text)) {
+                case .closed:
+                    break
                 case .overflow(let itemCount, let byteCount):
                     deliveryQueue.finish()
                     Task { await self.handleSinkError(UISinkError.overflow(itemCount: itemCount, byteCount: byteCount)) }
@@ -309,18 +317,18 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                     usageOutput: result.response.usageOutput))
             }
             deliveryQueue.finish()
-            await deltaDeliveryTask?.value
-            deltaDelivery = nil
+            await deliveryTask.value
+            if deltaDelivery === deliveryQueue { deltaDelivery = nil }
             await pairTransportResult(result, reservation: reservation)
         } catch is CancellationError {
             deliveryQueue.finish()
-            await deltaDeliveryTask?.value
-            deltaDelivery = nil
+            await deliveryTask.value
+            if deltaDelivery === deliveryQueue { deltaDelivery = nil }
             return // Generation invalidation already dropped this run; nothing to pair.
         } catch let failure as TransportFailure {
             deliveryQueue.finish()
-            await deltaDeliveryTask?.value
-            deltaDelivery = nil
+            await deliveryTask.value
+            if deltaDelivery === deliveryQueue { deltaDelivery = nil }
             // Classified at the failure site by the adapter (R2); the
             // transition policy stays the sole retry authority.
             await apply(.transportFailed(
@@ -328,8 +336,8 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                 phase: failure.phase, error: failure.message, atMillis: clock.nowMillis()))
         } catch {
             deliveryQueue.finish()
-            await deltaDeliveryTask?.value
-            deltaDelivery = nil
+            await deliveryTask.value
+            if deltaDelivery === deliveryQueue { deltaDelivery = nil }
             await apply(.transportFailed(
                 requestID: invocation.requestID, generation: invocation.generation,
                 phase: .ambiguous, error: String(describing: error), atMillis: clock.nowMillis()))

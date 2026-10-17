@@ -78,3 +78,12 @@ public final class InMemoryUISink: UISink, @unchecked Sendable {
         }
     }
 }
+
+
+extension UISink {
+    /// Core-owned terminal envelope minting (DX-03): non-Core targets must
+    /// never construct SessionEventProjection directly.
+    public func emitTerminal(outcome: String, detail: String) async throws {
+        try await emit(.runFinished(outcome: outcome, detail: detail))
+    }
+}

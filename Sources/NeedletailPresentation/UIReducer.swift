@@ -36,6 +36,7 @@ private func reduceInput(_ state: UIState, _ input: InputAction) -> (UIState, [U
         composer.cursor += scalars.count
         composer.revision += 1
     case .deleteBackward(let count):
+        guard count > 0 else { return (state, []) }
         let keep = max(0, composer.cursor - count)
         let prefix = String(composer.text.unicodeScalars.prefix(keep))
         let suffix = String(composer.text.unicodeScalars.dropFirst(composer.cursor))

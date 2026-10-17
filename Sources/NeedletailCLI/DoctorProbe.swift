@@ -13,7 +13,7 @@ import NeedletailProviders
 enum DoctorProbe {
     static func run(alias: String) throws {
         guard let path = defaultConfigPath() else {
-            eprint("error $: configNotFound — no configuration file found for --probe. Fix: pass a config via --config or place one at ~/.config/needletail/config.json.")
+            eprint("error $: configNotFound — no configuration file found for --probe. Fix: pass a config in $XDG_CONFIG_HOME/needletail/config.json or ~/.config/needletail/config.json or place one at ~/.config/needletail/config.json.")
             throw ExitCode(2)
         }
         let snapshot: ConfigSnapshot

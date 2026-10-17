@@ -224,8 +224,21 @@ struct RunCommand: ParsableCommand {
         // 4. Scripted backend
         let scriptEntries: [ScriptedToolBackend.Entry]
         if let toolsPath = tools {
-            let toolData = try readBoundedFile(toolsPath, limit: 1024 * 1024)
-            guard let array = try JSONSerialization.jsonObject(with: toolData) as? [[String: Any]] else {
+            let toolData: Data
+            do {
+                toolData = try readBoundedFile(toolsPath, limit: 1024 * 1024)
+            } catch {
+                eprint("error $.tools.: invalidToolScript — \(terminalSafe(String(describing: error))). Fix: pass a valid --tools JSON file.")
+                throw ExitCode(2)
+            }
+            let object: Any
+            do {
+                object = try JSONSerialization.jsonObject(with: toolData)
+            } catch {
+                eprint("error $.tools.: malformedJSON — \(terminalSafe(String(describing: error))). Fix: validate the tools file as JSON.")
+                throw ExitCode(2)
+            }
+            guard let array = object as? [[String: Any]] else {
                 eprint("tools script must be JSON array")
                 throw ExitCode(2)
             }
@@ -302,7 +315,7 @@ struct RunCommand: ParsableCommand {
         // 7. Submit and wait for completion (multi-turn loop)
         await actor.submitText(commandID: CommandID("cmd-run"), text: prompt, kind: .followUp, sealed: sealed)
         // Poll for terminal phase with timeout (max 60s per run, plus turn budget)
-        let deadline = Date().addingTimeInterval(max(60.0, Double((maxTurns ?? 80) * min(max(1, profile.requestTimeout), 60))))
+        let deadline = Date().addingTimeInterval(max(60.0, Double(maxTurns ?? 80) * Double(max(1, profile.requestTimeout))))
         var finalState: SessionState?
         var approvalRequest: ApprovalRequest?
         while Date() < deadline {
@@ -318,6 +331,10 @@ struct RunCommand: ParsableCommand {
                 finalState = current
                 break
             default:
+                if current.queueHeld && !current.unresolvedOperations.isEmpty {
+                    finalState = current
+                    break
+                }
                 try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                 continue
             }
@@ -327,17 +344,32 @@ struct RunCommand: ParsableCommand {
         if let f = finalState {
             done = f
         } else {
+            await actor.cancel()
             done = await actor.currentState()
+            let reason = terminalSafe("run did not complete within the wall budget")
             eprint("run did not complete within timeout")
+            if isJSONL {
+                try? await sink.emitTerminal(outcome: "budget_exhausted", detail: reason)
+            }
             try? await httpClient.shutdown().get()
             throw ExitCode(5)
         }
         // Shutdown HTTP client before handling output (actor no longer needs it)
         try? await httpClient.shutdown().get()
+        if done.queueHeld && !done.unresolvedOperations.isEmpty {
+            let marker = done.unresolvedOperations.compactMap { $0.callID }.joined(separator: ",")
+            let reason = terminalSafe("ambiguous delivery; reconcile unresolved operation(s): \(marker)")
+            if isJSONL {
+                try? await sink.emitTerminal(outcome: "ambiguous", detail: reason)
+            }
+            eprint("held: ambiguous delivery requires explicit reconciliation: \(reason)")
+            try? await httpClient.shutdown().get()
+            throw ExitCode(4)
+        }
         if let approval = approvalRequest {
             let reason = "approval required for \(approval.operation)"
             if isJSONL {
-                try? await sink.emit(.runFinished(outcome: "approval_required", detail: reason))
+                try? await sink.emitTerminal(outcome: "approval_required", detail: reason)
             }
             eprint("approval required: \(terminalSafe(reason))")
             throw ExitCode(3)
@@ -350,7 +382,7 @@ struct RunCommand: ParsableCommand {
             case .completed(let receipt):
                 outcome = "completed"
                 detail = "turns=\(receipt.turnsUsed)"
-                try? await sink.emit(.runFinished(outcome: outcome, detail: detail))
+                try? await sink.emitTerminal(outcome: outcome, detail: detail)
                 // Human final answer goes to stderr in JSONL mode and is
                 // terminal-safe: no control scalar reaches the terminal or
                 // JSON diagnostics.
@@ -363,28 +395,28 @@ struct RunCommand: ParsableCommand {
                 // Map RunFailure to exit code per §12.2
                 switch failure {
                 case .approvalDenied(let msg):
-                    try? await sink.emit(.runFinished(outcome: "approval_required", detail: msg))
+                    try? await sink.emitTerminal(outcome: "approval_required", detail: msg)
                     eprint("approval required: \(terminalSafe(msg))")
                     throw ExitCode(3)
                 case .budgetExhausted:
-                    try? await sink.emit(.runFinished(outcome: "budget_exhausted", detail: "\(failure)"))
+                    try? await sink.emitTerminal(outcome: "budget_exhausted", detail: "\(failure)")
                     eprint("budget exhausted: \(failure)")
                     throw ExitCode(5)
                 case .integrityStopped:
-                    try? await sink.emit(.runFinished(outcome: "integrity", detail: "\(failure)"))
+                    try? await sink.emitTerminal(outcome: "integrity", detail: "\(failure)")
                     eprint("integrity failure: \(failure)")
                     throw ExitCode(6)
                 case .providerError(let msg):
-                    try? await sink.emit(.runFinished(outcome: "provider_error", detail: msg))
+                    try? await sink.emitTerminal(outcome: "provider_error", detail: msg)
                     eprint("provider failure: \(terminalSafe(msg))")
                     throw ExitCode(4)
                 case .invalidStopped(let msg):
-                    try? await sink.emit(.runFinished(outcome: "invalid", detail: msg))
+                    try? await sink.emitTerminal(outcome: "invalid", detail: msg)
                     eprint("invalid: \(terminalSafe(msg))")
                     throw ExitCode(2)
                 }
             case .interrupted:
-                try? await sink.emit(.runFinished(outcome: "interrupted", detail: "interrupted"))
+                try? await sink.emitTerminal(outcome: "interrupted", detail: "interrupted")
                 eprint("interrupted")
                 throw ExitCode(130)
             default:

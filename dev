@@ -146,7 +146,7 @@ test)
     shift || true
     case "$sub" in
     quick)
-        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE"
+        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests"
         ;;
     native)
         run_swift_test native --filter "$FILTER_PRIMITIVE"

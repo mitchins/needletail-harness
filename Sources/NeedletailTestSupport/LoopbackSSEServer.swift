@@ -106,7 +106,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_addr.s_addr = INADDR_ANY
+        address.sin_addr.s_addr = in_addr_t(INADDR_LOOPBACK).bigEndian
         address.sin_port = 0
         let bound = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -168,9 +168,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             if threadExited { break }
             usleep(5_000)
         }
-        close(listenFD)
-        close(wakeRead)
-        close(wakeWrite)
+        // Descriptors are closed only by serveLoop after it exits.
     }
 
     private func markExited() {
@@ -194,7 +192,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
     }
 
     private func serveLoop(listenFD: Int32, wakeRead: Int32) {
-        defer { markExited() }
+        defer { close(listenFD); close(wakeRead); close(wakeWrite); markExited() }
         while true {
             var fds = [
                 pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0),
@@ -211,6 +209,8 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             guard fds[0].revents & Int16(POLLIN) != 0 else { continue }
             let client = accept(listenFD, nil, nil)
             guard client >= 0 else { continue }
+            var timeout = timeval(tv_sec: 1, tv_usec: 0)
+            _ = setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
             handleClient(client)
         }
     }
@@ -238,6 +238,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             if let abort = script.abortAfterChunks, index >= abort {
                 return // Abrupt close: no end, no Content-Length framing.
             }
+            if lock.withLock({ stopped }) { return }
             if chunk.delayMillis > 0 {
                 usleep(useconds_t(min(chunk.delayMillis, 60_000) * 1_000))
             }

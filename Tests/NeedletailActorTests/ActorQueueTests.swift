@@ -18,7 +18,7 @@ struct ActorQueueTests {
         await actor.submitText(commandID: CommandID("d-1"), text: "different text", kind: .followUp, sealed: false)
         let state = await actor.currentState()
         let queued = state.queue.filter { $0.commandID == CommandID("d-1") }
-        #expect(queued.count <= 1, "no duplicate entry, got \(queued.count)")
+        #expect(queued.count == 0, "duplicate replay must not queue, got \(queued.count)")
     }
 
     @Test("withdrawn IDs replay withdrawn acks, never new entries")

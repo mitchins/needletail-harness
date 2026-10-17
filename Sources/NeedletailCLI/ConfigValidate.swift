@@ -65,7 +65,7 @@ struct ConfigValidate: ParsableCommand {
             eprint("\(error)")
             throw ExitCode(2)
         } catch {
-            eprint("error $: malformedJSON — \(error). Fix: validate the file as strict JSON first.")
+            eprint("error $: malformedJSON — \(terminalSafe(String(describing: error))). Fix: validate the file as strict JSON first.")
             throw ExitCode(2)
         }
         print(renderSummary(snapshot, decision: decision))

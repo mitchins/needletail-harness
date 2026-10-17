@@ -344,7 +344,8 @@ public func deliveryStatus(entry: QueueEntry, activeRequest: ActiveRequest?) -> 
     switch entry.state {
     case .withdrawn: return .withdrawn
     case .held: return .held
-    case .queued, .dispatched, .admittedToHistory:
+    case .queued: return .queued
+    case .dispatched, .admittedToHistory:
         guard let active = activeRequest else { return .queued }
         switch active.delivery {
         case .sending: return .sending

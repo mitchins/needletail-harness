@@ -76,7 +76,17 @@ public final class FileHandleUISink: UISink, @unchecked Sendable {
             throw UISinkError.underlying(String(cString: strerror(errno)))
         }
 #else
-        try handle.write(contentsOf: data)
+        do {
+            try handle.write(contentsOf: data)
+        } catch let error as NSError {
+            if let posix = error.userInfo["NSPOSIXErrorDomain"] as? Int, posix == EPIPE {
+                throw UISinkError.brokenPipe
+            }
+            if errno == EPIPE {
+                throw UISinkError.brokenPipe
+            }
+            throw UISinkError.underlying(error.localizedDescription)
+        }
 #endif
     }
 }

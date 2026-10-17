@@ -156,7 +156,10 @@ public struct SessionEventProjection: Sendable, Equatable {
     }
 
     /// Terminal `run_finished` envelope payload carrier (M1-D JSONL).
-    public static func runFinished(outcome: String, detail: String) -> SessionEventProjection {
-        SessionEventProjection(kind: "run_finished", detail: terminalSafe(detail), outcome: outcome)
+    public static func terminalSignal(outcome: String, detail: String) -> SessionEventProjection {
+        return runFinished(outcome: outcome, detail: detail)
+    }
+
+    public static func runFinished(outcome: String, detail: String) -> SessionEventProjection {        SessionEventProjection(kind: "run_finished", detail: terminalSafe(detail), outcome: outcome)
     }
 }

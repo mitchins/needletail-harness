@@ -36,7 +36,8 @@ def check_capture(capture_path):
         msgs = req["messages"]
         print(f"\nRequest {idx+1}: {len(msgs)} messages")
         for m in msgs:
-            print(f"  {m['role']}: {m.get('content','')[:50]!r} {m.get('tool_calls','')!r} {m.get('tool_call_id','')!r}")
+            content = m.get('content') or ''
+            print(f"  {m['role']}: {str(content)[:50]!r} {m.get('tool_calls','')!r} {m.get('tool_call_id','')!r}")
 
         # Request 1: only user prompt
         if idx == 0:

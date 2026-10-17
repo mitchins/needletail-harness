@@ -50,6 +50,7 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
         var status: Int
         var headers: [(String, String)]
         var body: [UInt8]
+        var errorBody: [UInt8]
     }
 
     private let lock = NSLock()
@@ -57,7 +58,7 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
     private var headers: [(String, String)] = []
     private var body: [UInt8] = []
     private var budget = StreamBudget()
-    private var boundBreach: Error?
+    private var boundBreach: (any Error)?
     private var errorBytes: [UInt8] = []
     /// Deadline verdict recorded by the supervisor BEFORE it cancels the
     /// request: the cancellation echo (Swift CancellationError or
@@ -102,6 +103,10 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
         lock.withLock { deadlineVerdict }
     }
 
+    func takeBoundBreach() -> BoundBreach? {
+        lock.withLock { boundBreach as? BoundBreach }
+    }
+
     func didSendRequestHead(task: HTTPClient.Task<Response>, _ head: HTTPRequestHead) {}
     func didSendRequestPart(task: HTTPClient.Task<Response>, _ part: IOData) {}
     func didSendRequest(task: HTTPClient.Task<Response>) {}
@@ -133,6 +138,7 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
                 } catch {
                     if boundBreach == nil {
                         boundBreach = error
+                        task.cancel()
                     }
                     return
                 }
@@ -208,7 +214,8 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
                   let delta = first["delta"] as? [String: Any],
                   let content = delta["content"] as? String, !content.isEmpty
             else { continue }
-            // Terminal-safe already, but ensure no control bytes leak
+            // Delta projection is display-only; never emit raw model text
+            // directly into terminals. Authoritative JSONL stays separate.
             deltas.append(terminalSafe(content))
         }
         return deltas
@@ -221,7 +228,7 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
             if let breach = boundBreach {
                 throw breach
             }
-            return CollectedStream(status: status, headers: headers, body: body)
+            return CollectedStream(status: status, headers: headers, body: body, errorBody: errorBytes)
         }
     }
 
@@ -406,7 +413,10 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
                     if let verdict = delegate.takeDeadlineVerdict() {
                         throw verdict
                     }
-                    if error is CancellationError {
+                    if let bound = delegate.takeBoundBreach() {
+                        throw TransportFailure(phase: .postContent, message: bound.description)
+                    }
+                    if error is CancellationError || Task.isCancelled {
                         throw CancellationError()
                     }
                     if let failure = error as? TransportFailure {
@@ -472,10 +482,9 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
         wholeDeadline: NIODeadline,
         task: HTTPClient.Task<BoundedStreamDelegate.Response>
     ) async -> Void {
-        // Lingers until group teardown: after recording the verdict it keeps
-        // sleeping (the socket is already cancelled), so this child can only
-        // complete via cancellation — which happens after group.next()
-        // already returned the verdict. No exit-throw race by construction.
+        // Releasing the socket on any exit, including outer task-group
+        // cancellation, prevents a stalled HTTP future from pinning the run.
+        defer { task.cancel() }
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 50_000_000)
             if Task.isCancelled { return }
@@ -509,7 +518,7 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
                 let location = collected.headers.first(where: { $0.0.lowercased() == "location" })?.1
                 throw ChatTransportError.redirectRefused(location: location)
             }
-            let body = String(decoding: collected.body.prefix(SSEBounds.maxErrorBytes), as: UTF8.self)
+            let body = String(decoding: collected.errorBody.prefix(SSEBounds.maxErrorBytes), as: UTF8.self)
             throw ChatTransportError.httpStatus(collected.status, body)
         }
         if let encoding = collected.headers.first(where: { $0.0.lowercased() == "content-encoding" })?.1,

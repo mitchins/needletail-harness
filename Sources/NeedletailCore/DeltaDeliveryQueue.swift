@@ -8,11 +8,11 @@ import Foundation
 /// fragment.
 public final class DeltaDeliveryQueue: @unchecked Sendable {
     public struct Item: Sendable {
-        public let outcome: RequestID
+        public let requestID: RequestID
         public let text: String
 
         public init(requestID: RequestID, text: String) {
-            self.outcome = requestID
+            self.requestID = requestID
             self.text = text
         }
     }
@@ -44,6 +44,7 @@ public final class DeltaDeliveryQueue: @unchecked Sendable {
 
     public enum OfferResult: Equatable, Sendable {
         case accepted
+        case closed
         case overflow(itemCount: Int, byteCount: Int)
     }
 
@@ -56,7 +57,7 @@ public final class DeltaDeliveryQueue: @unchecked Sendable {
         lock.lock()
         if finished {
             lock.unlock()
-            return .overflow(itemCount: buffer.count, byteCount: pendingBytes)
+            return .closed
         }
         if buffer.count < itemCap, pendingBytes + bytes <= byteCap {
             if !waiters.isEmpty {
@@ -103,10 +104,6 @@ public final class DeltaDeliveryQueue: @unchecked Sendable {
         }
     }
 
-    public func drain() async {
-        finish()
-        await consumer?.value
-    }
 
     private func receive() async -> Item? {
         return await withCheckedContinuation { continuation in

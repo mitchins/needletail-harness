@@ -15,8 +15,13 @@ enum ScriptedError: Error {
 /// Immediate canned FIFO transport. Records every invocation.
 final class ScriptedTransport: ModelTransport, @unchecked Sendable {
     private let lock = NSLock()
-    var script: [ProviderResponse] = []
+    private var _script: [ProviderResponse] = []
     private var _invocations: [ProviderInvocation] = []
+
+    var script: [ProviderResponse] {
+        get { lock.withLock { _script } }
+        set { lock.withLock { _script = newValue } }
+    }
 
     var invocations: [ProviderInvocation] {
         lock.withLock { _invocations }
@@ -24,7 +29,7 @@ final class ScriptedTransport: ModelTransport, @unchecked Sendable {
 
     func invoke(_ invocation: ProviderInvocation, intake: BoundedChannelState<ProviderResponse>) async throws -> TransportResult {
         lock.withLock { _invocations.append(invocation) }
-        guard let next = lock.withLock({ script.isEmpty ? nil : script.removeFirst() }) else {
+        guard let next = lock.withLock({ _script.isEmpty ? nil : _script.removeFirst() }) else {
             throw ScriptedError.outOfScript
         }
         _ = intake
@@ -71,8 +76,13 @@ final class GatedTransport: ModelTransport, @unchecked Sendable {
 /// suspends on the test-owned gate (never auto-decides).
 final class ScriptedApprovals: ApprovalGateway, @unchecked Sendable {
     private let lock = NSLock()
-    var script: [ApprovalDecision] = []
+    private var _script: [ApprovalDecision] = []
     private var _requests: [ApprovalRequest] = []
+
+    var script: [ApprovalDecision] {
+        get { lock.withLock { _script } }
+        set { lock.withLock { _script = newValue } }
+    }
     var gate: AsyncStream<ApprovalDecision>?
 
     var requests: [ApprovalRequest] {
@@ -81,7 +91,7 @@ final class ScriptedApprovals: ApprovalGateway, @unchecked Sendable {
 
     func decide(_ request: ApprovalRequest) async -> ApprovalDecision {
         lock.withLock { _requests.append(request) }
-        if let next = lock.withLock({ script.isEmpty ? nil : script.removeFirst() }) {
+        if let next = lock.withLock({ _script.isEmpty ? nil : _script.removeFirst() }) {
             return next
         }
         guard let gate = lock.withLock({ gate }) else {
@@ -190,15 +200,9 @@ enum ActorFixtures {
         _ label: String,
         sourceLocation: SourceLocation = #_sourceLocation
     ) async throws {
-        for _ in 0..<2_000 {
+        for _ in 0..<20_000 {
             if check(await actor.currentState()) { return }
             await Task.yield()
-        }
-        // Under heavier scheduling (offline aggregate), actor effect tasks
-        // need a short concrete wait to make progress past 10k yields.
-        for _ in 0..<500 {
-            if check(await actor.currentState()) { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
         }
         Issue.record("actor never reached \(label)", sourceLocation: sourceLocation)
         throw ScriptedError.outOfScript
