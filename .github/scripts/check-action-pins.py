@@ -10,7 +10,7 @@ import sys
 # and all workflow `uses:` references in the same reviewed change.
 APPROVED = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",  # v7.0.1
-    "SonarSource/sonarqube-scan-action": "d209202bc7d53ff1cc128f7f907dac145c9d6ae9",  # v8.3.0
+    "SonarSource/sonarqube-scan-action": "d209202bc7d53ff1cc128f7f907dac145c9d6ae9",  # v8.3.0 #ggignore verified action commit, not a Sonar token
 }
 USE = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
