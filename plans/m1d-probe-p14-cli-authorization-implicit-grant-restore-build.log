@@ -1,0 +1,39 @@
+probe: p14-cli-authorization-implicit-grant-restore-build
+command: swift build -c release --product needletail
+exit: 0
+seconds: 16.77
+output (retained, not summarized):
+Building for production...
+[Computing dependencies]
+[Provisioning 3 / 74]
+[Using on-disk description]
+/data/coding/needletail/Sources/NeedletailCLI/RunCommand.swift:115:13: [1;33mwarning: [1;39mno calls to throwing functions occur within 'try' expression[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker\UnnecessaryEffectMarker]8;;\]
+[0;36m113 |[0;0m         }
+[0;36m114 |[0;0m         func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
+[0;36m115 |[0;0m             try lock.withLock {
+    [0;36m|[0;0m             `- [1;33mwarning: [1;39mno calls to throwing functions occur within 'try' expression[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker\UnnecessaryEffectMarker]8;;\]
+[0;36m116 |[0;0m                 let matching = log.filter { $0.sequence.value > since }
+[0;36m117 |[0;0m                 let window = matching.prefix(limit)
+
+/data/coding/needletail/Sources/NeedletailCLI/RunCommand.swift:201:33: [1;33mwarning: [1;39mresult of call to 'createFile(atPath:contents:attributes:)' is unused[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+[0;36m199 |[0;0m         let traceHandle: FileHandle?
+[0;36m200 |[0;0m         if let tracePath = trace {
+[0;36m201 |[0;0m             FileManager.default.createFile(atPath: tracePath, contents: nil)
+    [0;36m|[0;0m                                 `- [1;33mwarning: [1;39mresult of call to 'createFile(atPath:contents:attributes:)' is unused[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+[0;36m202 |[0;0m             guard let handle = FileHandle(forWritingAtPath: tracePath) else {
+[0;36m203 |[0;0m                 eprint("cannot open trace file \(tracePath)")
+
+/data/coding/needletail/Sources/NeedletailCLI/RunCommand.swift:162:33: [1;33mwarning: [1;39mimmutable value 'endpoint' was never used; consider replacing with '_' or removing it[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+[0;36m160 |[0;0m         // 2. Route check (authorize-before-dial)
+[0;36m161 |[0;0m         let route = authorizeRequestDestination(snapshot: snapshot, requestedAlias: aliasToUse, sealed: false)
+[0;36m162 |[0;0m         guard case .allowed(let endpoint, _) = route else {
+    [0;36m|[0;0m                                 `- [1;33mwarning: [1;39mimmutable value 'endpoint' was never used; consider replacing with '_' or removing it[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+[0;36m163 |[0;0m             eprint("route denied for alias '\(terminalSafe(aliasToUse))'")
+[0;36m164 |[0;0m             throw ExitCode(2)
+
+[#NoUsage]: <https://docs.swift.org/compiler/documentation/diagnostics/no-usage>
+[#UnnecessaryEffectMarker]: <https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker>
+[2 / 4] needletail-product
+[6 / 6] needletail-product
+Build complete! (13.94 secs)
+

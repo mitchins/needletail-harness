@@ -1,0 +1,6 @@
+[
+  {"tool": "read", "arguments": {"path": "src/main.py"}, "result": "file content of src/main.py: print('hello')"},
+  {"tool": "edit", "arguments": {"path": "src/main.py", "old": "old", "new": "new"}, "result": "edit applied"},
+  {"tool": "exec", "arguments": {"command": "pytest"}, "result": "test failure: assertion failed in test_main.py:42"},
+  {"tool": "edit", "arguments": {"path": "src/main.py", "old": "bad", "new": "fixed"}, "result": "edit repaired"}
+]

@@ -1,0 +1,84 @@
+probe: p10-digest-argument-bypass
+command: swift test --filter BackendTests
+exit: 1
+seconds: 18.72
+output (retained, not summarized):
+Building for debugging...
+[Computing dependencies]
+[Provisioning 16 / 122]
+[Using on-disk description]
+[4 / 7] NeedletailCore
+/data/coding/needletail/Sources/NeedletailCore/SessionActor.swift:377:27: [1;33mwarning: [1;39mno 'async' operations occur within 'await' expression[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker\UnnecessaryEffectMarker]8;;\]
+[0;36m375 |[0;0m             try? await Task.sleep(nanoseconds: delayMillis * 1_000_000)
+[0;36m376 |[0;0m             guard !Task.isCancelled else { return }
+[0;36m377 |[0;0m             let current = await self.currentGeneration(runID: runID)
+    [0;36m|[0;0m                           `- [1;33mwarning: [1;39mno 'async' operations occur within 'await' expression[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker\UnnecessaryEffectMarker]8;;\]
+[0;36m378 |[0;0m             guard !Task.isCancelled, current == generation else { return }
+[0;36m379 |[0;0m             await self.applyTick(at: deadlineMillis)
+
+[#UnnecessaryEffectMarker]: <https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker>
+[8 / 9] NeedletailCore
+[10 / 25] needletail-product
+[10 / 37] NeedletailPresentation-product
+[10 / 72] DequeModule
+[10 / 71] NeedletailPresentationTests-product
+[22 / 68] NeedletailProviders
+[38 / 78] BehaviourTests-test-runner
+[48 / 88] NeedletailActorTests-test-runner
+[55 / 94] NeedletailPresentationTests-test-runner
+[70 / 97] NeedletailProviders
+[71 / 97] NeedletailProviders
+[74 / 100] NeedletailStateTests-test-runner
+[75 / 96] NeedletailConfigTests-test-runner
+[76 / 99] NeedletailQualificationProbes-test-runner
+[77 / 100] NeedletailPresentationTests-test-runner
+/data/coding/needletail/Sources/NeedletailProviders/ScriptedToolBackend.swift:92:19: [1;33mwarning: [1;39mimmutable value 'a' was never used; consider replacing with '_' or removing it[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+ [0;36m90 |[0;0m     /// compare as raw strings (exact bytes — still never guessed).
+ [0;36m91 |[0;0m     private func jsonEqual(_ scripted: String, _ actual: String) -> Bool {
+ [0;36m92 |[0;0m         guard let a = try? JSONSerialization.jsonObject(with: Data(scripted.utf8), options: [.fragmentsAllowed]),
+    [0;36m|[0;0m                   `- [1;33mwarning: [1;39mimmutable value 'a' was never used; consider replacing with '_' or removing it[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+ [0;36m93 |[0;0m               let b = try? JSONSerialization.jsonObject(with: Data(actual.utf8), options: [.fragmentsAllowed])
+ [0;36m94 |[0;0m         else {
+
+/data/coding/needletail/Sources/NeedletailProviders/ScriptedToolBackend.swift:93:19: [1;33mwarning: [1;39mimmutable value 'b' was never used; consider replacing with '_' or removing it[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+ [0;36m91 |[0;0m     private func jsonEqual(_ scripted: String, _ actual: String) -> Bool {
+ [0;36m92 |[0;0m         guard let a = try? JSONSerialization.jsonObject(with: Data(scripted.utf8), options: [.fragmentsAllowed]),
+ [0;36m93 |[0;0m               let b = try? JSONSerialization.jsonObject(with: Data(actual.utf8), options: [.fragmentsAllowed])
+    [0;36m|[0;0m                   `- [1;33mwarning: [1;39mimmutable value 'b' was never used; consider replacing with '_' or removing it[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+ [0;36m94 |[0;0m         else {
+ [0;36m95 |[0;0m             return scripted == actual
+
+[#NoUsage]: <https://docs.swift.org/compiler/documentation/diagnostics/no-usage>
+[77 / 101] NeedletailTerminalTests-test-runner
+[80 / 103] NeedletailPresentationTests-test-runner
+[84 / 103] NeedletailProviders
+[89 / 103] NeedletailPresentationTests-test-runner
+[90 / 104] NeedletailProviders-product
+[90 / 104] NeedletailPrimitiveTests-product
+[91 / 104] NeedletailProviderIntegrationTests-product
+[96 / 107] needletail-product
+[97 / 107] NeedletailProviderTests-test-runner
+[98 / 111] NeedletailProviderIntegrationTests-test-runner
+[106 / 119] NeedletailProviderIntegrationTests-test-runner
+[128 / 134] NeedletailConfigIntegrationTests-test-runner
+[133 / 133] NeedletailProviderIntegrationTests-test-runner
+Build complete! (16.03 secs)
+◇ Test run started.
+↳ Testing Library Version: 6.4 (efd8d65801f569d)
+↳ Target Platform: x86_64-unknown-linux-gnu
+◇ Suite BackendTests started.
+◇ Test "capability denial precedes matching and never executes" started.
+◇ Test "exhausted script fails honest with the expectation shown" started.
+◇ Test "changed value mismatches honestly" started.
+◇ Test "exact verbatim match executes; digest never consulted" started.
+✘ Test "changed value mismatches honestly" recorded an issue at BackendTests.swift:56:25: Issue recorded
+↳ mismatch must fail
+✘ Test "changed value mismatches honestly" failed after 0.001 seconds with 1 issue.
+✔ Test "exhausted script fails honest with the expectation shown" passed after 0.002 seconds.
+✔ Test "capability denial precedes matching and never executes" passed after 0.002 seconds.
+✔ Test "exact verbatim match executes; digest never consulted" passed after 0.002 seconds.
+✘ Suite BackendTests failed after 0.002 seconds with 1 issue.
+✘ Test run with 4 tests in 1 suite failed after 0.002 seconds with 1 issue.
+Note: Some test targets reported failures:
+  - NeedletailProviderTests (Swift Testing)
+

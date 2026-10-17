@@ -9,10 +9,17 @@ import NeedletailCore
 struct Doctor: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "doctor",
-        abstract: "Offline local checks only; no network requests."
+        abstract: "Offline local checks by default; --probe sends one synthetic request."
     )
 
+    @Option(name: .long, help: "Validate one model alias and route, then send exactly one synthetic probe request to the authorized endpoint (loopback or configured origin only; fixed literals, never workspace bytes).")
+    var probe: String?
+
     mutating func run() throws {
+        if let alias = probe {
+            try DoctorProbe.run(alias: alias)
+            return
+        }
         print("needletail \(NeedletailVersion(major: 0, minor: 3, patch: 0))")
         print("platform: \(hostPlatform())")
 

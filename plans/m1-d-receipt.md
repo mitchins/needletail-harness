@@ -1,0 +1,22 @@
+# M1-D closeout receipt — review, remediation, report gate
+
+- Scope: headless `needletail run` integration slice over `8c3ce24` (uncommitted workdir). Report: `plans/m1-d-report.md`.
+- Independent review: `glm-reviewer` (instead of requested DeepSeek because the first reviewer task was scheduler-cancelled) returned `READY WITH CHANGES`.
+- Remediation status from that review:
+  - B1 transcript overflow handling: fixed.
+  - M1 wall timeout: fixed.
+  - M2 structured run_finished: fixed.
+  - m1 help default: fixed.
+  - M5 direct dependency declaration: fixed.
+  - m7 exact-page cursor: fixed.
+  - m10 unknown format validation: fixed.
+  - Argument-shape defense added in `ScriptedToolBackend`.
+- Evidence refreshed after remediation:
+  - `swift test --parallel --num-workers 1` rc=0.
+  - `./dev test offline` rc=0.
+  - `./dev release-bundle` rc=0 (dynamic fallback; static build failed, as previously accepted).
+  - `./dev test packaging` rc=0.
+  - 10/10 negatives rc=0.
+  - 5/5 BDD-06 probes rc=0 (restored baseline).
+- Residuals (disclosed): H1/H2 implemented; remaining low-risk polish includes human newline layout and trace double-close.
+- Disposition: local evidence green and blocker/deeper-major remediation applied; local H1/H2 remediation applied; remains pending owner approval, final independent review, and PR/CI/CodeRabbit before any merge.

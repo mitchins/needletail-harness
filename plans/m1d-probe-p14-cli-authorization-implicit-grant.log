@@ -1,0 +1,17 @@
+probe: p14-cli-authorization-implicit-grant
+command: /usr/bin/python3 /data/coding/needletail/demo/m1d-negatives.py
+exit: 1
+seconds: 14.38
+output (retained, not summarized):
+FAIL authorization-denied: no denied envelope
+PASS approval-required (0.35s)
+FAIL sealed-tool-free: sealed protocol stop, got 2
+PASS malformed-arguments (0.34s)
+PASS incomplete-completion (0.25s)
+PASS turn-exhaustion (0.66s)
+PASS midstream-abort-no-resend (0.20s)
+PASS cancel-mid-stream (5.43s)
+PASS closed-stdout-backpressure (5.73s)
+PASS secret-control-audit (0.27s)
+NEGATIVE DEMOS FAILED: authorization-denied, sealed-tool-free
+

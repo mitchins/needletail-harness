@@ -1,0 +1,82 @@
+probe: p12-delta-before-completion-removed
+command: swift test --filter BoundaryVerificationTests
+exit: 1
+seconds: 15.00
+output (retained, not summarized):
+Building for debugging...
+[Computing dependencies]
+[Provisioning 1 / 122]
+[Using on-disk description]
+[4 / 7] NeedletailCore
+/data/coding/needletail/Sources/NeedletailCore/SessionActor.swift:287:17: [1;33mwarning: [1;39minitialization of immutable value 'requestID' was never used; consider replacing with assignment to '_' or removing it[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+[0;36m285 |[0;0m         var activeTransport: Transport = transport
+[0;36m286 |[0;0m         if var deltaTransport = transport as? any DeltaStreamingTransport {
+[0;36m287 |[0;0m             let requestID = invocation.requestID
+    [0;36m|[0;0m                 `- [1;33mwarning: [1;39minitialization of immutable value 'requestID' was never used; consider replacing with assignment to '_' or removing it[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/no-usage\NoUsage]8;;\]
+[0;36m288 |[0;0m             deltaTransport.deltaSink = { _ in } // BDD06_PROBE: delta sink removed
+[0;36m289 |[0;0m             if let cast = deltaTransport as? Transport {
+
+/data/coding/needletail/Sources/NeedletailCore/SessionActor.swift:369:27: [1;33mwarning: [1;39mno 'async' operations occur within 'await' expression[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker\UnnecessaryEffectMarker]8;;\]
+[0;36m367 |[0;0m             try? await Task.sleep(nanoseconds: delayMillis * 1_000_000)
+[0;36m368 |[0;0m             guard !Task.isCancelled else { return }
+[0;36m369 |[0;0m             let current = await self.currentGeneration(runID: runID)
+    [0;36m|[0;0m                           `- [1;33mwarning: [1;39mno 'async' operations occur within 'await' expression[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker\UnnecessaryEffectMarker]8;;\]
+[0;36m370 |[0;0m             guard !Task.isCancelled, current == generation else { return }
+[0;36m371 |[0;0m             await self.applyTick(at: deadlineMillis)
+
+[#NoUsage]: <https://docs.swift.org/compiler/documentation/diagnostics/no-usage>
+[#UnnecessaryEffectMarker]: <https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker>
+[8 / 9] NeedletailCore
+[10 / 85] HTTPTypes
+[10 / 74] NIOCore
+[10 / 71] AsyncHTTPClient
+[26 / 61] NeedletailProviders-product
+[26 / 61] NeedletailQualificationProbes-product
+[36 / 66] NeedletailTerminalTests-product
+[50 / 79] NeedletailActorTests-test-runner
+[62 / 88] NeedletailConfigTests-test-runner
+[72 / 88] NeedletailPresentationTests-test-runner
+[81 / 95] NeedletailPresentationTests-test-runner
+[83 / 97] NeedletailProviderTests-test-runner
+[86 / 101] NeedletailProviderIntegrationTests-product
+[88 / 103] NeedletailProviderTests-test-runner
+[94 / 107] NeedletailProviderTests-test-runner
+[101 / 109] NeedletailConfigIntegrationTests-test-runner
+[110 / 116] NeedletailProviderIntegrationTests-test-runner
+[113 / 117] NeedletailProviderTests-test-runner
+[121 / 125] NeedletailPrimitiveTests-test-runner
+[125 / 125] NeedletailPrimitiveTests-test-runner
+Build complete! (11.06 secs)
+◇ Test run started.
+↳ Testing Library Version: 6.4 (efd8d65801f569d)
+↳ Target Platform: x86_64-unknown-linux-gnu
+◇ Suite BoundaryVerificationTests started.
+◇ Test "authorization: workspace default is fail-closed; explicit fixture is trusted" started.
+✔ Test "authorization: workspace default is fail-closed; explicit fixture is trusted" passed after 0.005 seconds.
+◇ Test "delta is observable before completion and the sink order is monotonic" started.
+✘ Test "delta is observable before completion and the sink order is monotonic" recorded an issue at BoundaryVerificationTests.swift:149:9: Expectation failed: sawDeltaBeforeFinish
+↳ model delta observable before provider completion
+↳ sawDeltaBeforeFinish → <not evaluated>
+✘ Test "delta is observable before completion and the sink order is monotonic" recorded an issue at BoundaryVerificationTests.swift:158:9: Expectation failed: envelopes.contains { $0.kind == "delta" }
+↳ delta envelope present
+↳ envelopes.contains { $0.kind == "delta" } → <not evaluated>
+✘ Test "delta is observable before completion and the sink order is monotonic" failed after 0.600 seconds with 2 issues.
+◇ Test "bounded sinks fail loudly instead of silently dropping" started.
+✔ Test "bounded sinks fail loudly instead of silently dropping" passed after 0.042 seconds.
+◇ Test "incremental display deltas equal authoritative assembly under fragmentation" started.
+✔ Test "incremental display deltas equal authoritative assembly under fragmentation" passed after 0.125 seconds.
+◇ Test "raw provider ring stays bounded and native" started.
+✔ Test "raw provider ring stays bounded and native" passed after 0.126 seconds.
+✘ Suite BoundaryVerificationTests failed after 0.903 seconds with 2 issues.
+↳ /// M1-D closure boundaries, all exercised through the production transport,
+↳ /// session actor, and sink (no test-only decoder path):
+↳ /// 1. Authorization stays fail-closed unless an explicit fixture grant is used.
+↳ /// 2. JSONL deltas are observable before completion, sequence stays monotonic,
+↳ ///    bounded sinks fail loudly, and a closed pipe is never a silent drop.
+↳ /// 3. Incremental display deltas cannot diverge from the authoritative
+↳ ///    OpenAPIRuntime assembly under fragmentation, CRLF/UTF-8, multiline data,
+↳ ///    or incomplete completion.
+✘ Test run with 5 tests in 1 suite failed after 0.904 seconds with 2 issues.
+Note: Some test targets reported failures:
+  - NeedletailProviderIntegrationTests (Swift Testing)
+

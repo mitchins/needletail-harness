@@ -1,0 +1,78 @@
+probe: p13-raw-ring-bound-removed
+command: swift test --filter BoundaryVerificationTests
+exit: 1
+seconds: 16.94
+output (retained, not summarized):
+Building for debugging...
+[Computing dependencies]
+[Provisioning 6 / 122]
+[Using on-disk description]
+[1 / 4] NeedletailCore
+[3 / 6] NeedletailCore
+/data/coding/needletail/Sources/NeedletailCore/SessionActor.swift:377:27: [1;33mwarning: [1;39mno 'async' operations occur within 'await' expression[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker\UnnecessaryEffectMarker]8;;\]
+[0;36m375 |[0;0m             try? await Task.sleep(nanoseconds: delayMillis * 1_000_000)
+[0;36m376 |[0;0m             guard !Task.isCancelled else { return }
+[0;36m377 |[0;0m             let current = await self.currentGeneration(runID: runID)
+    [0;36m|[0;0m                           `- [1;33mwarning: [1;39mno 'async' operations occur within 'await' expression[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker\UnnecessaryEffectMarker]8;;\]
+[0;36m378 |[0;0m             guard !Task.isCancelled, current == generation else { return }
+[0;36m379 |[0;0m             await self.applyTick(at: deadlineMillis)
+
+[#UnnecessaryEffectMarker]: <https://docs.swift.org/compiler/documentation/diagnostics/unnecessary-effect-marker>
+[7 / 8] NeedletailCore
+[9 / 12] CryptoBoringWrapper
+[9 / 72] CNIOOpenBSD
+[9 / 72] NIO
+[25 / 60] NeedletailRuntime-product
+[25 / 60] BehaviourTests-product
+[27 / 60] NeedletailTerminalTests-test-runner
+[27 / 60] NeedletailQualificationProbes-product
+[43 / 73] NeedletailConfigTests-test-runner
+[46 / 75] NeedletailQualificationProbes-test-runner
+[54 / 83] NeedletailConfigTests-test-runner
+[68 / 86] NeedletailStateTests-test-runner
+[74 / 90] BehaviourTests-test-runner
+[79 / 93] NeedletailStateTests-test-runner
+[80 / 94] NeedletailPresentationTests-test-runner
+[81 / 95] NeedletailProviderTests-product
+[87 / 101] NeedletailPrimitiveTests-product
+[89 / 102] NeedletailProviderTests-test-runner
+[91 / 104] NeedletailProviderIntegrationTests-test-runner
+[97 / 110] NeedletailProviderTests-test-runner
+[114 / 117] BehaviourTests-test-runner
+[124 / 124] NeedletailProviderIntegrationTests-test-runner
+[124 / 124] NeedletailPrimitiveTests-test-runner
+Build complete! (12.03 secs)
+◇ Test run started.
+↳ Testing Library Version: 6.4 (efd8d65801f569d)
+↳ Target Platform: x86_64-unknown-linux-gnu
+◇ Suite BoundaryVerificationTests started.
+◇ Test "authorization: workspace default is fail-closed; explicit fixture is trusted" started.
+✔ Test "authorization: workspace default is fail-closed; explicit fixture is trusted" passed after 0.005 seconds.
+◇ Test "delta is observable before completion and the sink order is monotonic" started.
+✔ Test "delta is observable before completion and the sink order is monotonic" passed after 0.300 seconds.
+◇ Test "bounded sinks fail loudly instead of silently dropping" started.
+✔ Test "bounded sinks fail loudly instead of silently dropping" passed after 0.004 seconds.
+◇ Test "incremental display deltas equal authoritative assembly under fragmentation" started.
+✔ Test "incremental display deltas equal authoritative assembly under fragmentation" passed after 0.040 seconds.
+◇ Test "raw provider ring stays bounded and native" started.
+✘ Test "raw provider ring stays bounded and native" recorded an issue at BoundaryVerificationTests.swift:279:9: Expectation failed: ring.count == 8
+↳ ring count bound dominates, evicting oldest
+↳ ring.count == 8 → false
+↳   ring.count → 9
+✘ Test "raw provider ring stays bounded and native" recorded an issue at BoundaryVerificationTests.swift:281:9: Expectation failed: !ring.contains { String(decoding: $0.rawBody, as: UTF8.self).contains("ring-0") }
+↳ !ring.contains { String(decoding: $0.rawBody, as: UTF8.self).contains("ring-0") } → <not evaluated>
+↳   ring.contains { String(decoding: $0.rawBody, as: UTF8.self).contains("ring-0") } → <not evaluated>
+✘ Test "raw provider ring stays bounded and native" failed after 0.100 seconds with 2 issues.
+✘ Suite BoundaryVerificationTests failed after 0.451 seconds with 2 issues.
+↳ /// M1-D closure boundaries, all exercised through the production transport,
+↳ /// session actor, and sink (no test-only decoder path):
+↳ /// 1. Authorization stays fail-closed unless an explicit fixture grant is used.
+↳ /// 2. JSONL deltas are observable before completion, sequence stays monotonic,
+↳ ///    bounded sinks fail loudly, and a closed pipe is never a silent drop.
+↳ /// 3. Incremental display deltas cannot diverge from the authoritative
+↳ ///    OpenAPIRuntime assembly under fragmentation, CRLF/UTF-8, multiline data,
+↳ ///    or incomplete completion.
+✘ Test run with 5 tests in 1 suite failed after 0.452 seconds with 2 issues.
+Note: Some test targets reported failures:
+  - NeedletailProviderIntegrationTests (Swift Testing)
+
