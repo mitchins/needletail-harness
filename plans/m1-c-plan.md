@@ -35,7 +35,7 @@ What this slice is NOT: Responses/Messages adapters (M5), real provider traffic 
 
 ## 3. Cases (17; one variant never satisfies all)
 
-- **WIRE-01/02** (integration): every-byte-boundary splits (small fixtures, exhaustive) + sampled splits (large fixtures) over the REAL adapter+loopback path (not just the parser Liu — M0 proved the parser; M1-C proves the adapter preserves it); CRLF/comments/heartbeats/multiline/empty-lines; truncated streams yield complete-prefix events only.
+- **WIRE-01/02** (integration): every-byte-boundary splits (small fixtures, exhaustive) + sampled splits (large fixtures) over the REAL adapter+loopback path (not just the parser — M0 proved the parser; M1-C proves the adapter preserves it); CRLF/comments/heartbeats/multiline/empty-lines; truncated streams yield complete-prefix events only.
 - **WIRE-03** (integration): over-limit unterminated line/event + 9th tool call + 17 MiB stream → bounded typed errors BEFORE parser accumulation (memory assertions via allocation caps where measurable, error-kind assertions always).
 - **WIRE-04** (integration): two interleaved tool-call argument streams assemble by native id/index in provider order.
 - **WIRE-05** (integration): malformed/incomplete/duplicate-ID/missing-completion tool calls → zero proposals, typed compatibility/protocol errors.
