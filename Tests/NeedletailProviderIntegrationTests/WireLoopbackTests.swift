@@ -106,8 +106,12 @@ struct WireLoopbackTests {
         do {
             _ = try await Self.run(script: SSEScript(chunks: [ScriptChunk(bytes: Array(nine.utf8))]))
             Issue.record("9th distinct call must refuse")
+        } catch let failure as TransportFailure {
+            #expect(failure.phase == .postContent, "ninth call follows content: \(failure)")
+            #expect(failure.message == "malformedEvent: more than 8 tool calls",
+                    "typed eight-call bound: \(failure.message)")
         } catch {
-            #expect("\(error)".contains("tooManyToolCalls"), "bound names its limit: \(error)")
+            Issue.record("wrong error class for ninth tool call: \(error)")
         }
     }
 
