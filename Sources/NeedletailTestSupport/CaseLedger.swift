@@ -248,13 +248,30 @@ public struct CaseResult: Sendable, Equatable, Codable {
         self.evidenceTier = evidenceTier
     }
 
+    /// Test gates without tier checks: the test field always; the review
+    /// field if and only if the entry requires the `reviewProcess` layer; a
+    /// present environment field always. A mock-tier pin that passes these
+    /// gates proves behavior; it never vetoes a case whose certifying
+    /// (required) variants carry adequate tiers — that separation is what
+    /// lets one shared contract run at mock and native tiers (M2-0).
+    public func testGatesSatisfied(for entry: CatalogueEntry) -> Bool {
+        guard testStatus.isSatisfied else { return false }
+        if entry.evidenceLayers.contains(.reviewProcess) {
+            guard let reviewStatus, reviewStatus.isSatisfied else { return false }
+        } else if let reviewStatus, !reviewStatus.isSatisfied {
+            return false
+        }
+        if let environmentStatus, !environmentStatus.isSatisfied { return false }
+        return true
+    }
+
     /// A case is satisfied only when every required field is PASS and every
     /// evidence layer the catalogue entry requires is backed by a passing
     /// record: the test field always; the review field if and only if the
     /// entry requires the `reviewProcess` layer; a present environment field
     /// always. Absent required evidence never satisfies (BDD-03/BDD-04).
     public func satisfied(for entry: CatalogueEntry) -> Bool {
-        guard testStatus.isSatisfied else { return false }
+        guard testGatesSatisfied(for: entry) else { return false }
         for required in entry.evidenceLayers {
             switch required {
             case .nativeProcess:
@@ -265,12 +282,6 @@ public struct CaseResult: Sendable, Equatable, Codable {
                 continue
             }
         }
-        if entry.evidenceLayers.contains(.reviewProcess) {
-            guard let reviewStatus, reviewStatus.isSatisfied else { return false }
-        } else if let reviewStatus, !reviewStatus.isSatisfied {
-            return false
-        }
-        if let environmentStatus, !environmentStatus.isSatisfied { return false }
         return true
     }
 }
@@ -351,8 +362,14 @@ public enum ResultsReconciler {
             }
             let allReportedPass = variants.allSatisfy { $0.satisfied(for: entry) }
             if let required = requiredVariants[caseID], !required.isEmpty {
+                // Mock/native separation: every reported variant must still
+                // pass its TEST gates (a failing mock vetoes — behavior
+                // regressed), but only the designated certifying variants
+                // must carry tier-adequate evidence. A passing mock pin of
+                // the same shared contract never vetoes native certification.
+                let failing = variants.filter { !$0.testGatesSatisfied(for: entry) }
                 let passingIDs = Set(variants.filter { $0.satisfied(for: entry) }.map(\.variantID))
-                if allReportedPass && required.isSubset(of: passingIDs) {
+                if failing.isEmpty && required.isSubset(of: passingIDs) {
                     satisfied.append(caseID)
                 } else {
                     unsatisfied.append(caseID)

@@ -3,37 +3,28 @@ import Foundation
 import NeedletailCore
 import NeedletailTestSupport
 
+/// STORE-06/07/09 over the in-memory backend (variant `in-memory`).
+/// Native durability is proven by the SQLite executions of the same shared
+/// assertions in `NeedletailPrimitiveTests`; this file pins the semantics
+/// every backend must share.
 struct StoreContractTests {
-    @Test("STATE-02 store contract: append order and pagination")
-    func appendOrderAndPagination() throws {
-        let store = InMemorySessionStore()
-        try store.append(.transcriptAppended(.user("a")))
-        try store.append(.transcriptAppended(.user("b")))
-        try store.append(.transcriptAppended(.user("c")))
-        let (page1, next1) = try store.records(since: 0, limit: 2)
-        #expect(page1.map(\.record) == [.transcriptAppended(.user("a")), .transcriptAppended(.user("b"))])
-        #expect(next1 != nil)
-        let (page2, next2) = try store.records(since: next1!, limit: 2)
-        #expect(page2.map(\.record) == [.transcriptAppended(.user("c"))])
-        #expect(next2 == nil)
+
+    @Test("STORE-07 in-memory transcript resume and list preserves order across pages")
+    func STORE_07_inMemoryResumeListsInOrder() throws {
+        try StoreContractAssertions.assertAppendOrderAndPagination(
+            InMemorySessionStore(), variant: "in-memory")
     }
 
-    @Test("STATE-02 store contract: writer ownership is exclusive")
-    func writerOwnershipExclusive() throws {
+    @Test("STORE-06 in-memory second writer on one session learns the exact owner")
+    func STORE_06_inMemoryWriterOwnershipExclusive() throws {
         let store = InMemorySessionStore()
-        try store.claimWriterOwnership(session: SessionID("s1"))
-        #expect(throws: StoreError.self) {
-            try store.claimWriterOwnership(session: SessionID("s2"))
-        }
-        store.releaseWriterOwnership(session: SessionID("s1"))
-        try store.claimWriterOwnership(session: SessionID("s2"))
+        try StoreContractAssertions.assertWriterOwnershipExclusive(
+            first: store, second: store, variant: "in-memory")
     }
 
-    @Test("STATE-02 store contract: bounded quota fails honestly")
-    func boundedQuota() throws {
-        let store = InMemorySessionStore()
-        // Not filling 10k; just verify append increments count.
-        try store.append(.transcriptAppended(.user("x")))
-        #expect(store.count == 1)
+    @Test("STORE-09 in-memory store fills to quota then fails honestly")
+    func STORE_09_inMemoryQuotaBoundary() throws {
+        try StoreContractAssertions.assertQuotaBoundary(
+            InMemorySessionStore(), limit: InMemorySessionStore.recordCap, variant: "in-memory")
     }
 }
