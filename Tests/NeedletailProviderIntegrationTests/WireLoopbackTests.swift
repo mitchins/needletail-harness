@@ -107,7 +107,7 @@ struct WireLoopbackTests {
             _ = try await Self.run(script: SSEScript(chunks: [ScriptChunk(bytes: Array(nine.utf8))]))
             Issue.record("9th distinct call must refuse")
         } catch {
-            #expect("\(error)".contains("8"), "bound names its limit: \(error)")
+            #expect("\(error)".contains("tooManyToolCalls"), "bound names its limit: \(error)")
         }
     }
 

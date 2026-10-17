@@ -359,7 +359,9 @@ struct M1DCasesTests {
             config: budgetConfig, tools: tools, trusted: true, maxTurns: 2))
         #expect(budget.exit == 5, "budget exhaustion maps to exit 5: \(budget.stderr)")
 
-        let invalid = try M1DCases.writeConfig(try temporaryDirectory(), port: 0)
+        let invalidDirectory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: invalidDirectory) }
+        let invalid = try M1DCases.writeConfig(invalidDirectory, port: 0)
         try Data("not json".utf8).write(to: URL(fileURLWithPath: invalid))
         let invalidResult = try M1DCases.run(M1DCases.runArguments(config: invalid))
         #expect(invalidResult.exit == 2, "invalid config maps to exit 2: \(invalidResult.stderr)")

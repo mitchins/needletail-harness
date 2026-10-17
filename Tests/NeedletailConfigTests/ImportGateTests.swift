@@ -34,7 +34,8 @@ struct ImportGateTests {
                 guard trimmed.hasPrefix("import ") else { continue }
                 let trimmedImport = trimmed.dropFirst(7).trimmingCharacters(in: .whitespaces)
                 let pieces = trimmedImport.split(whereSeparator: { $0.isWhitespace })
-                let module = pieces.last { !$0.isEmpty && !["struct", "class", "enum", "actor", "protocol", "typealias", "let", "var"].contains(String($0)) }?.trimmingCharacters(in: CharacterSet(charactersIn: " \";")) ?? ""
+                let module = (pieces.last { !$0.isEmpty && !["struct", "class", "enum", "actor", "protocol", "typealias", "let", "var"].contains(String($0)) }?.trimmingCharacters(in: CharacterSet(charactersIn: " \";")) ?? "")
+                    .split(separator: ".").first.map(String.init) ?? ""
                 #expect(!Self.forbiddenImports.contains(module),
                         "\(path): forbidden import '\(module)' — Core performs no I/O")
             }
