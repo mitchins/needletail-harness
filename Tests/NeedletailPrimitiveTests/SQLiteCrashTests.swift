@@ -4,6 +4,8 @@ import Foundation
 import NeedletailCore
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Darwin)
+import Darwin
 #endif
 
 /// STORE-02 bounded crash primitive — SIGKILL mid-transaction over a
@@ -49,11 +51,12 @@ struct SQLiteCrashTests {
         child.standardError = FileHandle.nullDevice
         try child.run()
         // The child is ALWAYS reaped: a failed sync kills (never leaves a
-        // stdin-blocked orphan behind).
+        // stdin-blocked orphan behind). SIGKILL on every POSIX platform —
+        // SIGTERM would let cleanup handlers run and void the crash point.
         defer {
             if child.isRunning {
-                #if canImport(Glibc)
-                Glibc.kill(child.processIdentifier, SIGKILL)
+                #if canImport(Glibc) || canImport(Darwin)
+                kill(child.processIdentifier, SIGKILL)
                 #else
                 child.terminate()
                 #endif
@@ -73,20 +76,21 @@ struct SQLiteCrashTests {
         try writeLine("SELECT 'ready:'||changes();\n")
         var echo = Data()
         let readyMarker = Data("ready:1".utf8)
-        #if canImport(Glibc)
-        // Deadline-driven poll: the fd is waited on with a timeout, so a
-        // silent child fails closed instead of blocking the runner forever.
+        #if canImport(Glibc) || canImport(Darwin)
+        // Deadline-driven POSIX poll on every supported platform: the fd is
+        // waited on with a timeout, so a silent child fails closed instead
+        // of blocking the runner forever. No Thread.sleep anywhere here.
         let stop = Date().addingTimeInterval(10)
         while !echo.contains(readyMarker) {
             let remaining = max(0, stop.timeIntervalSinceNow)
             var fds = pollfd(fd: stdout.fileHandleForReading.fileDescriptor,
                              events: Int16(POLLIN), revents: 0)
-            let waited = Glibc.poll(&fds, 1, Int32(remaining * 1000))
+            let waited = poll(&fds, 1, Int32(remaining * 1000))
             guard waited > 0 else { break }
             if fds.revents & Int16(POLLIN) != 0 {
                 echo.append(stdout.fileHandleForReading.availableData)
             } else {
-                break
+                break // HUP/ERR: the child died without confirming.
             }
         }
         #else
@@ -99,8 +103,8 @@ struct SQLiteCrashTests {
         #endif
         #expect(echo.contains(readyMarker), "child must confirm the uncommitted write ran (got \(String(data: echo, encoding: .utf8) ?? "?"))")
         #expect(child.isRunning, "child must still hold the transaction when killed")
-        #if canImport(Glibc)
-        Glibc.kill(child.processIdentifier, SIGKILL)
+        #if canImport(Glibc) || canImport(Darwin)
+        kill(child.processIdentifier, SIGKILL)
         #else
         child.terminate()
         #endif

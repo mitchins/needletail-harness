@@ -9,18 +9,88 @@ import NeedletailTestSupport
 /// Exists only to execute the shared `StoreContractAssertions` against a
 /// real database file, giving STORE-06/07/09 native-storage evidence.
 /// Ordering, pagination, ownership and quota are enforced in SQL; record
-/// PAYLOAD bytes ride a per-handle map keyed by rowid (SQL holds a
-/// diagnostic fingerprint). A missing payload is `.integrity`, never a
-/// silent substitution — but payload BYTE durability across reopen is proven
-/// by the STORE-01/STORE-02 primitives, not here. The quota count cache is
-/// exact under the single-writer contract runs (this handle is the sole
-/// appender); the shared assertion's final SQL tally cross-checks it.
+/// payloads persist in a `payload` column via the test-local lossless codec
+/// below, so a FRESH handle on the same file resumes the full history
+/// (STORE-07 reopen leg). Shapes outside the codec fail reads with
+/// `.integrity` — the probe never invents payload bytes. The quota count
+/// cache is exact under the single-writer contract runs (this handle is the
+/// sole appender); the shared assertion's final SQL tally cross-checks it.
+///
+/// Lossless codec for the transcript shapes the shared contract appends.
+private struct TranscriptPayload: Codable {
+    var kind: String // "user" | "assistantText" | "toolCall" | "toolResponse"
+    var text: String?
+    var callID: String?
+    var tool: String?
+    var arguments: String?
+
+    init(_ entry: TranscriptEntry) throws {
+        switch entry {
+        case .user(let text):
+            self.init(kind: "user", text: text)
+        case .assistantText(let text):
+            self.init(kind: "assistantText", text: text)
+        case .toolCall(let call):
+            self.init(kind: "toolCall", callID: call.callID, tool: call.tool, arguments: call.arguments)
+        case .toolResponse(let callID, let text):
+            self.init(kind: "toolResponse", text: text, callID: callID)
+        }
+    }
+
+    init(kind: String, text: String? = nil, callID: String? = nil, tool: String? = nil, arguments: String? = nil) {
+        self.kind = kind
+        self.text = text
+        self.callID = callID
+        self.tool = tool
+        self.arguments = arguments
+    }
+
+    var entry: TranscriptEntry? {
+        switch kind {
+        case "user":
+            text.map(TranscriptEntry.user)
+        case "assistantText":
+            text.map(TranscriptEntry.assistantText)
+        case "toolCall":
+            if let callID, let tool, let arguments {
+                TranscriptEntry.toolCall(NativeToolCall(callID: callID, tool: tool, arguments: arguments))
+            } else { nil }
+        case "toolResponse":
+            if let callID, let text {
+                TranscriptEntry.toolResponse(callID: callID, text: text)
+            } else { nil }
+        default:
+            nil
+        }
+    }
+}
+
+private enum ProbePayload {
+    static func encode(_ record: DurableRecord) throws -> String {
+        guard case .transcriptAppended(let entry) = record else {
+            throw StoreError.integrity("probe store persists transcript records only, got other shape")
+        }
+        let data = try JSONEncoder().encode(TranscriptPayload(entry))
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw StoreError.integrity("payload is not UTF-8")
+        }
+        return text
+    }
+
+    static func decode(_ text: String) throws -> DurableRecord {
+        guard let data = text.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(TranscriptPayload.self, from: data),
+              let entry = payload.entry else {
+            throw StoreError.integrity("undecodable payload: \(text.prefix(64))")
+        }
+        return .transcriptAppended(entry)
+    }
+}
 final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
     private let queue: DatabaseQueue
     private let limit: Int
     private let lock = NSLock()
     private var recordCount: Int
-    private var payloads: [Int64: DurableRecord] = [:]
 
     init(path: String, limit: Int) throws {
         // WAL is set via Configuration so the mode change happens at
@@ -42,7 +112,7 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS records(
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fingerprint TEXT NOT NULL)
+                    payload TEXT NOT NULL)
                 """)
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS writer(
@@ -60,34 +130,39 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
         // every contract run — and the final row tally is verified in SQL.
         let count: Int = lock.withLock { recordCount }
         guard count < limit else { throw StoreError.quotaExceeded(limit: limit) }
+        // The payload codec throws .integrity for shapes the probe cannot
+        // persist — before any SQL runs, so nothing half-written remains.
+        let encoded = try ProbePayload.encode(record)
         let rowID = try queue.write { db -> Int64 in
-            try db.execute(sql: "INSERT INTO records (fingerprint) VALUES (?)",
-                           arguments: [String(describing: record)])
+            try db.execute(sql: "INSERT INTO records (payload) VALUES (?)",
+                           arguments: [encoded])
             return db.lastInsertedRowID
         }
-        lock.withLock {
-            payloads[rowID] = record
-            recordCount += 1
-        }
+        lock.withLock { recordCount += 1 }
+        _ = rowID
     }
 
     func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
-        let rows = try queue.read { db in
+        let texts = try queue.read { db in
             try Row.fetchAll(db, sql: """
-                SELECT seq FROM records WHERE seq > ? ORDER BY seq LIMIT ?
+                SELECT seq, payload FROM records WHERE seq > ? ORDER BY seq LIMIT ?
                 """, arguments: [since, limit])
         }
-        let batch = try lock.withLock { () throws -> [SequencedRecord] in
-            try rows.map { row in
-                let seq: Int64 = row["seq"]
-                guard let record = payloads[seq] else {
-                    throw StoreError.integrity("payload missing for seq \(seq)")
-                }
-                return SequencedRecord(sequence: SequenceNumber(UInt64(seq)), record: record)
-            }
+        // Every row decodes through the lossless codec: a fresh handle on a
+        // reopened file resumes identical records, not fingerprints.
+        let batch = try texts.map { row -> SequencedRecord in
+            let seq: Int64 = row["seq"]
+            let payload: String = row["payload"]
+            return try SequencedRecord(sequence: SequenceNumber(UInt64(seq)),
+                                       record: ProbePayload.decode(payload))
         }
         let next: UInt64? = batch.count < limit ? nil : batch.last?.sequence.value
         return (batch, next)
+    }
+
+    /// GRDB reaps the connection; the file stays for the next handle.
+    func close() throws {
+        try queue.close()
     }
 
     func claimWriterOwnership(session: SessionID) throws {
@@ -135,10 +210,20 @@ struct SQLiteStoreContractTests {
     func STORE_07_sqliteResumeListsInOrder() throws {
         let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try SQLiteProbeStore(
-            path: directory.appendingPathComponent("store.sqlite").path,
-            limit: InMemorySessionStore.recordCap)
-        try StoreContractAssertions.assertAppendOrderAndPagination(store, variant: "sqlite")
+        let dbPath = directory.appendingPathComponent("store.sqlite").path
+        let first = try SQLiteProbeStore(path: dbPath, limit: InMemorySessionStore.recordCap)
+        try StoreContractAssertions.assertAppendOrderAndPagination(first, variant: "sqlite")
+        // Reopen leg: a FRESH handle on the same file resumes the identical
+        // history — payloads persist in SQL, not in handle memory.
+        try first.close()
+        let reopened = try SQLiteProbeStore(path: dbPath, limit: InMemorySessionStore.recordCap)
+        let (all, tailNext) = try reopened.records(since: 0, limit: Int.max)
+        let expected = (0..<7).map { DurableRecord.transcriptAppended(.user("msg-\($0)")) }
+        #expect(all.map(\.record) == expected, "reopened store resumes identical records")
+        #expect(all.map(\.sequence.value) == [1, 2, 3, 4, 5, 6, 7], "reopened sequences stay dense")
+        #expect(tailNext == nil, "full read ends with a nil cursor")
+        let (tail, _) = try reopened.records(since: 4, limit: 10)
+        #expect(tail.map(\.record) == Array(expected[4...]), "reopened since-cursor replays the tail")
     }
 
     @Test("STORE-06 sqlite second writer on one session learns the exact owner")

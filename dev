@@ -302,7 +302,18 @@ coverage)
         echo "FAIL [coverage]: runner wrote no xunit output at $_xunit_actual. Not a pass."
         exit 1
     fi
-    NT_XUNIT_PATH="$_xunit_actual" NT_COVERAGE_ACTIVE=1 run_swift_test coverage-ingest --filter "XUnitIngestionTests"
+    # Exported (not prefix-assigned: POSIX leaves export-through-function
+    # unspecified, and a non-inherited env would silently SKIP the ingestion
+    # test). The INGEST line is required: a skipped ingestion must never
+    # print COVERAGE OK (BDD-01..04 — skipped is not pass).
+    export NT_XUNIT_PATH="$_xunit_actual" NT_COVERAGE_ACTIVE=1
+    run_swift_test coverage-ingest --filter "XUnitIngestionTests"
+    unset NT_XUNIT_PATH NT_COVERAGE_ACTIVE
+    _ingest_log="$root_dir/.needletail-dev/logs/dev-coverage-ingest.log"
+    if ! grep -q '^INGEST: ' "$_ingest_log"; then
+        echo "FAIL [coverage]: ingestion produced no INGEST evidence line (skipped, not executed). Not a pass."
+        exit 1
+    fi
     echo "COVERAGE OK: executed results reconciled (evidence: $_xunit_actual)."
     ;;
 vendor-check)

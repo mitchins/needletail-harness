@@ -181,7 +181,9 @@ struct XUnitIngestionTests {
             Issue.record("ingestion invalid: \(reconciliation)")
             return
         }
-        print("INGEST: executed=\(executed.count) labeled=\(results.count + skippedKnown.count + xmlFailures.count) unlabeled=\(unlabeled) skipped=\(skippedKnown.count) failed=\(xmlFailures.count) satisfied=\(report.satisfied.count) unsatisfied=\(report.unsatisfied.count) missing=\(report.missing.count)")
+        // `results` already contains every non-skipped labeled test (passes
+        // AND failures); adding xmlFailures again would double-count.
+        print("INGEST: executed=\(executed.count) labeled=\(results.count + skippedKnown.count) unlabeled=\(unlabeled) skipped=\(skippedKnown.count) failed=\(xmlFailures.count) satisfied=\(report.satisfied.count) unsatisfied=\(report.unsatisfied.count) missing=\(report.missing.count)")
         #expect(xmlFailures.isEmpty, "executed failures in evidence: \(xmlFailures)")
         for (caseID, variants) in Self.requiredEvidence {
             for (variantID, expectedModule) in variants {
