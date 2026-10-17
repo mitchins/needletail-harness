@@ -4,7 +4,7 @@ import NeedletailCore
 import NeedletailTestSupport
 
 struct ReplayQualificationTests {
-    @Test("M2-0 replay: identical cancellation trace yields identical state and no late resurrection")
+    @Test("STATE-01 replay: identical cancellation trace yields identical state and no late resurrection")
     func cancelledLateCompletionReplays() throws {
         func run() throws -> SessionState {
             var ids = StateFixtures.ids()
@@ -21,6 +21,6 @@ struct ReplayQualificationTests {
         let a = try run()
         let b = try run()
         #expect(a == b, "replay must be deterministic")
-        #expect(a.phase.isTerminal || a.phase == .cancelling, "cancelled run does not become completed")
+        #expect(a.phase == .cancelling, "cancelled run does not become completed")
     }
 }

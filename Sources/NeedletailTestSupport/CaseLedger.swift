@@ -255,13 +255,15 @@ public struct CaseResult: Sendable, Equatable, Codable {
     /// always. Absent required evidence never satisfies (BDD-03/BDD-04).
     public func satisfied(for entry: CatalogueEntry) -> Bool {
         guard testStatus.isSatisfied else { return false }
-        let rank: [EvidenceLayer: Int] = [
-            .pure: 0, .integration: 1, .terminalAdapter: 2, .pty: 3,
-            .nativeProcess: 4, .nativeStorage: 5, .liveProvider: 6,
-            .packaging: 7, .reviewProcess: 8,
-        ]
-        for required in entry.evidenceLayers where required == .nativeProcess || required == .nativeStorage {
-            guard (rank[evidenceTier] ?? 0) >= (rank[required] ?? 0) else { return false }
+        for required in entry.evidenceLayers {
+            switch required {
+            case .nativeProcess:
+                guard evidenceTier == .nativeProcess || evidenceTier == .nativeStorage else { return false }
+            case .nativeStorage:
+                guard evidenceTier == .nativeStorage else { return false }
+            default:
+                continue
+            }
         }
         if entry.evidenceLayers.contains(.reviewProcess) {
             guard let reviewStatus, reviewStatus.isSatisfied else { return false }

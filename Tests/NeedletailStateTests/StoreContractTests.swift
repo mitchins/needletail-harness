@@ -4,7 +4,7 @@ import NeedletailCore
 import NeedletailTestSupport
 
 struct StoreContractTests {
-    @Test("M2-0 store contract: append order and pagination")
+    @Test("STATE-02 store contract: append order and pagination")
     func appendOrderAndPagination() throws {
         let store = InMemorySessionStore()
         try store.append(.transcriptAppended(.user("a")))
@@ -18,7 +18,7 @@ struct StoreContractTests {
         #expect(next2 == nil)
     }
 
-    @Test("M2-0 store contract: writer ownership is exclusive")
+    @Test("STATE-02 store contract: writer ownership is exclusive")
     func writerOwnershipExclusive() throws {
         let store = InMemorySessionStore()
         try store.claimWriterOwnership(session: SessionID("s1"))
@@ -29,7 +29,7 @@ struct StoreContractTests {
         try store.claimWriterOwnership(session: SessionID("s2"))
     }
 
-    @Test("M2-0 store contract: bounded quota fails honestly")
+    @Test("STATE-02 store contract: bounded quota fails honestly")
     func boundedQuota() throws {
         let store = InMemorySessionStore()
         // Not filling 10k; just verify append increments count.
