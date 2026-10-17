@@ -25,3 +25,6 @@ ThirdParty/
 Archive*.zip
 Archive *zip
 demo/__pycache__/
+
+# Security
+.env
