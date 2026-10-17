@@ -36,8 +36,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate all workflow actions use verified Node 24 SHA pins
-        run: python3 .github/scripts/check-action-pins.py
+      - name: Install CI YAML parser and SQLite headers
+        run: |
+          # Build-host dependencies only, never shipped with Needletail.
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev python3-yaml
+          test -f /usr/include/sqlite3.h
+          /usr/bin/python3 -c 'import yaml'
+
+      - name: Validate audited Node 24 action pins (YAML-aware)
+        run: |
+          /usr/bin/python3 .github/scripts/test-action-pins.py
+          /usr/bin/python3 .github/scripts/check-action-pins.py
 
       - name: Install the pinned Swift toolchain (swiftly)
         run: |
@@ -74,15 +84,6 @@ jobs:
             *"Swift version 6.4"*) echo "toolchain pin holds across steps" ;;
             *) echo "FAIL: later step does not resolve pinned Swift 6.4"; exit 1 ;;
           esac
-
-      - name: Provision SQLite headers (GRDB system-library requirement)
-        run: |
-          # GRDB's GRDBSQLite system-library target requires sqlite3.h. This
-          # installs the distro dev package on the ephemeral runner only; the
-          # harness itself never installs anything (I02).
-          sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev
-          test -f /usr/include/sqlite3.h || { echo "FAIL: sqlite3.h missing after install"; exit 1; }
 
       - name: Resolve the locked graph (pinned)
         run: |

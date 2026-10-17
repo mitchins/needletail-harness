@@ -19,8 +19,9 @@ jobs:
   quality:
     name: SonarQube Cloud quality gate
     # GitHub does not provide secrets on fork-origin pull_request events.
-    # Trusted branch PRs and main receive analysis; forks keep secret-free Linux CI.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Trusted human-authored branch PRs and main receive analysis; forks and
+    # Dependabot PRs (which cannot access ordinary Actions secrets) are skipped.
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
