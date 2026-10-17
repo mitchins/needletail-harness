@@ -95,17 +95,11 @@ jobs:
       - name: Build
         run: ./dev build
 
-      - name: Pure and primitive suites (quick)
-        run: ./dev test quick
-
-      - name: Native primitives (native)
-        run: ./dev test native
+      - name: Full offline gate (quick/native/PTY/case-bound integrations)
+        run: ./dev test offline
 
       - name: Vendor integrity
         run: ./dev vendor-check
-
-      - name: Catalogue reconciliation (coverage)
-        run: ./dev coverage
 
       - name: False-pass guards
         run: |
