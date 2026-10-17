@@ -224,6 +224,7 @@ public struct CaseResult: Sendable, Equatable, Codable {
     public var reviewStatus: CaseStatus?
     public var environmentStatus: CaseStatus?
     public var kind: String
+    public var evidenceTier: EvidenceLayer
 
     enum CodingKeys: String, CodingKey {
         case caseID = "case_id"
@@ -232,17 +233,19 @@ public struct CaseResult: Sendable, Equatable, Codable {
         case reviewStatus = "review_status"
         case environmentStatus = "environment_status"
         case kind
+        case evidenceTier = "evidence_tier"
     }
 
     public init(caseID: String, variantID: String = "default", testStatus: CaseStatus,
                 reviewStatus: CaseStatus? = nil, environmentStatus: CaseStatus? = nil,
-                kind: String = "evidence") {
+                kind: String = "evidence", evidenceTier: EvidenceLayer = .pure) {
         self.caseID = caseID
         self.variantID = variantID
         self.testStatus = testStatus
         self.reviewStatus = reviewStatus
         self.environmentStatus = environmentStatus
         self.kind = kind
+        self.evidenceTier = evidenceTier
     }
 
     /// A case is satisfied only when every required field is PASS and every
@@ -252,6 +255,14 @@ public struct CaseResult: Sendable, Equatable, Codable {
     /// always. Absent required evidence never satisfies (BDD-03/BDD-04).
     public func satisfied(for entry: CatalogueEntry) -> Bool {
         guard testStatus.isSatisfied else { return false }
+        let rank: [EvidenceLayer: Int] = [
+            .pure: 0, .integration: 1, .terminalAdapter: 2, .pty: 3,
+            .nativeProcess: 4, .nativeStorage: 5, .liveProvider: 6,
+            .packaging: 7, .reviewProcess: 8,
+        ]
+        for required in entry.evidenceLayers where required == .nativeProcess || required == .nativeStorage {
+            guard (rank[evidenceTier] ?? 0) >= (rank[required] ?? 0) else { return false }
+        }
         if entry.evidenceLayers.contains(.reviewProcess) {
             guard let reviewStatus, reviewStatus.isSatisfied else { return false }
         } else if let reviewStatus, !reviewStatus.isSatisfied {
