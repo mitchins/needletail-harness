@@ -27,7 +27,7 @@ struct BackendTests {
         ToolBatch(proposals.map { ToolProposal(callID: $0.0, tool: $0.1, argumentsDigest: "d", arguments: $0.2) })
     }
 
-    @Test("exact verbatim match executes; digest never consulted")
+    @Test("WIRE-05 exact verbatim match executes; digest never consulted")
     func exactMatchExecutes() async throws {
         let backend = Self.backend([
             ("read", "{\"path\":\"f\"}", "file-bytes"),
@@ -46,7 +46,7 @@ struct BackendTests {
         #expect(second.receipt.summary == "second")
     }
 
-    @Test("changed value mismatches honestly")
+    @Test("WIRE-05 changed value mismatches honestly")
     func mismatchHonest() async throws {
         let backend = Self.backend()
         do {
@@ -61,7 +61,7 @@ struct BackendTests {
         }
     }
 
-    @Test("capability denial precedes matching and never executes")
+    @Test("WIRE-05 capability denial precedes matching and never executes")
     func denialFirst() async throws {
         let backend = Self.backend(caps: .allDenied)
         do {
@@ -76,7 +76,7 @@ struct BackendTests {
         }
     }
 
-    @Test("exhausted script fails honest with the expectation shown")
+    @Test("WIRE-05 exhausted script fails honest with the expectation shown")
     func exhaustionHonest() async throws {
         let backend = Self.backend()
         _ = try await backend.execute(batch:

@@ -8,7 +8,7 @@ import NeedletailCore
 /// Forbidden: dispatch without reserveEffect, counter leaks across runs.
 struct AdmissionTests {
 
-    @Test("admission reserves IDs and orders intent before dispatch")
+    @Test("STATE-01 admission reserves IDs and orders intent before dispatch")
     func admissionReservesAndOrders() throws {
         var ids = StateFixtures.ids()
         let (state, run) = try StateFixtures.admitted("hello", ids: &ids)

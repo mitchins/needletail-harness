@@ -71,7 +71,7 @@ struct BoundaryVerificationTests {
 
     // MARK: 1. Authorization fail-closed
 
-    @Test("authorization: workspace default is fail-closed; explicit fixture is trusted")
+    @Test("WIRE-08 authorization: workspace default is fail-closed; explicit fixture is trusted")
     func authorizationFailClosed() throws {
         let json = """
         {"version":1,"default_model":"loop","allow_http_origins":["http://127.0.0.1:9"],"models":[{"alias":"loop","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:9","model":"m","context_window":4096,"max_output":128,"locality":"local","connect_timeout_s":5,"read_idle_timeout_s":10,"request_timeout_s":60,"max_in_flight":1}],"tools":{"read":true,"search":true,"edit":true,"write":true,"exec":true,"consult":true}}
@@ -101,7 +101,7 @@ struct BoundaryVerificationTests {
 
     // MARK: 2. JSONL/stream ordering + bounded sinks
 
-    @Test("delta is observable before completion and the sink order is monotonic")
+    @Test("WIRE-08 delta is observable before completion and the sink order is monotonic")
     func deltaBeforeCompletion() async throws {
         let server = try LoopbackSSEServer()
         let first = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"},\"finish_reason\":null}]}\n\n"
@@ -160,7 +160,7 @@ struct BoundaryVerificationTests {
         #expect(envelopes.map(\.seq).last == UInt64(envelopes.count), "sink sequence has no gaps")
     }
 
-    @Test("bounded sinks fail loudly instead of silently dropping")
+    @Test("WIRE-08 bounded sinks fail loudly instead of silently dropping")
     func boundedSinksFailLoudly() async throws {
         let memory = InMemoryUISink(sessionID: "boundary-bound")
         for index in 0..<InMemoryUISink.itemCap {
@@ -195,7 +195,7 @@ struct BoundaryVerificationTests {
 
     // MARK: 3. SSE equivalence
 
-    @Test("incremental display deltas equal authoritative assembly under fragmentation")
+    @Test("WIRE-08 incremental display deltas equal authoritative assembly under fragmentation")
     func incrementalEqualsAuthoritative() async throws {
         let bodies: [(name: String, text: String, fragmentSize: Int?)] = [
             ("fragmented-text", CannedTurn.text("hello world"), 7),
@@ -248,7 +248,7 @@ struct BoundaryVerificationTests {
 
     // MARK: Bounded raw provider ring
 
-    @Test("raw provider ring stays bounded and native")
+    @Test("WIRE-08 raw provider ring stays bounded and native")
     func rawProviderRingBounded() async throws {
         let server = try LoopbackSSEServer()
         for index in 0..<9 {
@@ -283,7 +283,7 @@ struct BoundaryVerificationTests {
         #expect(server.requests.count == 9, "nine provider attempts produced the bound")
     }
 
-    @Test("H1: concurrent sink emits preserve ordering and terminal-last")
+    @Test("WIRE-08 H1: concurrent sink emits preserve ordering and terminal-last")
     func h1ConcurrentSinkOrdering() async throws {
         let sink = InMemoryUISink(sessionID: "h1-concurrency")
         await withThrowingTaskGroup(of: Void.self) { group in
