@@ -285,6 +285,19 @@ public struct CaseResult: Sendable, Equatable, Codable {
                 guard evidenceTier == .terminalAdapter || evidenceTier == .pty else { return false }
             case .pty:
                 guard evidenceTier == .pty else { return false }
+            case .liveProvider:
+                // Nothing in the offline suites produces live-provider
+                // evidence (M3+): exact match, so such requirements fail
+                // closed instead of passing on pure results.
+                guard evidenceTier == .liveProvider else { return false }
+            case .packaging:
+                // Same fail-closed rule for packaging evidence.
+                guard evidenceTier == .packaging else { return false }
+            case .integration:
+                // Lax on purpose: `.integration` is the in-process default,
+                // not a scarce native resource. The WIRE-01 rows pin that a
+                // `.pure` pass satisfies an `[.integration]` requirement.
+                continue
             default:
                 continue
             }

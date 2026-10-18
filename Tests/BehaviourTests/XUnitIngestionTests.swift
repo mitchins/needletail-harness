@@ -141,9 +141,9 @@ struct XUnitIngestionTests {
     private static var requiredVariants: [String: Set<String>] {
         requiredEvidence.mapValues { Set($0.keys) }
     }
-    @Test("M2-0 ingestion joins executed runner results to the catalogue",
+    @Test("BDD-01 ingestion joins executed runner results to the catalogue",
           .enabled(if: ingestionEnabled, "run via ./dev coverage (sets NT_XUNIT_PATH)"))
-    func ingestionReconcilesExecutedResults() throws {
+    func BDD_01_ingestionReconcilesExecutedResults() throws {
         let path = try #require(ProcessInfo.processInfo.environment["NT_XUNIT_PATH"],
                                 "NT_XUNIT_PATH must point at fresh xunit output")
         let data = try #require(FileManager.default.contents(atPath: path),

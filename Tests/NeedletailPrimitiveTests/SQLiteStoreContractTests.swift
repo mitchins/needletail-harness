@@ -4,19 +4,9 @@ import Foundation
 import NeedletailCore
 import NeedletailTestSupport
 
-/// Test-local SQLite `SessionStore` (NOT product code, NOT M2-A).
-///
-/// Exists only to execute the shared `StoreContractAssertions` against a
-/// real database file, giving STORE-06/07/09 native-storage evidence.
-/// Ordering, pagination, ownership and quota are enforced in SQL; record
-/// payloads persist in a `payload` column via the test-local lossless codec
-/// below, so a FRESH handle on the same file resumes the full history
-/// (STORE-07 reopen leg). Shapes outside the codec fail reads with
-/// `.integrity` — the probe never invents payload bytes. The quota count
-/// cache is exact under the single-writer contract runs (this handle is the
-/// sole appender); the shared assertion's final SQL tally cross-checks it.
-///
 /// Lossless codec for the transcript shapes the shared contract appends.
+/// Shapes outside the codec fail reads with `.integrity` — the probe never
+/// invents payload bytes.
 private struct TranscriptPayload: Codable {
     var kind: String // "user" | "assistantText" | "toolCall" | "toolResponse"
     var text: String?
@@ -87,6 +77,16 @@ private enum ProbePayload {
     }
 }
 final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
+    /// Test-local SQLite `SessionStore` (NOT product code, NOT M2-A).
+    ///
+    /// Exists only to execute the shared `StoreContractAssertions` against a
+    /// real database file, giving STORE-06/07/09 native-storage evidence.
+    /// Ordering, pagination, ownership and quota are enforced in SQL; record
+    /// payloads persist in a `payload` column via the test-local lossless
+    /// codec above, so a FRESH handle on the same file resumes the full
+    /// history (STORE-07 reopen leg). The quota count cache is exact under
+    /// the single-writer contract runs (this handle is the sole appender);
+    /// the shared assertion's final SQL tally cross-checks it.
     private let queue: DatabaseQueue
     private let limit: Int
     private let lock = NSLock()
@@ -100,8 +100,8 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
         configuration.journalMode = .wal
         // NORMAL sync keeps the 10k-row quota fill fast; crash durability
         // is proven separately by the STORE-02 kill primitive, not here.
-        // prepareDatabase runs outside any transaction, which both pragmas
-        // require.
+        // prepareDatabase runs outside any transaction, which this pragma
+        // requires (journalMode above is applied by GRDB at connect time).
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA synchronous = NORMAL")
         }
