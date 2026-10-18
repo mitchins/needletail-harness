@@ -75,12 +75,19 @@ struct SQLiteCrashTests {
         }
         try writeLine("PRAGMA journal_mode=DELETE;\n")
         try writeLine("PRAGMA cache_size=-40;\n")
+        // Spill precondition baseline: with the committed row written and
+        // no transaction open, this is the file's clean size.
+        let cleanSize = try #require(
+            (try FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int,
+            "must stat the database file before staging the crash")
         try writeLine("BEGIN IMMEDIATE;\n")
         // 5,000 rows through one recursive INSERT (~150 KB) against a
-        // 40 KB page cache: dirty pages MUST spill to the rollback journal
-        // rather than linger in the child cache. `changes()` ties the echo
-        // to the write itself: a failed INSERT echoes ready:0 and fails
-        // closed instead of proving nothing.
+        // 40 KB page cache: dirty pages must spill from the child cache
+        // into the database file itself (a cache spill writes dirty pages
+        // to the DB; the rollback journal only holds the ORIGINAL page
+        // images for undo). `changes()` ties the echo to the write itself:
+        // a failed INSERT echoes ready:0 and fails closed instead of
+        // proving nothing.
         try writeLine("INSERT INTO probe (note) SELECT 'doom-' || x FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5000) SELECT x FROM c);\n")
         try writeLine("SELECT 'ready:'||changes();\n")
         var echo = Data()
@@ -112,6 +119,15 @@ struct SQLiteCrashTests {
         #endif
         #expect(echo.contains(readyMarker), "child must confirm the uncommitted write ran (got \(String(data: echo, encoding: .utf8) ?? "?"))")
         #expect(child.isRunning, "child must still hold the transaction when killed")
+        // Spill PROVEN, not assumed: journal existence alone doesn't prove a
+        // page left the child cache (DELETE mode opens the journal on the
+        // first page write regardless). The database FILE must have grown —
+        // only a cache spill writes dirty pages to it mid-transaction.
+        let dirtySize = try #require(
+            (try FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int,
+            "must stat the database file before the kill")
+        #expect(dirtySize > cleanSize,
+                "dirty pages must have spilled into the database file (clean \(cleanSize) B, now \(dirtySize) B)")
         // Rollback-journal path engaged: with an open write txn in DELETE
         // mode the -journal file must exist — otherwise the kill would test
         // process death without journal-based page rollback.
