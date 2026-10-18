@@ -151,7 +151,9 @@ struct XUnitIngestionTests {
         let delegate = Parser()
         let parser = XMLParser(data: data)
         parser.delegate = delegate
-        #expect(parser.parse(), "xunit XML must parse")
+        // Require, not expect: reconciling a truncated parse would mix a
+        // parse failure with derived gate failures and hide the root cause.
+        try #require(parser.parse(), "xunit XML must parse")
         let executed = delegate.cases
         #expect(!executed.isEmpty, "runner reported zero test cases: no evidence ingested")
 

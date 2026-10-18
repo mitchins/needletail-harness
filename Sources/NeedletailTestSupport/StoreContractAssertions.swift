@@ -47,17 +47,24 @@ public enum StoreContractAssertions {
                 "[\(variant)] sequences must be dense from 1")
     }
 
-    /// STORE-06: two writers on the same session conflict; the loser learns
-    /// the exact owner. `second` must share backing state with `first`
+    /// STORE-06: two writers on one session conflict; the loser learns the
+    /// exact owner. `second` must share backing state with `first`
     /// (same instance for in-memory, second handle on the same file for
-    /// SQLite) — otherwise the test proves nothing.
+    /// SQLite — genuinely two writers) — otherwise the test proves nothing.
+    /// Contention model (M2-0 boundary): the slot holds ONE session; a
+    /// DIFFERENT session contending fails with the current owner's ID.
+    /// Re-claiming the SAME session is an idempotent no-op (crash-recovery
+    /// re-acquire), pinned below. Fencing tokens that distinguish two live
+    /// writers of one session are M2-A store design, not this contract.
     public static func assertWriterOwnershipExclusive(
         first: any SessionStore, second: any SessionStore, variant: String
     ) throws {
         try first.claimWriterOwnership(session: SessionID("s1"))
+        // Same-session reclaim is idempotent: a restarted writer re-acquires
+        // its own session without error.
+        try first.claimWriterOwnership(session: SessionID("s1"))
         // A second writer loses while s1 holds the lock and learns the
-        // exact owner. (Re-claiming the same session is an idempotent
-        // no-op, not a conflict — only a DIFFERENT session contends.)
+        // exact owner.
         #expect(throws: StoreError.alreadyOwned(session: "s1")) {
             try second.claimWriterOwnership(session: SessionID("s2"))
         }

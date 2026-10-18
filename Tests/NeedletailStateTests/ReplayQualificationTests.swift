@@ -68,8 +68,12 @@ struct ReplayQualificationTests {
             if case .reserveEffect = $0 { return true }
             return false
         }), "cancel must not re-request or reserve")
-        // RECEIPT ORACLE (cancelled): a cancel record exists.
-        #expect(!cancelled.records.isEmpty, "cancel must leave a receipt")
+        // RECEIPT ORACLE (cancelled): a `cancelling` receipt exists —
+        // presence alone would pass without proving the cancel was recorded.
+        #expect(cancelled.records.contains(where: {
+            if case .eventAppended(_, "cancelling", _) = $0 { return true }
+            return false
+        }), "cancel must leave a cancelling receipt, got \(cancelled.records)")
         let preCancelDropped = cancelled.state.droppedStaleCount
 
         // Late completion for the CANCELLED reservation (real ID).
