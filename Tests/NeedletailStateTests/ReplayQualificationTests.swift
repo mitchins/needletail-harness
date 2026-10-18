@@ -95,11 +95,33 @@ struct ReplayQualificationTests {
         #expect(a.final == b.final, "replay must be deterministic")
         #expect(a.reservedID == b.reservedID, "deterministic IDs mint the same reservation")
         // STATE ORACLE (late): no resurrection, exactly one stale drop, and
-        // the drop changes NOTHING else — whole-state preservation.
-        #expect(a.final.phase == .cancelling, "cancelled run does not become completed")
+        // the drop changes NOTHING else. Expected state is rebuilt with the
+        // INITIALIZER, field by field from the cancelled state — not via
+        // `replacing`, which the stale-drop path itself calls (a helper
+        // defect would otherwise cancel out on both sides of the equality).
+        let expected = SessionState(
+            sessionID: a.cancelled.sessionID, epoch: a.cancelled.epoch,
+            trustMode: a.cancelled.trustMode, phase: .cancelling,
+            activeRun: a.cancelled.activeRun, activeRequest: a.cancelled.activeRequest,
+            queue: a.cancelled.queue, queueHeld: a.cancelled.queueHeld,
+            heldReason: a.cancelled.heldReason,
+            admittedCommands: a.cancelled.admittedCommands,
+            consumedEffects: a.cancelled.consumedEffects,
+            turnsUsed: a.cancelled.turnsUsed, turnLimit: a.cancelled.turnLimit,
+            runDeadlineMillis: a.cancelled.runDeadlineMillis,
+            preSendRetries: a.cancelled.preSendRetries,
+            invalidTracker: a.cancelled.invalidTracker,
+            pendingApproval: a.cancelled.pendingApproval,
+            pendingBatch: a.cancelled.pendingBatch,
+            retryDeadlineMillis: a.cancelled.retryDeadlineMillis,
+            liveReservations: a.cancelled.liveReservations,
+            generation: a.cancelled.generation,
+            unresolvedOperations: a.cancelled.unresolvedOperations,
+            droppedStaleCount: a.preCancelDropped + 1,
+            lastSequence: a.cancelled.lastSequence)
+        #expect(a.final == expected, "stale drop must preserve the whole cancelled state")
         #expect(a.final.droppedStaleCount == a.preCancelDropped + 1, "late completion drops exactly once")
-        #expect(a.final == a.cancelled.replacing(droppedStaleCount: a.preCancelDropped + 1),
-                "stale drop must preserve the whole cancelled state")
+        #expect(a.final.phase == .cancelling, "cancelled run does not become completed")
         #expect(a.final.liveReservations.isEmpty, "late completion reserves nothing")
         // EFFECT + RECEIPT ORACLES (late): bare drop — nothing out, nothing appended.
         #expect(a.late.effects.isEmpty, "late completion emits no effects, got \(a.late.effects)")
