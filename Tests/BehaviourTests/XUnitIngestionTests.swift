@@ -24,8 +24,9 @@ import NeedletailTestSupport
 ///   as unlabeled, never failed.
 /// - Variant IDs are the bare function names; the M2-0 `requiredVariants`
 ///   below name the exact functions expected, so a rename fails loudly.
-/// - `<skipped>` produces NO record: a skipped case lands in `missing` and
-///   can never satisfy its gate (BDD-04). `<failure>`/`<error>` → FAIL.
+/// - `<skipped>` is RECORDED as a `.deferredByPlan` result: a skipped case
+///   lands in `unsatisfied` and can never satisfy its gate (BDD-04) —
+///   not missing, not passed. `<failure>`/`<error>` → FAIL.
 /// - Parameterized cases collapse to ONE `<testcase>` in xunit (verified):
 ///   per-argument variants are invisible to this join — a documented gap,
 ///   not silently assumed coverage.
@@ -209,12 +210,12 @@ struct XUnitIngestionTests {
             #expect(report.satisfied.contains(caseID),
                     "M2-0 scope case \(caseID) must be satisfied; unsatisfied=\(report.unsatisfied) missing=\(report.missing.filter { Self.requiredVariants.keys.contains($0) })")
         }
-        // Skipped known cases are absent from results, hence missing — a
-        // skip is never a pass (BDD-04). Pin it for every skipped case the
-        // extractor recognised.
+        // Skipped known cases are RECORDED as deferred results, hence
+        // unsatisfied — a skip is never a pass and never silently missing
+        // (BDD-04). Pin it for every skipped case the extractor recognised.
         for caseID in Set(skippedKnown) {
-            #expect(report.missing.contains(caseID) || report.unsatisfied.contains(caseID),
-                    "skipped case \(caseID) must not be satisfied")
+            #expect(report.unsatisfied.contains(caseID),
+                    "skipped case \(caseID) must be unsatisfied, not satisfied or missing")
             #expect(!report.satisfied.contains(caseID), "skipped case \(caseID) must not be satisfied")
         }
     }
