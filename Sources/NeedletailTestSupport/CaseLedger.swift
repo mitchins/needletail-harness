@@ -278,6 +278,13 @@ public struct CaseResult: Sendable, Equatable, Codable {
                 guard evidenceTier == .nativeProcess || evidenceTier == .nativeStorage else { return false }
             case .nativeStorage:
                 guard evidenceTier == .nativeStorage else { return false }
+            case .terminalAdapter:
+                // Asymmetric, like the native pair: a pty run exercises the
+                // terminal adapter, but adapter-only evidence never certifies
+                // a pty requirement (PTY-01 vs TERM-01).
+                guard evidenceTier == .terminalAdapter || evidenceTier == .pty else { return false }
+            case .pty:
+                guard evidenceTier == .pty else { return false }
             default:
                 continue
             }

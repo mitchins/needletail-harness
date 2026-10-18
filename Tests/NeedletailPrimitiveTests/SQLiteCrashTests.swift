@@ -16,7 +16,11 @@ import Darwin
 /// commit, then reopening must show the committed row, no trace of the
 /// uncommitted row, and a writable database. Bounded: one child, one
 /// kill, temp dir removed on exit; the child is synchronised on a
-/// `SELECT 'ready'` echo (no blind sleeps on the kill path).
+/// `SELECT 'ready:'||changes()` echo (no blind sleeps on the kill path).
+private enum POSIXRequired: Error {
+    case unavailable
+}
+
 struct SQLiteCrashTests {
 
     @Test("STORE-02 SIGKILL mid-transaction rolls back and the database reopens writable")
@@ -94,12 +98,12 @@ struct SQLiteCrashTests {
             }
         }
         #else
-        let stop = Date().addingTimeInterval(10)
-        while !echo.contains(readyMarker) {
-            echo.append(stdout.fileHandleForReading.availableData)
-            if Date() > stop { break }
-            Thread.sleep(forTimeInterval: 0.02)
-        }
+        // No POSIX poll here: the readiness wait below could block the
+        // runner forever on a silent child, and terminate() sends SIGTERM,
+        // which does not exercise the SIGKILL crash contract. Fail closed
+        // instead of reporting a weaker test as a pass.
+        Issue.record("STORE-02 requires POSIX poll + SIGKILL (Glibc/Darwin); refusing the weaker fallback")
+        throw POSIXRequired.unavailable
         #endif
         #expect(echo.contains(readyMarker), "child must confirm the uncommitted write ran (got \(String(data: echo, encoding: .utf8) ?? "?"))")
         #expect(child.isRunning, "child must still hold the transaction when killed")
