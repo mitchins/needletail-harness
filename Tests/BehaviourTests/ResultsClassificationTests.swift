@@ -100,8 +100,8 @@ struct ResultsClassificationTests {
         #expect(reason.contains("example"), "reason must mention example records: \(reason)")
     }
 
-    @Test("TESTING §3 terminal tiers match asymmetrically")
-    func TERM_01_terminalTiersAreAsymmetric() {
+    @Test("BDD-03 terminal tiers match asymmetrically")
+    func BDD_03_terminalTiersAreAsymmetric() {
         // PTY-01 requires [.pty]: adapter-only evidence must not satisfy
         // it. TERM-01 requires [.terminalAdapter, .pty]: a pty run covers the
         // adapter obligation, but nothing lower than pty certifies pty.
