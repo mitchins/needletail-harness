@@ -19,6 +19,7 @@ struct ReplayQualificationTests {
         let final: SessionState
         let reservedID: EffectID
         let preCancelDropped: Int
+        let cancelled: SessionState
         let late: Transition
     }
 
@@ -82,7 +83,7 @@ struct ReplayQualificationTests {
             expectedRevision: run.revision, mutating: false,
             outcome: .success("late"), atMillis: 1006), &ids)
         return Trace(final: late.state, reservedID: reservation.effectID,
-                     preCancelDropped: preCancelDropped, late: late)
+                     preCancelDropped: preCancelDropped, cancelled: cancelled.state, late: late)
     }
 
     @Test("STATE-01 replay: identical cancellation trace yields identical state and no late resurrection")
@@ -92,9 +93,12 @@ struct ReplayQualificationTests {
         // Determinism: the same trace from the same seed is bit-identical.
         #expect(a.final == b.final, "replay must be deterministic")
         #expect(a.reservedID == b.reservedID, "deterministic IDs mint the same reservation")
-        // STATE ORACLE (late): no resurrection, exactly one stale drop.
+        // STATE ORACLE (late): no resurrection, exactly one stale drop, and
+        // the drop changes NOTHING else — whole-state preservation.
         #expect(a.final.phase == .cancelling, "cancelled run does not become completed")
         #expect(a.final.droppedStaleCount == a.preCancelDropped + 1, "late completion drops exactly once")
+        #expect(a.final == a.cancelled.replacing(droppedStaleCount: a.preCancelDropped + 1),
+                "stale drop must preserve the whole cancelled state")
         #expect(a.final.liveReservations.isEmpty, "late completion reserves nothing")
         // EFFECT + RECEIPT ORACLES (late): bare drop — nothing out, nothing appended.
         #expect(a.late.effects.isEmpty, "late completion emits no effects, got \(a.late.effects)")

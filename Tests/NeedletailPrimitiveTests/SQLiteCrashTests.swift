@@ -73,13 +73,18 @@ struct SQLiteCrashTests {
             try #require(child.isRunning, "sqlite3 child died before the transaction was staged")
             stdin.fileHandleForWriting.write(Data(line.utf8))
         }
+        try writeLine("PRAGMA journal_mode=DELETE;\n")
+        try writeLine("PRAGMA cache_size=-40;\n")
         try writeLine("BEGIN IMMEDIATE;\n")
-        try writeLine("INSERT INTO probe (note) VALUES ('doomed');\n")
-        // `changes()` ties the echo to the write itself: a failed INSERT
-        // would echo ready:0 and fail closed instead of proving nothing.
+        // 5,000 rows through one recursive INSERT (~150 KB) against a
+        // 40 KB page cache: dirty pages MUST spill to the rollback journal
+        // rather than linger in the child cache. `changes()` ties the echo
+        // to the write itself: a failed INSERT echoes ready:0 and fails
+        // closed instead of proving nothing.
+        try writeLine("INSERT INTO probe (note) SELECT 'doom-' || x FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5000) SELECT x FROM c);\n")
         try writeLine("SELECT 'ready:'||changes();\n")
         var echo = Data()
-        let readyMarker = Data("ready:1".utf8)
+        let readyMarker = Data("ready:5000".utf8)
         #if canImport(Glibc) || canImport(Darwin)
         // Deadline-driven POSIX poll on every supported platform: the fd is
         // waited on with a timeout, so a silent child fails closed instead
@@ -107,6 +112,11 @@ struct SQLiteCrashTests {
         #endif
         #expect(echo.contains(readyMarker), "child must confirm the uncommitted write ran (got \(String(data: echo, encoding: .utf8) ?? "?"))")
         #expect(child.isRunning, "child must still hold the transaction when killed")
+        // Rollback-journal path engaged: with an open write txn in DELETE
+        // mode the -journal file must exist — otherwise the kill would test
+        // process death without journal-based page rollback.
+        #expect(FileManager.default.fileExists(atPath: path + "-journal"),
+                "rollback journal must exist while the child holds its transaction")
         #if canImport(Glibc) || canImport(Darwin)
         kill(child.processIdentifier, SIGKILL)
         #else

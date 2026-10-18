@@ -135,4 +135,24 @@ struct VariantCountingTests {
         #expect(report.unsatisfied == ["STORE-07"], "a failing mock pin vetoes certification")
         #expect(report.satisfied.isEmpty)
     }
+
+    @Test("BDD-02 a low-tier required variant never certifies the case")
+    func BDD_02_lowTierRequiredVariantNeverCertifies() throws {
+        // Fail-closed tier rule: the required `sqlite` variant passes its
+        // test but carries `.pure` evidence — the native requirement is
+        // uncertified and the case stays unsatisfied (never a pass).
+        let entry = CatalogueEntry(id: "STORE-07", family: "STORE", scenario: "resume", dueMilestone: "M2", evidenceLayers: [.nativeStorage, .integration])
+        let catalogue = Catalogue(entries: [entry])
+        for tier in [EvidenceLayer.pure, .nativeProcess] {
+            let results = [
+                CaseResult(caseID: "STORE-07", variantID: "sqlite", testStatus: .pass, evidenceTier: tier),
+            ]
+            guard case .consistent(let report) = ResultsReconciler.reconcile(
+                catalogue: catalogue, results: results, requiredVariants: ["STORE-07": ["sqlite"]]) else {
+                Issue.record("expected a consistent report, got tier \(tier)"); return
+            }
+            #expect(report.unsatisfied == ["STORE-07"], "\(tier) evidence must not certify native storage")
+            #expect(report.satisfied.isEmpty)
+        }
+    }
 }
