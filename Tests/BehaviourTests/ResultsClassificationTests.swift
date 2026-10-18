@@ -99,4 +99,33 @@ struct ResultsClassificationTests {
         }
         #expect(reason.contains("example"), "reason must mention example records: \(reason)")
     }
+
+    @Test("BDD-03 terminal tiers match asymmetrically")
+    func BDD_03_terminalTiersAreAsymmetric() {
+        // PTY-01 requires [.pty]: adapter-only evidence must not satisfy
+        // it. TERM-01 requires [.terminalAdapter, .pty]: a pty run covers the
+        // adapter obligation, but nothing lower than pty certifies pty.
+        let ptyOnly = Catalogue(entries: [
+            CatalogueEntry(id: "PTY-01", family: "PTY", scenario: "pty", dueMilestone: "M4", evidenceLayers: [.pty]),
+        ])
+        let both = Catalogue(entries: [
+            CatalogueEntry(id: "TERM-01", family: "TERM", scenario: "adapter", dueMilestone: "M4", evidenceLayers: [.terminalAdapter, .pty]),
+        ])
+        func status(catalogue: Catalogue, tier: EvidenceLayer) -> Reconciliation {
+            ResultsReconciler.reconcile(catalogue: catalogue,
+                results: [CaseResult(caseID: catalogue.entries[0].id, testStatus: .pass, evidenceTier: tier)])
+        }
+        if case .consistent(let report) = status(catalogue: ptyOnly, tier: .terminalAdapter) {
+            #expect(report.unsatisfied == ["PTY-01"], "adapter evidence must not certify a pty requirement")
+        } else { Issue.record("expected consistent report") }
+        if case .consistent(let report) = status(catalogue: ptyOnly, tier: .pty) {
+            #expect(report.satisfied == ["PTY-01"])
+        } else { Issue.record("expected consistent report") }
+        if case .consistent(let report) = status(catalogue: both, tier: .pty) {
+            #expect(report.satisfied == ["TERM-01"], "pty covers the adapter obligation")
+        } else { Issue.record("expected consistent report") }
+        if case .consistent(let report) = status(catalogue: both, tier: .terminalAdapter) {
+            #expect(report.unsatisfied == ["TERM-01"], "adapter evidence leaves the pty obligation open")
+        } else { Issue.record("expected consistent report") }
+    }
 }

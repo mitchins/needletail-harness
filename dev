@@ -282,13 +282,39 @@ test)
     esac
     ;;
 coverage)
-    # M0 scope: reconcile the frozen catalogue against executed evidence.
-    # The full TESTING §4 reconciliation (results ingestion, tier and due
-    # matching, skip/pending-gate reporting) lands with results ingestion;
-    # today this runs the catalogue reconciliation suite and never reports a
-    # missing/skipped/unexecuted case as a pass.
-    echo "Reconciling cases/catalog.json against cases/expected-index.json and the spec inventory (M0 scope)."
-    run_swift_test coverage --filter "$FILTER_BEHAVIOUR"
+    # M2-0: join ACTUAL Swift Testing runner output to the catalogue via the
+    # single ResultsReconciler (no second reconciler, no invented evidence).
+    # Phase 1 runs the evidence suites with --xunit-output. SwiftPM writes
+    # "<base>-swift-testing.xml" (verified on Swift 6.4): the previous file
+    # is deleted first, so a stale report can never pass, and a missing
+    # file fails closed below. Phase 2 re-runs ONLY the ingestion suite
+    # with NT_XUNIT_PATH set; the ingestion test is disabled anywhere else.
+    _xunit_base="$root_dir/.needletail-dev/xunit/results.xml"
+    # SwiftPM writes the real report at "<stem>-swift-testing.xml" plus an
+    # empty stub at the exact base path (verified on Swift 6.4): ingest the
+    # former, delete both first so a stale report can never pass.
+    _xunit_actual="${_xunit_base%.xml}-swift-testing.xml"
+    mkdir -p "$(dirname "$_xunit_base")"
+    rm -f "$_xunit_base" "$_xunit_actual"
+    echo "Reconciling executed results ($FILTER_BEHAVIOUR + $FILTER_PRIMITIVE + $FILTER_STATE_PURE) against cases/catalog.json."
+    run_swift_test coverage-evidence --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_STATE_PURE" --xunit-output "$_xunit_base"
+    if [ ! -f "$_xunit_actual" ]; then
+        echo "FAIL [coverage]: runner wrote no xunit output at $_xunit_actual. Not a pass."
+        exit 1
+    fi
+    # Exported (not prefix-assigned: POSIX leaves export-through-function
+    # unspecified, and a non-inherited env would silently SKIP the ingestion
+    # test). The INGEST line is required: a skipped ingestion must never
+    # print COVERAGE OK (BDD-01..04 — skipped is not pass).
+    export NT_XUNIT_PATH="$_xunit_actual" NT_COVERAGE_ACTIVE=1
+    run_swift_test coverage-ingest --filter "XUnitIngestionTests"
+    unset NT_XUNIT_PATH NT_COVERAGE_ACTIVE
+    _ingest_log="$root_dir/.needletail-dev/logs/dev-coverage-ingest.log"
+    if ! grep -q '^INGEST: ' "$_ingest_log"; then
+        echo "FAIL [coverage]: ingestion produced no INGEST evidence line (skipped, not executed). Not a pass."
+        exit 1
+    fi
+    echo "COVERAGE OK: executed results reconciled (evidence: $_xunit_actual)."
     ;;
 vendor-check)
     # Vendored integrity. OFFLINE FIRST: SHA256SUMS-vendored records the
