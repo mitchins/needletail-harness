@@ -3,7 +3,7 @@
 //// queue) as values; SQL lives in M2-A. M1-B appends to the seam and proves
 /// the ORDER (intent before dispatch) — crash durability is M2's proof.
 
-public enum DurableRecord: Sendable, Equatable {
+public enum DurableRecord: Sendable, Equatable, Codable {
     case sessionOpened(session: SessionID, atMillis: UInt64)
     case epochOpened(EpochDescriptor)
     case eventAppended(seq: SequenceNumber, kind: String, digest: String)

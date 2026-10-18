@@ -10,13 +10,13 @@
 /// against the snapshot's allow-list. The stored `origin` field is
 /// diagnostics only and is never consulted for routing, so stale or
 /// hand-built origins cannot authorize anything.
-public enum Route: Sendable, Equatable {
+public enum Route: Sendable, Equatable, Codable {
     case allowed(endpoint: String, alias: String)
     case denied(RouteDenial)
 }
 
-public struct RouteDenial: Sendable, Equatable {
-    public enum Kind: Sendable, Equatable {
+public struct RouteDenial: Sendable, Equatable, Codable {
+    public enum Kind: Sendable, Equatable, Codable {
         case unknownAlias
         case localOnlyViolation
         case originNotAllowlisted

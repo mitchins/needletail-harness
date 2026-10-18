@@ -56,6 +56,10 @@ let package = Package(
             dependencies: [
                 "NeedletailCore",
                 .product(name: "SystemPackage", package: "swift-system"),
+                // M2-A decision D-2 extension: the durable GRDB store lives
+                // in Runtime (the I/O-bearing target). ImportGateTests keep
+                // GRDB out of Core/CLI; the linkage activates with A1.
+                .product(name: "GRDB", package: "GRDB.swift"),
             ]
         ),
         .target(
@@ -100,6 +104,10 @@ let package = Package(
             dependencies: [
                 "NeedletailCore",
                 "NeedletailTestSupport",
+                // M2-A A0: native-tier reach for the production store — the
+                // STORE certification tests must execute the real Runtime
+                // store, and the ingestion tier map classifies this target.
+                "NeedletailRuntime",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
                 .product(name: "Subprocess", package: "swift-subprocess"),

@@ -7,7 +7,7 @@
 
 /// One ordered conversation element. Tool calls carry the VERBATIM native
 /// arguments (never digests — digests must not feed execution, D2).
-public enum TranscriptEntry: Sendable, Equatable {
+public enum TranscriptEntry: Sendable, Equatable, Codable {
     case user(String)
     case assistantText(String)
     case toolCall(NativeToolCall)

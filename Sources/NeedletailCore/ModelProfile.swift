@@ -9,7 +9,7 @@ import Foundation // Value types only (Data): no platform I/O.
 /// here as `WireProtocol`/`Locality` (same raw strings as Providers'
 /// `NativeProtocol`/`LocalityClass`) so Core never imports Providers.
 /// An integration test pins the two vocabularies equal.
-public enum WireProtocol: String, Sendable, Equatable, CaseIterable {
+public enum WireProtocol: String, Sendable, Equatable, CaseIterable, Codable {
     case openAIChatCompletions = "openai-chat-completions"
     case openAIResponses = "openai-responses"
     case anthropicMessages = "anthropic-messages"
@@ -25,7 +25,7 @@ public enum WireProtocol: String, Sendable, Equatable, CaseIterable {
     }
 }
 
-public enum Locality: String, Sendable, Equatable {
+public enum Locality: String, Sendable, Equatable, Codable {
     case local
     case cloud
 }
@@ -138,7 +138,7 @@ public struct ModelProfile: Sendable, Equatable {
     }
 }
 
-public struct ConfigSnapshot: Sendable, Equatable {
+public struct ConfigSnapshot: Sendable, Equatable, Codable {
     public let version: Int
     public let profiles: [String: ModelProfile]
     public let defaultAlias: String

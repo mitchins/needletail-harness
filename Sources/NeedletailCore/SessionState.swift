@@ -128,7 +128,7 @@ public enum QueueEntryState: String, Sendable, Equatable, Codable {
     case withdrawn
 }
 
-public struct QueueEntry: Sendable, Equatable {
+public struct QueueEntry: Sendable, Equatable, Codable {
     public let entryID: String
     public let commandID: CommandID
     public let kind: QueueKind
@@ -233,13 +233,13 @@ public struct InvalidTracker: Sendable, Equatable {
     }
 }
 
-public enum OperationState: Sendable, Equatable {
+public enum OperationState: Sendable, Equatable, Codable {
     case intent
     case unknown
     case done
 }
 
-public struct OperationRef: Sendable, Equatable {
+public struct OperationRef: Sendable, Equatable, Codable {
     public let operationID: OperationID
     public let callID: String?
     public let state: OperationState
@@ -253,7 +253,7 @@ public struct OperationRef: Sendable, Equatable {
     }
 }
 
-public struct EpochDescriptor: Sendable, Equatable {
+public struct EpochDescriptor: Sendable, Equatable, Codable {
     public let epochID: EpochID
     public let parentEpochID: EpochID?
     public let configSnapshot: ConfigSnapshot
