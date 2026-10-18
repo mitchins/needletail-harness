@@ -155,4 +155,23 @@ struct VariantCountingTests {
             #expect(report.satisfied.isEmpty)
         }
     }
+
+    @Test("BDD-04 a skipped sibling vetoes satisfaction without required variants")
+    func BDD_04_skippedSiblingVetoesSatisfaction() throws {
+        // The ingestion layer records executed-but-skipped tests as
+        // `.deferredByPlan`. Even with no required variants, the deferred
+        // record fails its test gate, so passing siblings cannot carry the
+        // case — a skip is unsatisfied, never a silent pass.
+        let entry = CatalogueEntry(id: "WIRE-01", family: "WIRE", scenario: "byte splits", dueMilestone: "M1", evidenceLayers: [.integration])
+        let catalogue = Catalogue(entries: [entry])
+        let results = [
+            CaseResult(caseID: "WIRE-01", variantID: "byte-split-1", testStatus: .pass),
+            CaseResult(caseID: "WIRE-01", variantID: "byte-split-2", testStatus: .deferredByPlan),
+        ]
+        guard case .consistent(let report) = ResultsReconciler.reconcile(catalogue: catalogue, results: results) else {
+            Issue.record("expected a consistent report"); return
+        }
+        #expect(report.unsatisfied == ["WIRE-01"], "a skipped sibling must veto satisfaction")
+        #expect(report.satisfied.isEmpty)
+    }
 }

@@ -168,7 +168,19 @@ struct XUnitIngestionTests {
                 continue
             }
             if test.failed { xmlFailures.append("\(caseID)/\(variantID)") }
-            if test.skipped { skippedKnown.append(caseID); continue }
+            if test.skipped {
+                // A skip is RECORDED, never dropped: a skipped variant with
+                // passing siblings must still leave the case unsatisfied
+                // (BDD-04). `.deferredByPlan` is the vocabulary's "not run in
+                // this gate" status; its test gate fails, so it vetoes
+                // satisfaction without claiming a failure occurred.
+                skippedKnown.append(caseID)
+                results.append(CaseResult(
+                    caseID: caseID, variantID: variantID,
+                    testStatus: .deferredByPlan,
+                    evidenceTier: Self.tier(module: test.module, function: test.function)))
+                continue
+            }
             moduleByKey["\(caseID)/\(variantID)"] = test.module
             results.append(CaseResult(
                 caseID: caseID, variantID: variantID,
@@ -183,9 +195,9 @@ struct XUnitIngestionTests {
             Issue.record("ingestion invalid: \(reconciliation)")
             return
         }
-        // `results` already contains every non-skipped labeled test (passes
-        // AND failures); adding xmlFailures again would double-count.
-        print("INGEST: executed=\(executed.count) labeled=\(results.count + skippedKnown.count) unlabeled=\(unlabeled) skipped=\(skippedKnown.count) failed=\(xmlFailures.count) satisfied=\(report.satisfied.count) unsatisfied=\(report.unsatisfied.count) missing=\(report.missing.count)")
+        // `results` holds every labeled executed test (passes, failures AND
+        // recorded skips); `skippedKnown` is the labeled-skip subset.
+        print("INGEST: executed=\(executed.count) labeled=\(results.count) unlabeled=\(unlabeled) skipped=\(skippedKnown.count) failed=\(xmlFailures.count) satisfied=\(report.satisfied.count) unsatisfied=\(report.unsatisfied.count) missing=\(report.missing.count)")
         #expect(xmlFailures.isEmpty, "executed failures in evidence: \(xmlFailures)")
         for (caseID, variants) in Self.requiredEvidence {
             for (variantID, expectedModule) in variants {

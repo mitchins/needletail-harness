@@ -60,6 +60,7 @@ struct ReplayQualificationTests {
         // STATE ORACLE (cancelled): reservations cleared, queue held.
         #expect(cancelled.state.phase == .cancelling, "cancel lands in cancelling")
         #expect(cancelled.state.liveReservations.isEmpty, "cancel clears live reservations")
+        #expect(cancelled.state.queueHeld, "cancel holds the queue while the run is interrupted")
         // EFFECT ORACLE (cancelled): in-flight cancel signalled, and the
         // forbidden shapes are absent — no re-request, no new reservation.
         #expect(cancelled.effects.contains(.cancelInFlight(runID: run.runID, reason: "operator cancel")),
