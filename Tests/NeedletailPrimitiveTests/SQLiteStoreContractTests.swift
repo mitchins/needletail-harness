@@ -79,8 +79,10 @@ private enum ProbePayload {
 final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
     /// Test-local SQLite `SessionStore` (NOT product code, NOT M2-A).
     ///
-    /// Exists only to execute the shared `StoreContractAssertions` against a
-    /// real database file, giving STORE-06/07/09 native-storage evidence.
+/// Exists only to execute the shared `StoreContractAssertions` against a
+/// real database file, giving STORE-07/09 native-storage evidence plus
+/// global-writer-slot evidence (STORE-06 certification is deferred to M2-A;
+/// see `XUnitIngestionTests.deferredToM2A`).
     /// Ordering, pagination, ownership and quota are enforced in SQL; record
     /// payloads persist in a `payload` column via the test-local lossless
     /// codec above, so a FRESH handle on the same file resumes the full
@@ -194,7 +196,8 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
     }
 }
 
-/// STORE-06/07/09 over a real SQLite file (variant `sqlite`): the same
+/// Global writer slot + STORE-07/09 over a real SQLite file (variant
+/// `sqlite`): the same
 /// shared assertions as the in-memory backend, so semantics cannot drift
 /// between mock and native tiers.
 struct SQLiteStoreContractTests {
@@ -226,8 +229,8 @@ struct SQLiteStoreContractTests {
         #expect(tail.map(\.record) == Array(expected[4...]), "reopened since-cursor replays the tail")
     }
 
-    @Test("STORE-06 sqlite second writer on one session learns the exact owner")
-    func STORE_06_sqliteWriterOwnershipExclusive() throws {
+    @Test("global writer slot: a competing session's claim fails with the exact owner (sqlite)")
+    func SingleWriterSlot_sqliteCompetingSessionLearnsOwner() throws {
         let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("store.sqlite").path

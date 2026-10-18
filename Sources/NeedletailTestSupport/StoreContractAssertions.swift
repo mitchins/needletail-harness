@@ -2,7 +2,8 @@ import Testing
 import Foundation
 import NeedletailCore
 
-/// Shared `SessionStore` contract assertions (M2-0, STORE-06/07/09).
+/// Shared `SessionStore` contract assertions (M2-0: global writer slot,
+/// STORE-07/09; STORE-06 certification deferred to M2-A).
 ///
 /// One definition, executed against every backing implementation (in-memory
 /// in `NeedletailStateTests`, SQLite in `NeedletailPrimitiveTests`), so a
@@ -47,15 +48,19 @@ public enum StoreContractAssertions {
                 "[\(variant)] sequences must be dense from 1")
     }
 
-    /// STORE-06: two writers on one session conflict; the loser learns the
-    /// exact owner. `second` must share backing state with `first`
-    /// (same instance for in-memory, second handle on the same file for
-    /// SQLite — genuinely two writers) — otherwise the test proves nothing.
-    /// Contention model (M2-0 boundary): the slot holds ONE session; a
-    /// DIFFERENT session contending fails with the current owner's ID.
-    /// Re-claiming the SAME session is an idempotent no-op (crash-recovery
-    /// re-acquire), pinned below. Fencing tokens that distinguish two live
-    /// writers of one session are M2-A store design, not this contract.
+    /// Global writer-slot contract (supports, but does NOT certify, STORE-06).
+    ///
+    /// What this pins: the slot holds ONE session; a DIFFERENT session
+    /// contending fails with the current owner's ID; re-claiming the SAME
+    /// session is an idempotent no-op (crash-recovery re-acquire).
+    /// What this does NOT pin: two independent writers competing for the
+    /// SAME session. The `SessionStore` interface has no writer identity
+    /// (fencing tokens), so two handles CAN both "own" one session — that
+    /// is STORE-06 proper, owed to M2-A with the production store
+    /// (see `XUnitIngestionTests.deferredToM2A` for the executable gate).
+    /// `second` must share backing state with `first` (same instance for
+    /// in-memory, second handle on the same file for SQLite) — otherwise
+    /// the test proves nothing.
     public static func assertWriterOwnershipExclusive(
         first: any SessionStore, second: any SessionStore, variant: String
     ) throws {

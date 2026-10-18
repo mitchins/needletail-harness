@@ -132,7 +132,6 @@ struct XUnitIngestionTests {
     /// not assumed from the substring.
     private static let requiredEvidence: [String: [String: String]] = [
         "STATE-01": ["STATE_01_cancelledLateCompletionReplays": "NeedletailStateTests"],
-        "STORE-06": ["STORE_06_sqliteWriterOwnershipExclusive": "NeedletailPrimitiveTests"],
         "STORE-07": ["STORE_07_sqliteResumeListsInOrder": "NeedletailPrimitiveTests"],
         "STORE-09": ["STORE_09_sqliteQuotaBoundary": "NeedletailPrimitiveTests"],
         "STORE-01": ["STORE_01_sqliteReopenPersistsRecords": "NeedletailPrimitiveTests"],
@@ -142,6 +141,18 @@ struct XUnitIngestionTests {
     private static var requiredVariants: [String: Set<String>] {
         requiredEvidence.mapValues { Set($0.keys) }
     }
+
+    /// Cases whose CERTIFYING evidence does not exist yet and is owed to a
+    /// later milestone (STORE-06 "two writers open same session": with the
+    /// current `SessionStore` interface, same-session claims are idempotent
+    /// and the slot has no writer identity, so two handles CAN both hold
+    /// "ownership" of one session — global-slot exclusion of a DIFFERENT
+    /// session is proven, but not same-session fencing). The named variant
+    /// is the exact test M2-A must add once writer identity/fencing exists;
+    /// until then STORE-06 must stay unsatisfied no matter what else passes.
+    private static let deferredToM2A: [String: Set<String>] = [
+        "STORE-06": ["STORE_06_twoWritersCompeteForOneSession"],
+    ]
     @Test("BDD-01 ingestion joins executed runner results to the catalogue",
           .enabled(if: ingestionEnabled, "run via ./dev coverage (sets NT_XUNIT_PATH)"))
     func BDD_01_ingestionReconcilesExecutedResults() throws {
@@ -217,6 +228,13 @@ struct XUnitIngestionTests {
             #expect(report.unsatisfied.contains(caseID),
                     "skipped case \(caseID) must be unsatisfied, not satisfied or missing")
             #expect(!report.satisfied.contains(caseID), "skipped case \(caseID) must not be satisfied")
+        }
+        // Deferred-to-M2A cases must NEVER be satisfied by the evidence that
+        // exists today, whatever else passes (BDD-03/04 — absent required
+        // evidence is never a pass).
+        for caseID in Self.deferredToM2A.keys.sorted() {
+            #expect(!report.satisfied.contains(caseID),
+                    "deferred case \(caseID) is not certifiable in M2-0; satisfied=\(report.satisfied)")
         }
     }
 }

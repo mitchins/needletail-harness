@@ -3,7 +3,8 @@ import Foundation
 import NeedletailCore
 import NeedletailTestSupport
 
-/// STORE-06/07/09 over the in-memory backend (variant `in-memory`).
+/// Global writer slot + STORE-07/09 over the in-memory backend (variant
+/// `in-memory`).
 /// Native durability is proven by the SQLite executions of the same shared
 /// assertions in `NeedletailPrimitiveTests`; this file pins the semantics
 /// every backend must share.
@@ -15,8 +16,8 @@ struct StoreContractTests {
             InMemorySessionStore(), variant: "in-memory")
     }
 
-    @Test("STORE-06 in-memory second writer on one session learns the exact owner")
-    func STORE_06_inMemoryWriterOwnershipExclusive() throws {
+    @Test("global writer slot: a competing session's claim fails with the exact owner (in-memory)")
+    func SingleWriterSlot_inMemoryCompetingSessionLearnsOwner() throws {
         let store = InMemorySessionStore()
         try StoreContractAssertions.assertWriterOwnershipExclusive(
             first: store, second: store, variant: "in-memory")
