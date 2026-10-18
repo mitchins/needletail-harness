@@ -298,7 +298,13 @@ public struct CaseResult: Sendable, Equatable, Codable {
                 // not a scarce native resource. The WIRE-01 rows pin that a
                 // `.pure` pass satisfies an `[.integration]` requirement.
                 continue
-            default:
+            case .pure:
+                // The floor: any executed evidence covers a pure requirement.
+                continue
+            case .reviewProcess:
+                // Never a tier question: the review field below decides.
+                // No `default` arm on purpose — a new EvidenceLayer must not
+                // compile until its matching rule is defined (fail closed).
                 continue
             }
         }
