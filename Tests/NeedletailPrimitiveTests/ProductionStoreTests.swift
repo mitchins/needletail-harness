@@ -3,6 +3,7 @@ import GRDB
 import Foundation
 import NeedletailCore
 import NeedletailRuntime
+@testable import NeedletailRuntime
 import NeedletailTestSupport
 
 /// M2-A A1 native-storage evidence over the PRODUCTION store
@@ -73,6 +74,18 @@ struct ProductionStoreTests {
             Issue.record("expected StoreError.integrity, got \(error)"); return
         }
 
+        // Future-version refusal must name the reason.
+        do {
+            _ = try GRDBSessionStore(path: path)
+            Issue.record("a future-schema store must refuse to open")
+        } catch let error as StoreError {
+            guard case .integrity(let message) = error, message.contains("future schema version") else {
+                Issue.record("expected future-schema .integrity, got \(error)"); return
+            }
+        } catch {
+            Issue.record("expected StoreError.integrity, got \(error)"); return
+        }
+
         // Corrupt file: valid SQLite header garbage is unreadable as our
         // schema — open must fail closed, never construct a half store.
         let corruptPath = directory.appendingPathComponent("corrupt.sqlite").path
@@ -86,6 +99,98 @@ struct ProductionStoreTests {
             }
         } catch {
             Issue.record("expected StoreError.integrity, got \(error)"); return
+        }
+
+        // Foreign schema stamped with OUR version: opens must fail on the
+        // shape check, never silently adopt incompatible tables.
+        let foreignPath = directory.appendingPathComponent("foreign.sqlite").path
+        let foreign = try GRDBSessionStore(path: foreignPath)
+        try foreign.close()
+        let rawForeign = try DatabaseQueue(path: foreignPath)
+        try rawForeign.write { db in
+            try db.execute(sql: "DROP TABLE records")
+            try db.execute(sql: "CREATE TABLE records (different INTEGER)")
+        }
+        do {
+            _ = try GRDBSessionStore(path: foreignPath)
+            Issue.record("a foreign-schema store must refuse to open")
+        } catch let error as StoreError {
+            guard case .integrity(let message) = error, message.contains("foreign or incompatible") else {
+                Issue.record("expected foreign-schema .integrity, got \(error)"); return
+            }
+        } catch {
+            Issue.record("expected StoreError.integrity, got \(error)"); return
+        }
+
+        // Corrupt PAYLOAD row: a valid store file with one undecodable row
+        // fails reads with .integrity — never skipped, never substituted.
+        let rowPath = directory.appendingPathComponent("rowfault.sqlite").path
+        let rowStore = try GRDBSessionStore(path: rowPath)
+        try rowStore.append(.transcriptAppended(.user("keep")))
+        try rowStore.append(.transcriptAppended(.user("doomed")))
+        let rawRow = try DatabaseQueue(path: rowPath)
+        try rawRow.write { db in
+            try db.execute(sql: "UPDATE records SET payload = 'garbage' WHERE seq = 2")
+        }
+        do {
+            _ = try rowStore.records(since: 0, limit: 100)
+            Issue.record("a corrupt payload row must fail reads")
+        } catch let error as StoreError {
+            guard case .integrity = error else {
+                Issue.record("expected .integrity, got \(error)"); return
+            }
+        } catch {
+            Issue.record("expected StoreError.integrity, got \(error)"); return
+        }
+    }
+
+    @Test("STORE-05 store refuses non-positive page limits")
+    func STORE_05_sqliteRejectsNonPositiveLimit() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try GRDBSessionStore(
+            path: directory.appendingPathComponent("store.sqlite").path)
+        try store.append(.transcriptAppended(.user("only")))
+        do {
+            _ = try store.records(since: 0, limit: 0)
+            Issue.record("limit 0 must be an integrity fault")
+        } catch let error as StoreError {
+            guard case .integrity = error else {
+                Issue.record("expected .integrity, got \(error)"); return
+            }
+        }
+        do {
+            _ = try store.records(since: 0, limit: -1)
+            Issue.record("negative limit (SQLite no-limit) must be an integrity fault")
+        } catch let error as StoreError {
+            guard case .integrity = error else {
+                Issue.record("expected .integrity, got \(error)"); return
+            }
+        }
+    }
+
+    @Test("store durability pragmas hold on the store's own connection")
+    func storePragmasHold() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try GRDBSessionStore(
+            path: directory.appendingPathComponent("store.sqlite").path)
+        // GRDB's WAL setup forces synchronous=NORMAL after prepareDatabase;
+        // the store re-asserts FULL post-init. Verify on the store's OWN
+        // connection (these pragmas are per-connection).
+        let synchronous = try store.pragmaValue("synchronous")
+        let journalMode = try store.pragmaValue("journal_mode")
+        #expect(synchronous == "2", "synchronous must be FULL (2), got \(synchronous ?? "?")")
+        #expect(journalMode == "wal", "journal_mode must be wal, got \(journalMode ?? "?")")
+        // Post-close operations are typed .integrity, never GRDB misuse.
+        try store.close()
+        do {
+            try store.append(.transcriptAppended(.user("after-close")))
+            Issue.record("append after close must fail")
+        } catch let error as StoreError {
+            guard case .integrity = error else {
+                Issue.record("expected .integrity, got \(error)"); return
+            }
         }
     }
 
@@ -108,17 +213,24 @@ struct ProductionStoreTests {
         try store.close()
         let reopened = try GRDBSessionStore(path: store.path)
         var resumed = 0
+        var pages = 0
         var cursor: UInt64? = 0
         var lastSeq: UInt64 = 0
         while let since = cursor {
             let (page, next) = try reopened.records(since: since, limit: 512)
+            // Bounded paging is the contract: a page never exceeds the
+            // limit, and the resume provably takes MANY pages (10007 rows
+            // / 512) — never loaded wholesale.
+            #expect(page.count <= 512, "page must respect the limit, got \(page.count)")
             for record in page {
                 #expect(record.sequence.value == lastSeq + 1, "sequences stay dense at scale")
                 lastSeq = record.sequence.value
             }
             resumed += page.count
+            pages += 1
             cursor = next
         }
         #expect(resumed == 10_007, "7 shared-contract rows + 10k bulk rows resume in full, got \(resumed)")
+        #expect(pages >= 20, "10_007 rows at limit 512 must take ~20 pages, got \(pages)")
     }
 }
