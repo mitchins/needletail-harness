@@ -134,10 +134,11 @@ struct RecordCodecTests {
 
     @Test("record codec encodes canonically: insertion order must not change the bytes")
     func encodingIsCanonical() throws {
-        // Equal-by-value snapshots built with DIFFERENT dictionary
-        // insertion orders (profiles dict and requestOptions dict) must
-        // produce BYTE-identical rows — sortedKeys must erase insertion
-        // order, and a golden pin catches any encoder change.
+        // Equal-by-value records whose dictionary LITERALS are written
+        // in different orders (profiles map and requestOptions map) must
+        // produce BYTE-identical rows: the encoder's canonical form must
+        // not depend on construction order, and the golden pin catches
+        // any encoder change.
         // Only LITERAL INSERTION ORDER differs between the two builds —
         // the values (including the verbatim requestOptionsRaw bytes) are
         // identical, so the records are equal by value and the bytes must

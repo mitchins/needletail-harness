@@ -132,9 +132,10 @@ struct XUnitIngestionTests {
     /// not assumed from the substring.
     private static let requiredEvidence: [String: [String: String]] = [
         "STATE-01": ["STATE_01_cancelledLateCompletionReplays": "NeedletailStateTests"],
-        "STORE-07": ["STORE_07_sqliteResumeListsInOrder": "NeedletailPrimitiveTests"],
+        "STORE-01": ["STORE_01_sqliteProductionStorePersistsAcrossReopen": "NeedletailPrimitiveTests"],
+        "STORE-05": ["STORE_05_sqliteFutureOrCorruptStoreFailsClosed": "NeedletailPrimitiveTests"],
+        "STORE-07": ["STORE_07_sqliteProductionResumeAtScale": "NeedletailPrimitiveTests"],
         "STORE-09": ["STORE_09_sqliteQuotaBoundary": "NeedletailPrimitiveTests"],
-        "STORE-01": ["STORE_01_sqliteReopenPersistsRecords": "NeedletailPrimitiveTests"],
         "STORE-02": ["STORE_02_sigkillMidTransactionRollsBack": "NeedletailPrimitiveTests"],
     ]
 
