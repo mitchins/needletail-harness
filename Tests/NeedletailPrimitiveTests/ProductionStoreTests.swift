@@ -303,6 +303,35 @@ struct ProductionStoreTests {
         #expect((rows[1]["session"] as String?) == "s-legacy", "new row carries the session")
     }
 
+    @Test("STORE-05 sqlite already-v2 file gains the session index on open")
+    func STORE_05_sqliteAlreadyV2GainsSessionIndex() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("preindex.sqlite").path
+
+        // Simulate a file stamped v2 by the PRE-index build: v2 tables, no
+        // records_session index. Simulate by creating the store, dropping
+        // the index, and reopening.
+        let first = try GRDBSessionStore(path: path)
+        try first.close()
+        let raw = try DatabaseQueue(path: path)
+        try raw.write { db in
+            try db.execute(sql: "DROP INDEX IF EXISTS records_session")
+        }
+        let before = try DatabaseQueue(path: path).read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='records_session'"))
+        }
+        #expect(before.isEmpty, "fixture must start index-free")
+
+        // Reopen: index restored unconditionally (idempotent), after the
+        // fail-closed version/shape checks.
+        let reopened = try GRDBSessionStore(path: path)
+        let indexes = try DatabaseQueue(path: path).read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='records_session'"))
+        }
+        #expect(indexes.contains("records_session"), "already-v2 file must gain the session index on open")
+    }
+
     // MARK: - STORE-06 (the M2-0 deferral lands here)
 
     @Test("STORE-06 sqlite two writers compete for one session (fenced)")

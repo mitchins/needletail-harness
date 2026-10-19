@@ -117,6 +117,12 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 // file stamped with our version but carrying foreign or
                 // missing tables is not a needletail store.
                 try Self.assertSchemaShape(db)
+                // The session index must exist on EVERY v2 file — including
+                // ones stamped v2 before the index landed (pre-fold A2) —
+                // and ONLY after the fail-closed checks above passed.
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS records_session ON records(session, seq)
+                    """)
                 return
             }
             if version < 1 {
