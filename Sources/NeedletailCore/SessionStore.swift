@@ -35,6 +35,10 @@ public enum StoreError: Error, Sendable, Equatable {
     /// success.
     case notWriter(session: String, writer: String)
     case quotaExceeded(limit: Int)
+    /// Bounded lock contention exhausted (busy timeout): the database is
+    /// healthy but another writer held it past the bound. DISTINCT from
+    /// corruption (`.integrity`) — retrying later is meaningful.
+    case contention(String)
     case integrity(String)
 }
 

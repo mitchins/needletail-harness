@@ -332,6 +332,68 @@ struct ProductionStoreTests {
         #expect(indexes.contains("records_session"), "already-v2 file must gain the session index on open")
     }
 
+    @Test("A2 sqlite session index exists and survives reopen")
+    func A2_sqliteSessionIndexPresent() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try GRDBSessionStore(
+            path: directory.appendingPathComponent("store.sqlite").path)
+        let indexes = try DatabaseQueue(path: store.path).read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='index'"))
+        }
+        #expect(indexes.contains("records_session"), "session-count/pagination index must exist")
+        try store.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
+        try store.append(.transcriptAppended(.user("x")), as: Self.identity)
+        // Session quota COUNT uses the index: correctness check through it.
+        let (page, _) = try store.records(session: Self.identity.session, since: 0, limit: 10)
+        #expect(page.count == 1)
+    }
+
+    @Test("A2 sqlite bounded contention yields typed .contention, not raw BUSY")
+    func A2_sqliteContentionIsTyped() async throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try GRDBSessionStore(
+            path: directory.appendingPathComponent("store.sqlite").path)
+        // Hold the exclusive write transaction from the raw handle; the
+        // store's fenced append must contend past its busy timeout (5 s),
+        // then fail with typed .contention — not raw SQLITE_BUSY.
+        let raw = try DatabaseQueue(path: store.path)
+        let gate = DispatchSemaphore(value: 0)
+        let holder = Task.detached {
+            do {
+                try raw.writeWithoutTransaction { db in
+                    try db.execute(sql: "BEGIN IMMEDIATE")
+                    try db.execute(sql: "INSERT INTO writer (session, writer) VALUES ('s-hold', 'w-hold')")
+                    gate.signal()
+                    Thread.sleep(forTimeInterval: 7)
+                    try db.execute(sql: "ROLLBACK")
+                }
+            } catch {
+                Issue.record("holder transaction failed: \(error)")
+                gate.signal()
+            }
+        }
+        gate.wait()
+        let start = Date()
+        do {
+            try store.append(
+                .transcriptAppended(.user("contended")),
+                as: WriterIdentity(session: SessionID("s-hold"), writer: "w-hold"))
+            Issue.record("expected typed contention under a held lock")
+        } catch let error as StoreError {
+            guard case .contention = error else {
+                Issue.record("expected typed .contention, got \(error)"); return
+            }
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(elapsed >= 4.0, "contention must exercise the bounded timeout, took \(elapsed)s")
+        await holder.value
+        // After the external transaction ends, the store works normally.
+        try store.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
+        try store.append(.transcriptAppended(.user("after-contention")), as: Self.identity)
+    }
+
     // MARK: - STORE-06 (the M2-0 deferral lands here)
 
     @Test("STORE-06 sqlite two writers compete for one session (fenced)")

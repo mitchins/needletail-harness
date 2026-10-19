@@ -225,6 +225,17 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
+
+    /// A2 review: translate exhausted bounded contention into the typed
+    /// outcome — the database is healthy, another writer held the lock past
+    /// the busy timeout. Corruption stays `.integrity`.
+    private static func translate(_ error: Error) -> Error {
+        if let dbError = error as? DatabaseError, dbError.resultCode == .SQLITE_BUSY {
+            return StoreError.contention("database busy past the bounded timeout: \(dbError.message)")
+        }
+        return error
+    }
+
     // MARK: - Closed-store contract
 
     private func assertOpenLocked() throws {
@@ -240,7 +251,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         // Encode BEFORE the transaction so a codec failure cannot leave a
         // half-written row.
         let payload = try RecordCodec.encode(record)
-        try queue.write { db in
+        do { try queue.write { db in
             // FENCING inside the mutation's own transaction (BEGIN
             // IMMEDIATE): the ownership row is the only authority.
             let holder = try String.fetchOne(
@@ -270,7 +281,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 sql: "INSERT INTO records (seq, session, payload) VALUES (?, ?, ?)",
                 arguments: [last + 1, identity.session.raw,
                             String(decoding: payload, as: UTF8.self)])
-        }
+        } } catch { throw Self.translate(error) }
     }
 
     /// Single-transaction bulk append (import/migration tooling and scale
@@ -363,7 +374,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         gate.lock()
         defer { gate.unlock() }
         try assertOpenLocked()
-        try queue.write { db in
+        do { try queue.write { db in
             try db.execute(
                 sql: "INSERT INTO writer (session, writer) VALUES (?, ?) ON CONFLICT(session) DO NOTHING",
                 arguments: [session.raw, writer])
@@ -374,7 +385,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 throw StoreError.alreadyOwned(
                     session: session.raw, writer: holder ?? "?")
             }
-        }
+        } } catch { throw Self.translate(error) }
     }
 
     /// Only the CURRENT writer of the session can release: the delete is

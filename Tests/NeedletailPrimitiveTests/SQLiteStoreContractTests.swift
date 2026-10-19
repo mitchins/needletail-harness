@@ -76,23 +76,16 @@ private enum ProbePayload {
         return .transcriptAppended(entry)
     }
 }
-final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
-    /// Test-local SQLite `SessionStore` (NOT product code, NOT M2-A).
-    ///
+/// Test-local SQLite `SessionStore` (NOT product code, NOT M2-A).
+///
 /// Exists only to execute the shared `StoreContractAssertions` against a
-/// real database file, giving STORE-07/09 native-storage evidence plus
-/// global-writer-slot evidence (STORE-06 certification is deferred to M2-A;
-/// see `XUnitIngestionTests.deferredToM2A`).
-    /// Ordering, pagination, ownership and quota are enforced in SQL; record
-    /// payloads persist in a `payload` column via the test-local lossless
-    /// codec above, so a FRESH handle on the same file resumes the full
-    /// history (STORE-07 reopen leg). The quota count cache is exact under
-    /// the single-writer contract runs (this handle is the sole appender);
-    /// the shared assertion's final SQL tally cross-checks it.
+/// real database file, giving STORE-06/07/09 assertions a second backend
+/// (the production `GRDBSessionStore` certifies STORE-01/06/07/09).
+/// Ownership fencing is shared-file SQL state; quota checks run inside the
+/// same single transaction as the fence and the insert.
+final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
     private let queue: DatabaseQueue
     private let limit: Int
-    private let lock = NSLock()
-    private var recordCount: Int
 
     init(path: String, limit: Int) throws {
         // WAL is set via Configuration so the mode change happens at
@@ -109,7 +102,6 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
         }
         self.queue = try DatabaseQueue(path: path, configuration: configuration)
         self.limit = limit
-        var initial = 0
         try queue.write { db in
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS records(
@@ -123,9 +115,7 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
                     session TEXT PRIMARY KEY,
                     writer TEXT NOT NULL)
                 """)
-            initial = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records") ?? 0
         }
-        self.recordCount = initial
     }
 
     func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
@@ -147,7 +137,6 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
             try db.execute(sql: "INSERT INTO records (session, payload) VALUES (?, ?)",
                            arguments: [identity.session.raw, encoded])
         }
-        lock.withLock { recordCount += 1 }
     }
 
     /// UNSCOPED diagnostic read (support tooling/tests only).
