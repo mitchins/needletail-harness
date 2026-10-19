@@ -235,7 +235,14 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// A2 review: translate exhausted bounded contention into the typed
     /// outcome — the database is healthy, another writer held the lock past
     /// the busy timeout. Corruption stays `.integrity`.
-    private static func translate(_ error: Error) -> Error {
+    /// Shared busy mapping for every DB access (writes, reads, pragmaValue):
+    /// a bounded-timeout exhaustion surfaces as typed `.contention` so a
+    /// healthy-but-locked database is distinguishable from corruption
+    /// (`.integrity`). Non-busy errors pass through untouched. Internal for
+    /// direct unit coverage (a WAL reader cannot be forced into contention
+    /// by a peer writer holding locks — reads use shared snapshots — so the
+    /// mapping itself is pinned by unit, the timeout by the write test).
+    static func translate(_ error: Error) -> Error {
         if let dbError = error as? DatabaseError, dbError.resultCode == .SQLITE_BUSY {
             return StoreError.contention("database busy past the bounded timeout: \(dbError.message)")
         }
@@ -338,12 +345,15 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         guard limit > 0 else {
             throw StoreError.integrity("invalid page limit \(limit); must be > 0")
         }
-        let rows = try queue.read { db in
+        let rows: [Row]
+        do {
+            rows = try queue.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT seq, payload FROM records
                 WHERE session = ? AND seq > ? ORDER BY seq LIMIT ?
                 """, arguments: [session.raw, since, limit])
         }
+        } catch { throw Self.translate(error) }
         let batch = try Self.decodeBatch(rows)
         let next: UInt64? = batch.count < limit ? nil : batch.last?.sequence.value
         return (batch, next)
@@ -360,11 +370,14 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         guard limit > 0 else {
             throw StoreError.integrity("invalid page limit \(limit); must be > 0")
         }
-        let rows = try queue.read { db in
+        let rows: [Row]
+        do {
+            rows = try queue.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT seq, payload FROM records WHERE seq > ? ORDER BY seq LIMIT ?
                 """, arguments: [since, limit])
         }
+        } catch { throw Self.translate(error) }
         let batch = try Self.decodeBatch(rows)
         let next: UInt64? = batch.count < limit ? nil : batch.last?.sequence.value
         return (batch, next)
@@ -448,8 +461,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         gate.lock()
         defer { gate.unlock() }
         try assertOpenLocked()
-        return try queue.read { db in
-            try String.fetchOne(db, sql: "PRAGMA \(name)")
-        }
+        do {
+            return try queue.read { db in
+                try String.fetchOne(db, sql: "PRAGMA " + name)
+            }
+        } catch { throw Self.translate(error) }
     }
 }

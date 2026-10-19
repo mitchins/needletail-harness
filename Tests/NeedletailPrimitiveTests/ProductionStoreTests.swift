@@ -2,9 +2,8 @@ import Testing
 import GRDB
 import Foundation
 import NeedletailCore
-import NeedletailRuntime
-import NeedletailTestSupport
 @testable import NeedletailRuntime
+import NeedletailTestSupport
 
 /// M2-A production-store native-storage evidence (`GRDBSessionStore`):
 /// reopen persistence (STORE-01), durability pragmas (STORE-01),
@@ -325,11 +324,26 @@ struct ProductionStoreTests {
 
         // Reopen: index restored unconditionally (idempotent), after the
         // fail-closed version/shape checks.
-        let reopened = try GRDBSessionStore(path: path)
+        _ = try GRDBSessionStore(path: path)
         let indexes = try DatabaseQueue(path: path).read { db in
             try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='records_session'"))
         }
         #expect(indexes.contains("records_session"), "already-v2 file must gain the session index on open")
+    }
+
+    @Test("busy errors map to typed contention; other sqlite errors pass through")
+    func translateMapsBusyOnly() {
+        let busy = DatabaseError(resultCode: .SQLITE_BUSY, message: "database is locked", sql: nil)
+        guard case StoreError.contention = GRDBSessionStore.translate(busy) else {
+            Issue.record("SQLITE_BUSY must map to typed .contention"); return
+        }
+        let locked = DatabaseError(resultCode: .SQLITE_LOCKED, message: "table locked", sql: nil)
+        if case StoreError.contention = GRDBSessionStore.translate(locked) {
+            Issue.record("SQLITE_LOCKED is not a timeout and must pass through typed as itself")
+        }
+        let ioerr = DatabaseError(resultCode: .SQLITE_IOERR, message: "io", sql: nil)
+        #expect((GRDBSessionStore.translate(ioerr) as? DatabaseError)?.resultCode == .SQLITE_IOERR,
+                "non-busy errors must pass through unchanged")
     }
 
     @Test("A2 sqlite session index exists and survives reopen")
