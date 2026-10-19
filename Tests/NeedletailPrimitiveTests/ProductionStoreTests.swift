@@ -144,6 +144,86 @@ struct ProductionStoreTests {
         }
     }
 
+    @Test("STORE-05 sqlite foreign unversioned store is rejected before adoption")
+    func STORE_05_sqliteForeignVersionZeroRejected() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Foreign v0: a valid SQLite file with user tables that are not a
+        // needletail schema must be rejected BEFORE we create or stamp
+        // anything.
+        let foreignPath = directory.appendingPathComponent("foreign-v0.sqlite").path
+        let foreignDB = try DatabaseQueue(path: foreignPath)
+        try foreignDB.write { db in
+            try db.execute(sql: "CREATE TABLE payments (id INTEGER PRIMARY KEY, cents INTEGER)")
+            try db.execute(sql: "INSERT INTO payments (cents) VALUES (42)")
+        }
+        do {
+            _ = try GRDBSessionStore(path: foreignPath)
+            Issue.record("a foreign v0 store must be rejected, not adopted")
+        } catch let error as StoreError {
+            guard case .integrity(let message) = error, message.contains("foreign unversioned") else {
+                Issue.record("expected foreign-v0 .integrity, got \(error)"); return
+            }
+        } catch {
+            Issue.record("expected StoreError.integrity, got \(error)"); return
+        }
+        // Nothing was written into the foreign file.
+        let recheck = try DatabaseQueue(path: foreignPath)
+        let tables = try recheck.read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        }
+        #expect(tables == ["payments"], "foreign store must be untouched, got \(tables.sorted())")
+
+        // Crashed-migration v0 (OUR tables present, stamped v0): opening
+        // RESUMES the migration rather than rejecting.
+        let crashedPath = directory.appendingPathComponent("crashed-v0.sqlite").path
+        let crashed = try GRDBSessionStore(path: crashedPath)
+        try crashed.close()
+        let rawCrashed = try DatabaseQueue(path: crashedPath)
+        try rawCrashed.write { db in
+            try db.execute(sql: "PRAGMA user_version = 0")
+        }
+        let resumed = try GRDBSessionStore(path: crashedPath)
+        let (all, _) = try resumed.records(since: 0, limit: 10)
+        #expect(all.isEmpty, "resumed store opens clean")
+    }
+
+    @Test("STORE-05 sqlite impostor column types and primary keys are rejected")
+    func STORE_05_sqliteImpostorColumnTypesRejected() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // records.seq TEXT PRIMARY KEY: same column NAMES, incompatible
+        // declared type and key metadata — ordering would corrupt silently
+        // (10 sorts after 9) if only names were checked.
+        func impostor(path: String, seqDecl: String) throws {
+            let db = try DatabaseQueue(path: path)
+            try db.write { outer in
+                try outer.execute(sql: """
+                    CREATE TABLE records (seq \(seqDecl), payload TEXT NOT NULL)
+                    """)
+                try outer.execute(sql: """
+                    CREATE TABLE writer (slot INTEGER PRIMARY KEY, owner TEXT NOT NULL)
+                    """)
+            }
+            do {
+                _ = try GRDBSessionStore(path: path)
+                Issue.record("impostor schema \(seqDecl) must be rejected")
+            } catch let error as StoreError {
+                guard case .integrity(let message) = error, message.contains("foreign or incompatible") else {
+                    Issue.record("expected impostor-schema .integrity, got \(error)"); return
+                }
+            } catch {
+                Issue.record("expected StoreError.integrity, got \(error)"); return
+            }
+        }
+        try impostor(path: directory.appendingPathComponent("text-seq.sqlite").path,
+                     seqDecl: "TEXT PRIMARY KEY")
+        try impostor(path: directory.appendingPathComponent("no-pk-seq.sqlite").path,
+                     seqDecl: "INTEGER")
+    }
+
     @Test("STORE-05 store refuses non-positive page limits")
     func STORE_05_sqliteRejectsNonPositiveLimit() throws {
         let directory = try Self.freshDirectory()
@@ -169,8 +249,8 @@ struct ProductionStoreTests {
         }
     }
 
-    @Test("store durability pragmas hold on the store's own connection")
-    func storePragmasHold() throws {
+    @Test("STORE-01 sqlite durability pragmas hold on the store's own connection")
+    func STORE_01_sqliteDurabilityPragmasHoldOnOwnConnection() throws {
         let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try GRDBSessionStore(
