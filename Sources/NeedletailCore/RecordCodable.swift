@@ -47,7 +47,7 @@ extension ModelProfile: Codable {
             maxInFlight: try container.decode(Int.self, forKey: .maxInFlight),
             requestOptions: try container.decode([String: JSONValue].self, forKey: .requestOptions),
             requestOptionsRaw: try container.decode(Data.self, forKey: .requestOptionsRaw),
-            unqualifiedOptions: try container.decodeIfPresent([String].self, forKey: .unqualifiedOptions) ?? [],
+            unqualifiedOptions: try container.decode([String].self, forKey: .unqualifiedOptions),
             path: "$.store.model-profile")
     }
 

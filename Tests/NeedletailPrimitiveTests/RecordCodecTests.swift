@@ -46,7 +46,7 @@ struct RecordCodecTests {
 
     private static let opID = OperationID("op-1")
 
-    private static func allNineCases() throws -> [DurableRecord] {
+    private static func allCases() throws -> [DurableRecord] {
         [
             .sessionOpened(session: SessionID("s-1"), atMillis: 1000),
             .epochOpened(try epoch(id: "epoch-1", parent: nil,
@@ -65,8 +65,31 @@ struct RecordCodecTests {
                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false)),
             .checkpointCommitted(try epoch(id: "epoch-3", parent: EpochID("epoch-1"),
                                            route: .allowed(endpoint: "http://127.0.0.1:11434/v1", alias: "local-coder"))),
+            .transcriptAppended(.assistantText("covered here too, not only in the sibling test")),
         ]
     }
+
+    /// NO default arm on purpose: a new DurableRecord case must fail the
+    /// BUILD here before it can silently dodge the round-trip oracle.
+    private static func caseName(_ record: DurableRecord) -> String {
+        switch record {
+        case .sessionOpened: return "sessionOpened"
+        case .epochOpened: return "epochOpened"
+        case .eventAppended: return "eventAppended"
+        case .operationIntent: return "operationIntent"
+        case .operationResult: return "operationResult"
+        case .queueAdmitted: return "queueAdmitted"
+        case .queueUpdated: return "queueUpdated"
+        case .checkpointCommitted: return "checkpointCommitted"
+        case .transcriptAppended: return "transcriptAppended"
+        }
+    }
+
+    private static let expectedCaseNames: Set<String> = [
+        "sessionOpened", "epochOpened", "eventAppended", "operationIntent",
+        "operationResult", "queueAdmitted", "queueUpdated",
+        "checkpointCommitted", "transcriptAppended",
+    ]
 
     /// The transcript shapes ride DurableRecord.transcriptAppended; every
     /// TranscriptEntry case round-trips too (toolCall carries an already
@@ -82,13 +105,20 @@ struct RecordCodecTests {
 
     // MARK: - Round trip (the oracle)
 
-    @Test("record codec round-trips every DurableRecord case losslessly")
+    @Test("record codec round-trips EVERY DurableRecord case losslessly (exhaustiveness pinned)")
     func roundTripEveryDurableRecordCase() throws {
-        for (index, record) in try Self.allNineCases().enumerated() {
+        let records = try Self.allCases()
+        var covered: Set<String> = []
+        for (index, record) in records.enumerated() {
             let data = try RecordCodec.encode(record)
             let decoded = try RecordCodec.decode(data)
             #expect(decoded == record, "case \(index) must survive encode/decode unchanged")
+            covered.insert(Self.caseName(record))
         }
+        // The table must have exercised every case exactly by name; a new
+        // case without a fixture fails here even before the build break.
+        #expect(covered == Self.expectedCaseNames,
+                "fixture table must cover all nine cases, covered=\(covered.sorted())")
     }
 
     @Test("record codec round-trips every TranscriptEntry case losslessly")
@@ -102,24 +132,57 @@ struct RecordCodecTests {
 
     // MARK: - Canonicality
 
-    @Test("record codec encodes canonically: identical values produce identical bytes")
+    @Test("record codec encodes canonically: insertion order must not change the bytes")
     func encodingIsCanonical() throws {
-        let record = try Self.allNineCases()[1] // epochOpened with a full snapshot
-        let first = try RecordCodec.encode(record)
-        let second = try RecordCodec.encode(record)
-        #expect(first == second, "sortedKeys canonical form must be byte-stable")
-        // Dictionary iteration order must not leak into the bytes.
-        let withTwoProfiles = ConfigSnapshot(
-            version: 1,
-            profiles: ["b-model": try Self.profile(alias: "b-model"), "a-model": try Self.profile(alias: "a-model")],
-            defaultAlias: "a-model", allowHTTPOrigins: [], tools: .allDenied)
-        let snapshotRecord = DurableRecord.epochOpened(EpochDescriptor(
-            epochID: EpochID("epoch-9"), parentEpochID: nil,
-            configSnapshot: withTwoProfiles, profile: try Self.profile(alias: "a-model"),
-            effectiveCaps: EffectiveCapabilities(tools: .allDenied, route: .localOnly, deniedBy: []),
-            route: .allowed(endpoint: "http://127.0.0.1:11434/v1", alias: "a-model")))
-        #expect(try RecordCodec.encode(snapshotRecord) == RecordCodec.encode(snapshotRecord),
-                "multi-profile snapshots encode byte-stably")
+        // Equal-by-value snapshots built with DIFFERENT dictionary
+        // insertion orders (profiles dict and requestOptions dict) must
+        // produce BYTE-identical rows — sortedKeys must erase insertion
+        // order, and a golden pin catches any encoder change.
+        // Only LITERAL INSERTION ORDER differs between the two builds —
+        // the values (including the verbatim requestOptionsRaw bytes) are
+        // identical, so the records are equal by value and the bytes must
+        // not depend on construction order.
+        let optionsA = ["temperature": JSONValue.number(0.2), "top_p": .number(0.9)]
+        let optionsB = ["top_p": JSONValue.number(0.9), "temperature": .number(0.2)]
+        let raw = Data(#"{"temperature":0.2,"top_p":0.9}"#.utf8)
+        func make(_ alias: String, options: [String: JSONValue], raw: Data, order: (String, String)) throws -> DurableRecord {
+            let p1 = try Self.profile(alias: order.0)
+            let p2 = try Self.profile(alias: order.1)
+            var profiles = [p1.alias: p1, p2.alias: p2]
+            // Rebuild the chosen profile with this option ordering.
+            let chosen = try ModelProfile(
+                alias: alias, wireProtocol: .openAIChatCompletions,
+                baseURL: "http://127.0.0.1:11434", modelID: "qwen2.5-coder-32b",
+                contextWindow: 262144, maxOutput: 4096, locality: .local,
+                credential: CredentialReference(kind: .env(name: "NT_STORE_KEY")),
+                connectTimeout: 10, readIdleTimeout: 300, requestTimeout: 1800,
+                maxInFlight: 1, requestOptions: options, requestOptionsRaw: raw)
+            profiles[alias] = chosen
+            let snapshot = ConfigSnapshot(
+                version: 1, profiles: profiles, defaultAlias: alias,
+                allowHTTPOrigins: ["http://127.0.0.1:11434"], tools: .allDenied)
+            return .epochOpened(EpochDescriptor(
+                epochID: EpochID("epoch-order"), parentEpochID: nil,
+                configSnapshot: snapshot, profile: chosen,
+                effectiveCaps: EffectiveCapabilities(tools: .allDenied, route: .localOnly, deniedBy: []),
+                route: .allowed(endpoint: "http://127.0.0.1:11434/v1", alias: alias)))
+        }
+        let insertionOne = try make("a-model", options: optionsA, raw: raw, order: ("a-model", "b-model"))
+        let insertionTwo = try make("a-model", options: optionsB, raw: raw, order: ("b-model", "a-model"))
+        #expect(insertionOne == insertionTwo, "the two built records must be equal by value")
+        let bytesOne = try RecordCodec.encode(insertionOne)
+        let bytesTwo = try RecordCodec.encode(insertionTwo)
+        #expect(bytesOne == bytesTwo, "insertion order must not leak into the bytes")
+        // Golden pin: any encoder change (key order, casing, shape)
+        // breaks this equality and must be a conscious decision.
+        // Captured verbatim from the encoder on this toolchain
+        // (Swift 6.4 synthesized shapes: _0 payloads, {"raw":...} IDs,
+        // bare-string raw-value enums) — never hand-authored.
+        let golden = #"""
+{"epochOpened":{"_0":{"configSnapshot":{"allowHTTPOrigins":["http://127.0.0.1:11434"],"defaultAlias":"a-model","profiles":{"a-model":{"alias":"a-model","baseURL":"http://127.0.0.1:11434","connectTimeout":10,"contextWindow":262144,"credential":{"kind":{"env":{"name":"NT_STORE_KEY"}}},"locality":"local","maxInFlight":1,"maxOutput":4096,"modelID":"qwen2.5-coder-32b","readIdleTimeout":300,"requestOptions":{"temperature":0.2,"top_p":0.9},"requestOptionsRaw":"eyJ0ZW1wZXJhdHVyZSI6MC4yLCJ0b3BfcCI6MC45fQ==","requestTimeout":1800,"unqualifiedOptions":[],"wireProtocol":"openai-chat-completions"},"b-model":{"alias":"b-model","baseURL":"http://127.0.0.1:11434","connectTimeout":10,"contextWindow":262144,"credential":{"kind":{"env":{"name":"NT_STORE_KEY"}}},"locality":"local","maxInFlight":1,"maxOutput":4096,"modelID":"qwen2.5-coder-32b","readIdleTimeout":300,"requestOptions":{"temperature":0.2},"requestOptionsRaw":"eyJ0ZW1wZXJhdHVyZSI6MC4yfQ==","requestTimeout":1800,"unqualifiedOptions":[],"wireProtocol":"openai-chat-completions"}},"tools":{"consult":false,"edit":false,"exec":"denied","read":false,"search":false,"write":false},"version":1},"effectiveCaps":{"deniedBy":[],"route":"localOnly","tools":{"consult":false,"edit":false,"exec":"denied","read":false,"search":false,"write":false}},"epochID":{"raw":"epoch-order"},"profile":{"alias":"a-model","baseURL":"http://127.0.0.1:11434","connectTimeout":10,"contextWindow":262144,"credential":{"kind":{"env":{"name":"NT_STORE_KEY"}}},"locality":"local","maxInFlight":1,"maxOutput":4096,"modelID":"qwen2.5-coder-32b","readIdleTimeout":300,"requestOptions":{"temperature":0.2,"top_p":0.9},"requestOptionsRaw":"eyJ0ZW1wZXJhdHVyZSI6MC4yLCJ0b3BfcCI6MC45fQ==","requestTimeout":1800,"unqualifiedOptions":[],"wireProtocol":"openai-chat-completions"},"route":{"allowed":{"alias":"a-model","endpoint":"http://127.0.0.1:11434/v1"}}}}}
+"""#;
+        #expect(String(data: bytesOne, encoding: .utf8) == golden,
+                "golden bytes drifted — an encoder change must be a conscious decision")
     }
 
     // MARK: - Fail-closed integrity oracles
@@ -145,17 +208,60 @@ struct RecordCodecTests {
         assertIntegrityFailure(Data("not json".utf8))
     }
 
+    @Test("encoded rows never carry derived origin/pathPrefix; decode re-derives them")
+    func derivedFieldsAreNeverEncoded() throws {
+        let record = try Self.allCases()[1] // epochOpened with a full snapshot
+        let json = String(data: try RecordCodec.encode(record), encoding: .utf8)!
+        #expect(!json.contains("\"origin\""), "derived origin must never be encoded")
+        #expect(!json.contains("\"pathPrefix\""), "derived pathPrefix must never be encoded")
+        // Positive oracle: decoding re-derives the origin from baseURL.
+        guard case .epochOpened(let descriptor) = try RecordCodec.decode(try RecordCodec.encode(record)) else {
+            Issue.record("expected epochOpened"); return
+        }
+        #expect(descriptor.profile.origin == "http://127.0.0.1:11434",
+                "origin must be re-derived from baseURL, got \(descriptor.profile.origin)")
+        #expect(descriptor.profile.pathPrefix == "")
+    }
+
     @Test("record codec refuses a semantically invalid profile row (validating decode)")
     func decodeRefusesInvalidProfileRow() throws {
-        // Hand-built JSON with an out-of-range limit and a base URL whose
-        // origin disagrees with the stored one: the VALIDATING init must
-        // reject it — synthesis would have accepted both silently.
-        let tampered = """
-        {"epochOpened":{"configSnapshot":{"allowHTTPOrigins":[],"defaultAlias":"x","profiles":{"x":{"alias":"x","baseURL":"https://evil.example/v1","connectTimeout":10,"contextWindow":-5,"credential":{"env":"K"},"locality":{"_0":"local"},"maxInFlight":1,"maxOutput":4096,"modelID":"m","readIdleTimeout":300,"requestOptions":{},"requestOptionsRaw":"e30i","requestTimeout":1800,"unqualifiedOptions":[],"wireProtocol":{"_0":"openai-chat-completions"}}},"tools":{"consult":false,"edit":false,"exec":{"_0":"denied"},"read":false,"search":false,"write":false}},"effectiveCaps":{"deniedBy":[],"route":{"_0":"localOnly"},"tools":{"consult":false,"edit":false,"exec":{"_0":"denied"},"read":false,"search":false,"write":false}},"epochID":{"_0":"epoch-x"},"parentEpochID":null,"profile":{"alias":"x","baseURL":"https://evil.example/v1","connectTimeout":10,"contextWindow":-5,"credential":{"env":"K"},"locality":{"_0":"local"},"maxInFlight":1,"maxOutput":4096,"modelID":"m","readIdleTimeout":300,"requestOptions":{},"requestOptionsRaw":"e30i","requestTimeout":1800,"unqualifiedOptions":[],"wireProtocol":{"_0":"openai-chat-completions"}},"route":{"allowed":{"_0":{"_0":"https://evil.example/v1","_1":"x"}}}}}
-        """
+        // Build the tampered row from REAL encoded bytes (the synthesized
+        // wire format is an implementation detail we must not hand-guess):
+        // flip contextWindow to an out-of-range value in BOTH copies of the
+        // profile (configSnapshot.profiles and the top-level profile). The
+        // VALIDATING init must reject the row — synthesized decoding would
+        // assign -5 silently. A structural-JSON failure would also throw,
+        // so the RED probe for this oracle swaps the custom conformance for
+        // synthesized Codable and expects THIS test to fail.
+        let record = try Self.allCases()[1]
+        var object = try JSONSerialization.jsonObject(
+            with: RecordCodec.encode(record)) as! [String: Any]
+        // The synthesized shape wraps a single associated value under "_0".
+        guard var payload = object["epochOpened"] as? [String: Any],
+              var inner = payload["_0"] as? [String: Any],
+              var snapshot = inner["configSnapshot"] as? [String: Any],
+              var profiles = snapshot["profiles"] as? [String: Any],
+              var topProfile = inner["profile"] as? [String: Any] else {
+            Issue.record("unexpected encoded shape"); return
+        }
+        for (alias, anyProfile) in profiles {
+            guard var profile = anyProfile as? [String: Any] else {
+                Issue.record("unexpected profile shape"); return
+            }
+            profile["contextWindow"] = -5
+            profiles[alias] = profile
+        }
+        topProfile["contextWindow"] = -5
+        snapshot["profiles"] = profiles
+        inner["configSnapshot"] = snapshot
+        inner["profile"] = topProfile
+        payload["_0"] = inner
+        object["epochOpened"] = payload
+        let tampered = try JSONSerialization.data(withJSONObject: object)
+
         do {
-            _ = try RecordCodec.decode(Data(tampered.utf8))
-            Issue.record("a semantically invalid profile row must fail the decode")
+            _ = try RecordCodec.decode(tampered)
+            Issue.record("an out-of-range profile row must fail the decode, not decode silently")
         } catch let error as StoreError {
             guard case .integrity = error else {
                 Issue.record("expected .integrity, got \(error)"); return

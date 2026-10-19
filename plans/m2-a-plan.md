@@ -78,8 +78,9 @@ No M2-B/C/D behaviour; no re-execution of unknown side effects; no silent trunca
 
 ## 8. Known unrelated tooling issues (tracked separately, NOT A0 scope)
 
-- **Sonar coverage-import defect**: the main-branch Sonar coverage import is broken (reported by the operator). Not a code defect; to be fixed in CI tooling separately. M2-A slices do not gate on Sonar.
+- **Sonar coverage-import defect**: the main-branch Sonar quality gate is broken (red on `f62ccdd`+ main runs and on PRs alike; operator-acknowledged). Not a code defect; to be fixed in CI tooling separately. M2-A slices do not gate on Sonar.
 - **PTY-05 intermittent failure**: flaky on the Linux builder (operator-reported). M4-scope case; tracked so an M2-A run hitting it is triaged as the known flake, never absorbed silently into a green run.
+- **A0 bundler note (M0-D audit trail)**: with GRDB in the Runtime graph, BOTH linkage modes now emit `lib/` (libsqlite3 collected; Swift libs in dynamic mode) and a pure-shell launcher at `bundle/needletail` (static mode previously placed the raw ELF there). `linkage-manifest.txt`/`size.txt` still read `bin/needletail.real`; `linkage-mode.txt` stays truthful. CI verified static mode (linux success on `71e1d5b`); local verified dynamic mode.
 
 ## 9. Rev2 → REV3 changes (delta review: F-fixes confirmed; G-findings folded)
 

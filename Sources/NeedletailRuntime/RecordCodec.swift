@@ -13,6 +13,11 @@ import NeedletailCore
 /// stale origin.
 public enum RecordCodec {
 
+    /// Encode failures propagate as `EncodingError` (the only known source
+    /// is a non-finite `JSONValue.number`, which configuration loading
+    /// already rejects upstream); decode failures are ALWAYS
+    /// `StoreError.integrity` — an undecodable stored row is a store
+    /// integrity fault by definition, and is never substituted.
     public static func encode(_ record: DurableRecord) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
