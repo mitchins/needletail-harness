@@ -168,19 +168,31 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         let prior = state
         let result = transition(state, event, &ids)
         state = result.state
-        // S2: the outer transition's records append BEFORE any pump-driven
-        // follow-up — cause precedes consequence in the store log (M2 replays
-        // this order).
+        // S2 + A3-1: the transition's whole record group commits ATOMICALLY
+        // before ANY effect performs — cause precedes consequence, and an
+        // intent group either commits whole (dispatch may proceed) or not
+        // at all (no external side effect exists). A failed RESULT commit
+        // after a possible side effect stops here: no success asserted, no
+        // continuation performed — the earlier-committed intents stand
+        // alone, which is exactly the evidence later reconciliation needs
+        // to classify them unknown.
         do {
-            for record in result.records {
-                try store.append(record, as: WriterIdentity(
+            if !result.records.isEmpty {
+                try store.appendBatch(result.records, as: WriterIdentity(
                     session: state.sessionID, writer: writer))
             }
         } catch {
             // Integrity-visible halt (never silent divergence): the computed
             // records are unpersisted, so the run cannot continue on them.
             // M2 owns recovery; M1-B fails the run visibly here.
-            state = prior.replacing(phase: .failed(.integrityStopped("store append failed; intent unpersisted")))
+            let reason: String
+            switch event {
+            case .effectCompleted, .effectFailed:
+                reason = "store append failed; result unpersisted, outcome unresolved"
+            default:
+                reason = "store append failed; intent unpersisted"
+            }
+            state = prior.replacing(phase: .failed(.integrityStopped(reason)))
             return
         }
         for effect in result.effects {

@@ -41,6 +41,25 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
+    public func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {
+        // A3-1 atomic override: validate EVERYTHING first (fencing, quota
+        // for the whole group), then commit — a failing batch leaves the
+        // log untouched, never partially committed.
+        try lock.withLock {
+            guard let owner = claims[identity.session.raw], owner == identity.writer else {
+                throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+            }
+            guard log.count + records.count <= Self.recordCap else {
+                throw StoreError.quotaExceeded(limit: Self.recordCap)
+            }
+            for record in records {
+                sequence += 1
+                log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
+                sessions.append(identity.session.raw)
+            }
+        }
+    }
+
     public func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
         guard limit > 0 else {
             throw StoreError.integrity("invalid page limit \(limit); must be > 0")

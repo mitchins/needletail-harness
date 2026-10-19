@@ -65,6 +65,14 @@ public protocol SessionStore: Sendable {
     /// `identity.session`. A stale writer (never claimed, superseded, or
     /// voided by recovery) fails closed with `.notWriter`.
     func append(_ record: DurableRecord, as identity: WriterIdentity) throws
+    /// A3-1 ATOMIC batch commit: a transition's whole record group commits
+    /// as ONE unit — no partially committed intent/result batch. The
+    /// fencing check covers the whole group inside the same transaction.
+    /// Production (GRDB) and scripted (InMemory) stores override with a
+    /// real single-transaction implementation; the default sequential loop
+    /// keeps diagnostic-only conformances compiling without claiming
+    /// atomicity they do not provide.
+    func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws
     /// Paged read (R15): bounded batches with an explicit cursor — history
     /// is never loaded wholesale (SPEC §9.2, ARCH §1).
     /// SESSION-SCOPED paged read (R15 + A2 isolation): returns ONLY this
@@ -84,6 +92,16 @@ public protocol SessionStore: Sendable {
     /// release: a stale identity fails closed with `.notWriter` and never
     /// removes a newer writer's claim.
     func releaseWriterOwnership(session: SessionID, writer: String) throws
+}
+
+extension SessionStore {
+    /// Default sequential batch (NO atomicity claim): diagnostic-only
+    /// conformances inherit this. Durable paths must override.
+    public func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {
+        for record in records {
+            try append(record, as: identity)
+        }
+    }
 }
 
 /// Bounded intake/spool channel as a VALUE (STATE-04, R6/R12): pure

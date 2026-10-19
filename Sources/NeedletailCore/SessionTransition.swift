@@ -457,22 +457,42 @@ private func drop(_ state: SessionState) -> Transition {
 }
 
 /// Stale drop WITH retention (R2/C3): a live mutating effect whose outcome
-/// is now unknowable keeps an `unknown` marker + record, appended BEFORE
+/// is now unknowable keeps `unknown` markers + records, appended BEFORE
 /// dropping. Already-consumed duplicates never reach here (bare counter).
+/// A3-1: unknown markers derive the SAME per-proposal operation IDs as the
+/// dispatch-time intents, so a later reconciliation can pair each unmatched
+/// intent with its unknown outcome instead of guessing.
 private func dropRetaining<I: IDSource>(_ state: SessionState, effectID: EffectID, ids: inout I) -> Transition {
-    let ref = OperationRef(
-        operationID: ids.nextOperationID(), callID: effectID.raw,
-        state: .unknown, mutating: true)
-    let (markers, overflow) = appendUnresolved(state.unresolvedOperations, ref)
-    if overflow {
-        return integrityStop(state, ids: &ids)
+    let reservation = state.liveReservations.first(where: { $0.effectID == effectID })
+    let proposals = reservation?.batch.proposals ?? []
+    let mutating = reservation?.mutating ?? true
+    let refs: [OperationRef]
+    if proposals.isEmpty {
+        refs = [OperationRef(
+            operationID: OperationID(effectID.raw), callID: effectID.raw,
+            state: .unknown, mutating: mutating)]
+    } else {
+        refs = proposals.map {
+            OperationRef(
+                operationID: operationID(effectID: effectID, callID: $0.callID),
+                callID: $0.callID, state: .unknown, mutating: mutating)
+        }
+    }
+    var unresolved = state.unresolvedOperations
+    var records: [DurableRecord] = []
+    for ref in refs {
+        let (markers, overflow) = appendUnresolved(unresolved, ref)
+        unresolved = markers
+        if overflow {
+            return integrityStop(state, ids: &ids)
+        }
+        records.append(.operationResult(ref, outcome: "unknown"))
     }
     var live = state.liveReservations
     live.removeAll(where: { $0.effectID == effectID })
-    let record = DurableRecord.operationResult(ref, outcome: "unknown")
     return Transition(
-        state: bumped(state, unresolved: markers, live: live),
-        effects: [], records: [record])
+        state: bumped(state, unresolved: unresolved, live: live),
+        effects: [], records: records)
 }
 
 // MARK: - Row handlers
@@ -1239,10 +1259,31 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         records: prefix)
 }
 
+/// A3-1 stable operation identity (SPEC §9.1): every externally
+/// dispatchable tool operation is identified by its reservation's effect ID
+/// plus its own call ID. Derived, never minted — so an intent and its later
+/// completion resolve to the SAME ID without shared mutable bookkeeping,
+/// and replays derive identical IDs. `"/"` cannot collide with minted IDs
+/// (minted IDs never contain it) nor across proposals (callIDs are unique
+/// per batch, enforced at admission) nor across effects (effectIDs unique).
+private func operationID(effectID: EffectID, callID: String) -> OperationID {
+    OperationID("\(effectID.raw)/\(callID)")
+}
+
 private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: ToolBatch, ids: inout I) -> Transition {
     guard let run = state.activeRun else {
         let (s1, prefix) = sequenced(state, kind: "failed", digest: "no-run", ids: &ids)
         return Transition(state: s1.replacing(phase: .failed(.providerError("trusted dispatch without a run"))), effects: [], records: prefix)
+    }
+    // Intent-before-effect (SPEC §9.1): a dispatchable batch without clean
+    // per-operation identity fails closed HERE — no intent records, no
+    // reservation, no executor call. Admission normally guarantees shape;
+    // this is the last gate before external side effects.
+    var seenCalls: Set<String> = []
+    for proposal in batch.proposals {
+        guard !proposal.callID.isEmpty, seenCalls.insert(proposal.callID).inserted else {
+            return failRun(state, failure: .providerError("malformed dispatch batch: empty or duplicate call identity"), hold: true, atMillis: 0, ids: &ids)
+        }
     }
     let effectID = ids.nextEffectID()
     let mutating = batch.proposals.contains { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" }
@@ -1253,10 +1294,19 @@ private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: Too
     let next = s1.replacing(
         phase: .executing, pendingApproval: .some(nil), pendingBatch: .some(nil),
         liveReservations: state.liveReservations + [reservation])
+    // Every dispatchable operation commits its durable intent in the SAME
+    // record group as the dispatch: the actor persists this whole group
+    // atomically BEFORE performing `.reserveEffect`, so no external side
+    // effect exists without its identifiable intent.
+    let intents = batch.proposals.map {
+        DurableRecord.operationIntent(OperationRef(
+            operationID: operationID(effectID: effectID, callID: $0.callID),
+            callID: $0.callID, state: .intent, mutating: mutating))
+    }
     return Transition(
         state: next,
         effects: [.reserveEffect(reservation)],
-        records: prefix)
+        records: prefix + intents)
 }
 
 private func grantApproval<I: IDSource>(_ state: SessionState, requestID: RequestID, ids: inout I) -> Transition {
@@ -1291,10 +1341,9 @@ private func holdForApproval<I: IDSource>(
 // MARK: Effect completion (M1B2-3 continuation)
 
 private func continueAfterEffect<I: IDSource>(
-    _ state: SessionState, effectID: EffectID, receipt: String, atMillis: UInt64, ids: inout I
-) -> Transition {
-    _ = effectID
-    _ = atMillis
+     _ state: SessionState, effectID: EffectID, receipt: String, atMillis: UInt64, ids: inout I
+ ) -> Transition {
+     _ = atMillis
     // S9: a mismatched mutating completion may have left markers while a
     // run nominally continues — continuation re-checks before dispatching.
     if !state.unresolvedOperations.isEmpty {
@@ -1325,24 +1374,43 @@ private func continueAfterEffect<I: IDSource>(
     consumed.insert(effectID)
     var live = state.liveReservations
     live.removeAll(where: { $0.effectID == effectID })
-    let ref = OperationRef(operationID: ids.nextOperationID(), callID: effectID.raw, state: .done, mutating: false)
+    // A3-1 correlated completion: results carry the SAME derived operation
+    // IDs as the dispatch-time intents, per proposal, with the reservation's
+    // own mutating flag (a mutating batch's completion is mutating — the
+    // old hardcoded `false` broke that correlation). The reservation is
+    // guaranteed present here (checkStale only lets matching completions
+    // through); the reservation-gone fallback keeps flow identical with a
+    // stable effect-level ID rather than a minted one.
+    let completedBatch = state.liveReservations.first(where: { $0.effectID == effectID })?.batch
+    let completedMutating = state.liveReservations.first(where: { $0.effectID == effectID })?.mutating ?? false
+    let results: [DurableRecord]
+    let responses: [DurableRecord]
+    if let proposals = completedBatch?.proposals, !proposals.isEmpty {
+        results = proposals.map {
+            DurableRecord.operationResult(OperationRef(
+                operationID: operationID(effectID: effectID, callID: $0.callID),
+                callID: $0.callID, state: .done, mutating: completedMutating),
+                outcome: receipt)
+        }
+        responses = proposals.map {
+            DurableRecord.transcriptAppended(.toolResponse(callID: $0.callID, text: receipt))
+        }
+    } else {
+        results = [.operationResult(
+            OperationRef(operationID: OperationID(effectID.raw), callID: effectID.raw, state: .done, mutating: completedMutating),
+            outcome: receipt)]
+        responses = []
+    }
     let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
     let next = s1.replacing(
         phase: .requesting, consumedEffects: consumed,
         turnsUsed: state.turnsUsed + 1, liveReservations: live, lastSequence: seq.value)
-    // Each proposal in the completed batch gets its tool response carrying
-    // the receipt text — pairing is callID-keyed, so multi-call batches
-    // stay exact. Stale completions (reservation gone) record nothing.
-    let responses = (state.liveReservations.first(where: { $0.effectID == effectID })?.batch.proposals ?? []).map {
-        DurableRecord.transcriptAppended(.toolResponse(callID: $0.callID, text: receipt))
-    }
     return Transition(
         state: next,
         effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
         records: prefix + [
             .eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw)),
-            .operationResult(ref, outcome: receipt),
-        ] + responses)
+        ] + results + responses)
 }
 
 private func completeEffect<I: IDSource>(
@@ -1365,20 +1433,35 @@ private func failEffect<I: IDSource>(_ state: SessionState, effectID: EffectID, 
 // MARK: Cancellation (C3: retention BEFORE invalidation)
 
 private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, ids: inout I) -> Transition {
-    // C3: every live MUTATING reservation keeps its unknown marker + record
-    // FIRST; only then are the tables cleared and the generation bumped.
+    // C3: every live MUTATING reservation keeps its unknown markers +
+    // records FIRST; only then are the tables cleared and the generation
+    // bumped. A3-1: markers derive the SAME per-proposal operation IDs as
+    // the dispatch-time intents, so each unmatched intent later reconciles
+    // to unknown instead of an unpairable effect-level guess.
     var unresolved = state.unresolvedOperations
     var records: [DurableRecord] = []
     for reservation in state.liveReservations where reservation.mutating {
-        let ref = OperationRef(
-            operationID: ids.nextOperationID(), callID: reservation.effectID.raw,
-            state: .unknown, mutating: true)
-        let (markers, overflow) = appendUnresolved(unresolved, ref)
-        unresolved = markers
-        if overflow {
-            return integrityStop(state, ids: &ids)
+        let proposals = reservation.batch.proposals
+        let refs: [OperationRef]
+        if proposals.isEmpty {
+            refs = [OperationRef(
+                operationID: OperationID(reservation.effectID.raw), callID: reservation.effectID.raw,
+                state: .unknown, mutating: true)]
+        } else {
+            refs = proposals.map {
+                OperationRef(
+                    operationID: operationID(effectID: reservation.effectID, callID: $0.callID),
+                    callID: $0.callID, state: .unknown, mutating: true)
+            }
         }
-        records.append(.operationResult(ref, outcome: "unknown"))
+        for ref in refs {
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow {
+                return integrityStop(state, ids: &ids)
+            }
+            records.append(.operationResult(ref, outcome: "unknown"))
+        }
     }
     let (s1, prefix) = sequenced(state, kind: "cancelling", digest: "cancel", ids: &ids)
     var active: ActiveRequest? = nil
