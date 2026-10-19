@@ -118,7 +118,10 @@ struct RunCommand: ParsableCommand {
             }
         }
         func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
-            try lock.withLock {
+            guard limit > 0 else {
+                throw StoreError.integrity("invalid page limit \(limit); must be > 0")
+            }
+            return try lock.withLock {
                 let window = log.enumerated().filter {
                     $0.element.sequence.value > since && sessions[$0.offset] == session.raw
                 }.prefix(limit).map { $0.element }

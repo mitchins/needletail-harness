@@ -45,8 +45,9 @@ public enum StoreContractAssertions {
         let (tail, tailNext) = try store.records(session: identity.session, since: 4, limit: 10)
         #expect(tail.map(\.record) == Array(payloads[4...]), "[\(variant)] since-cursor must replay the tail")
         #expect(tailNext == nil, "[\(variant)] tail read must end with a nil cursor")
-        // Per-session sequences are strictly increasing and dense from 1
-        // within the session's OWN log (global identity stays `seq`).
+        // Single-session log: strictly increasing and dense from 1. (The
+        // global `seq` identity is shared across sessions; per-session
+        // density holds only when one session wrote the whole fixture.)
         let (all, _) = try store.records(session: identity.session, since: 0, limit: Int.max)
         #expect(all.map(\.sequence.value) == [1, 2, 3, 4, 5, 6, 7],
                 "[\(variant)] per-session sequences must be dense from 1")

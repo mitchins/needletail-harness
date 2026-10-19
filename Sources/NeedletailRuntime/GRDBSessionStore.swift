@@ -144,6 +144,12 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 // to "" (counted toward the GLOBAL quota, attributable to no
                 // session). v1 slot-based claims are VOID: the old model had
                 // no writer identity, so explicit re-claim is required.
+                // Consequence (documented): backfilled rows carry "" — they are
+                // invisible to session-scoped reads, unattributable to any
+                // session quota, and visible only through the unscoped
+                // diagnostic read; they still count toward the GLOBAL quota.
+                // v1 never shipped, so this is tested dev-history handling,
+                // not a compatibility promise.
                 // Idempotent against a crashed-migration v0 file that
                 // already carries the v2 column set.
                 let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(records)")
@@ -294,7 +300,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         defer { gate.unlock() }
         try assertOpenLocked()
         let payloads = try records.map { try RecordCodec.encode($0) }
-        try queue.write { db in
+        do { try queue.write { db in
             let holder = try String.fetchOne(
                 db, sql: "SELECT writer FROM writer WHERE session = ?",
                 arguments: [identity.session.raw])
@@ -322,7 +328,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                     arguments: [last, identity.session.raw,
                                 String(decoding: payload, as: UTF8.self)])
             }
-        }
+        } } catch { throw Self.translate(error) }
     }
 
     public func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
@@ -396,7 +402,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         gate.lock()
         defer { gate.unlock() }
         try assertOpenLocked()
-        try queue.write { db in
+        do { try queue.write { db in
             try db.execute(
                 sql: "DELETE FROM writer WHERE session = ? AND writer = ?",
                 arguments: [session.raw, writer])
@@ -404,7 +410,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             guard deleted == 1 else {
                 throw StoreError.notWriter(session: session.raw, writer: writer)
             }
-        }
+        } } catch { throw Self.translate(error) }
     }
 
     /// A1 test/receipt support: an explicit close hands the file to a

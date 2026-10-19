@@ -139,7 +139,7 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
         }
     }
 
-    /// UNSCOPED diagnostic read (support tooling/tests only).
+    /// SESSION-SCOPED read (per-session log, per-session cursors).
     func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
         let texts = try queue.read { db in
             try Row.fetchAll(db, sql: """

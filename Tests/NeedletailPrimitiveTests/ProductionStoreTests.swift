@@ -394,6 +394,38 @@ struct ProductionStoreTests {
         try store.append(.transcriptAppended(.user("after-contention")), as: Self.identity)
     }
 
+    @Test("STORE-05 sqlite v1 legacy rows are visible only through the unscoped read")
+    func STORE_05_sqliteLegacyRowsUnscopedOnly() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Documented v1 consequence: backfilled rows (session "") are
+        // invisible to session-scoped reads, unattributable to any session
+        // quota, visible only through the unscoped diagnostic read, and
+        // counted toward the GLOBAL quota.
+        let path = directory.appendingPathComponent("legacy.sqlite").path
+        let raw = try DatabaseQueue(path: path)
+        let legacyPayload = String(
+            decoding: try RecordCodec.encode(.transcriptAppended(.user("legacy-row"))),
+            as: UTF8.self)
+        try raw.write { db in
+            try db.execute(sql: "CREATE TABLE records (seq INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+            try db.execute(sql: "CREATE TABLE writer (slot INTEGER PRIMARY KEY CHECK (slot = 1), owner TEXT NOT NULL)")
+            try db.execute(sql: "INSERT INTO records (payload) VALUES (?)", arguments: [legacyPayload])
+            try db.execute(sql: "PRAGMA user_version = 1")
+        }
+        let store = try GRDBSessionStore(path: path)
+        let identity = WriterIdentity(session: SessionID("s-new"), writer: "w-new")
+        try store.claimWriterOwnership(session: identity.session, writer: identity.writer)
+        let (scoped, _) = try store.records(session: identity.session, since: 0, limit: 100)
+        #expect(scoped.isEmpty, "legacy rows must not appear in any session-scoped read")
+        let (all, _) = try store.records(since: 0, limit: 100)
+        #expect(all.count == 1, "legacy row visible only via the unscoped diagnostic read")
+        #expect(all.first?.record == .transcriptAppended(.user("legacy-row")))
+        try store.append(.transcriptAppended(.user("new-row")), as: identity)
+        let (global, _) = try store.records(since: 0, limit: 100)
+        #expect(global.count == 2, "both rows counted in the global tally")
+    }
+
     // MARK: - STORE-06 (the M2-0 deferral lands here)
 
     @Test("STORE-06 sqlite two writers compete for one session (fenced)")
