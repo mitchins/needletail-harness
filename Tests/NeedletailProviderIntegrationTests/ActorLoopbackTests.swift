@@ -101,7 +101,7 @@ struct ActorLoopbackTests {
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: "e2e"), clock: VirtualClock(now: 1_000_000),
             transport: flaky, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals())
+            store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "test-writer")
 
         await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
         // Arm: the flaky preSend classifies, the actor arms the deadline —
@@ -145,7 +145,7 @@ struct ActorLoopbackTests {
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: "e2e-abort"), clock: VirtualClock(now: 2_000_000),
             transport: flaky, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals())
+            store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "test-writer")
 
         await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
         let done = try await ActorLoopback.awaitState({

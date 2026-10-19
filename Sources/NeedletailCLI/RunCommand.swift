@@ -104,8 +104,12 @@ struct RunCommand: ParsableCommand {
         private let lock = NSLock()
         private var log: [SequencedRecord] = []
         private var sequence: UInt64 = 0
-        func append(_ record: DurableRecord) throws {
+        private var claims: [String: String] = [:]
+        func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
             try lock.withLock {
+                guard claims[identity.session.raw] == identity.writer else {
+                    throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+                }
                 guard log.count < 10_000 else { throw StoreError.quotaExceeded(limit: 10_000) }
                 sequence += 1
                 log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
@@ -121,8 +125,22 @@ struct RunCommand: ParsableCommand {
                 return (batch, next)
             }
         }
-        func claimWriterOwnership(session: SessionID) throws {}
-        func releaseWriterOwnership(session: SessionID) {}
+        func claimWriterOwnership(session: SessionID, writer: String) throws {
+            try lock.withLock {
+                if let current = claims[session.raw], current != writer {
+                    throw StoreError.alreadyOwned(session: session.raw, writer: current)
+                }
+                claims[session.raw] = writer
+            }
+        }
+        func releaseWriterOwnership(session: SessionID, writer: String) throws {
+            try lock.withLock {
+                guard claims[session.raw] == writer else {
+                    throw StoreError.notWriter(session: session.raw, writer: writer)
+                }
+                claims[session.raw] = nil
+            }
+        }
     }
 
     private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, isJSONL: Bool) async throws {
@@ -291,10 +309,14 @@ struct RunCommand: ParsableCommand {
             snapshotProvider: { snapshot })
 
         // 6. Actor
+        // A2 fencing: this live CLI run claims its session for a unique
+        // per-process writer identity before any durable mutation.
+        let writerID = UUID().uuidString
+        try store.claimWriterOwnership(session: state.sessionID, writer: writerID)
         let actor = SessionActor(
             state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
             transport: transport, executor: backend, store: store,
-            approvals: HeadlessApprovals(), sink: sink)
+            approvals: HeadlessApprovals(), sink: sink, writer: writerID)
 
         // H2: catchable SIGINT drives production cancellation (not a default
         // termination), so JSONL runs can emit terminal run_finished and

@@ -4,28 +4,34 @@ import NeedletailCore
 import NeedletailTestSupport
 
 /// Global writer slot + STORE-07/09 over the in-memory backend (variant
-/// `in-memory`).
-/// Native durability is proven by the SQLite executions of the same shared
-/// assertions in `NeedletailPrimitiveTests`; this file pins the semantics
-/// every backend must share.
+/// `in-memory`). The fencing assertion here is the SAME STORE-06 contract
+/// the SQLite production store certifies.
 struct StoreContractTests {
+
+    private static let identity = WriterIdentity(
+        session: SessionID("s-contract"), writer: "in-memory-1")
 
     @Test("STORE-07 in-memory transcript resume and list preserves order across pages")
     func STORE_07_inMemoryResumeListsInOrder() throws {
+        let store = InMemorySessionStore()
+        try store.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
         try StoreContractAssertions.assertAppendOrderAndPagination(
-            InMemorySessionStore(), variant: "in-memory")
+            store, variant: "in-memory", identity: Self.identity)
     }
 
-    @Test("global writer slot: a competing session's claim fails with the exact owner (in-memory)")
-    func SingleWriterSlot_inMemoryCompetingSessionLearnsOwner() throws {
+    @Test("STORE-06 fencing contract holds on the in-memory backend")
+    func STORE_06_inMemoryFencingContract() throws {
         let store = InMemorySessionStore()
-        try StoreContractAssertions.assertWriterOwnershipExclusive(
+        try StoreContractAssertions.assertWriterFencing(
             first: store, second: store, variant: "in-memory")
     }
 
     @Test("STORE-09 in-memory store fills to quota then fails honestly")
     func STORE_09_inMemoryQuotaBoundary() throws {
+        let store = InMemorySessionStore()
+        try store.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
         try StoreContractAssertions.assertQuotaBoundary(
-            InMemorySessionStore(), limit: InMemorySessionStore.recordCap, variant: "in-memory")
+            store, limit: InMemorySessionStore.recordCap, variant: "in-memory",
+            identity: Self.identity)
     }
 }

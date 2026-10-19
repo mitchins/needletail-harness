@@ -36,19 +36,28 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
 
     /// Current schema version. Bump ONLY with a forward-only migration.
     /// Public: STORE-05 tests stamp a FUTURE version to prove fail-closed
-    /// opening.
-    public static let schemaVersion: Int32 = 1
+    /// opening. v2 (A2): fenced writer ownership per session
+    /// (`writer(session, writer)`) and per-row session attribution
+    /// (`records.session`) for session quotas. v1 ownership claims are
+    /// VOIDED by the upgrade (the old slot model had no writer identity):
+    /// explicit re-claim is required — fail-closed recovery.
+    public static let schemaVersion: Int32 = 2
 
     private let queue: DatabaseQueue
     /// The opened file path (public for reopen-test legibility).
     public let path: String
+    /// STORE-09 quotas, enforced INSIDE each fenced append transaction.
+    public let sessionRecordLimit: Int
+    public let globalRecordLimit: Int
     private var closed = false
     /// Serializes every operation against `close` so the typed
     /// closed-store contract holds atomically (A1 stabilization).
     private let gate = NSLock()
 
-    public init(path: String) throws {
+    public init(path: String, sessionRecordLimit: Int = 10_000, globalRecordLimit: Int = 100_000) throws {
         self.path = path
+        self.sessionRecordLimit = sessionRecordLimit
+        self.globalRecordLimit = globalRecordLimit
         var configuration = Configuration()
         configuration.journalMode = .wal
         do {
@@ -104,16 +113,40 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 try Self.assertSchemaShape(db)
                 return
             }
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS records(
-                    seq INTEGER PRIMARY KEY,
-                    payload TEXT NOT NULL)
-                """)
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS writer(
-                    slot INTEGER PRIMARY KEY CHECK (slot = 1),
-                    owner TEXT NOT NULL)
-                """)
+            if version < 1 {
+                try db.execute(sql: """
+                    CREATE TABLE IF NOT EXISTS records(
+                        seq INTEGER PRIMARY KEY,
+                        payload TEXT NOT NULL)
+                    """)
+                try db.execute(sql: """
+                    CREATE TABLE IF NOT EXISTS writer(
+                        slot INTEGER PRIMARY KEY CHECK (slot = 1),
+                        owner TEXT NOT NULL)
+                    """)
+                try db.execute(sql: "PRAGMA user_version = 1")
+            }
+            if version < 2 {
+                // v2: per-row session attribution + per-session fenced
+                // ownership. v1 rows had no session context — they backfill
+                // to "" (counted toward the GLOBAL quota, attributable to no
+                // session). v1 slot-based claims are VOID: the old model had
+                // no writer identity, so explicit re-claim is required.
+                // Idempotent against a crashed-migration v0 file that
+                // already carries the v2 column set.
+                let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(records)")
+                    .compactMap { $0["name"] as String? }
+                if !columns.contains("session") {
+                    try db.execute(sql: "ALTER TABLE records ADD COLUMN session TEXT NOT NULL DEFAULT ''")
+                }
+                try db.execute(sql: "DROP TABLE writer")
+                try db.execute(sql: """
+                    CREATE TABLE writer(
+                        session TEXT PRIMARY KEY,
+                        writer TEXT NOT NULL)
+                    """)
+                try db.execute(sql: "PRAGMA user_version = 2")
+            }
             try Self.assertSchemaShape(db)
             try db.execute(sql: "PRAGMA user_version = \(Self.schemaVersion)")
         }
@@ -133,8 +166,15 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     }
 
     static let declaredShape: [String: [ColumnSpec]] = [
-        "records": [ColumnSpec("seq", "INTEGER", pk: true), ColumnSpec("payload", "TEXT")],
-        "writer": [ColumnSpec("slot", "INTEGER", pk: true), ColumnSpec("owner", "TEXT")],
+        "records": [
+            ColumnSpec("seq", "INTEGER", pk: true),
+            ColumnSpec("session", "TEXT"),
+            ColumnSpec("payload", "TEXT"),
+        ],
+        "writer": [
+            ColumnSpec("session", "TEXT", pk: true),
+            ColumnSpec("writer", "TEXT"),
+        ],
     ]
 
     /// Declared shape check: exact column set, declared type (SQLite type
@@ -174,41 +214,83 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
-    public func append(_ record: DurableRecord) throws {
+    public func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
         gate.lock()
         defer { gate.unlock() }
         try assertOpenLocked()
-        // The codec throws .integrity for nothing today (all shapes
-        // encodable); encode BEFORE the transaction so a failure cannot
-        // leave a half-written row.
+        // Encode BEFORE the transaction so a codec failure cannot leave a
+        // half-written row.
         let payload = try RecordCodec.encode(record)
         try queue.write { db in
+            // FENCING inside the mutation's own transaction (BEGIN
+            // IMMEDIATE): the ownership row is the only authority.
+            let holder = try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [identity.session.raw])
+            guard holder == identity.writer else {
+                throw StoreError.notWriter(
+                    session: identity.session.raw, writer: identity.writer)
+            }
+            // STORE-09 quotas, same transaction as the fencing check and
+            // the insert — a breached quota can never slip between checks
+            // and write, and a failed append rolls back whole.
+            let global = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM records") ?? 0
+            guard global < globalRecordLimit else {
+                throw StoreError.quotaExceeded(limit: globalRecordLimit)
+            }
+            let sessionRows = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM records WHERE session = ?",
+                arguments: [identity.session.raw]) ?? 0
+            guard sessionRows < sessionRecordLimit else {
+                throw StoreError.quotaExceeded(limit: sessionRecordLimit)
+            }
             let last = try Int64.fetchOne(
                 db, sql: "SELECT MAX(seq) FROM records") ?? 0
             try db.execute(
-                sql: "INSERT INTO records (seq, payload) VALUES (?, ?)",
-                arguments: [last + 1, String(decoding: payload, as: UTF8.self)])
+                sql: "INSERT INTO records (seq, session, payload) VALUES (?, ?, ?)",
+                arguments: [last + 1, identity.session.raw,
+                            String(decoding: payload, as: UTF8.self)])
         }
     }
 
     /// Single-transaction bulk append (import/migration tooling and scale
-    /// fixtures). Protocol `append` remains the durability path — one
-    /// commit per record; this convenience deliberately commits ONCE for
-    /// the whole batch. A failing batch rolls back whole (GRDB transaction
-    /// semantics), leaving no partial rows.
-    public func appendBatch(_ records: [DurableRecord]) throws {
+    /// fixtures): ONE fencing + quota check for the whole batch, committed
+    /// ONCE. A failing batch rolls back whole (GRDB transaction
+    /// semantics), leaving no partial rows. The batch is attributed to
+    /// `identity.session`.
+    public func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {
         gate.lock()
         defer { gate.unlock() }
         try assertOpenLocked()
         let payloads = try records.map { try RecordCodec.encode($0) }
         try queue.write { db in
+            let holder = try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [identity.session.raw])
+            guard holder == identity.writer else {
+                throw StoreError.notWriter(
+                    session: identity.session.raw, writer: identity.writer)
+            }
+            let global = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM records") ?? 0
+            guard global + payloads.count <= globalRecordLimit else {
+                throw StoreError.quotaExceeded(limit: globalRecordLimit)
+            }
+            let sessionRows = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM records WHERE session = ?",
+                arguments: [identity.session.raw]) ?? 0
+            guard sessionRows + payloads.count <= sessionRecordLimit else {
+                throw StoreError.quotaExceeded(limit: sessionRecordLimit)
+            }
             var last = try Int64.fetchOne(
                 db, sql: "SELECT MAX(seq) FROM records") ?? 0
             for payload in payloads {
                 last += 1
                 try db.execute(
-                    sql: "INSERT INTO records (seq, payload) VALUES (?, ?)",
-                    arguments: [last, String(decoding: payload, as: UTF8.self)])
+                    sql: "INSERT INTO records (seq, session, payload) VALUES (?, ?, ?)",
+                    arguments: [last, identity.session.raw,
+                                String(decoding: payload, as: UTF8.self)])
             }
         }
     }
@@ -242,36 +324,46 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         return (batch, next)
     }
 
-    /// Global writer slot (A1 semantics — same as the M2-0 probes):
-    /// a DIFFERENT session contending fails with the current owner;
-    /// same-session reclaim is an idempotent no-op. Writer-identity
-    /// FENCING for one session is A2 (STORE-06).
-    public func claimWriterOwnership(session: SessionID) throws {
+    /// A2 STORE-06: per-session fenced ownership. `INSERT ... ON CONFLICT
+    /// DO NOTHING` inside the write transaction makes the claim atomic —
+    /// a competing writer either wins the row or reads exactly who does.
+    /// Re-claim with the SAME identity is an idempotent no-op
+    /// (crash-recovery re-acquire); a different writer learns both
+    /// identities of the holder.
+    public func claimWriterOwnership(session: SessionID, writer: String) throws {
         gate.lock()
         defer { gate.unlock() }
         try assertOpenLocked()
         try queue.write { db in
-            let current = try String.fetchOne(
-                db, sql: "SELECT owner FROM writer WHERE slot = 1")
-            if let current, current != session.raw {
-                throw StoreError.alreadyOwned(session: current)
-            }
-            if current == nil {
-                try db.execute(
-                    sql: "INSERT INTO writer (slot, owner) VALUES (1, ?)",
-                    arguments: [session.raw])
+            try db.execute(
+                sql: "INSERT INTO writer (session, writer) VALUES (?, ?) ON CONFLICT(session) DO NOTHING",
+                arguments: [session.raw, writer])
+            let holder = try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [session.raw])
+            guard holder == writer else {
+                throw StoreError.alreadyOwned(
+                    session: session.raw, writer: holder ?? "?")
             }
         }
     }
 
-    public func releaseWriterOwnership(session: SessionID) {
+    /// Only the CURRENT writer of the session can release: the delete is
+    /// filtered by BOTH identities, and a no-op delete (row absent or held
+    /// by a newer writer) fails closed — an old writer can never remove a
+    /// newer writer's claim.
+    public func releaseWriterOwnership(session: SessionID, writer: String) throws {
         gate.lock()
         defer { gate.unlock() }
-        guard !closed else { return }
-        try? queue.write { db in
+        try assertOpenLocked()
+        try queue.write { db in
             try db.execute(
-                sql: "DELETE FROM writer WHERE slot = 1 AND owner = ?",
-                arguments: [session.raw])
+                sql: "DELETE FROM writer WHERE session = ? AND writer = ?",
+                arguments: [session.raw, writer])
+            let deleted = db.changesCount
+            guard deleted == 1 else {
+                throw StoreError.notWriter(session: session.raw, writer: writer)
+            }
         }
     }
 

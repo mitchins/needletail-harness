@@ -27,21 +27,53 @@ public struct SequencedRecord: Sendable, Equatable {
 }
 
 public enum StoreError: Error, Sendable, Equatable {
-    case alreadyOwned(session: String)
-    case notOwner(session: String)
+    /// Another live writer holds the session; BOTH identities travel.
+    case alreadyOwned(session: String, writer: String)
+    /// The calling identity does not currently own the session (never
+    /// claimed, superseded by another writer, or voided by recovery).
+    /// Fenced mutations and releases refuse with this — never a silent
+    /// success.
+    case notWriter(session: String, writer: String)
     case quotaExceeded(limit: Int)
     case integrity(String)
 }
 
+/// A live writer instance bound to exactly one session. `session` and
+/// `writer` are DISTINCT identities: `writer` identifies one live writer
+/// INSTANCE (unique among concurrent writers of the session; uniqueness
+/// across processes is the caller's contract — a restarted process
+/// re-claims explicitly with the SAME identity). Every durable mutation
+/// is fenced inside the mutation's own transaction against the current
+/// `(session, writer)` ownership row; a stale writer fails closed.
+public struct WriterIdentity: Sendable, Equatable, Codable {
+    public let session: SessionID
+    public let writer: String
+
+    public init(session: SessionID, writer: String) {
+        self.session = session
+        self.writer = writer
+    }
+}
+
 public protocol SessionStore: Sendable {
-    func append(_ record: DurableRecord) throws
+    /// FENCED durable append: implementations validate, INSIDE the
+    /// mutation's own transaction, that `identity.writer` currently owns
+    /// `identity.session`. A stale writer (never claimed, superseded, or
+    /// voided by recovery) fails closed with `.notWriter`.
+    func append(_ record: DurableRecord, as identity: WriterIdentity) throws
     /// Paged read (R15): bounded batches with an explicit cursor — history
     /// is never loaded wholesale (SPEC §9.2, ARCH §1).
     func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?)
-    /// Single-writer ownership (kept for M2 STORE-06; the single M1-B actor
-    /// never contends — documented seam, not dead abstraction).
-    func claimWriterOwnership(session: SessionID) throws
-    func releaseWriterOwnership(session: SessionID)
+    /// Claim exclusive write ownership of `session` for `writer`. A
+    /// different live writer holding the session fails with
+    /// `.alreadyOwned(session:writer:)` (both identities travel);
+    /// re-claiming with the SAME identity is an idempotent no-op
+    /// (crash-recovery re-acquire).
+    func claimWriterOwnership(session: SessionID, writer: String) throws
+    /// Release ownership. Only the CURRENT writer of the session can
+    /// release: a stale identity fails closed with `.notWriter` and never
+    /// removes a newer writer's claim.
+    func releaseWriterOwnership(session: SessionID, writer: String) throws
 }
 
 /// Bounded intake/spool channel as a VALUE (STATE-04, R6/R12): pure

@@ -135,8 +135,9 @@ struct XUnitIngestionTests {
         "STORE-01": ["STORE_01_sqliteProductionStorePersistsAcrossReopen": "NeedletailPrimitiveTests",
                      "STORE_01_sqliteDurabilityPragmasHoldOnOwnConnection": "NeedletailPrimitiveTests"],
         "STORE-05": ["STORE_05_sqliteFutureOrCorruptStoreFailsClosed": "NeedletailPrimitiveTests"],
+        "STORE-06": ["STORE_06_sqliteTwoWritersCompeteForOneSession": "NeedletailPrimitiveTests"],
         "STORE-07": ["STORE_07_sqliteProductionResumeAtScale": "NeedletailPrimitiveTests"],
-        "STORE-09": ["STORE_09_sqliteQuotaBoundary": "NeedletailPrimitiveTests"],
+        "STORE-09": ["STORE_09_sqliteProductionQuotasEnforceInTransaction": "NeedletailPrimitiveTests"],
         "STORE-02": ["STORE_02_sigkillMidTransactionRollsBack": "NeedletailPrimitiveTests"],
     ]
 
@@ -145,16 +146,13 @@ struct XUnitIngestionTests {
     }
 
     /// Cases whose CERTIFYING evidence does not exist yet and is owed to a
-    /// later milestone (STORE-06 "two writers open same session": with the
-    /// current `SessionStore` interface, same-session claims are idempotent
-    /// and the slot has no writer identity, so two handles CAN both hold
-    /// "ownership" of one session — global-slot exclusion of a DIFFERENT
-    /// session is proven, but not same-session fencing). The named variant
-    /// is the exact test M2-A must add once writer identity/fencing exists;
-    /// until then STORE-06 must stay unsatisfied no matter what else passes.
-    private static let deferredToM2A: [String: Set<String>] = [
-        "STORE-06": ["STORE_06_twoWritersCompeteForOneSession"],
-    ]
+    /// later milestone. EMPTY as of A2: STORE-06 landed
+    /// (`STORE_06_sqliteTwoWritersCompeteForOneSession` — two independent
+    /// handles, fenced writes/releases in the mutation transaction) and
+    /// moved to `requiredEvidence`. The invariant below keeps this map and
+    /// `requiredEvidence` disjoint; a future deferral registers here and
+    /// hard-blocks its case from `satisfied` until the named test exists.
+    private static let deferredToM2A: [String: Set<String>] = [:]
     @Test("BDD-01 ingestion joins executed runner results to the catalogue",
           .enabled(if: ingestionEnabled, "run via ./dev coverage (sets NT_XUNIT_PATH)"))
     func BDD_01_ingestionReconcilesExecutedResults() throws {
@@ -238,5 +236,9 @@ struct XUnitIngestionTests {
             #expect(!report.satisfied.contains(caseID),
                     "deferred case \(caseID) is not certifiable in M2-0; satisfied=\(report.satisfied)")
         }
+        // Maps invariant (A2): a case is either required-here or deferred —
+        // never both, and every deferred case must be due eventually.
+        #expect(Set(Self.requiredEvidence.keys).isDisjoint(with: Self.deferredToM2A.keys),
+                "requiredEvidence and deferredToM2A must be disjoint")
     }
 }

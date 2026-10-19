@@ -2,23 +2,34 @@ import Foundation
 import NeedletailCore
 
 /// M1-B in-memory session store (SPEC §9 shapes, TESTING §5 seams). Same
-/// append/load/ownership SEMANTICS the M2 GRDB store will implement;
-/// crash durability, WAL behavior and migrations are M2-A proofs, never
+/// append/load/ownership SEMANTICS the M2 GRDB store implements; crash
+/// durability, WAL behavior and migrations are M2-A proofs, never
 /// claimed here. Bounded at 10_000 records with a visible overflow error
 /// (R19) — evidence is never silently dropped. Dev-only: never linked into
 /// the shipped harness.
+///
+/// A2 FENCING: `claims` maps session → owning writer. `append(as:)` is
+/// fenced against the map inside the mutation; a stale writer fails
+/// closed with `.notWriter`.
 public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
     public static let recordCap = 10_000
 
     private let lock = NSLock()
     private var log: [SequencedRecord] = []
     private var sequence: UInt64 = 0
-    private var owner: String?
+    /// session → owning writer (A2 fencing).
+    private var claims: [String: String] = [:]
 
     public init() {}
 
-    public func append(_ record: DurableRecord) throws {
+    public func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
         try lock.withLock {
+            guard let owner = claims[identity.session.raw] else {
+                throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+            }
+            guard owner == identity.writer else {
+                throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+            }
             guard log.count < Self.recordCap else {
                 throw StoreError.quotaExceeded(limit: Self.recordCap)
             }
@@ -36,20 +47,23 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
-    public func claimWriterOwnership(session: SessionID) throws {
+    public func claimWriterOwnership(session: SessionID, writer: String) throws {
         try lock.withLock {
-            if let current = owner, current != session.raw {
-                throw StoreError.alreadyOwned(session: current)
+            if let current = claims[session.raw], current != writer {
+                throw StoreError.alreadyOwned(session: session.raw, writer: current)
             }
-            owner = session.raw
+            claims[session.raw] = writer
         }
     }
 
-    public func releaseWriterOwnership(session: SessionID) {
-        lock.withLock {
-            if owner == session.raw {
-                owner = nil
+    public func releaseWriterOwnership(session: SessionID, writer: String) throws {
+        try lock.withLock {
+            // Only the CURRENT writer of the session can release: a stale
+            // identity fails closed and never removes a newer claim.
+            guard claims[session.raw] == writer else {
+                throw StoreError.notWriter(session: session.raw, writer: writer)
             }
+            claims[session.raw] = nil
         }
     }
 

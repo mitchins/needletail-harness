@@ -56,7 +56,9 @@ struct TranscriptEmissionTests {
         }
         // Replay through a real store: order + verbatim arguments survive.
         let store = InMemorySessionStore()
-        for record in emitted { try store.append(record) }
+        let identity = WriterIdentity(session: SessionID("s-e"), writer: "emit")
+        try store.claimWriterOwnership(session: identity.session, writer: identity.writer)
+        for record in emitted { try store.append(record, as: identity) }
         let messages = try loadTranscript(from: store)
         #expect(messages.count == 3, "user + assistant-with-call + tool response: \(messages)")
         #expect(messages[0] == ChatMessage(role: .user, text: "read the file"))

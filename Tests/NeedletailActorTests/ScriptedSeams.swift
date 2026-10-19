@@ -177,7 +177,7 @@ enum ActorFixtures {
         let actor = SessionActor(
             state: try idleState(mode: mode, permissive: permissive), ids: DeterministicIDSource(prefix: "a"),
             clock: VirtualClock(now: 1_000_000),
-            transport: transport, executor: executor, store: store, approvals: approvals)
+            transport: transport, executor: executor, store: store, approvals: approvals, writer: "scripted-writer")
         return (actor, store)
     }
 

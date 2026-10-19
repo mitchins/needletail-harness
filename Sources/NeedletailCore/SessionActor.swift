@@ -34,6 +34,9 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     private let store: Store
     private let approvals: Approvals
     private let sink: any UISink
+    /// Durable-mutation writer identity (A2 fencing): identifies THIS live
+    /// actor instance; the session side comes from the actor's state.
+    private let writer: String
     /// Reservation table (effectID → reservation), captured pre-await.
     /// An entry is removed when its run is cancelled (after C3 retention
     /// records) or when its completion is first accepted (R3).
@@ -58,7 +61,7 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     public init(
         state: SessionState, ids: IDs, clock: ClockType,
         transport: Transport, executor: Executor, store: Store, approvals: Approvals,
-        sink: any UISink = NoopUISink()
+        sink: any UISink = NoopUISink(), writer: String
     ) {
         self.state = state
         self.ids = ids
@@ -68,6 +71,7 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         self.store = store
         self.approvals = approvals
         self.sink = sink
+        self.writer = writer
     }
 
     public var rawRecords: [RawProviderRecord] { rawRing }
@@ -161,7 +165,8 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         // this order).
         do {
             for record in result.records {
-                try store.append(record)
+                try store.append(record, as: WriterIdentity(
+                    session: state.sessionID, writer: writer))
             }
         } catch {
             // Integrity-visible halt (never silent divergence): the computed

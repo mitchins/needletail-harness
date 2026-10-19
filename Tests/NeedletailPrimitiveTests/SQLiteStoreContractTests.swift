@@ -116,17 +116,28 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     payload TEXT NOT NULL)
                 """)
+            try db.execute(sql: "DROP TABLE IF EXISTS writer")
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS writer(
-                    slot INTEGER PRIMARY KEY CHECK (slot = 1),
-                    owner TEXT NOT NULL)
+                    session TEXT PRIMARY KEY,
+                    writer TEXT NOT NULL)
                 """)
             initial = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records") ?? 0
         }
         self.recordCount = initial
     }
 
-    func append(_ record: DurableRecord) throws {
+    func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
+        // FENCED inside the mutation's own write transaction (shared file,
+        // two handles): the SQL ownership row is the only authority.
+        try queue.write { db in
+            let holder = try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [identity.session.raw])
+            guard holder == identity.writer else {
+                throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+            }
+        }
         // Cached count: COUNT(*) per append is O(n) and makes the 10k fill
         // quadratic. The cache is exact — this handle is the sole writer in
         // every contract run — and the final row tally is verified in SQL.
@@ -167,31 +178,30 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
         try queue.close()
     }
 
-    func claimWriterOwnership(session: SessionID) throws {
-        // Atomic claim: the INSERT either wins the single row or loses it
-        // in one statement — no read-then-write race between two handles.
-        let won = try queue.write { db -> Bool in
-            try db.execute(sql: """
-                INSERT INTO writer (slot, owner) VALUES (1, ?)
-                ON CONFLICT(slot) DO NOTHING
-                """, arguments: [session.raw])
-            return db.changesCount == 1
-        }
-        if won { return }
-        // Row already held: re-claiming the same session is an idempotent
-        // no-op, a different session learns the exact owner.
-        let owner: String? = try queue.read { db in
-            try String.fetchOne(db, sql: "SELECT owner FROM writer WHERE slot = 1")
-        }
-        if owner != session.raw {
-            throw StoreError.alreadyOwned(session: owner ?? "?")
+    func claimWriterOwnership(session: SessionID, writer: String) throws {
+        // A2 fencing persisted in the SHARED file: the atomic INSERT means
+        // a competing handle either wins the row or reads exactly who does.
+        try queue.write { db in
+            try db.execute(
+                sql: "INSERT INTO writer (session, writer) VALUES (?, ?) ON CONFLICT(session) DO NOTHING",
+                arguments: [session.raw, writer])
+            let holder = try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [session.raw])
+            guard holder == writer else {
+                throw StoreError.alreadyOwned(session: session.raw, writer: holder ?? "?")
+            }
         }
     }
 
-    func releaseWriterOwnership(session: SessionID) {
-        try? queue.write { db in
-            try db.execute(sql: "DELETE FROM writer WHERE slot = 1 AND owner = ?",
-                           arguments: [session.raw])
+    func releaseWriterOwnership(session: SessionID, writer: String) throws {
+        try queue.write { db in
+            try db.execute(
+                sql: "DELETE FROM writer WHERE session = ? AND writer = ?",
+                arguments: [session.raw, writer])
+            guard db.changesCount == 1 else {
+                throw StoreError.notWriter(session: session.raw, writer: writer)
+            }
         }
     }
 }
@@ -215,7 +225,9 @@ struct SQLiteStoreContractTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let dbPath = directory.appendingPathComponent("store.sqlite").path
         let first = try SQLiteProbeStore(path: dbPath, limit: InMemorySessionStore.recordCap)
-        try StoreContractAssertions.assertAppendOrderAndPagination(first, variant: "sqlite")
+        let identity = StoreContractAssertions.primaryIdentity
+        try first.claimWriterOwnership(session: identity.session, writer: identity.writer)
+        try StoreContractAssertions.assertAppendOrderAndPagination(first, variant: "sqlite", identity: identity)
         // Reopen leg: a FRESH handle on the same file resumes the identical
         // history — payloads persist in SQL, not in handle memory.
         try first.close()
@@ -229,15 +241,15 @@ struct SQLiteStoreContractTests {
         #expect(tail.map(\.record) == Array(expected[4...]), "reopened since-cursor replays the tail")
     }
 
-    @Test("global writer slot: a competing session's claim fails with the exact owner (sqlite)")
-    func SingleWriterSlot_sqliteCompetingSessionLearnsOwner() throws {
+    @Test("STORE-06 fencing contract holds on the sqlite probe backend")
+    func STORE_06_sqliteProbeFencingContract() throws {
         let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("store.sqlite").path
         let first = try SQLiteProbeStore(path: path, limit: InMemorySessionStore.recordCap)
         let second = try SQLiteProbeStore(path: path, limit: InMemorySessionStore.recordCap)
-        try StoreContractAssertions.assertWriterOwnershipExclusive(
-            first: first, second: second, variant: "sqlite")
+        try StoreContractAssertions.assertWriterFencing(
+            first: first, second: second, variant: "sqlite-probe")
     }
 
     @Test("STORE-09 sqlite store fills to quota then fails honestly")
@@ -247,7 +259,10 @@ struct SQLiteStoreContractTests {
         let store = try SQLiteProbeStore(
             path: directory.appendingPathComponent("store.sqlite").path,
             limit: InMemorySessionStore.recordCap)
+        let identity = WriterIdentity(session: SessionID("s-q"), writer: "quota")
+        try store.claimWriterOwnership(session: identity.session, writer: identity.writer)
         try StoreContractAssertions.assertQuotaBoundary(
-            store, limit: InMemorySessionStore.recordCap, variant: "sqlite")
+            store, limit: InMemorySessionStore.recordCap, variant: "sqlite",
+            identity: identity)
     }
 }

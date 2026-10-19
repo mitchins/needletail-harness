@@ -3,15 +3,15 @@ import GRDB
 import Foundation
 import NeedletailCore
 import NeedletailRuntime
-@testable import NeedletailRuntime
 import NeedletailTestSupport
+@testable import NeedletailRuntime
 
-/// M2-A A1 native-storage evidence over the PRODUCTION store
-/// (`GRDBSessionStore`): reopen persistence (STORE-01), fail-closed
-/// schema faults (STORE-05), and resume/list at scale (STORE-07).
+/// M2-A production-store native-storage evidence (`GRDBSessionStore`):
+/// reopen persistence (STORE-01), durability pragmas (STORE-01),
+/// fail-closed schema faults (STORE-05), resume/list at scale (STORE-07),
+/// per-session fenced writer ownership (STORE-06) and quotas (STORE-09).
 /// These are the CERTIFYING variants (tier map: NeedletailPrimitiveTests
-/// + `sqlite` token → `.nativeStorage`); the M2-0 probe-store tests
-/// remain as supporting evidence but no longer certify STORE-01/07.
+/// + `sqlite` token → `.nativeStorage`).
 struct ProductionStoreTests {
 
     private static func freshDirectory() throws -> URL {
@@ -20,6 +20,9 @@ struct ProductionStoreTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
+
+    private static let identity = WriterIdentity(
+        session: SessionID("s-prod"), writer: "prod-1")
 
     // MARK: - STORE-01
 
@@ -30,8 +33,9 @@ struct ProductionStoreTests {
         let path = directory.appendingPathComponent("store.sqlite").path
 
         let first = try GRDBSessionStore(path: path)
+        try first.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
         let written: [DurableRecord] = (0..<5).map { .transcriptAppended(.user("msg-\($0)")) }
-        for record in written { try first.append(record) }
+        for record in written { try first.append(record, as: Self.identity) }
         try first.close()
 
         // FRESH handle on the same file: identical records, dense sequences.
@@ -40,11 +44,38 @@ struct ProductionStoreTests {
         #expect(all.map(\.record) == written, "reopened store resumes identical records")
         #expect(all.map(\.sequence.value) == [1, 2, 3, 4, 5], "sequences stay dense across reopen")
         #expect(next == nil, "full read ends with a nil cursor")
-        // New appends continue the dense sequence after reopen.
-        try reopened.append(.transcriptAppended(.user("post-reopen")))
+        // New appends continue the dense sequence after reopen — the
+        // writer claim SURVIVED the close (durable ownership), so the same
+        // identity appends without re-claiming.
+        try reopened.append(.transcriptAppended(.user("post-reopen")), as: Self.identity)
         let (tail, _) = try reopened.records(since: 5, limit: 10)
         #expect(tail.map(\.record) == [.transcriptAppended(.user("post-reopen"))])
         #expect(tail.first?.sequence.value == 6)
+    }
+
+    @Test("STORE-01 sqlite durability pragmas hold on the store's own connection")
+    func STORE_01_sqliteDurabilityPragmasHoldOnOwnConnection() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try GRDBSessionStore(
+            path: directory.appendingPathComponent("store.sqlite").path)
+        // GRDB's WAL setup forces synchronous=NORMAL after prepareDatabase;
+        // the store re-asserts FULL post-init. Verify on the store's OWN
+        // connection (these pragmas are per-connection).
+        let synchronous = try store.pragmaValue("synchronous")
+        let journalMode = try store.pragmaValue("journal_mode")
+        #expect(synchronous == "2", "synchronous must be FULL (2), got \(synchronous ?? "?")")
+        #expect(journalMode == "wal", "journal_mode must be wal, got \(journalMode ?? "?")")
+        // Post-close operations are typed .integrity, never GRDB misuse.
+        try store.close()
+        do {
+            try store.append(.transcriptAppended(.user("after-close")), as: Self.identity)
+            Issue.record("append after close must fail")
+        } catch let error as StoreError {
+            guard case .integrity = error else {
+                Issue.record("expected .integrity, got \(error)"); return
+            }
+        }
     }
 
     // MARK: - STORE-05
@@ -63,18 +94,6 @@ struct ProductionStoreTests {
         try raw.write { db in
             try db.execute(sql: "PRAGMA user_version = \(GRDBSessionStore.schemaVersion + 1)")
         }
-        do {
-            _ = try GRDBSessionStore(path: path)
-            Issue.record("a future-schema store must refuse to open")
-        } catch let error as StoreError {
-            guard case .integrity = error else {
-                Issue.record("expected .integrity, got \(error)"); return
-            }
-        } catch {
-            Issue.record("expected StoreError.integrity, got \(error)"); return
-        }
-
-        // Future-version refusal must name the reason.
         do {
             _ = try GRDBSessionStore(path: path)
             Issue.record("a future-schema store must refuse to open")
@@ -126,8 +145,9 @@ struct ProductionStoreTests {
         // fails reads with .integrity — never skipped, never substituted.
         let rowPath = directory.appendingPathComponent("rowfault.sqlite").path
         let rowStore = try GRDBSessionStore(path: rowPath)
-        try rowStore.append(.transcriptAppended(.user("keep")))
-        try rowStore.append(.transcriptAppended(.user("doomed")))
+        try rowStore.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
+        try rowStore.append(.transcriptAppended(.user("keep")), as: Self.identity)
+        try rowStore.append(.transcriptAppended(.user("doomed")), as: Self.identity)
         let rawRow = try DatabaseQueue(path: rowPath)
         try rawRow.write { db in
             try db.execute(sql: "UPDATE records SET payload = 'garbage' WHERE seq = 2")
@@ -200,12 +220,8 @@ struct ProductionStoreTests {
         func impostor(path: String, seqDecl: String) throws {
             let db = try DatabaseQueue(path: path)
             try db.write { outer in
-                try outer.execute(sql: """
-                    CREATE TABLE records (seq \(seqDecl), payload TEXT NOT NULL)
-                    """)
-                try outer.execute(sql: """
-                    CREATE TABLE writer (slot INTEGER PRIMARY KEY, owner TEXT NOT NULL)
-                    """)
+                try outer.execute(sql: "CREATE TABLE records (seq \(seqDecl), payload TEXT NOT NULL)")
+                try outer.execute(sql: "CREATE TABLE writer (slot INTEGER PRIMARY KEY, owner TEXT NOT NULL)")
             }
             do {
                 _ = try GRDBSessionStore(path: path)
@@ -230,48 +246,32 @@ struct ProductionStoreTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try GRDBSessionStore(
             path: directory.appendingPathComponent("store.sqlite").path)
-        try store.append(.transcriptAppended(.user("only")))
-        do {
-            _ = try store.records(since: 0, limit: 0)
-            Issue.record("limit 0 must be an integrity fault")
-        } catch let error as StoreError {
-            guard case .integrity = error else {
-                Issue.record("expected .integrity, got \(error)"); return
-            }
-        }
-        do {
-            _ = try store.records(since: 0, limit: -1)
-            Issue.record("negative limit (SQLite no-limit) must be an integrity fault")
-        } catch let error as StoreError {
-            guard case .integrity = error else {
-                Issue.record("expected .integrity, got \(error)"); return
+        try store.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
+        try store.append(.transcriptAppended(.user("only")), as: Self.identity)
+        for badLimit in [0, -1] {
+            do {
+                _ = try store.records(since: 0, limit: badLimit)
+                Issue.record("limit \(badLimit) must be an integrity fault")
+            } catch let error as StoreError {
+                guard case .integrity = error else {
+                    Issue.record("expected .integrity, got \(error)"); return
+                }
             }
         }
     }
 
-    @Test("STORE-01 sqlite durability pragmas hold on the store's own connection")
-    func STORE_01_sqliteDurabilityPragmasHoldOnOwnConnection() throws {
+    // MARK: - STORE-06 (the M2-0 deferral lands here)
+
+    @Test("STORE-06 sqlite two writers compete for one session (fenced)")
+    func STORE_06_sqliteTwoWritersCompeteForOneSession() throws {
         let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try GRDBSessionStore(
-            path: directory.appendingPathComponent("store.sqlite").path)
-        // GRDB's WAL setup forces synchronous=NORMAL after prepareDatabase;
-        // the store re-asserts FULL post-init. Verify on the store's OWN
-        // connection (these pragmas are per-connection).
-        let synchronous = try store.pragmaValue("synchronous")
-        let journalMode = try store.pragmaValue("journal_mode")
-        #expect(synchronous == "2", "synchronous must be FULL (2), got \(synchronous ?? "?")")
-        #expect(journalMode == "wal", "journal_mode must be wal, got \(journalMode ?? "?")")
-        // Post-close operations are typed .integrity, never GRDB misuse.
-        try store.close()
-        do {
-            try store.append(.transcriptAppended(.user("after-close")))
-            Issue.record("append after close must fail")
-        } catch let error as StoreError {
-            guard case .integrity = error else {
-                Issue.record("expected .integrity, got \(error)"); return
-            }
-        }
+        let path = directory.appendingPathComponent("store.sqlite").path
+        // GENUINELY independent handles on one file.
+        let first = try GRDBSessionStore(path: path)
+        let second = try GRDBSessionStore(path: path)
+        try StoreContractAssertions.assertWriterFencing(
+            first: first, second: second, variant: "production-sqlite")
     }
 
     // MARK: - STORE-07
@@ -280,16 +280,21 @@ struct ProductionStoreTests {
     func STORE_07_sqliteProductionResumeAtScale() throws {
         let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
+        // The scale leg seeds 10k rows into one session: raise that
+        // session's quota for THIS store (quotas themselves are STORE-09).
         let store = try GRDBSessionStore(
-            path: directory.appendingPathComponent("store.sqlite").path)
+            path: directory.appendingPathComponent("store.sqlite").path,
+            sessionRecordLimit: 20_000)
+        try store.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
         // The SAME shared assertions the in-memory and probe backends run:
         // semantics cannot drift between backends.
-        try StoreContractAssertions.assertAppendOrderAndPagination(store, variant: "production-sqlite")
+        try StoreContractAssertions.assertAppendOrderAndPagination(
+            store, variant: "production-sqlite", identity: Self.identity)
         // Scale: a 10k-row history seeded via the single-transaction bulk
         // path (protocol `append` stays one-commit-per-record), then paged
         // back through a FRESH handle in bounded batches — never loaded
         // wholesale.
-        try store.appendBatch((0..<10_000).map { .transcriptAppended(.user("bulk-\($0 % 97)")) })
+        try store.appendBatch((0..<10_000).map { .transcriptAppended(.user("bulk-\($0 % 97)")) }, as: Self.identity)
         try store.close()
         let reopened = try GRDBSessionStore(path: store.path)
         var resumed = 0
@@ -312,5 +317,50 @@ struct ProductionStoreTests {
         }
         #expect(resumed == 10_007, "7 shared-contract rows + 10k bulk rows resume in full, got \(resumed)")
         #expect(pages >= 20, "10_007 rows at limit 512 must take ~20 pages, got \(pages)")
+    }
+
+    // MARK: - STORE-09
+
+    @Test("STORE-09 sqlite production quotas enforce inside the transaction")
+    func STORE_09_sqliteProductionQuotasEnforceInTransaction() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Small configured limits: no 10k fill needed to prove the rule.
+        let store = try GRDBSessionStore(
+            path: directory.appendingPathComponent("store.sqlite").path,
+            sessionRecordLimit: 3, globalRecordLimit: 5)
+        let s1 = WriterIdentity(session: SessionID("s-one"), writer: "w-one")
+        let s2 = WriterIdentity(session: SessionID("s-two"), writer: "w-two")
+        let s3 = WriterIdentity(session: SessionID("s-three"), writer: "w-three")
+        for identity in [s1, s2, s3] {
+            try store.claimWriterOwnership(session: identity.session, writer: identity.writer)
+        }
+        // Session quota: s-one fills its 3 rows; the 4th fails honestly.
+        for i in 0..<3 { try store.append(.transcriptAppended(.user("one-\(i)")), as: s1) }
+        #expect(throws: StoreError.quotaExceeded(limit: 3)) {
+            try store.append(.transcriptAppended(.user("one-overflow")), as: s1)
+        }
+        // Another session is unaffected by s-one's session quota.
+        try store.append(.transcriptAppended(.user("two-0")), as: s2)
+        // Global quota: 3 (s-one) + 1 (s-two) + 1 (s-two) = 5 → s-three's
+        // first append breaches the global cap.
+        try store.append(.transcriptAppended(.user("two-1")), as: s2)
+        #expect(throws: StoreError.quotaExceeded(limit: 5)) {
+            try store.append(.transcriptAppended(.user("three-0")), as: s3)
+        }
+        // In-transaction proof: a batch that would breach rolls back WHOLE
+        // — no partial rows slip past the quota check.
+        #expect(throws: StoreError.quotaExceeded(limit: 5)) {
+            try store.appendBatch((0..<4).map { .transcriptAppended(.user("batch-\($0)")) }, as: s3)
+        }
+        let (all, _) = try store.records(since: 0, limit: 100)
+        #expect(all.count == 5, "failed batch must leave zero partial rows, got \(all.count)")
+        // Released capacity still appends: a released session's rows stay
+        // (history is never rewritten), but the freed WRITER can retry on
+        // another session within the global cap... global is full, so the
+        // honest end state: every further append still fails.
+        #expect(throws: StoreError.quotaExceeded(limit: 5)) {
+            try store.append(.transcriptAppended(.user("two-2")), as: s2)
+        }
     }
 }

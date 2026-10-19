@@ -2,23 +2,26 @@ import Testing
 import Foundation
 import NeedletailCore
 
-/// Shared `SessionStore` contract assertions (M2-0: global writer slot,
-/// STORE-07/09; STORE-06 certification deferred to M2-A).
+/// Shared `SessionStore` contract assertions (M2-A A2: fencing + quotas +
+/// STORE-07/09; STORE-06 is fenced here and certified per backend).
 ///
-/// One definition, executed against every backing implementation (in-memory
-/// in `NeedletailStateTests`, SQLite in `NeedletailPrimitiveTests`), so a
-/// semantic drift in any backend fails the same assertion. Assertions stay
-/// in Swift Testing; nothing here wraps or replaces them. `variant` labels
-/// which backend produced the result for reconciliation.
+/// Assertions stay in Swift Testing; nothing here wraps or replaces them.
 public enum StoreContractAssertions {
 
-    /// STORE-07: paged resume/list returns the full history in order across
-    /// pages, honours `since` cursors, and ends with a nil cursor.
+    /// Identity used by the shared assertions for the "current" writer.
+    public static let primaryIdentity = WriterIdentity(
+        session: SessionID("s-contract"), writer: "contract-primary")
+
+    /// STORE-07 (and every backend): paged resume/list returns the full
+    /// history in order across pages, honours `since` cursors, and ends
+    /// with a nil cursor. The caller must have CLAIMED the identity's
+    /// session on `store` first (fenced appends).
     public static func assertAppendOrderAndPagination(
-        _ store: any SessionStore, variant: String
+        _ store: any SessionStore, variant: String,
+        identity: WriterIdentity = primaryIdentity
     ) throws {
         let payloads = (0..<7).map { DurableRecord.transcriptAppended(.user("msg-\($0)")) }
-        for record in payloads { try store.append(record) }
+        for record in payloads { try store.append(record, as: identity) }
         var pages: [[DurableRecord]] = []
         var cursor: UInt64? = 0
         // Bounded iteration: a store that never advances its cursor must
@@ -48,46 +51,87 @@ public enum StoreContractAssertions {
                 "[\(variant)] sequences must be dense from 1")
     }
 
-    /// Global writer-slot contract (supports, but does NOT certify, STORE-06).
+    /// STORE-06 — the FENCING contract, run identically by every backend.
+    /// `first` and `second` must share backing state (same instance for
+    /// in-memory, two handles on the same file for SQLite — genuinely two
+    /// live writers).
     ///
-    /// What this pins: the slot holds ONE session; a DIFFERENT session
-    /// contending fails with the current owner's ID; re-claiming the SAME
-    /// session is an idempotent no-op (crash-recovery re-acquire).
-    /// What this does NOT pin: two independent writers competing for the
-    /// SAME session. The `SessionStore` interface has no writer identity
-    /// (fencing tokens), so two handles CAN both "own" one session — that
-    /// is STORE-06 proper, owed to M2-A with the production store
-    /// (see `XUnitIngestionTests.deferredToM2A` for the executable gate).
-    /// `second` must share backing state with `first` (same instance for
-    /// in-memory, second handle on the same file for SQLite) — otherwise
-    /// the test proves nothing.
-    public static func assertWriterOwnershipExclusive(
+    /// Pinned: competing claim fails with BOTH identities; a stale writer's
+    /// DURABLE WRITE fails closed (`.notWriter`), not just its claim; only
+    /// the CURRENT writer can release (an old writer can never remove a
+    /// newer writer's claim); crash-recovery re-claim with the SAME
+    /// identity is idempotent; after release the other writer wins cleanly.
+    public static func assertWriterFencing(
         first: any SessionStore, second: any SessionStore, variant: String
     ) throws {
-        try first.claimWriterOwnership(session: SessionID("s1"))
-        // Same-session reclaim is idempotent: a restarted writer re-acquires
-        // its own session without error.
-        try first.claimWriterOwnership(session: SessionID("s1"))
-        // A second writer loses while s1 holds the lock and learns the
-        // exact owner.
-        #expect(throws: StoreError.alreadyOwned(session: "s1")) {
-            try second.claimWriterOwnership(session: SessionID("s2"))
+        let session = SessionID("s-fenced")
+        let writerA = "writer-a"
+        let writerB = "writer-b"
+        let identityA = WriterIdentity(session: session, writer: writerA)
+        let identityB = WriterIdentity(session: session, writer: writerB)
+
+        // A claims; B's competing claim learns BOTH identities.
+        try first.claimWriterOwnership(session: session, writer: writerA)
+        #expect(throws: StoreError.alreadyOwned(session: session.raw, writer: writerA)) {
+            try second.claimWriterOwnership(session: session, writer: writerB)
         }
-        first.releaseWriterOwnership(session: SessionID("s1"))
-        try second.claimWriterOwnership(session: SessionID("s2"))
+        // Same-identity reclaim is idempotent (crash-recovery re-acquire).
+        try first.claimWriterOwnership(session: session, writer: writerA)
+
+        // FENCED WRITE: B (stale) must fail a durable append.
+        #expect(throws: StoreError.notWriter(session: session.raw, writer: writerB)) {
+            try second.append(.transcriptAppended(.user("stale-b")), as: identityB)
+        }
+        // A (current) appends successfully — fencing is not a blanket veto.
+        try first.append(.transcriptAppended(.user("live-a")), as: identityA)
+
+        // STALE RELEASE: B can never remove A's claim.
+        #expect(throws: StoreError.notWriter(session: session.raw, writer: writerB)) {
+            try second.releaseWriterOwnership(session: session, writer: writerB)
+        }
+        // (Impersonation is unrepresentable at this API: the writer
+        // identity IS the credential — `release(writer:)` can only ever
+        // address the caller's own claim.)
+
+        // A releases; B claims and writes — clean handover.
+        try first.releaseWriterOwnership(session: session, writer: writerA)
+        try second.claimWriterOwnership(session: session, writer: writerB)
+        try second.append(.transcriptAppended(.user("live-b")), as: identityB)
+        // A is now the STALE writer: writes AND release fail closed.
+        #expect(throws: StoreError.notWriter(session: session.raw, writer: writerA)) {
+            try first.append(.transcriptAppended(.user("stale-a")), as: identityA)
+        }
+        #expect(throws: StoreError.notWriter(session: session.raw, writer: writerA)) {
+            try first.releaseWriterOwnership(session: session, writer: writerA)
+        }
+
+        // The log holds exactly the two accepted appends, in order.
+        let (all, _) = try second.records(since: 0, limit: 100)
+        #expect(all.map(\.record) == [
+            .transcriptAppended(.user("live-a")),
+            .transcriptAppended(.user("live-b")),
+        ], "[\(variant)] only fenced-in appends persist, got \(all.map(\.record))")
+        // Crash-recovery re-acquire: B re-claims its own live claim
+        // idempotently, then releases.
+        try second.claimWriterOwnership(session: session, writer: writerB)
+        try second.releaseWriterOwnership(session: session, writer: writerB)
     }
 
-    /// STORE-09: the store fills exactly to `limit`, then the next append
-    /// fails honestly with `.quotaExceeded` — evidence is never silently
-    /// dropped (R19). Fills from empty; callers pass a fresh store.
-    public static func assertQuotaBoundary(_ store: any SessionStore, limit: Int, variant: String) throws {
+    /// STORE-09 (in-memory tier): the store fills exactly to `limit`, then
+    /// the next append fails honestly with `.quotaExceeded` — evidence is
+    /// never silently dropped (R19). Fills from empty; callers pass a
+    /// fresh store with a claimed identity.
+    public static func assertQuotaBoundary(
+        _ store: any SessionStore, limit: Int, variant: String,
+        identity: WriterIdentity = primaryIdentity
+    ) throws {
         for i in 0..<limit {
-            try store.append(.transcriptAppended(.user("fill-\(i % 64)")))
+            try store.append(.transcriptAppended(.user("fill-\(i % 64)")), as: identity)
         }
         let (all, _) = try store.records(since: 0, limit: limit + 1)
         #expect(all.count == limit, "[\(variant)] store must hold exactly \(limit) records, got \(all.count)")
         #expect(throws: StoreError.quotaExceeded(limit: limit)) {
-            try store.append(.transcriptAppended(.user("overflow")))
+            try store.append(.transcriptAppended(.user("overflow")), as: identity)
         }
     }
 }
