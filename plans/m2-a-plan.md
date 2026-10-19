@@ -170,3 +170,13 @@ Adjudications accepted: v1 = unshipped dev history → documented limitation
 + focused regression (legacy row in diagnostic read, absent from scoped,
 global-count-only); SessionIsolationTests stays UNLABELED with the
 RecordCodecTests-style doc comment.
+
+## 13. A2 closure ledger corrections (item 1)
+
+- Commit f7187c5's subject claimed "TESTING §2 exemption" among folded items;
+  that claim was OVERSTATED — the wording lands in THIS batch (item 1). The
+  authoritative fold record is plan §12 + this section, not commit subjects.
+- A5 obligation: claims are never released on the production path
+  (RunCommand relies on unique per-process sessions today) — a reused store
+  file accumulates claim rows. A5 must add claim retention/release policy
+  (e.g. release at clean run end) or document bounded growth.
