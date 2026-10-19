@@ -185,13 +185,18 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             // Integrity-visible halt (never silent divergence): the computed
             // records are unpersisted, so the run cannot continue on them.
             // M2 owns recovery; M1-B fails the run visibly here.
-            let reason: String
-            switch event {
-            case .effectCompleted, .effectFailed:
-                reason = "store append failed; result unpersisted, outcome unresolved"
-            default:
-                reason = "store append failed; intent unpersisted"
+            // A3-1: the reason is classified from the UNPERSISTED GROUP, not
+            // the event kind — any group carrying an operation result (done
+            // completions, failure receipts, cancel/ambiguous unknowns)
+            // means a possible side effect's outcome is now unresolved,
+            // while a pure intent group means nothing executed yet.
+            let leftResultUnpersisted = result.records.contains {
+                if case .operationResult = $0 { return true }
+                return false
             }
+            let reason = leftResultUnpersisted
+                ? "store append failed; result unpersisted, outcome unresolved"
+                : "store append failed; intent unpersisted"
             state = prior.replacing(phase: .failed(.integrityStopped(reason)))
             return
         }
