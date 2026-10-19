@@ -13,12 +13,16 @@ struct OperationIntentActorTests {
     /// Commit-gated store: delegates everything to InMemory except the
     /// batch commit, which throws BEFORE touching the log when the test's
     /// predicate matches — an atomic commit failure, never a partial one.
+    /// Single-record `append` is deliberately UNGATED (the legacy
+    /// non-atomic path): the actor must commit transition groups via
+    /// `appendBatch`, so a regression to a per-record loop persists partial
+    /// groups and these tests go RED.
     final class GatedCommitStore: SessionStore, @unchecked Sendable {
         private let inner = InMemorySessionStore()
         var failWhen: (@Sendable ([DurableRecord]) -> Bool)?
 
         func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
-            try appendBatch([record], as: identity)
+            try inner.append(record, as: identity)
         }
 
         func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {

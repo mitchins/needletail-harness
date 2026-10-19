@@ -117,6 +117,22 @@ struct RunCommand: ParsableCommand {
                 sessions.append(identity.session.raw)
             }
         }
+        /// A3-1 atomic override: the whole transition group is quota/fencing
+        /// checked BEFORE any row lands — a breached quota at the 10k
+        /// boundary fails the group whole, never partially committed.
+        func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {
+            try lock.withLock {
+                guard claims[identity.session.raw] == identity.writer else {
+                    throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+                }
+                guard log.count + records.count <= 10_000 else { throw StoreError.quotaExceeded(limit: 10_000) }
+                for record in records {
+                    sequence += 1
+                    log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
+                    sessions.append(identity.session.raw)
+                }
+            }
+        }
         func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
             guard limit > 0 else {
                 throw StoreError.integrity("invalid page limit \(limit); must be > 0")

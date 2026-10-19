@@ -166,6 +166,25 @@ struct OperationIntentTests {
         #expect(second.state.droppedStaleCount == first.state.droppedStaleCount + 1)
     }
 
+    @Test("A3-1 cancellation retains unknown markers paired with the intent IDs")
+    func cancellationRetainsPairedUnknowns() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
+            ToolProposal(callID: "c2", tool: "write", argumentsDigest: "d"),
+        ])
+        let (executing, _, dispatchRecords) = try Self.executingState(batch: batch, ids: &ids)
+        let intentIDs = Set(Self.intents(in: dispatchRecords).map(\.operationID))
+        #expect(intentIDs.count == 2)
+        let cancelled = transition(executing, .cancelRequested(atMillis: 1006), &ids)
+        #expect(cancelled.state.liveReservations.isEmpty, "invalidation follows preservation")
+        let markerIDs = Set(cancelled.state.unresolvedOperations.map(\.operationID))
+        #expect(markerIDs == intentIDs, "cancel unknowns reuse the intent IDs, got \(markerIDs)")
+        #expect(cancelled.state.unresolvedOperations.allSatisfy { $0.state == .unknown && $0.mutating })
+        let recorded = Self.results(in: cancelled.records).filter { $0.1 == "unknown" }
+        #expect(Set(recorded.map { $0.0.operationID }) == intentIDs, "unknown outcomes pair with the intents")
+    }
+
     @Test("A3-1 consumed check drops even when the reservation is still live")
     func consumedCheckWinsOverLiveReservation() throws {
         var ids = StateFixtures.ids()
