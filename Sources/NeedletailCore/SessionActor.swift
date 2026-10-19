@@ -58,11 +58,14 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     private var rawRingMaxCount: Int { 8 }
     private var rawRingMaxBytes: Int { 16 * 1024 * 1024 }
 
+    /// Throws when the fencing claim cannot be established: constructing a
+    /// live writer against a session held by a DIFFERENT writer is a loud
+    /// failure, never a silently unfenced actor.
     public init(
         state: SessionState, ids: IDs, clock: ClockType,
         transport: Transport, executor: Executor, store: Store, approvals: Approvals,
         sink: any UISink = NoopUISink(), writer: String
-    ) {
+    ) throws {
         self.state = state
         self.ids = ids
         self.clock = clock
@@ -72,6 +75,11 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         self.approvals = approvals
         self.sink = sink
         self.writer = writer
+        // A2 fencing: this live actor instance establishes its writer
+        // identity BEFORE any durable mutation. Idempotent for a same-
+        // identity restart; a competing live writer fails here, loudly —
+        // never silently unfenced.
+        try store.claimWriterOwnership(session: state.sessionID, writer: writer)
     }
 
     public var rawRecords: [RawProviderRecord] { rawRing }

@@ -97,7 +97,7 @@ struct ActorLoopbackTests {
         let (inner, snapshot) = try LoopbackFixtures.transport(server: server)
         defer { await LoopbackFixtures.shutdown(inner.client) }
         let flaky = FlakyTransport(inner: inner)
-        let actor = SessionActor(
+        let actor = try SessionActor(
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: "e2e"), clock: VirtualClock(now: 1_000_000),
             transport: flaky, executor: TrivialExecutor(),
@@ -141,7 +141,7 @@ struct ActorLoopbackTests {
         defer { await LoopbackFixtures.shutdown(inner.client) }
         // No flakiness: the first (only) attempt streams, then FINs.
         let flaky = FlakyTransport(inner: inner, failFirst: false)
-        let actor = SessionActor(
+        let actor = try SessionActor(
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: "e2e-abort"), clock: VirtualClock(now: 2_000_000),
             transport: flaky, executor: TrivialExecutor(),

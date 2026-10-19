@@ -118,7 +118,7 @@ struct BoundaryVerificationTests {
         let snapshot = try LoopbackFixtures.snapshot(alias: "loop", baseURL: server.baseURL)
         defer { await LoopbackFixtures.shutdown(chat.client) }
 
-        let actor = AuthorizedActor(
+        let actor = try AuthorizedActor(
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: "boundary"), clock: VirtualClock(now: 5_000_000),
             transport: chat, executor: TrivialExecutor(),
@@ -262,7 +262,7 @@ struct BoundaryVerificationTests {
         let chat: ChatCompletionsTransport = try LoopbackFixtures.transport(server: server).0
         let snapshot = try LoopbackFixtures.snapshot(alias: "loop", baseURL: server.baseURL)
         defer { await LoopbackFixtures.shutdown(chat.client) }
-        let actor = AuthorizedActor(
+        let actor = try AuthorizedActor(
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: "ring"), clock: VirtualClock(now: 7_000_000),
             transport: chat, executor: TrivialExecutor(),

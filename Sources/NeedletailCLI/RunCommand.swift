@@ -313,7 +313,7 @@ struct RunCommand: ParsableCommand {
         // per-process writer identity before any durable mutation.
         let writerID = UUID().uuidString
         try store.claimWriterOwnership(session: state.sessionID, writer: writerID)
-        let actor = SessionActor(
+        let actor = try SessionActor(
             state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
             transport: transport, executor: backend, store: store,
             approvals: HeadlessApprovals(), sink: sink, writer: writerID)
