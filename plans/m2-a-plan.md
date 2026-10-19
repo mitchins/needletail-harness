@@ -202,3 +202,27 @@ global-quota slot proof for legacy rows, stale `defaultTransactionKind`
 instruction line (superseded by auto-managed IMMEDIATE, §12 retained),
 assertion message wording, `SessionID("")` escape hatch (documented:
 v1 unshipped, no production path constructs it).
+
+## 15. A3-1 CLOSED — independent review APPROVED (2026-10-19)
+
+Implementing commits `5add15a..a3ca247` (stable operation identities +
+durable intent/result ordering), fold `ba53a27` + addendum `a5d2258`.
+Reviewer: `deepseek-reviewer`, two rounds. Round 1 NEEDS_CHANGES (4
+finite findings); all folded with RED/GREEN evidence; round 2
+APPROVED — no remaining in-scope findings.
+
+Delivered: derived operation IDs (`effectID/callID`) binding dispatch
+intents to per-proposal completions; intent groups commit atomically
+(`appendBatch`: GRDB single-txn pre-existing, InMemory + Ephemeral
+overrides added) before any executor dispatch; failed result commits
+halt without asserting success (reason classified from the unpersisted
+record group); stale/cancel unknown markers reuse intent IDs.
+Tests: 7 reducer + 4 actor (commit-gated double) + InMemory group-quota
+atomicity; 8 RED counterfactuals verified (missing intent, minted
+result ID, consumed-check vs torn state, early-return removal x2,
+hardcoded mutating:false, minted cancel IDs, per-record actor
+regression). Gates at HEAD: quick + native green, coverage
+`executed=141 failed=0 satisfied=20`.
+
+Scope guard: reopen reconciliation, ownership takeover, artifact
+storage, A4/A5 NOT started — later A3 tasks.
