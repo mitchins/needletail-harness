@@ -145,3 +145,28 @@ PID assumptions. A3 qualifies an explicit, authorized recovery:
 - Old writer ID reuse is NOT recovery fencing; the takeover is deliberate,
   auditable (a durable record is appended for the recovery event).
 - Small + integrated with the GRDB ownership contract; no lease service.
+
+## 12. A2 delta review verdict (2d01e6c): NEEDS_CHANGES — fold BEFORE closing
+
+Folds confirmed (1,2,4 core; index/busyTimeout present). Remaining:
+1. HIGH: item 5 NOT folded despite commit subject — .coderabbit.yaml TESTING §2
+   wording (plan §10 item 5), RunCommand:327 redundant pre-claim, A5
+   claim-growth note. Commit/receipt claim must be corrected.
+2. MED: typed SQLITE_BUSY mapping (append/appendBatch/reads) + PRAGMA
+   index_list test + contention test; record: GRDB 7.11.1 has NO
+   defaultTransactionKind (write closures already IMMEDIATE) — plan §10 API
+   instruction stale, code correct.
+3. MED: index not created for ALREADY-v2 files (inside `version < 2`) — move
+   unconditional/idempotent post-branch.
+4. MED: scoped reads lack limit>0 guard in InMemory/Ephemeral/probe (GRDB has
+   it) — align all.
+5. LOW: dense-sequence oracle wording (single-session log, not per-session
+   density); 6. LOW: probe stale docs/dead recordCount/global-only quota —
+   fix comments or mirror; 7. LOW: isolation regression GRDB-only — extract
+   shared assertion, add InMemory leg + beta transcript; 8. LOW: RED probe
+   WAS executed (scope dropped → 4 oracle trips → byte-exact restore) —
+   record in receipt.
+Adjudications accepted: v1 = unshipped dev history → documented limitation
++ focused regression (legacy row in diagnostic read, absent from scoped,
+global-count-only); SessionIsolationTests stays UNLABELED with the
+RecordCodecTests-style doc comment.
