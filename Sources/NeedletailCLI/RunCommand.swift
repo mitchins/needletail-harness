@@ -321,10 +321,9 @@ struct RunCommand: ParsableCommand {
             snapshotProvider: { snapshot })
 
         // 6. Actor
-        // A2 fencing: this live CLI run claims its session for a unique
-        // per-process writer identity before any durable mutation.
+        // A2 fencing: the actor claims this session for a unique
+        // per-process writer identity in its own (throwing) init.
         let writerID = UUID().uuidString
-        try store.claimWriterOwnership(session: state.sessionID, writer: writerID)
         let actor = try SessionActor(
             state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
             transport: transport, executor: backend, store: store,
