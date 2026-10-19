@@ -63,6 +63,12 @@ public protocol SessionStore: Sendable {
     func append(_ record: DurableRecord, as identity: WriterIdentity) throws
     /// Paged read (R15): bounded batches with an explicit cursor — history
     /// is never loaded wholesale (SPEC §9.2, ARCH §1).
+    /// SESSION-SCOPED paged read (R15 + A2 isolation): returns ONLY this
+    /// session's records, in global-sequence order, with per-session cursor
+    /// paging. Cross-session content is unrepresentable in the result.
+    func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?)
+    /// UNSCOPED diagnostic read (support tooling/tests only): pages the
+    /// WHOLE store across sessions. Never feed this to a model request.
     func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?)
     /// Claim exclusive write ownership of `session` for `writer`. A
     /// different live writer holding the session fails with

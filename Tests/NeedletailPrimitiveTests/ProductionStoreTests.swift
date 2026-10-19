@@ -40,7 +40,7 @@ struct ProductionStoreTests {
 
         // FRESH handle on the same file: identical records, dense sequences.
         let reopened = try GRDBSessionStore(path: path)
-        let (all, next) = try reopened.records(since: 0, limit: 100)
+        let (all, next) = try reopened.records(session: Self.identity.session, since: 0, limit: 100)
         #expect(all.map(\.record) == written, "reopened store resumes identical records")
         #expect(all.map(\.sequence.value) == [1, 2, 3, 4, 5], "sequences stay dense across reopen")
         #expect(next == nil, "full read ends with a nil cursor")
@@ -48,7 +48,7 @@ struct ProductionStoreTests {
         // writer claim SURVIVED the close (durable ownership), so the same
         // identity appends without re-claiming.
         try reopened.append(.transcriptAppended(.user("post-reopen")), as: Self.identity)
-        let (tail, _) = try reopened.records(since: 5, limit: 10)
+        let (tail, _) = try reopened.records(session: Self.identity.session, since: 5, limit: 10)
         #expect(tail.map(\.record) == [.transcriptAppended(.user("post-reopen"))])
         #expect(tail.first?.sequence.value == 6)
     }
@@ -205,7 +205,7 @@ struct ProductionStoreTests {
             try db.execute(sql: "PRAGMA user_version = 0")
         }
         let resumed = try GRDBSessionStore(path: crashedPath)
-        let (all, _) = try resumed.records(since: 0, limit: 10)
+        let (all, _) = try resumed.records(session: Self.identity.session, since: 0, limit: 10)
         #expect(all.isEmpty, "resumed store opens clean")
     }
 
@@ -260,6 +260,49 @@ struct ProductionStoreTests {
         }
     }
 
+    @Test("STORE-05 sqlite v1 store migrates forward: rows kept, legacy claim voided")
+    func STORE_05_sqliteV1MigratesForwardAndVoidsLegacyClaims() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("v1.sqlite").path
+        // Hand-build a GENUINE v1 store: old shapes, one row, a live claim.
+        let v1 = try DatabaseQueue(path: path)
+        try v1.write { db in
+            try db.execute(sql: "CREATE TABLE records (seq INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+            try db.execute(sql: "CREATE TABLE writer (slot INTEGER PRIMARY KEY CHECK (slot = 1), owner TEXT NOT NULL)")
+            // v1 payloads were already codec JSON (RecordCodec's format
+            // predates v2) — encode through the same codec.
+            let legacyPayload = String(decoding: try RecordCodec.encode(.transcriptAppended(.user("legacy-row"))), as: UTF8.self)
+            try db.execute(sql: "INSERT INTO records (payload) VALUES (?)", arguments: [legacyPayload])
+            try db.execute(sql: "INSERT INTO writer (slot, owner) VALUES (1, 'legacy-writer')")
+            try db.execute(sql: "PRAGMA user_version = 1")
+        }
+        // Open migrates to v2: rows preserved with empty session
+        // attribution; the legacy claim is VOID.
+        let store = try GRDBSessionStore(path: path)
+        let legacyIdentity = WriterIdentity(session: SessionID("s-legacy"), writer: "legacy-writer")
+        do {
+            try store.append(.transcriptAppended(.user("post-migration")), as: legacyIdentity)
+            Issue.record("the voided legacy claim must not authorize appends")
+        } catch let error as StoreError {
+            guard case .notWriter = error else {
+                Issue.record("expected .notWriter, got \(error)"); return
+            }
+        }
+        // Explicit re-claim re-establishes fencing.
+        try store.claimWriterOwnership(session: legacyIdentity.session, writer: "legacy-writer")
+        try store.append(.transcriptAppended(.user("after-reclaim")), as: legacyIdentity)
+        // Rows preserved: legacy row + post-reclaim row, legacy attributed
+        // to no session (empty), new row attributed.
+        let (all, _) = try store.records(since: 0, limit: 100)
+        #expect(all.count == 2, "legacy row must survive the migration, got \(all.count)")
+        let rows = try DatabaseQueue(path: path).read { db in
+            try Row.fetchAll(db, sql: "SELECT session FROM records ORDER BY seq")
+        }
+        #expect((rows[0]["session"] as String?) == "", "legacy row attributes to no session")
+        #expect((rows[1]["session"] as String?) == "s-legacy", "new row carries the session")
+    }
+
     // MARK: - STORE-06 (the M2-0 deferral lands here)
 
     @Test("STORE-06 sqlite two writers compete for one session (fenced)")
@@ -302,7 +345,7 @@ struct ProductionStoreTests {
         var cursor: UInt64? = 0
         var lastSeq: UInt64 = 0
         while let since = cursor {
-            let (page, next) = try reopened.records(since: since, limit: 512)
+            let (page, next) = try reopened.records(session: Self.identity.session, since: since, limit: 512)
             // Bounded paging is the contract: a page never exceeds the
             // limit, and the resume provably takes MANY pages (10007 rows
             // / 512) — never loaded wholesale.

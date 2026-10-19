@@ -28,7 +28,7 @@ public enum StoreContractAssertions {
         // fail, never hang the runner.
         for _ in 0..<10 {
             guard let since = cursor else { break }
-            let (page, next) = try store.records(since: since, limit: 3)
+            let (page, next) = try store.records(session: identity.session, since: since, limit: 3)
             pages.append(page.map(\.record))
             cursor = next
         }
@@ -42,13 +42,14 @@ public enum StoreContractAssertions {
         let resumed = pages.flatMap { $0 }
         #expect(resumed == payloads, "[\(variant)] resumed history must equal append order")
         // Resume from the middle replays only the tail.
-        let (tail, tailNext) = try store.records(since: 4, limit: 10)
+        let (tail, tailNext) = try store.records(session: identity.session, since: 4, limit: 10)
         #expect(tail.map(\.record) == Array(payloads[4...]), "[\(variant)] since-cursor must replay the tail")
         #expect(tailNext == nil, "[\(variant)] tail read must end with a nil cursor")
-        // Sequences are strictly increasing and dense from 1.
-        let (all, _) = try store.records(since: 0, limit: Int.max)
+        // Per-session sequences are strictly increasing and dense from 1
+        // within the session's OWN log (global identity stays `seq`).
+        let (all, _) = try store.records(session: identity.session, since: 0, limit: Int.max)
         #expect(all.map(\.sequence.value) == [1, 2, 3, 4, 5, 6, 7],
-                "[\(variant)] sequences must be dense from 1")
+                "[\(variant)] per-session sequences must be dense from 1")
     }
 
     /// STORE-06 — the FENCING contract, run identically by every backend.
@@ -106,7 +107,7 @@ public enum StoreContractAssertions {
         }
 
         // The log holds exactly the two accepted appends, in order.
-        let (all, _) = try second.records(since: 0, limit: 100)
+        let (all, _) = try second.records(session: session, since: 0, limit: 100)
         #expect(all.map(\.record) == [
             .transcriptAppended(.user("live-a")),
             .transcriptAppended(.user("live-b")),
@@ -128,7 +129,7 @@ public enum StoreContractAssertions {
         for i in 0..<limit {
             try store.append(.transcriptAppended(.user("fill-\(i % 64)")), as: identity)
         }
-        let (all, _) = try store.records(since: 0, limit: limit + 1)
+        let (all, _) = try store.records(session: identity.session, since: 0, limit: limit + 1)
         #expect(all.count == limit, "[\(variant)] store must hold exactly \(limit) records, got \(all.count)")
         #expect(throws: StoreError.quotaExceeded(limit: limit)) {
             try store.append(.transcriptAppended(.user("overflow")), as: identity)

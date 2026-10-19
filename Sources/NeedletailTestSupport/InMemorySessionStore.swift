@@ -16,6 +16,8 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
 
     private let lock = NSLock()
     private var log: [SequencedRecord] = []
+    /// Per-record session attribution, index-aligned with `log`.
+    private var sessions: [String] = []
     private var sequence: UInt64 = 0
     /// session → owning writer (A2 fencing).
     private var claims: [String: String] = [:]
@@ -35,9 +37,21 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             }
             sequence += 1
             log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
+            sessions.append(identity.session.raw)
         }
     }
 
+    public func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
+        try lock.withLock {
+            let window = log.enumerated().filter {
+                $0.element.sequence.value > since && sessions[$0.offset] == session.raw
+            }.prefix(limit).map { $0.element }
+            let next: UInt64? = window.count < limit ? nil : window.last?.sequence.value
+            return (window, next)
+        }
+    }
+
+    /// UNSCOPED diagnostic read (support tooling/tests only).
     public func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
         try lock.withLock {
             let window = log.filter { $0.sequence.value > since }.prefix(limit)

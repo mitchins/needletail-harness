@@ -60,6 +60,12 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         self.globalRecordLimit = globalRecordLimit
         var configuration = Configuration()
         configuration.journalMode = .wal
+        // A2 review: bound lock contention (typed failures, never raw
+        // SQLITE_BUSY). Transaction KIND is auto-managed by GRDB 7.11
+        // (write closures run IMMEDIATE where needed) — the comments in
+        // this file say "BEGIN IMMEDIATE transaction" meaning the fenced
+        // write transaction; GRDB guarantees its atomicity either way.
+        configuration.busyMode = .timeout(5)
         do {
             self.queue = try DatabaseQueue(path: path, configuration: configuration)
         } catch {
@@ -144,6 +150,13 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                     CREATE TABLE writer(
                         session TEXT PRIMARY KEY,
                         writer TEXT NOT NULL)
+                    """)
+                // Session-count/pagination index (A2 review finding C):
+                // supports session-quota COUNT and ordered session reads.
+                // Created AFTER the v2 column exists (a v1 file gains the
+                // column in this same migration).
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS records_session ON records(session, seq)
                     """)
                 try db.execute(sql: "PRAGMA user_version = 2")
             }
@@ -295,6 +308,26 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
+    public func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
+        gate.lock()
+        defer { gate.unlock() }
+        try assertOpenLocked()
+        guard limit > 0 else {
+            throw StoreError.integrity("invalid page limit \(limit); must be > 0")
+        }
+        let rows = try queue.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT seq, payload FROM records
+                WHERE session = ? AND seq > ? ORDER BY seq LIMIT ?
+                """, arguments: [session.raw, since, limit])
+        }
+        let batch = try Self.decodeBatch(rows)
+        let next: UInt64? = batch.count < limit ? nil : batch.last?.sequence.value
+        return (batch, next)
+    }
+
+    /// UNSCOPED diagnostic read (support tooling/tests only): pages the
+    /// WHOLE store across sessions. Never feed this to a model request.
     public func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
         gate.lock()
         defer { gate.unlock() }
@@ -309,17 +342,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 SELECT seq, payload FROM records WHERE seq > ? ORDER BY seq LIMIT ?
                 """, arguments: [since, limit])
         }
-        // Every row decodes through the codec; a corrupted row is
-        // `.integrity` — never skipped, never substituted, never trapped on.
-        let batch = try rows.map { row -> SequencedRecord in
-            guard let seq: Int64 = row["seq"], seq >= 0,
-                  let payload: String = row["payload"] else {
-                throw StoreError.integrity("corrupt record row: unreadable seq/payload")
-            }
-            return try SequencedRecord(
-                sequence: SequenceNumber(UInt64(seq)),
-                record: RecordCodec.decode(Data(payload.utf8)))
-        }
+        let batch = try Self.decodeBatch(rows)
         let next: UInt64? = batch.count < limit ? nil : batch.last?.sequence.value
         return (batch, next)
     }
@@ -377,6 +400,20 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         guard !closed else { return }
         closed = true
         try queue.close()
+    }
+
+    /// Every row decodes through the codec; a corrupted row is
+    /// `.integrity` — never skipped, never substituted, never trapped on.
+    private static func decodeBatch(_ rows: [Row]) throws -> [SequencedRecord] {
+        try rows.map { row -> SequencedRecord in
+            guard let seq: Int64 = row["seq"], seq >= 0,
+                  let payload: String = row["payload"] else {
+                throw StoreError.integrity("corrupt record row: unreadable seq/payload")
+            }
+            return try SequencedRecord(
+                sequence: SequenceNumber(UInt64(seq)),
+                record: RecordCodec.decode(Data(payload.utf8)))
+        }
     }
 
     // MARK: - Diagnostics (test/receipt support)

@@ -103,6 +103,7 @@ struct RunCommand: ParsableCommand {
     final class EphemeralStore: SessionStore, @unchecked Sendable {
         private let lock = NSLock()
         private var log: [SequencedRecord] = []
+        private var sessions: [String] = []
         private var sequence: UInt64 = 0
         private var claims: [String: String] = [:]
         func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
@@ -113,8 +114,19 @@ struct RunCommand: ParsableCommand {
                 guard log.count < 10_000 else { throw StoreError.quotaExceeded(limit: 10_000) }
                 sequence += 1
                 log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
+                sessions.append(identity.session.raw)
             }
         }
+        func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
+            try lock.withLock {
+                let window = log.enumerated().filter {
+                    $0.element.sequence.value > since && sessions[$0.offset] == session.raw
+                }.prefix(limit).map { $0.element }
+                let next: UInt64? = window.count < limit ? nil : window.last?.sequence.value
+                return (window, next)
+            }
+        }
+        /// UNSCOPED diagnostic read (support tooling/tests only).
         func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
             try lock.withLock {
                 let matching = log.filter { $0.sequence.value > since }
@@ -293,7 +305,7 @@ struct RunCommand: ParsableCommand {
             // Paged transcript (M1-D D1): read from store, map to messages
             // Over-limit throws, which surfaces as preSend failure (honest)
             do {
-                let messages = try loadTranscript(from: store, limit: 1024)
+                let messages = try loadTranscript(from: store, session: state.sessionID, limit: 1024)
                 // If no transcript yet (should have user prompt), fallback to prompt
                 if messages.isEmpty {
                     return [ChatMessage(role: .user, text: promptCopy)]
@@ -408,7 +420,7 @@ struct RunCommand: ParsableCommand {
                 // Human final answer goes to stderr in JSONL mode and is
                 // terminal-safe: no control scalar reaches the terminal or
                 // JSON diagnostics.
-                if let last = try? loadTranscript(from: store).last, last.role == ChatRole.assistant {
+                if let last = try? loadTranscript(from: store, session: state.sessionID).last, last.role == ChatRole.assistant {
                     var err = StandardErrorStream()
                     print(terminalSafe(last.text), to: &err)
                 }
@@ -449,9 +461,9 @@ struct RunCommand: ParsableCommand {
             // Non-JSONL: print final assistant text to stdout, diagnostics to stderr
             switch done.phase {
             case .completed:
-                if let last = try? loadTranscript(from: store).last, last.role == ChatRole.assistant {
+                if let last = try? loadTranscript(from: store, session: state.sessionID).last, last.role == ChatRole.assistant {
                     print(terminalSafe(last.text))
-                } else if let transcript = try? loadTranscript(from: store), let lastAssistant = transcript.reversed().first(where: { $0.role == ChatRole.assistant }) {
+                } else if let transcript = try? loadTranscript(from: store, session: state.sessionID), let lastAssistant = transcript.reversed().first(where: { $0.role == ChatRole.assistant }) {
                     print(terminalSafe(lastAssistant.text))
                 }
                 return

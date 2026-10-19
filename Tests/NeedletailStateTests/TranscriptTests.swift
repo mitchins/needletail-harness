@@ -8,8 +8,7 @@ import NeedletailTestSupport
 /// into SessionState. Pure mapping + paging contract, no sockets.
 struct TranscriptTests {
     /// Fenced-append convenience for store seeding (A2 contract).
-    private static func seed(_ store: InMemorySessionStore, _ records: [DurableRecord]) throws {
-        let identity = WriterIdentity(session: SessionID("s-t"), writer: "seed")
+    private static func seed(_ store: InMemorySessionStore, _ identity: WriterIdentity, _ records: [DurableRecord]) throws {
         try store.claimWriterOwnership(session: identity.session, writer: identity.writer)
         for record in records { try store.append(record, as: identity) }
     }
@@ -48,7 +47,8 @@ struct TranscriptTests {
     @Test("transcript pages from the store in seq order")
     func transcriptPagesFromStore() throws {
         let store = InMemorySessionStore()
-        try Self.seed(store, [
+        let identity = WriterIdentity(session: SessionID("s-t"), writer: "seed")
+        try Self.seed(store, identity, [
             .transcriptAppended(.user("one")),
             .queueAdmitted(QueueEntry(
                 entryID: "e-1", commandID: CommandID("c-1"), kind: .followUp,
@@ -56,20 +56,21 @@ struct TranscriptTests {
                 targetEpochID: EpochID("epoch-1"), orderKey: 0)),
             .transcriptAppended(.assistantText("two")),
         ])
-        let messages = try loadTranscript(from: store)
+        let messages = try loadTranscript(from: store, session: identity.session)
         #expect(messages.map(\.text) == ["one", "two"], "seq order, transcript kinds only")
     }
 
     @Test("over-limit transcript pages fail honest, never truncate")
     func transcriptPageOverflowHonest() throws {
         let store = InMemorySessionStore()
-        try Self.seed(store, [
+        let identity = WriterIdentity(session: SessionID("s-t"), writer: "seed")
+        try Self.seed(store, identity, [
             .transcriptAppended(.user("a")),
             .transcriptAppended(.user("b")),
             .transcriptAppended(.user("c")),
         ])
         do {
-            _ = try loadTranscript(from: store, limit: 2)
+            _ = try loadTranscript(from: store, session: identity.session, limit: 2)
             Issue.record("over-limit page must refuse")
         } catch let error as TranscriptError {
             #expect(error == .pageOverflow(limit: 2), "typed: \(error)")

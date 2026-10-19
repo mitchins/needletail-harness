@@ -114,6 +114,7 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS records(
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session TEXT NOT NULL,
                     payload TEXT NOT NULL)
                 """)
             try db.execute(sql: "DROP TABLE IF EXISTS writer")
@@ -128,8 +129,12 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
     }
 
     func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
-        // FENCED inside the mutation's own write transaction (shared file,
-        // two handles): the SQL ownership row is the only authority.
+        // The payload codec throws .integrity for shapes the probe cannot
+        // persist — before any SQL runs, so nothing half-written remains.
+        let encoded = try ProbePayload.encode(record)
+        // FENCE + QUOTA + INSERT in ONE write transaction (same as the
+        // production store): the SQL ownership row is the only authority,
+        // and no other handle can reassign between check and insert.
         try queue.write { db in
             let holder = try String.fetchOne(
                 db, sql: "SELECT writer FROM writer WHERE session = ?",
@@ -137,22 +142,30 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
             guard holder == identity.writer else {
                 throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
             }
-        }
-        // Cached count: COUNT(*) per append is O(n) and makes the 10k fill
-        // quadratic. The cache is exact — this handle is the sole writer in
-        // every contract run — and the final row tally is verified in SQL.
-        let count: Int = lock.withLock { recordCount }
-        guard count < limit else { throw StoreError.quotaExceeded(limit: limit) }
-        // The payload codec throws .integrity for shapes the probe cannot
-        // persist — before any SQL runs, so nothing half-written remains.
-        let encoded = try ProbePayload.encode(record)
-        let rowID = try queue.write { db -> Int64 in
-            try db.execute(sql: "INSERT INTO records (payload) VALUES (?)",
-                           arguments: [encoded])
-            return db.lastInsertedRowID
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records") ?? 0
+            guard count < limit else { throw StoreError.quotaExceeded(limit: limit) }
+            try db.execute(sql: "INSERT INTO records (session, payload) VALUES (?, ?)",
+                           arguments: [identity.session.raw, encoded])
         }
         lock.withLock { recordCount += 1 }
-        _ = rowID
+    }
+
+    /// UNSCOPED diagnostic read (support tooling/tests only).
+    func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
+        let texts = try queue.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT seq, payload FROM records WHERE session = ? AND seq > ? ORDER BY seq LIMIT ?
+                """, arguments: [session.raw, since, limit])
+        }
+        let batch = try texts.map { row -> SequencedRecord in
+            let seq: Int64 = row["seq"]
+            let payload: String = row["payload"]
+            return try SequencedRecord(
+                sequence: SequenceNumber(UInt64(seq)),
+                record: ProbePayload.decode(payload))
+        }
+        let next: UInt64? = batch.count < limit ? nil : batch.last?.sequence.value
+        return (batch, next)
     }
 
     func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
