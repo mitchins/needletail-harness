@@ -180,3 +180,25 @@ RecordCodecTests-style doc comment.
   (RunCommand relies on unique per-process sessions today) — a reused store
   file accumulates claim rows. A5 must add claim retention/release policy
   (e.g. release at clean run end) or document bounded growth.
+
+## 14. A2 CLOSED — independent delta review APPROVED (2026-10-19)
+
+Reviewer: `deepseek-reviewer` (subagent ses_ead231231fffeAGFstoV7L9hzmf), read-only,
+range `2d01e6c..ea252be`. Verdict: APPROVED — no outstanding A2 correctness
+blockers. Verified first-hand: scoped reads (protocol split, GRDB WHERE
+clause, InMemory/Ephemeral per-record attribution, all `loadTranscript` call
+sites, shared assertions); probe single-transaction fence+quota+INSERT;
+index created unconditionally for already-v2 files after fail-closed checks;
+v1 fixture (genuine v1 DDL, preserved row, voided claim, re-claim); typed
+BUSY on all DB accesses with primary-code matching sufficient per GRDB 7.11.1
+(`resultCode` = extended's primaryResultCode); legacy-visibility regression;
+STORE-06/09 certifiers intact; `deferredToM2A` empty + disjoint invariant;
+isolation test unlabeled per TESTING §2 exemption.
+
+Non-blocking nits ACCEPTED as follow-ups (not A2 gate): §12 scope comment,
+probe/GRDB guard asymmetry on unscoped `limit>0`, shared isolation assertion
+for InMemory, RED-evidence receipt file, index-presence assertion wording,
+global-quota slot proof for legacy rows, stale `defaultTransactionKind`
+instruction line (superseded by auto-managed IMMEDIATE, §12 retained),
+assertion message wording, `SessionID("")` escape hatch (documented:
+v1 unshipped, no production path constructs it).
