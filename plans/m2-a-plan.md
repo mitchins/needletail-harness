@@ -91,3 +91,57 @@ No M2-B/C/D behaviour; no re-execution of unknown side effects; no silent trunca
 - G-05 `StoreError.alreadyOwned` payload change (winner's writer ID) added to A2 scope and the §6 ripple list.
 - G-06 import rule scoped to shipped targets; test-only GRDB linkage explicitly preserved (§5).
 - Non-blocking wording fix applied to §7.2 (application-crash durability is SQLite's guarantee under WAL, independent of sync mode).
+
+## 10. A2 remediation (review-folded, authorized; NEXT SESSION'S FIRST WORK)
+
+Verdict NEEDS_CHANGES (independent A2 review); findings to fold in order:
+
+1. **Session-scoped reads (HIGH)**: add `records(session:since:limit:)` to the
+   contract; keep the unscoped variant ONLY as documented diagnostic (or drop
+   it). GRDB: `AND session = ?`. InMemory: store per-record session. Probe +
+   Ephemeral likewise. `loadTranscript(from:session:limit:)` + all RunCommand
+   call sites. Shared `assertAppendOrderAndPagination` reads session-scoped.
+   REGRESSION: two sessions, one file, distinguishable private content
+   ("AAA-only" vs "BBB-FORBIDDEN"); neither transcript contains the other's
+   records; forbidden-content assertion explicit.
+2. **Probe atomicity**: SQLiteProbeStore fence-SELECT + quota + INSERT in ONE
+   `queue.write` (mirror GRDBSessionStore); fix the false "FENCED" comment.
+3. **Index + busy timeout**: v2 migration adds
+   `CREATE INDEX IF NOT EXISTS records_session ON records(session, seq)`
+   (supports session-quota COUNT and ordered session pagination; global
+   identity stays `seq` PK — per-session density is a read concern, not a
+   second sequence). `configuration.busyMode = .timeout(...)` +
+   `defaultTransactionKind = .immediate` (makes the BEGIN IMMEDIATE comments
+   TRUE); map exhausted BUSY to a typed StoreError; tests: index presence via
+   `PRAGMA index_list`, two-handle contention exercises the timeout.
+4. **v1 fixture test**: hand-build a genuine v1 file (old records/writer DDL,
+   one row, user_version=1, live claim); open → v2 shape, rows preserved with
+   session='', legacy claim VOID (old-writer append/release → .notWriter),
+   explicit re-claim required.
+5. Low items: drop RunCommand's redundant pre-claim; record never-release as
+   A5 concern (claim-row growth on reused files); .coderabbit.yaml TESTING §2
+   wording → "case-bearing tests' display names begin with the case ID;
+   support/oracle tests are UNLABELED support evidence and reconciled as
+   such" (explicit exemption — do NOT assign unrelated case IDs).
+
+Gates after fold: quick/native/coverage (STORE-06/09 stay satisfied), RED
+probes for the session-isolation regression, DeepSeek delta verify → A2 CLOSED.
+
+## 11. A3 recovery/ownership design obligation (operator directive)
+
+Ordinary release/re-claim covers cooperating writers only. A crashed
+process's claim persists and must NOT be recoverable by time, absence, or
+PID assumptions. A3 qualifies an explicit, authorized recovery:
+- Inspect + PRESERVE unresolved operation evidence first (intents without
+  results stay unknown; never auto-replay an unknown side effect).
+- `recoverOwnership(session:fromWriter:toWriter:authorization:)`-style
+  operation: atomically supersedes the old identity with a fresh one in one
+  transaction, subject to explicit preconditions (authorized invocation —
+  operator intent carried as a value, not elapsed time/PID liveness/absent
+  ack).
+- Post-takeover, every fenced mutation of the OLD identity fails `.notWriter`
+  (already guaranteed by the ownership row; recovery test proves it even if
+  the old writer resumes).
+- Old writer ID reuse is NOT recovery fencing; the takeover is deliberate,
+  auditable (a durable record is appended for the recovery event).
+- Small + integrated with the GRDB ownership contract; no lease service.
