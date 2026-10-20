@@ -118,11 +118,12 @@ struct ProductionExportCLIWiringTests {
         return body
     }
 
-    private static func run(_ arguments: [String], env: [String: String]) throws -> (exit: Int32, stdout: String, stderr: String) {
+    private static func run(_ arguments: [String], env: [String: String], cwd: URL? = nil) throws -> (exit: Int32, stdout: String, stderr: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: try binary())
         process.arguments = arguments
         process.environment = env
+        if let cwd { process.currentDirectoryURL = cwd }
         let outPipe = Pipe()
         let errPipe = Pipe()
         process.standardOutput = outPipe
@@ -423,6 +424,151 @@ struct ProductionExportCLIWiringTests {
         #expect(missingOutput.exit == 2, "missing --output is a usage error, got \(missingOutput.exit)")
         #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("o.jsonl").path),
                 "failed invocations leave no output behind")
+    }
+
+    @Test("A5-2 cli export resolves bare filenames against the working directory")
+    func exportResolvesBareFilenamesAgainstCwd() throws {
+        // The documented `needletail session export SESSION-ID --output
+        // session.jsonl` form must work: an empty parent maps to ".",
+        // resolved in the CALLER's working directory (passed as the
+        // child process cwd — never the test runner's).
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stateDir = try Self.trustedRun(
+            in: directory, prompt: "read it EXP-ALPHA-111", answer: "all done EXP-BETA-222")
+        let dbPath = stateDir.appendingPathComponent("store.sqlite").path
+        let sessions = try Self.sessionIDs(dbPath: dbPath)
+        let first = try #require(sessions.first)
+        let workDir = directory.appendingPathComponent("work")
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        let result = try Self.run(
+            ["session", "export", first, "--output", "session.jsonl"],
+            env: Self.environment(stateDir: stateDir), cwd: workDir)
+        #expect(result.exit == 0, "bare-filename export succeeds: \(result.stderr.prefix(300))")
+        let produced = workDir.appendingPathComponent("session.jsonl").path
+        #expect(FileManager.default.fileExists(atPath: produced),
+                "bare output lands in the caller's working directory")
+        let text = try String(contentsOfFile: produced, encoding: .utf8)
+        #expect(text.contains("\"complete\":true") || text.contains("\"complete\" : true"),
+                "exported file is complete")
+    }
+
+    @Test("A5-1 cli state directory prefers explicit override over XDG and HOME")
+    func stateDirectoryPrefersExplicitOverride() throws {
+        // NEEDLETAIL_STATE_DIR wins even when XDG_DATA_HOME and HOME are
+        // set: no state may land in the XDG tree from an overridden run.
+        // (Valid config so execution reaches state establishment; the run
+        // itself then fails fast against the dead loopback port.)
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let overrideDir = directory.appendingPathComponent("override-state")
+        let xdgDir = directory.appendingPathComponent("xdg-home")
+        let homeDir = directory.appendingPathComponent("home")
+        try FileManager.default.createDirectory(at: homeDir, withIntermediateDirectories: true)
+        let config = try Self.writeConfig(directory, port: 1, urlSuffix: "")
+        var env = Self.environment(stateDir: overrideDir)
+        env["XDG_DATA_HOME"] = xdgDir.path
+        env["HOME"] = homeDir.path
+        let result = try Self.run(
+            ["run", "--config", config, "--prompt", "x"],
+            env: env)
+        #expect(result.exit != 0, "run fails (dead loopback), but only after state setup")
+        #expect(FileManager.default.fileExists(atPath: overrideDir.appendingPathComponent("store.sqlite").path),
+                "store lands under NEEDLETAIL_STATE_DIR")
+        #expect(!FileManager.default.fileExists(atPath: xdgDir.path),
+                "XDG tree untouched when an override is set")
+    }
+
+    @Test("A5-1 cli refuses to run without any state home")
+    func refusesToRunWithoutStateHome() throws {
+        // No NEEDLETAIL_STATE_DIR, no XDG_DATA_HOME, no HOME: fail closed
+        // instead of scattering state. A valid config gets execution past
+        // validation to the state-directory step that must refuse.
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Self.writeConfig(directory, port: 1, urlSuffix: "")
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "NEEDLETAIL_STATE_DIR")
+        env.removeValue(forKey: "XDG_DATA_HOME")
+        env.removeValue(forKey: "HOME")
+        env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
+        let result = try Self.run(
+            ["run", "--config", config, "--prompt", "x"],
+            env: env)
+        #expect(result.exit == 2, "missing state home is a usage error, got \(result.exit)")
+        #expect(result.stderr.contains("NEEDLETAIL_STATE_DIR"),
+                "diagnostic names the remedy: \(result.stderr.prefix(200))")
+    }
+
+    @Test("A5-1 cli repairs lax state permissions before running")
+    func repairsLaxStatePermissions() throws {
+        // Pre-existing 0755 dir + 0644 database must be repaired to
+        // 0700/0600 rather than used as-is.
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stateDir = directory.appendingPathComponent("state")
+        try FileManager.default.createDirectory(
+            at: stateDir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755])
+        let dbPath = stateDir.appendingPathComponent("store.sqlite").path
+        let seed = try GRDBSessionStore(path: dbPath)
+        try seed.close()
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: dbPath)
+        #expect(try Self.posixMode(dbPath) == 0o644, "fixture starts lax")
+        let server = try LoopbackSSEServer()
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("done").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let config = try Self.writeConfig(directory, port: Int(server.port), urlSuffix: "")
+        let result = try Self.run(
+            ["run", "--config", config, "--prompt", "hi", "--format", "jsonl", "--alias", "loop"],
+            env: Self.environment(stateDir: stateDir))
+        #expect(result.exit == 0, "repaired state runs: \(result.stderr.prefix(200))")
+        #expect(try Self.posixMode(stateDir.path) == 0o700, "directory repaired private")
+        #expect(try Self.posixMode(dbPath) == 0o600, "database repaired private")
+    }
+
+    @Test("A5-1 cli released sessions refuse unfenced writers")
+    func releasedSessionsRefuseUnfencedWriters() throws {
+        // After a clean run releases its claim, a foreign writer cannot
+        // just append: fencing holds without a holder.
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stateDir = try Self.trustedRun(
+            in: directory, prompt: "read it", answer: "done")
+        let dbPath = stateDir.appendingPathComponent("store.sqlite").path
+        let sessions = try Self.sessionIDs(dbPath: dbPath)
+        let first = try #require(sessions.first)
+        #expect(try Self.writerHolders(dbPath: dbPath).isEmpty, "clean run released its claim")
+        let store = try GRDBSessionStore(path: dbPath)
+        defer { try? store.close() }
+        #expect(throws: StoreError.self) {
+            try store.append(.transcriptAppended(.user("intruder")),
+                             as: WriterIdentity(session: SessionID(first), writer: "intruder"))
+        }
+    }
+
+    @Test("A5-1 cli sealed trace file stays private with no state dir")
+    func sealedTraceStaysPrivate() throws {
+        // --trace output carries prompt/model text: it must be 0600 even
+        // though no durable store exists in a sealed run.
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let server = try LoopbackSSEServer()
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("sealed answer").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let config = try Self.writeConfig(directory, port: Int(server.port), urlSuffix: "")
+        let stateDir = directory.appendingPathComponent("state")
+        let traceURL = directory.appendingPathComponent("trace.jsonl")
+        let result = try Self.run(
+            ["run", "--config", config, "--prompt", "hello sealed", "--format", "jsonl", "--alias", "loop",
+             "--sealed", "--trace", traceURL.path],
+            env: Self.environment(stateDir: stateDir))
+        #expect(result.exit == 0, "sealed run with trace completes: \(result.stderr.prefix(200))")
+        #expect(try Self.posixMode(traceURL.path) == 0o600, "explicit trace file is private")
+        #expect(!FileManager.default.fileExists(atPath: stateDir.path),
+                "sealed runs create no state directory even with --trace")
     }
 }
 
