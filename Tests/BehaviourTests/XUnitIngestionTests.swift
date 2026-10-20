@@ -280,4 +280,35 @@ struct XUnitIngestionTests {
         #expect(store02["STORE_02_sigkillMidTransactionRollsBack"] == "NeedletailPrimitiveTests",
                 "the original DELETE-mode probe stays as supplementary evidence")
     }
+
+    @Test("PORT-04 gating body performs a native kill")
+    func port04GatingBodyPerformsNativeKill() throws {
+        // The gate keys on function name + module + pass: an EMPTIED
+        // PORT-04 body would still satisfy it. This source pin (same
+        // pattern as PresentationGateTests/ImportGateTests) asserts the
+        // gating body actually spawns the crash child and never touches
+        // an in-memory store — body removal fails loudly here.
+        var matrixFile = URL(fileURLWithPath: #filePath)
+        for _ in 0..<3 { matrixFile.deleteLastPathComponent() }
+        let matrixPath = matrixFile
+            .appendingPathComponent("Tests/NeedletailPrimitiveTests/CrashMatrixTests.swift").path
+        let text = try String(contentsOfFile: matrixPath, encoding: .utf8)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let start = lines.firstIndex(where: {
+            $0.contains("func PORT_04_sqliteNativeKillReopenLegMustExecute")
+        }) else {
+            Issue.record("PORT-04 gating function missing from CrashMatrixTests.swift")
+            return
+        }
+        let rest = lines[(start + 1)...]
+        guard let end = rest.firstIndex(where: { $0 == "    }" }) else {
+            Issue.record("PORT-04 gating function body never closes")
+            return
+        }
+        let body = rest[..<end].joined(separator: "\n")
+        #expect(body.contains("withKilledChild"),
+                "PORT-04 gating body must perform the native kill cycle")
+        #expect(!body.contains("InMemorySessionStore"),
+                "PORT-04 gating body must not touch an in-memory store")
+    }
 }
