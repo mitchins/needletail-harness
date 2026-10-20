@@ -278,3 +278,30 @@ validation, neutered `.done` agreement).
 
 Scope guard: crash matrices (A4), CLI production-store wiring (A5) NOT
 started. M2-A remaining: A4/A5, then epic review.
+
+## 18. A4-1 CLOSED — independent review APPROVED (2026-10-20)
+
+Implementing commits `b30f50e..2f44f2e` (content-addressed artifacts
+under a private managed root, tmp→fsync→rename→dirsync→verify→fenced
+reference ordering, fd snapshot reads, orphan/interrupted reporting,
+STORE-03/04 certified) plus fold `59e49ca`. Reviewer:
+`deepseek-reviewer`, two rounds. Round 1 NEEDS_CHANGES (6 findings:
+unverified dedup durability, non-snapshot reads, ignored session
+param, untranslated pre-check, symlinked root, colliding roots); all
+folded with new pins and RED/GREEN evidence each; round 2 APPROVED —
+no blocking findings.
+
+Delivered: SHA-256 (swift-crypto, Runtime-only) content addressing;
+0700 root / 0600 files; same-filesystem atomic rename;
+post-rename re-verification before any reference; reads verify size +
+digest via O_NOFOLLOW/fstat/bounded-copy snapshots (no mmap, no
+follows, no hangs, no unbounded reads); dedup re-establishes
+durability (fchmod/fsync/dirsync) instead of trusting squatters;
+symlinked roots refused; distinct stores never share a root;
+stale writers create nothing; orphans reported, never deleted or
+attached. Gates at HEAD: quick + native green (75 tests), coverage
+`executed=177 failed=0 satisfied=22` (STORE-03/04 satisfied as
+required). 11 RED counterfactuals total across both rounds.
+
+Scope guard: separate-process SIGKILL matrix + PORT-04 (A4-2), CLI
+production-store wiring (A5) NOT started.
