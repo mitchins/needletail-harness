@@ -309,6 +309,48 @@ struct SessionExportTests {
 
     // MARK: - Bounds, atomicity, read-only
 
+    @Test("A5-2 export bounds source bytes, not just output bytes")
+    func exportBoundsSourceBytes() throws {
+        // Adversarial shape: large confidential source fields with small
+        // redacted output. Output-byte limits alone would let this through
+        // while retaining the full source in memory; the source-byte budget
+        // must trip first. Deterministic: fixed sizes, no randomness.
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dbPath = directory.appendingPathComponent("store.sqlite").path
+        let store = try GRDBSessionStore(path: dbPath)
+        defer { try? store.close() }
+        let session = SessionID("s-adversarial")
+        try store.claimWriterOwnership(session: session, writer: "w-adv")
+        let bigSecret = String(repeating: "X", count: 10 * 1024) + "-ADVERSARIAL-SECRET"
+        var records: [DurableRecord] = [
+            .sessionOpened(session: session, atMillis: 1),
+        ]
+        for i in 0..<20 {
+            records.append(.transcriptAppended(.user("q\(i) \(bigSecret)")))
+        }
+        try store.appendBatch(records, as: WriterIdentity(session: session, writer: "w-adv"))
+        // Source is ~200KB; redacted output would be ~2KB. A 5KB budget
+        // must fail on the SOURCE bytes — output-only accounting would
+        // wrongly succeed while retaining everything.
+        do {
+            _ = try SessionExport.lines(
+                dbPath: dbPath, session: session, includeContent: false,
+                exportedAt: 1, limits: SessionExport.Limits(maxRecords: 1_000_000, maxBytes: 5_000))
+            Issue.record("adversarial redacted export must fail on source bytes")
+        } catch let error as SessionExport.ExportError {
+            guard case .byteLimitExceeded = error else {
+                Issue.record("expected byteLimitExceeded, got \(error)")
+                return
+            }
+        }
+        // Control: a generous budget exports the same ledger fine.
+        let lines = try SessionExport.lines(
+            dbPath: dbPath, session: session, includeContent: false,
+            exportedAt: 1, limits: .default)
+        #expect(!lines.joined().contains("ADVERSARIAL-SECRET"), "redaction still holds at scale")
+    }
+
     @Test("A5-2 export bounds fail closed without partial output")
     func exportBoundsFailClosed() throws {
         let directory = try Self.freshDirectory()

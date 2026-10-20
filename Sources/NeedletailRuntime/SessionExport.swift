@@ -34,9 +34,13 @@ import Darwin
 public enum SessionExport {
 
     /// Explicit, finite bounds: a ledger beyond either bound fails
-    /// visibly instead of truncating silently. Production defaults are
-    /// safety rails, not quotas; tests inject small limits through the
-    /// same code path.
+    /// closed instead of silently truncating. `maxRecords` caps the
+    /// record count; `maxBytes` caps ALL materialized bytes — output
+    /// lines AND decoded source rows (a redacted export of huge
+    /// confidential fields retains the full source in memory while
+    /// emitting almost nothing, so output bytes alone do not bound
+    /// retention). Production defaults are safety rails, not quotas;
+    /// tests inject small limits through the same code path.
     public struct Limits: Sendable {
         public var maxRecords: Int
         public var maxBytes: Int
@@ -339,6 +343,7 @@ public enum SessionExport {
                   "exportedAt": exportedAt, "content": includeContent,
                   "sensitive": true])
         var stream: [DurableRecord] = []
+        var sourceBytes = 0
         var cursor: UInt64 = 0
         while true {
             let rows: [Row]
@@ -364,6 +369,14 @@ public enum SessionExport {
                     record = try RecordCodec.decode(data)
                 } catch {
                     throw ExportError.unreadableStore("undecodable record row: \(error)")
+                }
+                // Source bytes count against the same budget as output
+                // bytes: decoded rows accumulate in `stream` for the
+                // end-of-stream reconcile, so unbounded source payloads
+                // would otherwise bypass the byte limit entirely.
+                sourceBytes += data.count
+                guard sourceBytes <= limits.maxBytes else {
+                    throw ExportError.byteLimitExceeded(limit: limits.maxBytes)
                 }
                 stream.append(record)
                 try emit(project(SequencedRecord(
@@ -393,6 +406,36 @@ public enum SessionExport {
                                  "unstarted": report.unmatchedNonMutating.map(\.raw),
                                  "orphaned": report.orphanResults.map { $0.operationID.raw }]])
         return lines
+    }
+
+    /// Reads only the final line of a file (bounded 1 MiB tail window,
+    /// O(1) memory regardless of export size): used to verify the export
+    /// trailer without re-materializing the whole export. A trailer that
+    /// does not fit the window fails verification (fail-closed).
+    private static func readLastLine(ofFileAtPath path: String) throws -> String {
+        let handle: FileHandle
+        do {
+            guard let opened = FileHandle(forReadingAtPath: path) else {
+                throw ExportError.outputUnwritable("cannot verify \(path)")
+            }
+            handle = opened
+        }
+        defer { try? handle.close() }
+        let end = (try? handle.seekToEnd()) ?? 0
+        let window: UInt64 = min(end, 1 << 20)
+        let start = end >= window ? end - window : 0
+        try handle.seek(toOffset: start)
+        guard let chunk = try handle.readToEnd(), !chunk.isEmpty else {
+            throw ExportError.outputUnwritable("cannot verify \(path)")
+        }
+        let text = String(decoding: chunk, as: UTF8.self)
+        // The file ends with "\n", so the last non-empty line is the
+        // complete final line, unless the file was torn, in which case
+        // the trailer check below fails closed.
+        guard let last = text.split(separator: "\n", omittingEmptySubsequences: true).last else {
+            throw ExportError.outputUnwritable("cannot verify \(path)")
+        }
+        return String(last)
     }
 
     /// Writes exported lines atomically and privately: a uniquely-named
@@ -440,9 +483,12 @@ public enum SessionExport {
             }
             // Verify before publishing: the trailer must be present and
             // claim completeness, or this file never becomes the export.
-            guard let text = try? String(contentsOfFile: tmp, encoding: .utf8),
-                  let last = text.split(separator: "\n", omittingEmptySubsequences: true).last,
-                  let trailer = try? JSONSerialization.jsonObject(with: Data(last.utf8)) as? [String: Any],
+            // Only the tail is read (bounded, O(1) regardless of export
+            // size): a truncation anywhere upstream necessarily corrupts
+            // or removes the final complete trailer line.
+            guard let trailerLine = try? Self.readLastLine(ofFileAtPath: tmp),
+                  let trailerData = trailerLine.data(using: .utf8),
+                  let trailer = try? JSONSerialization.jsonObject(with: trailerData) as? [String: Any],
                   (trailer["complete"] as? Bool) == true,
                   (trailer["recordCount"] as? Int) == lines.count - 2 else {
                 try? FileManager.default.removeItem(atPath: tmp)
