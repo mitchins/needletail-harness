@@ -138,7 +138,16 @@ struct XUnitIngestionTests {
         "STORE-06": ["STORE_06_sqliteTwoWritersCompeteForOneSession": "NeedletailPrimitiveTests"],
         "STORE-07": ["STORE_07_sqliteProductionResumeAtScale": "NeedletailPrimitiveTests"],
         "STORE-09": ["STORE_09_sqliteProductionQuotasEnforceInTransaction": "NeedletailPrimitiveTests"],
-        "STORE-02": ["STORE_02_sigkillMidTransactionRollsBack": "NeedletailPrimitiveTests"],
+        "STORE-02": ["STORE_02_sigkillMidTransactionRollsBack": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillBeforeIntentCommitLeavesNothing": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillAfterIntentCommitHoldsUnknown": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillAfterSideEffectHoldsWithoutRedispatch": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillBeforeResultCommitDerivesUncertainty": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillAfterResultCommitSurvivesComplete": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteInterruptedArtifactTmpReportsNoReference": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteRenamedArtifactWithoutReferenceIsOrphan": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteCommittedArtifactReferenceReadsVerified": "NeedletailPrimitiveTests"],
+        "PORT-04": ["PORT_04_sqliteNativeKillReopenLegMustExecute": "NeedletailPrimitiveTests"],
         "STORE-03": ["STORE_03_sqliteRenamedArtifactWithoutReferenceIsReportedOrphan": "NeedletailPrimitiveTests"],
         "STORE-04": ["STORE_04_sqliteReferenceToAbsentArtifactFailsTypedIntegrity": "NeedletailPrimitiveTests"],
     ]
@@ -242,5 +251,33 @@ struct XUnitIngestionTests {
         // never both, and every deferred case must be due eventually.
         #expect(Set(Self.requiredEvidence.keys).isDisjoint(with: Self.deferredToM2A.keys),
                 "requiredEvidence and deferredToM2A must be disjoint")
+    }
+
+    @Test("native kill/reopen evidence is pinned to the production tier")
+    func nativeKillEvidencePinnedToProductionTier() {
+        // PORT-04 exists precisely to stop in-memory success from masking a
+        // missing native leg: deleting or re-pointing this entry must fail
+        // loudly here, not silently weaken the gate. Same for the STORE-02
+        // production matrix: the old DELETE-mode sqlite3-CLI probe alone
+        // must never satisfy the final contract again.
+        #expect(Self.requiredEvidence["PORT-04"] ==
+                ["PORT_04_sqliteNativeKillReopenLegMustExecute": "NeedletailPrimitiveTests"],
+                "PORT-04 must require the native kill/reopen variant")
+        let store02 = Self.requiredEvidence["STORE-02"] ?? [:]
+        for variant in [
+            "STORE_02_sqliteKillBeforeIntentCommitLeavesNothing",
+            "STORE_02_sqliteKillAfterIntentCommitHoldsUnknown",
+            "STORE_02_sqliteKillAfterSideEffectHoldsWithoutRedispatch",
+            "STORE_02_sqliteKillBeforeResultCommitDerivesUncertainty",
+            "STORE_02_sqliteKillAfterResultCommitSurvivesComplete",
+            "STORE_02_sqliteInterruptedArtifactTmpReportsNoReference",
+            "STORE_02_sqliteRenamedArtifactWithoutReferenceIsOrphan",
+            "STORE_02_sqliteCommittedArtifactReferenceReadsVerified",
+        ] {
+            #expect(store02[variant] == "NeedletailPrimitiveTests",
+                    "STORE-02 must require production variant \(variant)")
+        }
+        #expect(store02["STORE_02_sigkillMidTransactionRollsBack"] == "NeedletailPrimitiveTests",
+                "the original DELETE-mode probe stays as supplementary evidence")
     }
 }
