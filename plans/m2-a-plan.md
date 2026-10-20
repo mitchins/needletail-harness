@@ -304,4 +304,36 @@ attached. Gates at HEAD: quick + native green (75 tests), coverage
 required). 11 RED counterfactuals total across both rounds.
 
 Scope guard: separate-process SIGKILL matrix + PORT-04 (A4-2), CLI
-production-store wiring (A5) NOT started.
+production-store wiring (A5) NOT started. M2-A remaining: A4/A5, then epic review.
+
+## 19. A4-2 CLOSED — independent review APPROVED (2026-10-20)
+
+Implementing commit `3fcf3ea..73adaae` (self-hosted crash children:
+same test binary re-invoked with `--filter` + env, staged production
+operations, readiness acknowledgement, parked SIGKILL with waitpid
+verification, fresh-handle reopen; 8 STORE-02 production variants +
+PORT-04 native leg + maps pin), folds `905dec0` (bounded reaper, WAL
+probe order, PORT-04 split, holder check, private fixtures) and
+`eeb85aa` (source-level pin on the PORT-04 gating body). Reviewer:
+`deepseek-reviewer`, three rounds. Rounds 1–2 NEEDS_CHANGES (6
+findings: unbounded waits, vacuous WAL probe, PORT-04 body-removal
+masking, writability masking ownership loss, tautological sentinel
+claim, non-private fixtures; then 1 residual: unpinned gating body);
+all folded with fresh evidence; round 3 APPROVED — no findings.
+
+Delivered: 8-point kill matrix (pre/post intent, post-effect with
+no-redispatch proof, uncommitted result txn via held raw txn, post
+commit + WAL, artifact tmp/renamed/committed) with verified SIGKILL
+termination per test; PORT-04 requires the native variant at the
+native tier (rename/break/body-removal each fail loudly — the last via
+the source pin); old DELETE-mode probe kept as supplementary
+evidence only. Durability scope: process-kill (SQLite WAL guarantee),
+never power-loss. Gates at HEAD: quick + native green (86 tests),
+coverage `executed=190 failed=0 satisfied=23` (STORE-02 all 9
+variants + PORT-04 + STORE-03/04). 8 RED counterfactuals total
+(dropped intent, premature success, neutered admission hold, blind
+orphan scan, 2 native-gate bypasses incl. end-to-end gate failure,
+emptied PORT-04 body).
+
+Scope guard: CLI production-store wiring (A5) NOT started.
+M2-A remaining: A5, then epic review.
