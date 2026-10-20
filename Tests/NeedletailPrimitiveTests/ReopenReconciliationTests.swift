@@ -195,6 +195,57 @@ struct ReopenReconciliationTests {
         #expect(report.heldOperations.first?.state == .unknown, "orphan hold is unknown, never asserted done")
     }
 
+    @Test("A3-2 ambiguous delivery unknowns hold after reopen")
+    func ambiguousDeliveryUnknownsHold() throws {
+        let (directory, path) = try Self.freshPath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = SessionID("s-ambiguous")
+        // Exact ambiguous-transport shape: callID-less, non-mutating,
+        // unknown-state. It must surface (never swallowed into a count)
+        // and hold — the live system blocks on every such marker.
+        try Self.seed(path, session: session, [
+            .operationResult(OperationRef(
+                operationID: OperationID("a-op-77"), state: .unknown, mutating: false),
+                outcome: "unknown"),
+        ])
+        let report = try Self.reopenAndReconcile(path, session: session)
+        #expect(report.completed.isEmpty)
+        #expect(report.nonToolResults == 0, "unknown-state is not a denial receipt")
+        #expect(report.orphanResults.map(\.operationID) == [OperationID("a-op-77")])
+        #expect(report.heldOperations.map(\.operationID) == [OperationID("a-op-77")],
+                "explicit unknown-state always holds")
+    }
+
+    @Test("A3-2 unknown-state results hold however the flags disagree")
+    func unknownStateAlwaysHolds() throws {
+        let (directory, path) = try Self.freshPath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Mutating intent, non-mutating unknown result.
+        let sessionA = SessionID("s-union-a")
+        try Self.seed(path, session: sessionA, [
+            Self.toolIntent("e1/c1", call: "c1", mutating: true),
+            Self.toolResult("e1/c1", call: "c1", mutating: false, state: .unknown, outcome: "unknown"),
+        ], writer: "w-a")
+        let reportA = try Self.reopenAndReconcile(path, session: sessionA)
+        #expect(reportA.heldOperations.map(\.operationID) == [OperationID("e1/c1")])
+        // Non-mutating intent, mutating unknown result.
+        let sessionB = SessionID("s-union-b")
+        try Self.seed(path, session: sessionB, [
+            Self.toolIntent("e1/c1", call: "c1", mutating: false),
+            Self.toolResult("e1/c1", call: "c1", mutating: true, state: .unknown, outcome: "unknown"),
+        ], writer: "w-b")
+        let reportB = try Self.reopenAndReconcile(path, session: sessionB)
+        #expect(reportB.heldOperations.map(\.operationID) == [OperationID("e1/c1")])
+        // Neither side mutating — still held: unknown-state is the claim.
+        let sessionC = SessionID("s-union-c")
+        try Self.seed(path, session: sessionC, [
+            Self.toolIntent("e1/c1", call: "c1", mutating: false),
+            Self.toolResult("e1/c1", call: "c1", mutating: false, state: .unknown, outcome: "unknown"),
+        ], writer: "w-c")
+        let reportC = try Self.reopenAndReconcile(path, session: sessionC)
+        #expect(reportC.heldOperations.map(\.operationID) == [OperationID("e1/c1")])
+    }
+
     @Test("A3-2 duplicate and contradictory ledgers fail closed")
     func malformedLedgersFailClosed() throws {
         let (directory, path) = try Self.freshPath()
@@ -229,6 +280,47 @@ struct ReopenReconciliationTests {
         let collideHandle = try GRDBSessionStore(path: path)
         #expect(throws: StoreError.self) { try collideHandle.reconcile(session: session3) }
         try collideHandle.close()
+    }
+
+    @Test("A3-2 callID-less malformed and duplicated shapes fail closed")
+    func callIDLessMalformedShapesFailClosed() throws {
+        // CallID-less intent carrying non-intent state.
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                .operationIntent(OperationRef(
+                    operationID: OperationID("a-op-1"), state: .done, mutating: false)),
+            ])
+        }
+        // CallID-less result carrying intent state.
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                .operationResult(OperationRef(
+                    operationID: OperationID("a-op-2"), state: .intent, mutating: false),
+                    outcome: "nope"),
+            ])
+        }
+        // Duplicate admission intents with the same ID.
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                .operationIntent(OperationRef(operationID: OperationID("a-op-3"), state: .intent, mutating: false)),
+                .operationIntent(OperationRef(operationID: OperationID("a-op-3"), state: .intent, mutating: false)),
+            ])
+        }
+        // Duplicate denial receipts with the same ID.
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                .operationResult(OperationRef(operationID: OperationID("a-op-4"), state: .done, mutating: false), outcome: "denied"),
+                .operationResult(OperationRef(operationID: OperationID("a-op-4"), state: .done, mutating: false), outcome: "denied"),
+            ])
+        }
+        // Denial/tool namespace collision: callID-less result sharing a
+        // tool operation ID.
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                Self.toolIntent("e1/c1", call: "c1", mutating: true),
+                .operationResult(OperationRef(operationID: OperationID("e1/c1"), state: .done, mutating: false), outcome: "denied"),
+            ])
+        }
     }
 
     @Test("A3-2 malformed record states fail closed")

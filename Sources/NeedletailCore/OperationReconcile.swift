@@ -10,21 +10,30 @@
 ///
 /// Classification per stable ID:
 /// - intent + done result → completed.
-/// - intent + unknown result → explicit unknown (durable recovery
-///   evidence; mutating members hold continuation).
+/// - intent + unknown result → explicit unknown (durable recovery evidence).
 /// - intent with no result → UNMATCHED. A mutating side effect may have
 ///   executed with its receipt lost (SPEC §9.1: crash between effect and
 ///   completion), so it is unknown and HELD. A non-mutating intent is
 ///   side-effect-free by construction, so it is demonstrably re-runnable
 ///   — reported, never held. This is the unknown-vs-unstarted line.
-/// - result with no intent → orphan. Our own ledger can emit these (deny
-///   receipts, pre-A3-1 completions, near-unreachable fallbacks), so they
-///   never fail the reopen; a mutating orphan is held as unknown, the rest
-///   are reported.
+/// - result with no intent → orphan. Our own ledger emits these (denial
+///   receipts excepted below, pre-A3-1 completions, ambiguous-delivery
+///   unknowns, near-unreachable fallbacks), so they never fail the
+///   reopen — but an unknown-state orphan is an explicit unknowability
+///   claim and always holds; a done-state orphan holds iff mutating.
+/// - HOLD RULE (single principle): every `.unknown`-state record —
+///   explicit, unmatched-mutating, or orphan — seeds the hold, however
+///   small its blast radius. The live system holds on every such marker
+///   (ambiguous delivery blocks the queue; stale/cancelled mutating work
+///   blocks continuation); reopen preserves that stance instead of
+///   downgrading it. Explicit reconciliation (A3-3) clears them.
+/// - callID-less, non-mutating, done results are denial receipts —
+///   informational only, never held, never orphaned tool work. Every
+///   other callID-less result takes the orphan path above.
 /// - duplicate intents, duplicate results, contradictory outcomes for one
 ///   ID, malformed states (non-`.intent` in an intent record, `.intent` in
-///   a result record), or a callID-less intent sharing an ID with tool
-///   records (namespace collision) → `.integrity`, fail closed.
+///   a result record), or admission/tool ID namespace collisions →
+///   `.integrity`, fail closed — including for callID-less records.
 ///
 /// A batch-level executor receipt NEVER completes individual calls: only a
 /// per-operation result record with the matching ID completes that call.
@@ -39,19 +48,23 @@
 public struct OperationReconciliation: Sendable, Equatable {
     /// Intent + done result, in first-seen order.
     public let completed: [OperationID]
-    /// Intent + unknown result (durable recovery evidence), first-seen.
+    /// Intent + unknown result (durable recovery evidence; all held —
+    /// `.unknown` is an explicit unknowability claim), first-seen.
     public let explicitUnknown: [OperationRef]
     /// Intent-only crashes on mutating operations (unknown + held).
     public let unmatchedMutating: [OperationRef]
     /// Intent-only crashes on side-effect-free operations (re-runnable).
     public let unmatchedNonMutating: [OperationID]
-    /// Results without intents (legacy/deny/fallback shapes), first-seen.
+    /// Results without intents (legacy/ambiguous/fallback shapes),
+    /// first-seen. Unknown-state orphans always hold; done-state orphans
+    /// hold iff mutating.
     public let orphanResults: [OperationRef]
-    /// Unknown-state mutating refs seeding `unresolvedOperations`.
+    /// Unknown-state refs seeding `unresolvedOperations`.
     public let heldOperations: [OperationRef]
     /// CallID-less intent markers (admission/provider), informational.
     public let admissionIntents: Int
-    /// CallID-less results (denial receipts), informational, never held.
+    /// CallID-less non-mutating done results (denial receipts),
+    /// informational, never held.
     public let nonToolResults: Int
 
     public init(
@@ -77,19 +90,16 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
     var results: [OperationID: (ref: OperationRef, outcome: String)] = [:]
     var resultOrder: [OperationID] = []
     var admissionIntents = 0
-    var nonToolResults: [OperationRef] = []
+    var nonToolResults = 0
     var toolIDs: Set<OperationID> = []
     var admissionIDs: Set<OperationID> = []
+    var denialIDs: Set<OperationID> = []
 
     for record in records {
         switch record {
         case .operationIntent(let ref):
-            guard ref.callID != nil else {
-                // Admission/provider marker, not a tool operation.
-                admissionIntents += 1
-                admissionIDs.insert(ref.operationID)
-                continue
-            }
+            // State validity is checked BEFORE the callID branch: a corrupt
+            // shape fails closed however it is addressed.
             guard ref.state == .intent else {
                 throw StoreError.integrity("operation intent \(ref.operationID.raw) carries non-intent state")
             }
@@ -98,14 +108,14 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             }
             intents[ref.operationID] = ref
             intentOrder.append(ref.operationID)
-            toolIDs.insert(ref.operationID)
-        case .operationResult(let ref, let outcome):
-            guard ref.callID != nil else {
-                // Denial receipt shape (callID-less, non-mutating, done):
-                // informational only, never held, never an orphaned tool op.
-                nonToolResults.append(ref)
-                continue
+            if ref.callID == nil {
+                // Admission/provider marker, not a tool operation.
+                admissionIntents += 1
+                admissionIDs.insert(ref.operationID)
+            } else {
+                toolIDs.insert(ref.operationID)
             }
+        case .operationResult(let ref, let outcome):
             guard ref.state != .intent else {
                 throw StoreError.integrity("operation result \(ref.operationID.raw) carries intent state")
             }
@@ -114,16 +124,30 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             }
             results[ref.operationID] = (ref, outcome)
             resultOrder.append(ref.operationID)
-            toolIDs.insert(ref.operationID)
+            if ref.callID == nil, ref.state == .done, !ref.mutating {
+                // Denial receipt shape: informational only, never held,
+                // never an orphaned tool operation.
+                nonToolResults += 1
+                denialIDs.insert(ref.operationID)
+            } else {
+                // Every other callID-less result (ambiguous-delivery
+                // unknowns, legacy shapes, corruption-adjacent) takes the
+                // orphan path: visible, and held when unknown or mutating.
+                toolIDs.insert(ref.operationID)
+            }
         default:
             continue
         }
     }
-    // Namespace discipline: admission (minted, callID-less) and tool
-    // (derived, callID-bearing) IDs must never collide — a collision is
-    // corruption, not a coincidence (A3-1: minted IDs never contain "/").
+    // Namespace discipline: admission markers and denial receipts (minted
+    // IDs) must never collide with tool operation IDs (derived IDs) — a
+    // collision is corruption, not a coincidence (A3-1: minted IDs never
+    // contain "/").
     if !admissionIDs.isDisjoint(with: toolIDs) {
         throw StoreError.integrity("admission/tool operation ID namespace collision")
+    }
+    if !denialIDs.isDisjoint(with: toolIDs) {
+        throw StoreError.integrity("denial/tool operation ID namespace collision")
     }
 
     var completed: [OperationID] = []
@@ -135,6 +159,8 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
 
     for id in intentOrder {
         let intent = intents[id]!
+        // Admission markers were counted above; they never pair.
+        guard intent.callID != nil else { continue }
         guard let result = results[id] else {
             if intent.mutating {
                 let unknown = OperationRef(
@@ -152,23 +178,20 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             continue
         }
         // Only `.unknown` reaches here (`.intent` in a result record is
-        // rejected above): durable recovery evidence.
+        // rejected above): durable recovery evidence. Unknown-state always
+        // holds — it is an explicit unknowability claim, not mere absence.
         explicitUnknown.append(result.ref)
-        // Conservative union: hold if EITHER side claims mutating.
-        let heldRef = OperationRef(
-            operationID: id, callID: result.ref.callID,
-            state: .unknown,
-            mutating: intent.mutating || result.ref.mutating)
-        if heldRef.mutating {
-            held.append(heldRef)
-        }
+        held.append(result.ref)
     }
-    for id in resultOrder where intents[id] == nil {
+    for id in resultOrder where intents[id] == nil && !denialIDs.contains(id) {
         let result = results[id]!
         orphanResults.append(result.ref)
         // No intent to pair with: the operation may have executed with its
-        // intent lost. Conservative unknown — hold iff mutating.
-        if result.ref.mutating {
+        // intent lost. Unknown-state orphans always hold (explicit claim);
+        // done-state orphans hold iff mutating (possible side effect).
+        if result.ref.state == .unknown {
+            held.append(result.ref)
+        } else if result.ref.mutating {
             held.append(OperationRef(
                 operationID: id, callID: result.ref.callID,
                 state: .unknown, mutating: true))
@@ -179,7 +202,7 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
         completed: completed, explicitUnknown: explicitUnknown,
         unmatchedMutating: unmatchedMutating, unmatchedNonMutating: unmatchedNonMutating,
         orphanResults: orphanResults, heldOperations: held,
-        admissionIntents: admissionIntents, nonToolResults: nonToolResults.count)
+        admissionIntents: admissionIntents, nonToolResults: nonToolResults)
 }
 
 extension SessionState {

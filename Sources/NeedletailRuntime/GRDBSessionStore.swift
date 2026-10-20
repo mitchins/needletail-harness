@@ -389,6 +389,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// the report) and runs the pure `reconcileOperations` classifier.
     /// Call on a FRESH handle after reopen; duplicates, contradictions and
     /// namespace collisions throw `.integrity` (fail closed).
+    /// An empty stream reconciles clean: a fresh session and a mistyped ID
+    /// are indistinguishable at the ledger level — session existence is
+    /// the caller's contract (a typo surfaces on the first fenced append
+    /// via `.notWriter`).
     public func reconcile(session: SessionID) throws -> OperationReconciliation {
         var stream: [DurableRecord] = []
         var cursor: UInt64 = 0
