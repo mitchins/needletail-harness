@@ -252,3 +252,29 @@ native green (54 tests), coverage `executed=156 failed=0 satisfied=20`.
 
 Scope guard: ownership takeover (A3-3), crash matrices (A4),
 CLI production-store wiring (A5) NOT started.
+
+## 17. A3-3 CLOSED — independent review APPROVED (2026-10-20)
+
+Implementing commit `e1f87ab..5e32ae2` (preflight `.done`
+callID/classification agreement + `RecoveryAuthorization` /
+`WriterRecovery` / `writerRecovered` + GRDB single-transaction guarded
+takeover + InMemory mirror + 7 two-handle recovery tests + codec tenth
+case + preflight regression). Reviewer: `deepseek-reviewer`, single
+round, APPROVED with no blocking findings — atomicity, fencing,
+fail-closed precedence, hold preservation and codec safety all verified
+first-hand against the cited lines.
+
+Delivered: scope-bound operator authorization (never a boolean;
+shape/scope validated before I/O); guarded atomic takeover (holder
+match → in-transaction ledger reconcile → quotas → conditional update
+→ audit with held evidence, full rollback otherwise); stale writers
+fail closed on append/batch/release/claim including via still-open
+handles; new writer gated pre-commit; invalid ledgers and exhausted
+session/global quotas prevent recovery; holds preserved byte-identical,
+never cleared. Gates at HEAD: quick + native green (62 tests),
+coverage `executed=164 failed=0 satisfied=20`. 5 RED counterfactuals
+verified (blind upsert, skipped audit, skipped reconcile, skipped auth
+validation, neutered `.done` agreement).
+
+Scope guard: crash matrices (A4), CLI production-store wiring (A5) NOT
+started. M2-A remaining: A4/A5, then epic review.
