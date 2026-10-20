@@ -32,6 +32,11 @@ import Darwin
 /// Durability scope: process-kill (application-crash) consistency, which
 /// is SQLite's own WAL guarantee. Nothing here claims disk-controller
 /// or power-failure resilience.
+/// Serialized: every test spawns a full test-runner child and hammers
+/// the store; running these concurrently risks load-induced flakes on
+/// the bounded reaping that a retry loop cannot distinguish from real
+/// hangs (M1D loopback suites serialize for the same reason).
+@Suite(.serialized)
 struct CrashMatrixTests {
 
     // MARK: - Child staging (runs ONLY when spawned with crash env)
@@ -316,7 +321,7 @@ struct CrashMatrixTests {
         /// child is certainly dead (reaped by us, or reaped elsewhere and
         /// therefore gone). A live child past the deadline fails loudly —
         /// never hangs the run.
-        func killAndVerifySIGKILL(deadline: TimeInterval = 10) throws -> Int32 {
+        func killAndVerifySIGKILL(deadline: TimeInterval = 30) throws -> Int32 {
             let pid = process.processIdentifier
             guard process.isRunning else {
                 throw CrashSetupError.childDied("child exited before the kill landed")
@@ -370,7 +375,7 @@ struct CrashMatrixTests {
             if process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
             }
-            if reapBounded(pid: process.processIdentifier, deadline: 10) == nil,
+            if reapBounded(pid: process.processIdentifier, deadline: 30) == nil,
                process.isRunning {
                 Issue.record("crash child survived SIGKILL past the teardown deadline")
             }

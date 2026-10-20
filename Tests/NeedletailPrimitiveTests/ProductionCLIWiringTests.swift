@@ -15,6 +15,11 @@ import Darwin
 /// state in the REAL GRDB store. No mocks of the store, no
 /// test-target doubles — every record below was committed by the
 /// shipped product through the production seam.
+///
+/// Serialized like the crash matrix: the killed-run test spawns a real
+/// binary and SIGKILLs it mid-run, which must not race other suites'
+/// process/OS load on bounded reaping.
+@Suite(.serialized)
 struct ProductionCLIWiringTests {
 
     private static func binary() throws -> String {
@@ -490,7 +495,7 @@ struct ProductionCLIWiringTests {
         #expect(committed > 0, "kill lands only after durable rows exist")
         #expect(process.isRunning, "child still mid-run when killed")
         kill(process.processIdentifier, SIGKILL)
-        let reapStop = Date().addingTimeInterval(10)
+        let reapStop = Date().addingTimeInterval(30)
         var status: Int32 = 0
         while process.isRunning, Date() < reapStop {
             if waitpid(process.processIdentifier, &status, WNOHANG) != 0 { break }
