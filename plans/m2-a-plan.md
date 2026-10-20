@@ -399,9 +399,12 @@ fail-closed on missing/corrupt/future/legacy/unknown-session; no
 overwrites, no symlinks followed, no partial output; 0600 artifacts.
 Gates at HEAD: quick + native green (112 native tests), coverage
 `executed=216 labeled=113 failed=0 satisfied=24` (STORE-08 satisfied
-as required). 9 RED counterfactuals (redaction removal, undeclared
-field, unscoped read, bounds removal, no-overwrite removal,
-unknown-session guard, version gate, raw writer IDs, bare-filename
-handling).
+as required). 11 RED counterfactuals (redaction removal, undeclared
+field, unscoped read, bounds removal, no-overwrite clobber, unknown-session
+guard, version gate, raw writer IDs, bare-filename handling, usage
+exit-code mapping, no read-back halting the run).
+Process-spawning suites run serialized with bounded 30s reaps after
+one load-induced SIGKILL-timeout flake in CI that never reproduced
+locally (same SHA green on re-run).
 
 Scope guard: M2-A epic closeout (A5-final) NOT started.
