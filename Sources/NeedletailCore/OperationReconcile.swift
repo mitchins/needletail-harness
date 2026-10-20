@@ -175,6 +175,16 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             continue
         }
         if result.ref.state == .done {
+            // A matching ID alone certifies nothing: the done result must
+            // agree with its intent on callID and operation classification
+            // (mutating). Contradictory metadata is corruption, not
+            // completion — fail closed. (`.unknown` pairs keep the
+            // conservative handling: no agreement required.)
+            guard result.ref.callID == intent.callID,
+                  result.ref.mutating == intent.mutating else {
+                throw StoreError.integrity(
+                    "done result for \(id.raw) contradicts its intent (callID/classification mismatch)")
+            }
             completed.append(id)
             continue
         }

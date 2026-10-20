@@ -103,6 +103,42 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
+    /// A3-3 scripted takeover mirror: same contract as the GRDB recovery
+    /// (guarded match → reconcile → quota → swap + audit), atomic under
+    /// the single lock. Holds are preserved, never cleared.
+    public func recoverWriterOwnership(
+        session: SessionID, expectedWriter: String, newWriter: String,
+        authorization: RecoveryAuthorization
+    ) throws {
+        try lock.withLock {
+            try authorization.validated(
+                for: session, expectedWriter: expectedWriter, newWriter: newWriter)
+            guard let current = claims[session.raw] else {
+                throw StoreError.notWriter(session: session.raw, writer: expectedWriter)
+            }
+            guard current == expectedWriter else {
+                throw StoreError.alreadyOwned(session: session.raw, writer: current)
+            }
+            let stream = log.enumerated()
+                .filter { sessions[$0.offset] == session.raw }
+                .map { $0.element.record }
+            let report = try reconcileOperations(stream)
+            guard log.count + 1 <= Self.recordCap else {
+                throw StoreError.quotaExceeded(limit: Self.recordCap)
+            }
+            claims[session.raw] = newWriter
+            sequence += 1
+            log.append(SequencedRecord(
+                sequence: SequenceNumber(sequence),
+                record: .writerRecovered(WriterRecovery(
+                    previousWriter: expectedWriter, newWriter: newWriter,
+                    operatorID: authorization.operatorID, reference: authorization.reference,
+                    reason: authorization.reason, atMillis: authorization.atMillis,
+                    unresolvedOperations: report.heldOperations))))
+            sessions.append(session.raw)
+        }
+    }
+
     /// Test inspection only: total appended records.
     public var count: Int {
         lock.withLock { log.count }

@@ -14,6 +14,13 @@ public enum DurableRecord: Sendable, Equatable, Codable {
     case checkpointCommitted(EpochDescriptor)
     /// Authoritative conversation element (M1-D transcript, ARCH §1).
     case transcriptAppended(TranscriptEntry)
+    /// A3-3 authorized ownership takeover (SPEC §9.1 recovery): the full
+    /// audit of one writer transition, committed atomically WITH the
+    /// ownership update. Reconstructible without any side channel: the
+    /// session comes from the row's session attribution, everything else
+    /// travels in `WriterRecovery` (previous/new writer, operator
+    /// authorization reference, and the held-operation evidence).
+    case writerRecovered(WriterRecovery)
 }
 
 public struct SequencedRecord: Sendable, Equatable {
@@ -59,6 +66,95 @@ public struct WriterIdentity: Sendable, Equatable, Codable {
     }
 }
 
+/// A3-3 authorized takeover proof. This is NOT a boolean and NOT an
+/// unverified caller string: it names the exact transition authorized
+/// (session + expected current writer + new writer, binding the proof so
+/// it cannot be replayed against a different takeover), WHO authorized it
+/// (operator identity — never a credential or bearer token, which are not
+/// representable here and must never be persisted), and the reviewable
+/// trail (authorization reference such as a ticket/approval ID, the human
+/// reason, and the decision time). The full value is persisted in the
+/// `writerRecovered` audit record. In-process callers cannot forge
+/// out-of-band operator identity — the guarantee is accountability (every
+/// takeover names its authorizer and reference durably), scope binding
+/// (replay against another session/writer fails closed), and fencing (a
+/// stale or forged expected-writer fails closed).
+public struct RecoveryAuthorization: Sendable, Equatable, Codable {
+    public let session: SessionID
+    public let expectedWriter: String
+    public let newWriter: String
+    public let operatorID: String
+    public let reference: String
+    public let reason: String
+    public let atMillis: UInt64
+
+    public init(
+        session: SessionID, expectedWriter: String, newWriter: String,
+        operatorID: String, reference: String, reason: String, atMillis: UInt64
+    ) {
+        self.session = session
+        self.expectedWriter = expectedWriter
+        self.newWriter = newWriter
+        self.operatorID = operatorID
+        self.reference = reference
+        self.reason = reason
+        self.atMillis = atMillis
+    }
+
+    /// Validates the proof against the requested takeover: every identity
+    /// and trail field present, a genuine transition (new != expected),
+    /// and exact scope binding (this proof authorizes THIS takeover, not
+    /// another session or writer pair).
+    public func validated(
+        for session: SessionID, expectedWriter: String, newWriter: String
+    ) throws {
+        guard !expectedWriter.isEmpty, !newWriter.isEmpty else {
+            throw StoreError.integrity("recovery requires non-empty writer identities")
+        }
+        guard newWriter != expectedWriter else {
+            throw StoreError.integrity("recovery to the same identity is not a takeover")
+        }
+        guard !operatorID.isEmpty, !reference.isEmpty, !reason.isEmpty else {
+            throw StoreError.integrity("recovery requires operator identity, authorization reference and reason")
+        }
+        guard self.session == session,
+              self.expectedWriter == expectedWriter,
+              self.newWriter == newWriter else {
+            throw StoreError.integrity("recovery authorization does not bind this session/writer transition")
+        }
+    }
+}
+
+/// A3-3 durable takeover audit (SPEC §9.1 recovery): previous and new
+/// writer IDs, the operator authorization (identity + reference + reason,
+/// never credentials), the decision time, and the unresolved-operation
+/// evidence that the takeover preserved (unknown-state refs — holds are
+/// NOT cleared by recovery). Persisted as
+/// `DurableRecord.writerRecovered`, attributed to the recovered session.
+public struct WriterRecovery: Sendable, Equatable, Codable {
+    public let previousWriter: String
+    public let newWriter: String
+    public let operatorID: String
+    public let reference: String
+    public let reason: String
+    public let atMillis: UInt64
+    public let unresolvedOperations: [OperationRef]
+
+    public init(
+        previousWriter: String, newWriter: String,
+        operatorID: String, reference: String, reason: String, atMillis: UInt64,
+        unresolvedOperations: [OperationRef]
+    ) {
+        self.previousWriter = previousWriter
+        self.newWriter = newWriter
+        self.operatorID = operatorID
+        self.reference = reference
+        self.reason = reason
+        self.atMillis = atMillis
+        self.unresolvedOperations = unresolvedOperations
+    }
+}
+
 public protocol SessionStore: Sendable {
     /// FENCED durable append: implementations validate, INSIDE the
     /// mutation's own transaction, that `identity.writer` currently owns
@@ -92,6 +188,21 @@ public protocol SessionStore: Sendable {
     /// release: a stale identity fails closed with `.notWriter` and never
     /// removes a newer writer's claim.
     func releaseWriterOwnership(session: SessionID, writer: String) throws
+    /// A3-3 EXPLICIT ownership recovery: a trusted-operator-authorized
+    /// takeover of `session` from `expectedWriter` to `newWriter`, with
+    /// the audit committed IN THE SAME transaction as the ownership
+    /// update. The expected writer must match the current holder — no
+    /// unconditional replace, no PID/timeout/absence authority, no
+    /// automatic recovery. An invalid operation ledger fails the whole
+    /// transaction (no takeover, no audit row). Recovery preserves every
+    /// unresolved-operation hold: it establishes NOTHING about external
+    /// operations, clears no markers, retries nothing. Production (GRDB)
+    /// and scripted (InMemory) stores implement this; other conformances
+    /// inherit the fail-closed default.
+    func recoverWriterOwnership(
+        session: SessionID, expectedWriter: String, newWriter: String,
+        authorization: RecoveryAuthorization
+    ) throws
 }
 
 extension SessionStore {
@@ -101,6 +212,16 @@ extension SessionStore {
         for record in records {
             try append(record, as: identity)
         }
+    }
+
+    /// Default recovery refusal: stores without a fenced atomic takeover
+    /// fail closed rather than half-recover.
+    public func recoverWriterOwnership(
+        session: SessionID, expectedWriter: String, newWriter: String,
+        authorization: RecoveryAuthorization
+    ) throws {
+        _ = session; _ = expectedWriter; _ = newWriter; _ = authorization
+        throw StoreError.integrity("writer recovery is not supported by this store")
     }
 }
 

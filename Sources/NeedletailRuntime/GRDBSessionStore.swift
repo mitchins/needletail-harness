@@ -448,6 +448,91 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         } } catch { throw Self.translate(error) }
     }
 
+    /// A3-3 EXPLICIT ownership recovery, ONE guarded SQLite transaction:
+    /// expected-holder match → session-ledger reconcile → quota check →
+    /// conditional ownership update → audit insert. Any failure rolls back
+    /// the WHOLE transaction: no takeover without its audit row, no audit
+    /// row without its takeover, and an invalid ledger prevents recovery.
+    /// Reads use raw SQL inside the transaction — never the locking public
+    /// `records` (which would re-enter the gate). No PID, timeout, absence,
+    /// or unconditional-replace authority anywhere in this path.
+    public func recoverWriterOwnership(
+        session: SessionID, expectedWriter: String, newWriter: String,
+        authorization: RecoveryAuthorization
+    ) throws {
+        gate.lock()
+        defer { gate.unlock() }
+        try assertOpenLocked()
+        // Pure authorization validation BEFORE any I/O: shape, genuine
+        // transition, and exact scope binding.
+        try authorization.validated(
+            for: session, expectedWriter: expectedWriter, newWriter: newWriter)
+        do { try queue.write { db in
+            // Guarded match: the expected writer must be the CURRENT
+            // holder. No row (never claimed) or a different holder fails
+            // closed with the identity that actually (doesn't) hold(s) it.
+            let holder = try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [session.raw])
+            guard let current = holder else {
+                throw StoreError.notWriter(session: session.raw, writer: expectedWriter)
+            }
+            guard current == expectedWriter else {
+                throw StoreError.alreadyOwned(session: session.raw, writer: current)
+            }
+            // Reconcile the session's operation evidence CONSISTENTLY with
+            // the takeover (same snapshot): an invalid ledger aborts the
+            // transaction before any write.
+            let payloads = try String.fetchAll(
+                db, sql: "SELECT payload FROM records WHERE session = ? ORDER BY seq",
+                arguments: [session.raw])
+            let stream = try payloads.map { payload in
+                guard let data = payload.data(using: .utf8) else {
+                    throw StoreError.integrity("record row payload is not UTF-8")
+                }
+                return try RecordCodec.decode(data)
+            }
+            let report = try reconcileOperations(stream)
+            // Quota for the audit row, same transaction: exhaustion fails
+            // the takeover whole (no partial recovery).
+            let global = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM records") ?? 0
+            guard global + 1 <= globalRecordLimit else {
+                throw StoreError.quotaExceeded(limit: globalRecordLimit)
+            }
+            let sessionRows = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM records WHERE session = ?",
+                arguments: [session.raw]) ?? 0
+            guard sessionRows + 1 <= sessionRecordLimit else {
+                throw StoreError.quotaExceeded(limit: sessionRecordLimit)
+            }
+            // Conditional ownership update: the WHERE clause re-asserts the
+            // guard, so the swap lands exactly once on the expected row.
+            try db.execute(
+                sql: "UPDATE writer SET writer = ? WHERE session = ? AND writer = ?",
+                arguments: [newWriter, session.raw, expectedWriter])
+            guard db.changesCount == 1 else {
+                throw StoreError.integrity("takeover update affected no row; ownership unchanged")
+            }
+            // Durable audit WITH the update: session, both writers,
+            // operator authorization, and the preserved unresolved
+            // evidence. Holds are NOT cleared — recovery establishes
+            // nothing about external operations.
+            let audit = DurableRecord.writerRecovered(WriterRecovery(
+                previousWriter: expectedWriter, newWriter: newWriter,
+                operatorID: authorization.operatorID, reference: authorization.reference,
+                reason: authorization.reason, atMillis: authorization.atMillis,
+                unresolvedOperations: report.heldOperations))
+            let encoded = try RecordCodec.encode(audit)
+            let last = try Int64.fetchOne(
+                db, sql: "SELECT MAX(seq) FROM records") ?? 0
+            try db.execute(
+                sql: "INSERT INTO records (seq, session, payload) VALUES (?, ?, ?)",
+                arguments: [last + 1, session.raw,
+                            String(decoding: encoded, as: UTF8.self)])
+        } } catch { throw Self.translate(error) }
+    }
+
     /// A1 test/receipt support: an explicit close hands the file to a
     /// FRESH handle deterministically. Under the gate, concurrent
     /// operations either finish before close or fail typed

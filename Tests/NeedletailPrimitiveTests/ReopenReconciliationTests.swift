@@ -246,6 +246,37 @@ struct ReopenReconciliationTests {
         #expect(reportC.heldOperations.map(\.operationID) == [OperationID("e1/c1")])
     }
 
+    @Test("A3-3 .done pairs must agree on callID and classification")
+    func donePairsMustAgreeOnCallIDAndClassification() throws {
+        // Matching ID but different callID → corrupt, not completed.
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                Self.toolIntent("e1/c1", call: "c1", mutating: true),
+                Self.toolResult("e1/c1", call: "cX", mutating: true, state: .done, outcome: "ok"),
+            ])
+        }
+        // Matching ID and callID but different classification → corrupt.
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                Self.toolIntent("e1/c1", call: "c1", mutating: true),
+                Self.toolResult("e1/c1", call: "c1", mutating: false, state: .done, outcome: "ok"),
+            ])
+        }
+        // Agreement certifies completion.
+        let clean = try reconcileOperations([
+            Self.toolIntent("e1/c1", call: "c1", mutating: true),
+            Self.toolResult("e1/c1", call: "c1", mutating: true, state: .done, outcome: "ok"),
+        ])
+        #expect(clean.completed == [OperationID("e1/c1")])
+        // `.unknown` pairs keep the conservative handling: inconsistent
+        // flags are held, never rejected (already qualified in A3-2).
+        let conservative = try reconcileOperations([
+            Self.toolIntent("e1/c1", call: "c1", mutating: true),
+            Self.toolResult("e1/c1", call: "c1", mutating: false, state: .unknown, outcome: "unknown"),
+        ])
+        #expect(conservative.heldOperations.map(\.operationID) == [OperationID("e1/c1")])
+    }
+
     @Test("A3-2 duplicate and contradictory ledgers fail closed")
     func malformedLedgersFailClosed() throws {
         let (directory, path) = try Self.freshPath()
