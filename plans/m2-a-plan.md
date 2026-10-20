@@ -373,3 +373,35 @@ exit-6 with no crash.
 
 Scope guard: STORE-08 support export (A5-2) and M2-A epic closeout
 (A5-final) NOT started.
+
+## 20. A5-2 CLOSED — independent review APPROVED (2026-10-20)
+
+Implementing commits `e3ef777..ef36ca1` (allowlisted JSONL export,
+read-only GRDB handle with schema-gate, bounded atomic private
+writes, `needletail session export` narrow CLI, STORE-08 binary +
+unit evidence, requiredEvidence + maps pin), folds `e0d4058` (verify
+fail-closed modes, umask-first, complete guard, binary resolution,
+evidence gaps) and `1324909`/`d0c6213` (CLI hardening tests, review
+nits). Reviewer: `deepseek-reviewer`, two rounds. Round 1
+NEEDS_CHANGES (8 findings: silent chmod, umask/trace privacy,
+incomplete reconcile guard, binary resolution, writer tokens as
+credentials, link errno mapping, tmp cleanup, test evidence); all
+folded with per-finding verification. Round 2 APPROVED with two
+non-blocking nits, both fixed in-tree (checkpoint fixture coverage,
+explicit handle close on write failure).
+
+Delivered: read-only, session-scoped `needletail session export`
+with redacted-by-default / content-on-request modes; credentials,
+raw payloads, epoch snapshots and recovery free text never enter
+either mode (writer identities travel as truncated hashes); unknown
+outcomes stay unknown with held/unstarted/orphan ID inventories;
+fail-closed on missing/corrupt/future/legacy/unknown-session; no
+overwrites, no symlinks followed, no partial output; 0600 artifacts.
+Gates at HEAD: quick + native green (112 native tests), coverage
+`executed=216 labeled=113 failed=0 satisfied=24` (STORE-08 satisfied
+as required). 9 RED counterfactuals (redaction removal, undeclared
+field, unscoped read, bounds removal, no-overwrite removal,
+unknown-session guard, version gate, raw writer IDs, bare-filename
+handling).
+
+Scope guard: M2-A epic closeout (A5-final) NOT started.
