@@ -351,6 +351,46 @@ struct SessionExportTests {
         #expect(!lines.joined().contains("ADVERSARIAL-SECRET"), "redaction still holds at scale")
     }
 
+    @Test("A5-2 export verifies trailers larger than any fixed tail window")
+    func exportVerifiesLargeTrailer() throws {
+        // Regression pin for the bounded-verification fold: the trailer
+        // is ONE JSON line whose size grows with the operation-ID
+        // inventories, so a fixed tail window (however generous) can
+        // reject a legitimate within-budget export. The verifier must
+        // scan back from EOF with no cap. Deterministic: fixed loop,
+        // long IDs inflate the trailer past 1 MiB with few records.
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dbPath = directory.appendingPathComponent("store.sqlite").path
+        let store = try GRDBSessionStore(path: dbPath)
+        defer { try? store.close() }
+        let session = SessionID("s-big-trailer")
+        try store.claimWriterOwnership(session: session, writer: "w-big")
+        var records: [DurableRecord] = [.sessionOpened(session: session, atMillis: 1)]
+        // 4500 completed operations (9001 rows: under the 10k session
+        // quota) with long IDs push the single-line trailer past 1 MiB.
+        let pad = String(repeating: "T", count: 240)
+        for i in 0..<4500 {
+            let id = "op-\(i)-\(pad)"
+            records.append(Self.toolIntent(id, call: "c\(i)", mutating: false))
+            records.append(Self.toolResult(id, call: "c\(i)", mutating: false, state: .done, outcome: "ok"))
+        }
+        try store.appendBatch(records, as: WriterIdentity(session: session, writer: "w-big"))
+        let lines = try SessionExport.lines(
+            dbPath: dbPath, session: session, includeContent: false,
+            exportedAt: 1, limits: .default)
+        let target = directory.appendingPathComponent("big.jsonl").path
+        try SessionExport.writeLines(lines, toFileAtPath: target)
+        let size = try FileManager.default.attributesOfItem(atPath: target)[.size] as? Int ?? 0
+        #expect(size > 1 << 20, "export file must exceed the old fixed window, got \(size) bytes")
+        #expect(lines.last?.utf8.count ?? 0 > 1 << 20,
+                "the TRAILER itself must exceed the old fixed window")
+        let decoded = try Self.decodeLines(lines)
+        let trailer = try #require(decoded.last)
+        #expect(trailer["complete"] as? Bool == true)
+        #expect(trailer["recordCount"] as? Int == records.count)
+    }
+
     @Test("A5-2 export bounds fail closed without partial output")
     func exportBoundsFailClosed() throws {
         let directory = try Self.freshDirectory()

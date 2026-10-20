@@ -276,9 +276,11 @@ struct RecordCodecTests {
             _ = try RecordCodec.decode(tampered)
             Issue.record("an out-of-range profile row must fail the decode, not decode silently")
         } catch let error as StoreError {
-            guard case .integrity = error else {
+            guard case .integrity(let message) = error else {
                 Issue.record("expected .integrity, got \(error)"); return
             }
+            #expect(message.contains("context_window"),
+                    "failure must come from the validating init, got: \(message)")
         } catch {
             Issue.record("expected StoreError.integrity, got \(error)"); return
         }

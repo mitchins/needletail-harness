@@ -1,10 +1,10 @@
 # STATUS — Needletail v0.3
 
-Updated: 12 October 2026 (session 1). Normative sources: COMPLETE-SPEC.md (all parts), DEPENDENCIES.md. This file is the project's single status tracker; the harness does not create a competing one.
+Updated: 21 October 2026 (M2-A preflight). Normative sources: COMPLETE-SPEC.md (all parts), DEPENDENCIES.md. This file is the project's single status tracker; the harness does not create a competing one.
 
 ## Current position
 
-- **Milestone:** M0 MERGED (`ffbc677`, PR #1, CodeRabbit APPROVED, 30/30 resolved, CI green; ledger reconciled to `main`). M1-A **IMPLEMENTED + REVIEWED READY TO CLOSE** 14 Oct 2026 — plan rev6 (`eb322bee…`, 397 lines), implementation commits `f7f2628`/`130176e`/`a76022c` (local-only, no push), independent DeepSeek final disposition **READY TO CLOSE** bound to `a76022c` on baseline `e3c0527`. 9 cases full + NET-06 offline-half PARTIAL; 35 M1 cases deferred to M1-B/C/D; M1-B handoff types (`ConfigSnapshot`, `ProfileSnapshot`, `EffectiveCapabilities`, `requiresNewEpoch`) defined, transition not started.
+- **Milestone:** M0 MERGED (`ffbc677`, PR #1, CodeRabbit APPROVED, 30/30 resolved, CI green; ledger reconciled to `main`). M1 MERGED 17 Oct 2026 (`38f00de`, PR #2: deterministic config, state, streaming, headless run, demos). M2-0 MERGED (`0cd5d7d`, PR #4: test assurance and replay qualification). M2-A implementation slices A0–A5-2 independently APPROVED on branch `m2-a-store` (PR #5 open, unmerged); EPIC-REVIEW READY pending this preflight (plan `plans/m2-a-plan.md` REV3 + §§14–21 closures; receipt `plans/m2-a-epic-receipt.md`). Historical M1-A detail preserved below (was: IMPLEMENTED + REVIEWED READY TO CLOSE 14 Oct 2026 — plan rev6 (`eb322bee…`, 397 lines), implementation commits `f7f2628`/`130176e`/`a76022c`, DeepSeek final disposition READY TO CLOSE bound to `a76022c`; 9 cases full + NET-06 offline-half PARTIAL; 35 M1 cases deferred to M1-B/C/D).
 
 ## Remote gates (13 October 2026)
 

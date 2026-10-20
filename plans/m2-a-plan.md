@@ -374,7 +374,7 @@ exit-6 with no crash.
 Scope guard: STORE-08 support export (A5-2) and M2-A epic closeout
 (A5-final) NOT started.
 
-## 20. A5-2 CLOSED — independent review APPROVED (2026-10-20)
+## 21. A5-2 CLOSED — independent review APPROVED (2026-10-20)
 
 Implementing commits `e3ef777..ef36ca1` (allowlisted JSONL export,
 read-only GRDB handle with schema-gate, bounded atomic private
