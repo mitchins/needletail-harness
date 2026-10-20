@@ -109,7 +109,6 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
                     session TEXT NOT NULL,
                     payload TEXT NOT NULL)
                 """)
-            try db.execute(sql: "DROP TABLE IF EXISTS writer")
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS writer(
                     session TEXT PRIMARY KEY,

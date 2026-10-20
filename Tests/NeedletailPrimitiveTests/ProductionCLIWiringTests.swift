@@ -314,7 +314,7 @@ struct ProductionCLIWiringTests {
                 "no WAL sidecar for a store that never opened")
         // No completion is reported on the failed start.
         if let envelopes = try? Self.jsonLines(result.stdout), !envelopes.isEmpty {
-            #expect(!envelopes.contains { ($0["outcome"] as? String) == "completed" },
+            #expect(!envelopes.contains { (($0["payload"] as? [String: Any])?["outcome"] as? String) == "completed" },
                     "no completion claimed when durable start failed")
         }
     }
@@ -555,6 +555,24 @@ struct ProductionCLIWiringTests {
         #expect(FileManager.default.fileExists(
             atPath: xdgHome.appendingPathComponent("needletail/store.sqlite").path),
                 "store lands under $XDG_DATA_HOME/needletail")
+
+        // A RELATIVE XDG_DATA_HOME is invalid per the XDG spec and is
+        // ignored: the store lands under HOME, not under a CWD-relative
+        // directory (which would scatter one store per working
+        // directory). Deterministic: fixed relative value, fixed HOME.
+        var relEnv = Self.environmentWithout(keys: ["NEEDLETAIL_STATE_DIR"])
+        let homeDir = directory.appendingPathComponent("home-fallback")
+        try FileManager.default.createDirectory(at: homeDir, withIntermediateDirectories: true)
+        relEnv["XDG_DATA_HOME"] = "relative-xdg"
+        relEnv["HOME"] = homeDir.path
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("rel").utf8))]))
+        let relRun = try Self.run(args, env: relEnv)
+        #expect(relRun.exit == 0, "relative XDG falls through to HOME: \(relRun.stderr.prefix(200))")
+        #expect(FileManager.default.fileExists(
+            atPath: homeDir.appendingPathComponent(".local/share/needletail/store.sqlite").path),
+                "store lands under HOME when XDG is relative")
+        #expect(!FileManager.default.fileExists(atPath: "relative-xdg"),
+                "no CWD-relative store directory is created")
 
         // No HOME, no XDG, no override: fail closed, never scatter state.
         let noHomeEnv = Self.environmentWithout(

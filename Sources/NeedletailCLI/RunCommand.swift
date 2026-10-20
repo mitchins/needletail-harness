@@ -181,15 +181,18 @@ struct RunCommand: ParsableCommand {
 
     /// A5-1 production state location. Explicit, private, XDG-compatible:
     /// `$NEEDLETAIL_STATE_DIR` wins (isolated test dirs and explicit
-    /// operator placement), else `$XDG_DATA_HOME/needletail`, else
-    /// `~/.local/share/needletail`. No silent fallback — without a home
-    /// the run refuses to start rather than scattering state.
+    /// operator placement), else absolute `$XDG_DATA_HOME/needletail`,
+    /// else `~/.local/share/needletail`. A relative XDG value is invalid
+    /// per the XDG Base Directory specification and is ignored (falls
+    /// through to HOME) rather than scattering a store per working
+    /// directory. No silent fallback — without a home the run refuses
+    /// to start rather than scattering state.
     static func resolveStateDirectory() throws -> String {
         let environment = ProcessInfo.processInfo.environment
         if let override = environment["NEEDLETAIL_STATE_DIR"], !override.isEmpty {
             return override
         }
-        if let xdg = environment["XDG_DATA_HOME"], !xdg.isEmpty {
+        if let xdg = environment["XDG_DATA_HOME"], xdg.hasPrefix("/") {
             return xdg + "/needletail"
         }
         if let home = environment["HOME"], !home.isEmpty {
@@ -620,7 +623,13 @@ struct RunCommand: ParsableCommand {
         }
         // Shutdown HTTP client before handling output (actor no longer needs it)
         try? await httpClient.shutdown().get()
-        if done.queueHeld && !done.unresolvedOperations.isEmpty {
+        if done.queueHeld && !done.unresolvedOperations.isEmpty && !done.phase.isTerminal {
+            // Non-terminal hold with unknown outcomes: ambiguous delivery
+            // needs explicit reconciliation (exit 4, provider-shaped).
+            // A TERMINAL phase (failed, interrupted, completed) falls
+            // through to the phase switch below (integrity → 6): a failed
+            // persistence commit must never masquerade as a provider
+            // outcome (SPEC §12.2).
             let marker = done.unresolvedOperations.compactMap { $0.callID }.joined(separator: ",")
             let reason = terminalSafe("ambiguous delivery; reconcile unresolved operation(s): \(marker)")
             if isJSONL {

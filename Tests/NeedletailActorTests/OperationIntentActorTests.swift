@@ -224,4 +224,77 @@ struct OperationIntentActorTests {
             Issue.record("expected failed phase")
         }
     }
+
+    @Test("A3-1 unpersisted results become unknown markers that block fresh runs")
+    func unpersistedResultsBecomeUnknownMarkers() async throws {
+        let approvals = ScriptedApprovals()
+        approvals.script = [.approve]
+        let (actor, transport, store, executor) = try Self.makeGatedActor(approvals: approvals)
+        // Fail ONLY the completion commit (groups carrying done results).
+        store.failWhen = { records in
+            records.contains {
+                if case .operationResult(let ref, _) = $0 { return ref.state == .done }
+                return false
+            }
+        }
+        transport.script = [ProviderResponse(
+            requestID: RequestID("scripted"), generation: Revision(0),
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
+            ], isFinal: false))]
+        await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
+        try await Self.awaitGatedPhase(actor, {
+            if case .failed = $0.phase { return true }; return false
+        }, "result commit failure fails the run")
+        // The unpersisted done result is a possible side effect with no
+        // durable outcome: it must survive as an unknown marker carrying
+        // the result's identity, and the queue must hold.
+        let state = await actor.currentState()
+        let unknowns = state.unresolvedOperations.filter { $0.state == .unknown }
+        #expect(!unknowns.isEmpty, "unpersisted results become unknown markers")
+        #expect(unknowns.allSatisfy { $0.callID == "c1" && $0.mutating },
+                "markers preserve the result identity (callID, mutating), got \(unknowns)")
+        #expect(state.queueHeld, "queue held after unpersisted results")
+        // A fresh operator input must NOT dispatch: the failed-phase
+        // reset to idle still leaves the markers, so admission holds
+        // instead of starting a new provider request.
+        let invocations = transport.invocations.count
+        await actor.submitText(commandID: CommandID("a-2"), text: "again", kind: .followUp, sealed: false)
+        for _ in 0..<20_000 where transport.invocations.count == invocations { await Task.yield() }
+        #expect(transport.invocations.count == invocations,
+                "held queue admits no new provider request after unpersisted results")
+        #expect(executor.calls.count == 1, "no second dispatch after unpersisted results")
+    }
+
+    @Test("A3-1 unpersisted non-mutating results take no markers and hold nothing")
+    func unpersistedNonMutatingResultsTakeNoMarkers() async throws {
+        let approvals = ScriptedApprovals()
+        approvals.script = [.approve]
+        let (actor, transport, store, _) = try Self.makeGatedActor(approvals: approvals)
+        // Fail ONLY the completion commit (groups carrying done results).
+        store.failWhen = { records in
+            records.contains {
+                if case .operationResult(let ref, _) = $0 { return ref.state == .done }
+                return false
+            }
+        }
+        // Read-only batch: the done result is non-mutating (no possible
+        // side effect), so the failed commit must fail plainly — markers
+        // and holds are for unknown side effects, not lost readouts.
+        transport.script = [ProviderResponse(
+            requestID: RequestID("scripted"), generation: Revision(0),
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c9", tool: "read", argumentsDigest: "d"),
+            ], isFinal: false))]
+        await actor.submitText(commandID: CommandID("a-1"), text: "read run", kind: .followUp, sealed: false)
+        try await Self.awaitGatedPhase(actor, {
+            if case .failed = $0.phase { return true }; return false
+        }, "result commit failure fails the run")
+        let state = await actor.currentState()
+        #expect(state.unresolvedOperations.isEmpty, "non-mutating results take no unknown markers")
+        #expect(!state.queueHeld, "no markers means no hold — the run fails plainly")
+        if case .failed = state.phase { } else {
+            Issue.record("expected failed phase")
+        }
+    }
 }

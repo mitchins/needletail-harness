@@ -304,7 +304,7 @@ struct SessionExportTests {
         }
         #expect(!hasKey("credential") && !hasKey("credentials"), "no credential fields")
         #expect(!hasKey("rawBody") && !hasKey("rawPayload"), "no raw provider payload fields")
-        #expect(!hasKey("text") == false, "content mode carries text fields")
+        #expect(hasKey("text"), "content mode carries text fields")
     }
 
     // MARK: - Bounds, atomicity, read-only

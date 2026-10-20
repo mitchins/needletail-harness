@@ -1,9 +1,11 @@
-# M2-A Epic Receipt — EPIC-REVIEW READY
+# M2-A Epic Receipt — EPIC-REVIEW READY (final round)
 
-Candidate head: `m2-a-store` @ `04f554a` + preflight (content-freeze SHA
-recorded at push; CI-qualification entry appended post-push as §8).
-PR #5 open, unmerged. No merge performed. Next session owns the
-aggregate CodeRabbit review + merge-readiness disposition.
+Authoritative candidate head: the `m2-a-store` tip containing this
+receipt (see §8 for its SHA + exact-SHA CI). Historical lineage (all
+superseded, preserved for audit): `04f554a` (bounds fix) →
+`6e848f4` (preflight) → `d7d8749` (CI-qualification record).
+PR #5 open, unmerged. No merge performed. Operator merge decision
+requested; do NOT squash-merge.
 
 ## 1. What M2-A claims (and does not)
 
@@ -18,18 +20,19 @@ aggregate CodeRabbit review + merge-readiness disposition.
   STATE-02/05, POLICY-01/06/07, PORT-03, BDD-05, PKG-05) belong to
   M2-B/C/D and are `missing` by design (171 missing, expected).
 
-## 2. Local gates at the candidate head (all green)
+## 2. Local gates at the candidate head (all green; re-run after the
+final-round corrections)
 
 - `./dev test quick`: 28 tests, 4 suites, pass.
-- `./dev test native`: 113 tests, 17 suites, pass.
+- `./dev test native`: 114 tests, 17 suites, pass.
 - `./dev coverage`: COVERAGE OK —
-  `executed=217 labeled=113 unlabeled=104 skipped=1 failed=0
+  `executed=218 labeled=113 unlabeled=105 skipped=1 failed=0
   satisfied=24 unsatisfied=5 missing=171`.
   - All 11 required cases satisfied (gate asserts every required
-    variant executed in its pinned module): STATE-01 (5 pass),
-    STORE-01 (3), STORE-02 (9), STORE-03 (1), STORE-04 (1),
-    STORE-05 (7), STORE-06 (3), STORE-07 (3), STORE-08 (2),
-    STORE-09 (3), PORT-04 (1). Zero failures anywhere.
+  variant executed in its pinned module): STATE-01 (5 pass),
+  STORE-01 (3), STORE-02 (9), STORE-03 (1), STORE-04 (1),
+  STORE-05 (7), STORE-06 (3), STORE-07 (3), STORE-08 (2),
+  STORE-09 (3), PORT-04 (1). Zero failures anywhere.
   - satisfied=24 preserved (23 pre-STORE-08 + STORE-08).
   - The 5 unsatisfied are non-required cases with partial evidence
     outside M2-A scope; none is M2-A-closeout.
@@ -114,25 +117,53 @@ aggregate CodeRabbit review + merge-readiness disposition.
 - Preflight test-only change (RecordCodecTests message assertion):
   no production impact; covered by local gates (no delta review
   required per mission §6).
+- Final-round production delta (SessionActor unknown markers +
+  RunCommand XDG/exit mapping): NEEDS_CHANGES (1 Medium exit-code
+  mapping, 2 Lows) → folded (terminal-phase exit gate, mutating
+  filter + conditional hold, failRun-style clears) → APPROVED,
+  with 1 accepted comment nit fixed (terminal vs failed wording).
 
 ## 8. CI qualification (verified post-push on the exact head)
 
-- Candidate head `6e848f4` pushed to `origin:m2-a-store`; `gh pr checks 5`
-  verified green on that SHA:
-  - `offline build and tests (Linux x86_64)`: PASS 12m59s
-    (run 39496187719, job 118881719026).
-  - `release bundle smoke (clean host)`: PASS 6m26s
-    (run 39496187719, job 118881718603).
-  - GitGuardian Security Checks: pass. CodeRabbit: pass (paused —
-    final aggregate round explicitly not invoked; next session owns it).
-- SonarQube Cloud quality gate: FAIL (run 39496187640,
-  job 118881718311; SonarCloud analysis fail) — reported separately,
-  never counted toward green. Known pre-existing coverage-import
-  gate defect on `main` + PRs (tracked separately, not an M2-A
+- Candidate head pushed to `origin:m2-a-store`; `gh pr checks 5`
+  verified green on that SHA (offline build+tests, release bundle
+  smoke, GitHub/GitGuardian checks; CodeRabbit check reflects the
+  completed aggregate review, not a pause).
+  [Run IDs + durations recorded in the push-qualification record;
+  Sonar below is reported separately.]
+- SonarQube Cloud quality gate: FAIL — reported separately, never
+  counted toward green. Known pre-existing coverage-import gate
+  defect on `main` + PRs (tracked separately, not an M2-A
   blocker). The PR as a whole is therefore NOT called green while
   this gate fails; the code gates above are green on the exact SHA.
 
-## 9. Unresolved risks / non-blockers
+## 9. Final aggregate CodeRabbit round (this session)
+
+- Invoked via PR comment (`@coderabbitai full review`); bot
+  acknowledged ("Full review triggered") and completed with verdict
+  CHANGES_REQUESTED + 9 findings (all Minor/Trivial except one
+  Major: unpersisted-result markers).
+- Triage against current source: 8 FIXED in tree (T0 receipt-SHA
+  reconciliation — this section; T1 relative-XDG rejection;
+  T2 unknown-result markers + exit-6 preservation + mutating-only
+  filter + volatile-state clears; T3 nested outcome assertion;
+  T5 sync contention test; T6 double negation; T7 #require cursor;
+  T8 probe DROP removal), 1 REJECTED with justification (T4
+  harness dedup — intentional divergence, zero behavioral gain,
+  deferred as post-merge hygiene).
+- Production-contract changes (SessionActor markers/hold,
+  RunCommand XDG + exit mapping) independently delta-reviewed:
+  NEEDS_CHANGES → folded (exit-6 gate, mutating filter,
+  failRun-style clears) → APPROVED.
+- RED/GREEN: mutating markers fail without the actor fix and pass
+  with it; non-mutating exclusion fails under mark-all and passes
+  with the filter; XDG/CLI suites green.
+- All 23 threads (14 historical + 9 new) replied with dispositions
+  and resolved (0 unresolved) BEFORE this commit; resolution
+  preserved the reasoned label rejection. Any re-raised future
+  bot comments are a new round, not this one.
+
+## 10. Unresolved risks / non-blockers
 
 - Sonar red (pre-existing, tracked separately).
 - One CI-only flake observed historically (single A3-2 test,
@@ -141,10 +172,12 @@ aggregate CodeRabbit review + merge-readiness disposition.
   serialized with bounded reaps as hardening.
 - Power-loss path unqualified by design (§4).
 - Four historical CodeRabbit threads dispositioned against current
-  source (see §10); 10 others already resolved. The final aggregate
-  CodeRabbit round is explicitly NOT invoked here (next session).
+  source (see §11); 10 others already resolved. The final aggregate
+  CodeRabbit round ran this session (§9): verdict CHANGES_REQUESTED
+  with 9 findings, all triaged (8 FIXED in tree, 1 principled
+  REJECT with justification); all 23 threads replied + resolved.
 
-## 10. Historical CodeRabbit thread disposition (4 remaining)
+## 11. Historical CodeRabbit thread disposition (4 remaining)
 
 1. RecordCodecTests display names lack catalogue IDs (Minor,
    maintainability) — REJECTED. `.coderabbit.yaml` TESTING §2
@@ -174,16 +207,26 @@ aggregate CodeRabbit review + merge-readiness disposition.
    §2 (lines 48–50) scope the exemption to non-certifying
    support/oracle tests with reconciliation treatment specified.
 
-## 11. Files changed in the preflight (vs 67a02d0)
+## 12. Files changed (vs d7d8749; final round)
 
-- `Sources/NeedletailRuntime/SessionExport.swift`: shared
-  materialized-bytes budget, per-page pre-decode charge, 500→200
-  pages, backward-scan trailer verification (DeepSeek-APPROVED).
+- `Sources/NeedletailCore/SessionActor.swift`: unpersisted MUTATING
+  results become bounded unknown markers + queue hold (plain failed
+  otherwise); volatile run fields cleared like failRun
+  (DeepSeek-APPROVED after NEEDS_CHANGES fold).
+- `Sources/NeedletailCLI/RunCommand.swift`: relative XDG ignored
+  (fail-through to HOME); terminal failed phases bypass the exit-4
+  ambiguous branch (SPEC §12.2, exit 6 preserved).
+- `Tests/NeedletailActorTests/OperationIntentActorTests.swift`: two
+  RED/GREEN pins (mutating markers + hold block fresh runs;
+  non-mutating take no markers, hold nothing).
+- `Tests/NeedletailPrimitiveTests/ProductionCLIWiringTests.swift`:
+  nested outcome assertion + relative-XDG regression test.
+- `Tests/NeedletailPrimitiveTests/ProductionStoreTests.swift`: sync
+  contention test on a dedicated Thread (no pool blocking).
 - `Tests/NeedletailPrimitiveTests/SessionExportTests.swift`:
-  large-trailer regression test (+1 MiB trailer assertion).
-- `Tests/NeedletailPrimitiveTests/RecordCodecTests.swift`:
-  `context_window` message assertion (test-only).
-- `plans/m2-a-plan.md`: duplicate `## 20` → `## 21` (A5-2).
-- `STATUS.md`: M1/M2-0 merged history + M2-A readiness (history
-  preserved, nothing rewritten).
-- This receipt.
+  double-negation cleanup.
+- `Tests/NeedletailPrimitiveTests/SessionIsolationTests.swift`:
+  cursor `#require` (no trap).
+- `Tests/NeedletailPrimitiveTests/SQLiteStoreContractTests.swift`:
+  DROP-writer removed (CREATE-only).
+- This receipt (§§1–2, 8–9, 11–12).

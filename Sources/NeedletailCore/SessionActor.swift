@@ -197,7 +197,44 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             let reason = leftResultUnpersisted
                 ? "store append failed; result unpersisted, outcome unresolved"
                 : "store append failed; intent unpersisted"
-            state = prior.replacing(phase: .failed(.integrityStopped(reason)))
+            if leftResultUnpersisted {
+                // Unpersisted MUTATING results are possible side effects
+                // with no durable outcome: each becomes an unknown marker
+                // (bounded like every other marker site) and the queue
+                // holds, so a later fresh admission cannot silently proceed
+                // past them (admitFreshRun blocks on unresolvedOperations,
+                // and the terminal-phase reset to idle does not clear
+                // markers). Non-mutating results (read-only outcomes,
+                // callID-less denial receipts) carry no side effect: the
+                // durable classifier treats them as re-runnable, so they
+                // take no markers — and with no markers the run fails
+                // plainly instead of holding an empty queue. An
+                // intent-only group means nothing executed: failed phase
+                // alone, no markers. Volatile run fields are cleared like
+                // failRun: nothing resumes behind the held queue.
+                var markers = prior.unresolvedOperations
+                for record in result.records {
+                    guard case .operationResult(let ref, _) = record, ref.mutating else { continue }
+                    guard markers.count < maxUnresolvedOperations else { break }
+                    markers.append(OperationRef(
+                        operationID: ref.operationID, callID: ref.callID,
+                        state: .unknown, mutating: ref.mutating))
+                }
+                if markers.count > prior.unresolvedOperations.count {
+                    state = prior.replacing(
+                        phase: .failed(.integrityStopped(reason)),
+                        activeRun: .some(nil), activeRequest: .some(nil),
+                        queueHeld: true, heldReason: .error(reason),
+                        pendingApproval: .some(nil), pendingBatch: .some(nil),
+                        retryDeadlineMillis: .some(nil),
+                        liveReservations: [],
+                        unresolvedOperations: markers)
+                } else {
+                    state = prior.replacing(phase: .failed(.integrityStopped(reason)))
+                }
+            } else {
+                state = prior.replacing(phase: .failed(.integrityStopped(reason)))
+            }
             return
         }
         for effect in result.effects {

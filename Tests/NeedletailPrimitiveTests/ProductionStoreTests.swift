@@ -364,7 +364,7 @@ struct ProductionStoreTests {
     }
 
     @Test("A2 sqlite bounded contention yields typed .contention, not raw BUSY")
-    func A2_sqliteContentionIsTyped() async throws {
+    func A2_sqliteContentionIsTyped() throws {
         let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try GRDBSessionStore(
@@ -372,9 +372,15 @@ struct ProductionStoreTests {
         // Hold the exclusive write transaction from the raw handle; the
         // store's fenced append must contend past its busy timeout (5 s),
         // then fail with typed .contention — not raw SQLITE_BUSY.
+        // The lock holder runs on a DEDICATED thread (not Task.detached):
+        // this test otherwise blocks cooperative-pool threads for ~7 s
+        // (gate + sleep + synchronous busy-timeout append), which can
+        // starve parallel suites on small CI runners.
         let raw = try DatabaseQueue(path: store.path)
         let gate = DispatchSemaphore(value: 0)
-        let holder = Task.detached {
+        let done = DispatchSemaphore(value: 0)
+        let holder = Thread {
+            defer { done.signal() }
             do {
                 try raw.writeWithoutTransaction { db in
                     try db.execute(sql: "BEGIN IMMEDIATE")
@@ -388,6 +394,7 @@ struct ProductionStoreTests {
                 gate.signal()
             }
         }
+        holder.start()
         gate.wait()
         let start = Date()
         do {
@@ -402,7 +409,7 @@ struct ProductionStoreTests {
         }
         let elapsed = Date().timeIntervalSince(start)
         #expect(elapsed >= 4.0, "contention must exercise the bounded timeout, took \(elapsed)s")
-        await holder.value
+        done.wait()
         // After the external transaction ends, the store works normally.
         try store.claimWriterOwnership(session: Self.identity.session, writer: Self.identity.writer)
         try store.append(.transcriptAppended(.user("after-contention")), as: Self.identity)

@@ -64,9 +64,9 @@ struct SessionIsolationTests {
         let (page1, cursor1) = try store.records(
             session: identityB.session, since: 0, limit: 1)
         #expect(page1.count == 1)
-        #expect(cursor1 != nil, "two rows at limit 1 must leave a cursor")
+        let next = try #require(cursor1, "two rows at limit 1 must leave a cursor")
         let (page2, cursor2) = try store.records(
-            session: identityB.session, since: cursor1!, limit: 100)
+            session: identityB.session, since: next, limit: 100)
         #expect(page2.map(\.record) == [DurableRecord.transcriptAppended(.user("BBB-FORBIDDEN-2"))])
         #expect(cursor2 == nil, "session B's second page ends its own log")
     }
