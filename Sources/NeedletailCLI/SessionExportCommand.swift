@@ -29,15 +29,26 @@ struct SessionExportCommand: ParsableCommand {
         abstract: "Export one session's durable records as versioned JSONL (read-only).")
 
     @Argument(help: "Session ID to export (as shown by the run's session records).")
-    var sessionID: String
+    var sessionID: String?
 
     @Option(name: .long, help: "Output JSONL file path. Created new with private (0600) permissions; never overwritten.")
-    var output: String
+    var output: String?
 
     @Flag(name: .long, help: "Include redacted content fields verbatim (transcript/tool text, receipts). The export is marked content-bearing; it makes no claim that user text is secret-free.")
     var includeContent: Bool = false
 
     mutating func run() throws {
+        // Usage errors are explicit exit 2 (SPEC §9.1 §12.2), never the
+        // parser default: downstream callers distinguish invalid
+        // invocation from operational failures.
+        guard let sessionID, !sessionID.isEmpty else {
+            eprint("usage: needletail session export SESSION-ID --output FILE [--include-content]")
+            throw ExitCode(2)
+        }
+        guard let output, !output.isEmpty else {
+            eprint("usage: needletail session export SESSION-ID --output FILE [--include-content]")
+            throw ExitCode(2)
+        }
         let stateDir: String
         do {
             stateDir = try RunCommand.resolveStateDirectory()

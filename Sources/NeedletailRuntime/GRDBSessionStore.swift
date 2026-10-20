@@ -216,8 +216,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// Declared shape check: exact column set, declared type (SQLite type
     /// affinity is case-insensitive) and primary-key membership must all
     /// match — a `records.seq TEXT PRIMARY KEY` impostor fails here
-    /// instead of corrupting ordering later (STORE-05).
-    private static func assertSchemaShape(_ db: Database) throws {
+    /// instead of corrupting ordering later (STORE-05). Internal so the
+    /// read-only export path can apply the identical contract without
+    /// opening a migrating handle.
+    static func assertSchemaShape(_ db: Database) throws {
         for (table, specs) in declaredShape {
             let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
             var byName: [String: Row] = [:]

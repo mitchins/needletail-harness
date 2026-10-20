@@ -153,12 +153,12 @@ struct SessionExportTests {
             "sensitive", "seq", "atMillis", "epochID", "parentEpochID", "profile",
             "eventSeq", "eventKind", "digest",
             "operationID", "callID", "state", "mutating", "outcome",
-            "action", "entryID", "commandID", "queueKind", "revision",
+            "action", "entryID", "commandID", "queueKind", "state", "revision",
             "targetEpochID", "orderKey", "sealed", "redacted", "text",
             "role", "tool", "arguments",
-            "previousWriter", "newWriter", "atMillis", "reason", "operatorID",
+            "previousWriterHash", "newWriterHash", "reason", "operatorID",
             "reference", "unresolved",
-            "artifactKind", "size", "relativePath",
+            "artifactKind", "size", "relativePath", "digest",
             "complete", "recordCount",
             "operations", "completed", "held", "unstarted", "orphaned",
         ]
@@ -188,7 +188,7 @@ struct SessionExportTests {
         let blob = lines.joined()
         for sentinel in ["ALPHA-111", "BETA-222", "hunter2-CRED-999", "GAMMA-333",
                          "DELTA-444", "EPSILON-555", "QUEUED-111", "REF-77", "REASON-888",
-                         "op-9", "SECRET-BASE-88", "s-b only", "CONTENT-000", "b-ok"] {
+                         "op-9", "w-old", "w-seed", "SECRET-BASE-88", "s-b only", "CONTENT-000", "b-ok"] {
             #expect(!blob.contains(sentinel), "default export leaks \(sentinel)")
         }
         // Structure survives redaction: kinds, IDs, states, digests.
@@ -251,6 +251,31 @@ struct SessionExportTests {
                           "EPSILON-555", "QUEUED-111", "op-9", "ticket-REF-77"] {
             #expect(blob.contains(permitted), "documented content must travel: \(permitted)")
         }
+        // Writer tokens NEVER travel, in either mode: only their truncated
+        // hashes do (equality preserved for correlation, token undisclosed).
+        #expect(!blob.contains("w-old") && !blob.contains("w-seed"),
+                "raw writer identities must not appear even in content mode")
+        let objects = try Self.decodeLines(lines)
+        let recoveryRows = objects.compactMap { $0["kind"] as? String == "recovery" ? $0 : nil }
+        #expect(recoveryRows.count == 1)
+        let hexSet = CharacterSet(charactersIn: "0123456789abcdef")
+        for row in recoveryRows {
+            for key in ["previousWriterHash", "newWriterHash"] {
+                guard let hash = row[key] as? String else {
+                    Issue.record("recovery row must carry \(key)")
+                    continue
+                }
+                #expect(hash.count == 16 && hash.unicodeScalars.allSatisfy(hexSet.contains),
+                        "writer hash is a 16-hex correlator, got \(hash)")
+            }
+            #expect(row["previousWriter"] == nil && row["newWriter"] == nil,
+                    "raw writer fields must not exist, even alongside hashes")
+        }
+        // Deterministic: re-exporting the same ledger yields the same bytes.
+        let again = try SessionExport.lines(
+            dbPath: dbPath, session: sessionA, includeContent: true,
+            exportedAt: 1_000_000, limits: .default)
+        #expect(again == lines, "exports are byte-deterministic for fixed inputs")
         // Still excluded even in content mode: epoch/config snapshots and
         // recovery free text never travel, whatever the flag says.
         for excluded in ["SECRET-BASE-88", "REASON-888"] {
@@ -261,7 +286,6 @@ struct SessionExportTests {
         // exists to harvest it into.
         #expect(blob.contains("hunter2-CRED-999"),
                 "user text travels verbatim in content mode (no secret-free claim)")
-        let objects = try Self.decodeLines(lines)
         #expect(objects.first?["content"] as? Bool == true)
         #expect(objects.first?["sensitive"] as? Bool == true)
         func hasKey(_ key: String) -> Bool {
@@ -391,11 +415,15 @@ struct SessionExportTests {
             return out
         }
         let journalsBefore = try journals()
+        let mainBefore = try Data(contentsOf: URL(fileURLWithPath: dbPath))
         _ = try SessionExport.lines(
             dbPath: dbPath, session: sessionA, includeContent: true,
             exportedAt: 1, limits: .default)
-        // Read-only proof: no rollback journal ever appears, and no WAL
-        // file gains frames as a side effect of reading.
+        // Read-only proof: the main database file is byte-identical
+        // (stronger than row counts — no page touched, no checkpoint
+        // triggered) and no rollback journal appears.
+        #expect(try Data(contentsOf: URL(fileURLWithPath: dbPath)) == mainBefore,
+                "main database file byte-identical after export")
         let journalsAfter = try journals()
         for name in journalsAfter.keys where name.hasSuffix("-journal") {
             Issue.record("read-only export created rollback journal \(name)")

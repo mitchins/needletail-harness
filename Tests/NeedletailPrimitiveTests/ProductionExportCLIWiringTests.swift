@@ -9,7 +9,11 @@ import NeedletailTestSupport
 /// synthetic loopback provider, then `needletail session export` against
 /// the produced store. The loopback proposes tools (trusted mode), so the
 /// ledger carries intents, done results, transcripts and queue rows with
-/// synthetic sentinels end to end.
+/// synthetic sentinels end to end. Serialized: every test below spawns
+/// real child processes plus a loopback server; parallel runs raced
+/// timing-sensitive handshakes, so (like the M1-D and A4-2 suites) this
+/// suite runs serially.
+@Suite(.serialized)
 struct ProductionExportCLIWiringTests {
 
     private static func binary() throws -> String {
@@ -183,7 +187,8 @@ struct ProductionExportCLIWiringTests {
             ["run", "--config", config, "--prompt", prompt, "--format", "jsonl", "--alias", "loop",
              "--tools", tools, "--trusted"],
             env: Self.environment(stateDir: stateDir))
-        #expect(result.exit == 0, "trusted tool run completes: \(result.stderr.prefix(300))")
+        #expect(result.exit == 0,
+                "trusted tool run completes: exit=\(result.exit) requests=\(server.requests.count) stderr=\(result.stderr.prefix(300))")
         return stateDir
     }
 
@@ -200,6 +205,9 @@ struct ProductionExportCLIWiringTests {
         #expect(FileManager.default.fileExists(atPath: dbPath))
         #expect(try Self.posixMode(stateDir.path) == 0o700, "state directory is private")
         #expect(try Self.posixMode(dbPath) == 0o600, "database file is private")
+        // Both binary runs were clean, so both claims were released.
+        #expect(try Self.writerHolders(dbPath: dbPath).isEmpty,
+                "completed binary runs leave no writer claims behind")
         // Export the FIRST session (discover IDs without touching the DB).
         let sessions = try Self.sessionIDs(dbPath: dbPath)
         #expect(sessions.count == 2, "two binary runs, two sessions, got \(sessions)")
@@ -233,6 +241,10 @@ struct ProductionExportCLIWiringTests {
         let operations = trailer["operations"] as? [String: Any]
         #expect((operations?["completed"] as? [String])?.count == 1)
         #expect(try Self.posixMode(outURL.path) == 0o600, "export file is private")
+        // The binary run completed cleanly, so its writer claim was
+        // released: a completed export leaves no lingering ownership.
+        #expect(try Self.writerHolders(dbPath: dbPath).isEmpty,
+                "clean binary run releases its writer claim")
     }
 
     @Test("STORE-08 sqlite content export permits only documented content")
@@ -383,6 +395,34 @@ struct ProductionExportCLIWiringTests {
             throw ExportWiringError.unparseable
         }
         return first
+    }
+
+    private static func writerHolders(dbPath: String) throws -> [String] {
+        let db = try DatabaseQueue(path: dbPath)
+        defer { try? db.close() }
+        return try db.read { db in
+            try String.fetchAll(db, sql: "SELECT writer FROM writer")
+        }
+    }
+
+    @Test("A5-2 cli export rejects missing arguments with usage errors")
+    func exportRejectsMissingArgumentsWithUsageErrors() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stateDir = directory.appendingPathComponent("state")
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        // Missing session ID and missing --output are usage errors (2),
+        // not operational failures.
+        let missingSession = try Self.run(
+            ["session", "export", "--output", directory.appendingPathComponent("o.jsonl").path],
+            env: Self.environment(stateDir: stateDir))
+        #expect(missingSession.exit == 2, "missing session ID is a usage error, got \(missingSession.exit)")
+        let missingOutput = try Self.run(
+            ["session", "export", "s-x"],
+            env: Self.environment(stateDir: stateDir))
+        #expect(missingOutput.exit == 2, "missing --output is a usage error, got \(missingOutput.exit)")
+        #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("o.jsonl").path),
+                "failed invocations leave no output behind")
     }
 }
 

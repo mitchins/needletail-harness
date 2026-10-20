@@ -396,7 +396,14 @@ struct RunCommand: ParsableCommand {
         let sink: any UISink
         let traceHandle: FileHandle?
         if let tracePath = trace {
-            FileManager.default.createFile(atPath: tracePath, contents: nil)
+            // Explicit operator output: created private (0600) at once
+            // rather than relying on umask alone, since sealed runs may
+            // carry sensitive prompts through this file.
+            guard FileManager.default.createFile(
+                atPath: tracePath, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                eprint("cannot create trace file \(tracePath)")
+                throw ExitCode(2)
+            }
             guard let handle = FileHandle(forWritingAtPath: tracePath) else {
                 eprint("cannot open trace file \(tracePath)")
                 throw ExitCode(2)

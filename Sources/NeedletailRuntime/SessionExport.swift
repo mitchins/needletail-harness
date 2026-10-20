@@ -68,6 +68,17 @@ public enum SessionExport {
     /// Redaction marker: content withheld by policy, not absent data.
     public static let redacted = "[redacted]"
 
+    /// Writer identity, hashed — never the raw token. Writer IDs are bearer
+    /// authority inside the store's fencing (whoever presents the pair may
+    /// write), so an export must not carry them verbatim, in EITHER mode:
+    /// equality is preserved (same writer → same hash, correlatable across
+    /// exports) while the token itself stays out of support artifacts.
+    /// Operators with legitimate DB access can recompute the hash to
+    /// identify a holder.
+    private static func writerTokenHash(_ writer: String) -> String {
+        String(artifactSHA256Hex(Data(writer.utf8)).prefix(16))
+    }
+
     /// Allowlisted projection of one sequenced record. ONLY the keys
     /// constructed here may appear in export output; every free-text
     /// payload is either omitted (with `"redacted": true`) or, with
@@ -129,9 +140,11 @@ public enum SessionExport {
         case .writerRecovered(let recovery):
             // Structural audit facts travel; free-text rationale never
             // does (not even with --include-content): reasons are operator
-            // prose that may incidentally quote sensitive context. The
-            // authorizing identity + reference stay when content was
-            // explicitly requested (reconstructible audit).
+            // prose that may incidentally quote sensitive context. Writer
+            // identities travel ONLY as truncated hashes (session fencing
+            // treats the raw pair as bearer authority, so the token itself
+            // never enters a support artifact). The authorizing identity
+            // and reference travel only with --include-content.
             var unresolved: [[String: Any]] = []
             for ref in recovery.unresolvedOperations {
                 let state: String
@@ -145,8 +158,8 @@ public enum SessionExport {
                                    "state": state, "mutating": ref.mutating])
             }
             var row: [String: Any] = ["seq": seq, "kind": "recovery",
-                                      "previousWriter": recovery.previousWriter,
-                                      "newWriter": recovery.newWriter,
+                                      "previousWriterHash": writerTokenHash(recovery.previousWriter),
+                                      "newWriterHash": writerTokenHash(recovery.newWriter),
                                       "atMillis": recovery.atMillis,
                                       "unresolved": unresolved,
                                       "reason": redacted]
@@ -265,14 +278,9 @@ public enum SessionExport {
         }
         defer { try? queue.close() }
         let version: Int32
-        let userTables: [String]
         do {
             version = try queue.read { db in
                 try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? -1
-            }
-            userTables = try queue.read { db in
-                try String.fetchAll(
-                    db, sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
             }
         } catch {
             throw ExportError.unreadableStore("cannot inspect \(dbPath): \(error)")
@@ -281,8 +289,17 @@ public enum SessionExport {
             throw ExportError.unreadableStore(
                 "\(dbPath) has schema version \(version), this build reads \(GRDBSessionStore.schemaVersion) read-only; open it with needletail run to migrate first")
         }
-        guard userTables.contains("records"), userTables.contains("writer") else {
-            throw ExportError.unreadableStore("\(dbPath) is not a needletail store")
+        // Declared-shape check (same contract as the production opener —
+        // a same-versioned foreign or tampered store fails here, before
+        // any record is read): exact columns, types and primary keys.
+        do {
+            try queue.read { db in
+                try GRDBSessionStore.assertSchemaShape(db)
+            }
+        } catch let error as StoreError {
+            throw ExportError.unreadableStore("schema mismatch in \(dbPath): \(error)")
+        } catch {
+            throw ExportError.unreadableStore("cannot inspect \(dbPath): \(error)")
         }
         // Count first: an over-limit ledger fails before any output
         // exists, and the trailer count is authoritative.
@@ -364,6 +381,12 @@ public enum SessionExport {
         } catch {
             throw ExportError.unreadableStore("session ledger fails reconciliation: \(error)")
         }
+        // Completeness is asserted, not assumed: fewer streamed records
+        // than counted means rows vanished mid-export (or a tampered
+        // sequence) — never certify a partial stream as complete.
+        guard stream.count >= total else {
+            throw ExportError.unreadableStore("exported \(stream.count) of \(total) records; refusing partial output")
+        }
         try emit(["kind": "trailer", "complete": true, "recordCount": stream.count,
                   "operations": ["completed": report.completed.map(\.raw),
                                  "held": report.heldOperations.map { $0.operationID.raw },
@@ -377,9 +400,15 @@ public enum SessionExport {
     /// the trailer), then an atomic link into place (link() fails if the
     /// target exists — never overwritten, never followed if it is a
     /// symlink), then directory sync. Any failure removes the tmp file;
-    /// the target path never holds a partial export.
+    /// the target path never holds a partial export. A failed directory
+    /// sync removes the just-linked target too: without a durable
+    /// directory entry the export must not be mistaken for complete.
     public static func writeLines(_ lines: [String], toFileAtPath target: String) throws {
-        let parent = (target as NSString).deletingLastPathComponent
+        var parent = (target as NSString).deletingLastPathComponent
+        if parent.isEmpty {
+            // Bare filenames ("out.jsonl") land in the working directory.
+            parent = "."
+        }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: parent, isDirectory: &isDir), isDir.boolValue else {
             throw ExportError.outputUnwritable("parent directory missing or not a directory: \(parent)")
@@ -395,6 +424,7 @@ public enum SessionExport {
                 throw ExportError.outputUnwritable("cannot create tmp file in \(parent)")
             }
             guard let handle = FileHandle(forWritingAtPath: tmp) else {
+                try? FileManager.default.removeItem(atPath: tmp)
                 throw ExportError.outputUnwritable("cannot open tmp file \(tmp)")
             }
             do {
@@ -417,19 +447,30 @@ public enum SessionExport {
                 try? FileManager.default.removeItem(atPath: tmp)
                 throw ExportError.outputUnwritable("export verification failed for \(target)")
             }
-            // Atomic commit: hard-link into place (fails if the target
-            // appeared concurrently — never overwritten, never followed).
-            let linked = tmp.withCString { tmpC in
+            // Atomic commit: hard-link into place. Only EEXIST means
+            // "target appeared"; any other errno is an output failure.
+            let linked: Int32 = tmp.withCString { tmpC in
                 target.withCString { targetC in
                     link(tmpC, targetC)
                 }
             }
             guard linked == 0 else {
+                let err = errno
                 try? FileManager.default.removeItem(atPath: tmp)
-                throw ExportError.targetExists(target)
+                if err == EEXIST {
+                    throw ExportError.targetExists(target)
+                }
+                throw ExportError.outputUnwritable("cannot link export into place \(target): errno \(err)")
             }
             try? FileManager.default.removeItem(atPath: tmp)
-            try syncArtifactDirectory(atPath: parent)
+            do {
+                try syncArtifactDirectory(atPath: parent)
+            } catch {
+                // Durability uncertain: remove the just-linked target
+                // rather than leave an export that may not survive.
+                try? FileManager.default.removeItem(atPath: target)
+                throw ExportError.outputUnwritable("cannot sync export directory \(parent): \(error)")
+            }
         }
     }
 }
