@@ -5,8 +5,9 @@
 /// Identity contract (A3-1): every tool operation carries a stable derived
 /// ID (`effectID/callID`) on both its intent and its completion. Records
 /// WITHOUT a callID are admission/provider markers (admission intents) or
-/// denial receipts — never tool operations (requirement: they must not be
-/// misclassified as orphaned tool work).
+/// denial receipts (callID-less, done, non-mutating) — never completed
+/// tool work. Any OTHER callID-less result takes the orphan path: visible
+/// and held when unknown or mutating, never silently absorbed.
 ///
 /// Classification per stable ID:
 /// - intent + done result → completed.
@@ -41,7 +42,7 @@
 /// unmatched — classified call by call, never inferred across the batch.
 ///
 /// Recovered state: `resumedAfterReopen` seeds exactly the held
-/// (unknown-state, mutating) refs into `unresolvedOperations`. Admission
+/// (unknown-state) refs into `unresolvedOperations`. Admission
 /// and continuation already refuse new work while that list is non-empty,
 /// so no automatic mutating continuation or re-dispatch under a new call
 /// ID is possible until an explicit reconciliation clears them.
