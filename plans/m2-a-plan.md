@@ -226,3 +226,29 @@ regression). Gates at HEAD: quick + native green, coverage
 
 Scope guard: reopen reconciliation, ownership takeover, artifact
 storage, A4/A5 NOT started — later A3 tasks.
+
+## 16. A3-2 CLOSED — independent review APPROVED (2026-10-20)
+
+Implementing commits `e5a4e45..13d61c0` (pure `reconcileOperations`
+classifier + `GRDBSessionStore.reconcile` + `resumedAfterReopen` + 11
+genuine-reopen tests + resume-hold test), fold `77dcb40`, doc addendum
+`ca9ae74`. Reviewer: `deepseek-reviewer`, two rounds. Round 1
+NEEDS_CHANGES (4 findings: swallowed ambiguous-delivery unknowns,
+callID-nil validation/dedup gaps, unpinned mutating union); all folded
+with fresh RED/GREEN evidence; round 2 APPROVED — no blocking findings
+(one doc inconsistency, fixed in `ca9ae74`).
+
+Delivered: stable-ID intent/result matching; completed vs explicit
+unknown vs unmatched (mutating held as unknown, non-mutating reported
+re-runnable); orphan results with conservative hold (unknown-state
+always holds, done-state holds iff mutating); callID-less admission
+markers and denial receipts never held; duplicates, contradictions,
+malformed states and namespace collisions fail closed; batch receipts
+never complete sibling calls (counterexample pinned). Resumed state
+seeds held refs into `unresolvedOperations`, blocking admission and
+continuation until explicit reconciliation. Gates at HEAD: quick +
+native green (54 tests), coverage `executed=156 failed=0 satisfied=20`.
+7 RED counterfactuals verified.
+
+Scope guard: ownership takeover (A3-3), crash matrices (A4),
+CLI production-store wiring (A5) NOT started.
