@@ -1,7 +1,7 @@
 # M2-A Epic Receipt — EPIC-REVIEW READY (final round)
 
-Authoritative candidate head: the `m2-a-store` tip containing this
-receipt (see §8 for its SHA + exact-SHA CI). Historical lineage (all
+Authoritative candidate head: `m2-a-store` @ `2bb748e` (this
+commit; see §8 for its exact-SHA CI). Historical lineage (all
 superseded, preserved for audit): `04f554a` (bounds fix) →
 `6e848f4` (preflight) → `d7d8749` (CI-qualification record).
 PR #5 open, unmerged. No merge performed. Operator merge decision
@@ -125,15 +125,21 @@ final-round corrections)
 
 ## 8. CI qualification (verified post-push on the exact head)
 
-- Candidate head pushed to `origin:m2-a-store`; `gh pr checks 5`
-  verified green on that SHA (offline build+tests, release bundle
-  smoke, GitHub/GitGuardian checks; CodeRabbit check reflects the
-  completed aggregate review, not a pause).
-  [Run IDs + durations recorded in the push-qualification record;
-  Sonar below is reported separately.]
-- SonarQube Cloud quality gate: FAIL — reported separately, never
-  counted toward green. Known pre-existing coverage-import gate
-  defect on `main` + PRs (tracked separately, not an M2-A
+- Candidate head `2bb748e` pushed to `origin:m2-a-store`;
+  `gh pr checks 5` verified green on that SHA:
+  - `offline build and tests (Linux x86_64)`: PASS 19m46s
+    (run 39513155750, job 118938854725).
+  - `release bundle smoke (clean host)`: PASS 6m55s
+    (run 39513155750, job 118938855256).
+  - GitGuardian Security Checks: pass. CodeRabbit: pass (the
+    completed aggregate review of this round, CHANGES_REQUESTED
+    with 9 findings, all triaged in §9 — not a pause).
+  (Prior identical-code head `d7d8749`: offline PASS 17m34s,
+  smoke PASS 5m39s, run 39498627756.)
+- SonarQube Cloud quality gate: FAIL (run 39513155793,
+  job 118938855170; SonarCloud analysis fail) — reported separately,
+  never counted toward green. Known pre-existing coverage-import
+  gate defect on `main` + PRs (tracked separately, not an M2-A
   blocker). The PR as a whole is therefore NOT called green while
   this gate fails; the code gates above are green on the exact SHA.
 
