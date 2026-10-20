@@ -383,6 +383,24 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         return (batch, next)
     }
 
+    /// A3-2 reopen reconciliation: reads the session's whole durable
+    /// record stream through the SESSION-SCOPED paged read (never the
+    /// unscoped diagnostic — cross-session content is unrepresentable in
+    /// the report) and runs the pure `reconcileOperations` classifier.
+    /// Call on a FRESH handle after reopen; duplicates, contradictions and
+    /// namespace collisions throw `.integrity` (fail closed).
+    public func reconcile(session: SessionID) throws -> OperationReconciliation {
+        var stream: [DurableRecord] = []
+        var cursor: UInt64 = 0
+        while true {
+            let (page, next) = try records(session: session, since: cursor, limit: 500)
+            stream += page.map(\.record)
+            guard let advanced = next else { break }
+            cursor = advanced
+        }
+        return try reconcileOperations(stream)
+    }
+
     /// A2 STORE-06: per-session fenced ownership. `INSERT ... ON CONFLICT
     /// DO NOTHING` inside the write transaction makes the claim atomic —
     /// a competing writer either wins the row or reads exactly who does.

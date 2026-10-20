@@ -202,4 +202,37 @@ struct OperationIntentTests {
         #expect(again.records.isEmpty, "consumed completion records nothing even with a live reservation")
         #expect(Self.results(in: again.records).isEmpty, "no second success result")
     }
+
+    @Test("A3-2 resumed state with held operations blocks new runs")
+    func resumedStateBlocksNewRuns() throws {
+        var ids = StateFixtures.ids()
+        // Ledger: one completed op, one intent-only mutating crash, one
+        // intent-only read. Only the mutating crash must hold.
+        let report = try reconcileOperations([
+            .operationIntent(OperationRef(operationID: OperationID("e1/c1"), callID: "c1", state: .intent, mutating: true)),
+            .operationResult(OperationRef(operationID: OperationID("e1/c1"), callID: "c1", state: .done, mutating: true), outcome: "ok"),
+            .operationIntent(OperationRef(operationID: OperationID("e1/c2"), callID: "c2", state: .intent, mutating: true)),
+            .operationIntent(OperationRef(operationID: OperationID("e1/c3"), callID: "c3", state: .intent, mutating: false)),
+        ])
+        #expect(report.heldOperations.map(\.operationID) == [OperationID("e1/c2")])
+        #expect(report.unmatchedNonMutating == [OperationID("e1/c3")])
+        let epoch = try StateFixtures.epoch(permissive: true)
+        let resumed = SessionState.resumedAfterReopen(
+            sessionID: SessionID("s-r"), epoch: epoch, trustMode: .workspace,
+            heldOperations: report.heldOperations)
+        #expect(resumed.queueHeld, "recovery holds the queue until explicit reconciliation")
+        #expect(resumed.unresolvedOperations.map(\.operationID) == [OperationID("e1/c2")])
+        // A new operator command must NOT start a run — queued held, and
+        // no re-dispatch under a fresh call ID is possible with no run.
+        let blocked = transition(resumed, StateFixtures.input("new work", id: "cmd-9"), &ids)
+        #expect(blocked.state.activeRun == nil, "no new run while unknowns stand")
+        #expect(blocked.state.queueHeld, "queue stays held")
+        #expect(blocked.state.liveReservations.isEmpty, "nothing dispatched")
+        // Control: a clean resume (nothing held) admits normally.
+        let clean = SessionState.resumedAfterReopen(
+            sessionID: SessionID("s-r"), epoch: epoch, trustMode: .workspace, heldOperations: [])
+        #expect(!clean.queueHeld && clean.unresolvedOperations.isEmpty)
+        let admitted = transition(clean, StateFixtures.input("new work", id: "cmd-9"), &ids)
+        #expect(admitted.state.activeRun != nil, "clean resume admits")
+    }
 }
