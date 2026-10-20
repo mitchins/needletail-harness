@@ -147,6 +147,8 @@ struct XUnitIngestionTests {
                       "STORE_02_sqliteInterruptedArtifactTmpReportsNoReference": "NeedletailPrimitiveTests",
                       "STORE_02_sqliteRenamedArtifactWithoutReferenceIsOrphan": "NeedletailPrimitiveTests",
                       "STORE_02_sqliteCommittedArtifactReferenceReadsVerified": "NeedletailPrimitiveTests"],
+        "STORE-08": ["STORE_08_sqliteRedactedExportOmitsConfidentialContent": "NeedletailPrimitiveTests",
+                     "STORE_08_sqliteContentExportPermitsOnlyDocumentedContent": "NeedletailPrimitiveTests"],
         "PORT-04": ["PORT_04_sqliteNativeKillReopenLegMustExecute": "NeedletailPrimitiveTests"],
         "STORE-03": ["STORE_03_sqliteRenamedArtifactWithoutReferenceIsReportedOrphan": "NeedletailPrimitiveTests"],
         "STORE-04": ["STORE_04_sqliteReferenceToAbsentArtifactFailsTypedIntegrity": "NeedletailPrimitiveTests"],
@@ -258,8 +260,9 @@ struct XUnitIngestionTests {
         // PORT-04 exists precisely to stop in-memory success from masking a
         // missing native leg: deleting or re-pointing this entry must fail
         // loudly here, not silently weaken the gate. Same for the STORE-02
-        // production matrix: the old DELETE-mode sqlite3-CLI probe alone
-        // must never satisfy the final contract again.
+        // production matrix and the STORE-08 export evidence: the old
+        // DELETE-mode sqlite3-CLI probe alone must never satisfy the final
+        // contract again, and unwitnessed export variants must never count.
         #expect(Self.requiredEvidence["PORT-04"] ==
                 ["PORT_04_sqliteNativeKillReopenLegMustExecute": "NeedletailPrimitiveTests"],
                 "PORT-04 must require the native kill/reopen variant")
@@ -279,6 +282,10 @@ struct XUnitIngestionTests {
         }
         #expect(store02["STORE_02_sigkillMidTransactionRollsBack"] == "NeedletailPrimitiveTests",
                 "the original DELETE-mode probe stays as supplementary evidence")
+        #expect(Self.requiredEvidence["STORE-08"] == [
+            "STORE_08_sqliteRedactedExportOmitsConfidentialContent": "NeedletailPrimitiveTests",
+            "STORE_08_sqliteContentExportPermitsOnlyDocumentedContent": "NeedletailPrimitiveTests",
+        ], "STORE-08 must require the native export variants")
     }
 
     @Test("PORT-04 gating body performs a native kill")
