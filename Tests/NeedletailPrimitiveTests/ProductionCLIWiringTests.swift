@@ -115,6 +115,13 @@ struct ProductionCLIWiringTests {
         let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
         group.wait()
         process.waitUntilExit()
+        // Signal deaths must never masquerade as exit codes: a crashed
+        // child (e.g. an un-shut-down HTTP client fatalErroring in deinit)
+        // fails loudly here instead of matching an expected code.
+        if process.terminationReason == .uncaughtSignal {
+            Issue.record("child binary died from signal \(process.terminationStatus): \(String(decoding: errBox.value, as: UTF8.self).prefix(300))")
+            throw WiringError.childCrashed(process.terminationStatus)
+        }
         return (process.terminationStatus, String(decoding: outData, as: UTF8.self), String(decoding: errBox.value, as: UTF8.self))
     }
 
@@ -127,6 +134,34 @@ struct ProductionCLIWiringTests {
         body += "data: {\"id\":\"t\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n"
         body += "data: [DONE]\n\n"
         return body
+    }
+
+    private static func toolCallChunk(callID: String, tool: String, arguments: String) -> String {
+        let delta: [String: Any] = [
+            "choices": [[
+                "index": 0,
+                "delta": ["tool_calls": [[
+                    "index": 0,
+                    "id": callID,
+                    "function": ["name": tool, "arguments": arguments],
+                ]]],
+                "finish_reason": NSNull(),
+            ]],
+        ]
+        let finish: [String: Any] = [
+            "choices": [["index": 0, "delta": [:], "finish_reason": "tool_calls"]],
+        ]
+        let usage: [String: Any] = [
+            "choices": [],
+            "usage": ["prompt_tokens": 1, "completion_tokens": 1],
+        ]
+        let dataJSON = { (object: [String: Any]) -> String in
+            (try? String(decoding: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)) ?? "{}"
+        }
+        return "data: " + dataJSON(delta) + "\n\n"
+            + "data: " + dataJSON(finish) + "\n\n"
+            + "data: " + dataJSON(usage) + "\n\n"
+            + "data: [DONE]\n\n"
     }
 
     private static func jsonLines(_ stdout: String) throws -> [[String: Any]] {
@@ -202,15 +237,16 @@ struct ProductionCLIWiringTests {
         // Fresh-handle read-back: exactly one session, identities first,
         // then the transcript of this run.
         let sessions = try Self.sessions(in: dbPath)
-        #expect(sessions.count == 1, "exactly this run's session, got \(sessions)")
+        let sessionID = try #require(sessions.first, "exactly this run's session must exist, got \(sessions)")
+        #expect(sessions.count == 1)
         let store = try GRDBSessionStore(path: dbPath)
         defer { try? store.close() }
-        let (page, _) = try store.records(session: SessionID(sessions[0]), since: 0, limit: 1000)
+        let (page, _) = try store.records(session: SessionID(sessionID), since: 0, limit: 1000)
         let kinds = page.map(\.record)
         // Identity rows come FIRST: nothing provider- or tool-driven may
         // precede them, so the run is identifiable even if it dies next.
         if case .sessionOpened(let openedSession, _) = kinds.first {
-            #expect(openedSession.raw == sessions[0], "sessionOpened names this run's session")
+            #expect(openedSession.raw == sessionID, "sessionOpened names this run's session")
         } else {
             Issue.record("first durable record must be sessionOpened, got \(String(describing: kinds.first))")
         }
@@ -238,18 +274,19 @@ struct ProductionCLIWiringTests {
                 "proven-clean run releases its ownership claim")
         // Post-hoc fencing: the released session refuses foreign writers —
         // identity rows were committed through the fenced path.
-        #expect(throws: StoreError.notWriter(session: sessions[0], writer: "intruder")) {
+        #expect(throws: StoreError.notWriter(session: sessionID, writer: "intruder")) {
             try store.append(.transcriptAppended(.user("intrusion")),
-                             as: WriterIdentity(session: SessionID(sessions[0]), writer: "intruder"))
+                             as: WriterIdentity(session: SessionID(sessionID), writer: "intruder"))
         }
         // And the session reconciles clean.
-        let report = try store.reconcile(session: SessionID(sessions[0]))
+        let report = try store.reconcile(session: SessionID(sessionID))
         #expect(report.heldOperations.isEmpty && report.completed.isEmpty,
                 "text-only run holds nothing and completes nothing operational")
     }
 
     @Test("A5-1 cli refuses corrupt store without overwrite")
-    func refusesCorruptStoreWithoutOverwrite() throws {        let directory = try Self.freshDirectory()
+    func refusesCorruptStoreWithoutOverwrite() throws {
+        let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let stateDir = directory.appendingPathComponent("state")
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
@@ -311,10 +348,11 @@ struct ProductionCLIWiringTests {
         // is retained (only proven-clean runs release).
         let dbPath = stateDir.appendingPathComponent("store.sqlite").path
         let sessions = try Self.sessions(in: dbPath)
+        let oneSession = try #require(sessions.first, "fresh run must have exactly one session")
         #expect(sessions.count == 1)
         let store = try GRDBSessionStore(path: dbPath)
         defer { try? store.close() }
-        let report = try store.reconcile(session: SessionID(sessions[0]))
+        let report = try store.reconcile(session: SessionID(oneSession))
         #expect(report.heldOperations.isEmpty && report.completed.isEmpty,
                 "classified failure records no unknown and completes nothing")
         #expect(try Self.writerHolders(dbPath: dbPath).count == 1,
@@ -337,6 +375,54 @@ struct ProductionCLIWiringTests {
         #expect(result.exit == 0, "sealed text run completes: \(result.stderr)")
         #expect(!FileManager.default.fileExists(atPath: stateDir.path),
                 "sealed runs create no state directory at all")
+    }
+
+    @Test("A5-1 cli denied tool fails the run without completion")
+    func deniedToolFailsRunWithoutCompletion() throws {
+        // Workspace headless policy denies ungranted mutating tools at
+        // validation (I05), before any dispatch or approval: the denial
+        // joins the transcript as a typed receipt, and the run then fails
+        // on script exhaustion with exit 4 and provider_error — never a
+        // completion, never a silent drop. (The exit-3 approval path
+        // exists for non-headless gateways; headless never approves, so
+        // the shutdown paired with its throw is defense-in-depth.)
+        let server = try LoopbackSSEServer()
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.toolCallChunk(callID: "c1", tool: "edit", arguments: "{\"path\":\"f\"}").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Self.writeConfig(directory, port: Int(server.port))
+        let stateDir = directory.appendingPathComponent("state")
+        let result = try Self.run(
+            ["run", "--config", config, "--prompt", "edit it", "--format", "jsonl", "--alias", "loop"],
+            env: Self.environment(stateDir: stateDir))
+        let envelopes = try Self.jsonLines(result.stdout)
+        #expect(result.exit == 4, "denied tooling exhausts the script into provider failure, got \(result.exit)")
+        #expect(envelopes.contains { (($0["payload"] as? [String: Any])?["outcome"] as? String) == "provider_error" },
+                "terminal envelope reports provider_error")
+        #expect(!envelopes.contains { (($0["payload"] as? [String: Any])?["outcome"] as? String) == "completed" },
+                "no completion on a denied run")
+        // The denied run holds no operation (validation refused dispatch)
+        // but keeps its claim: the pending approval decision is explicit
+        // operator business for a non-headless gateway.
+        let dbPath = stateDir.appendingPathComponent("store.sqlite").path
+        let store = try GRDBSessionStore(path: dbPath)
+        defer { try? store.close() }
+        let sessions = try Self.sessions(in: dbPath)
+        let oneSession = try #require(sessions.first, "fresh run must have exactly one session")
+        #expect(sessions.count == 1)
+        let (allRows, _) = try store.records(session: SessionID(oneSession), since: 0, limit: 1000)
+        #expect(allRows.contains {
+            if case .transcriptAppended(.toolResponse(_, let text)) = $0.record {
+                return text.hasPrefix("denied:")
+            }
+            return false
+        }, "typed denial receipt is durable in the transcript")
+        let report = try store.reconcile(session: SessionID(oneSession))
+        #expect(report.heldOperations.isEmpty && report.completed.isEmpty)
+        #expect(try Self.writerHolders(dbPath: dbPath).count == 1,
+                "denied run retains its claim")
     }
 
     @Test("A5-1 cli killed run retains claim and ledger for new run")
@@ -485,6 +571,22 @@ struct ProductionCLIWiringTests {
         #expect(repaired.exit == 0, "repaired state dir runs: \(repaired.stderr.prefix(200))")
         #expect(try Self.posixMode(laxDir.path) == 0o700, "directory repaired private")
         #expect(try Self.posixMode(laxDB) == 0o600, "database repaired private")
+
+        // Override wins over XDG when both are set: the store lands under
+        // the override and nothing is created under XDG (distinct paths
+        // per sub-case so earlier runs cannot pollute this assertion).
+        let overrideDir = directory.appendingPathComponent("override-state")
+        let xdgBase = directory.appendingPathComponent("xdg-other")
+        var bothEnv = Self.environment(stateDir: overrideDir)
+        bothEnv["XDG_DATA_HOME"] = xdgBase.path
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("ok").utf8))]))
+        let overridden = try Self.run(args, env: bothEnv)
+        #expect(overridden.exit == 0, "override run works: \(overridden.stderr.prefix(200))")
+        #expect(FileManager.default.fileExists(
+            atPath: overrideDir.appendingPathComponent("store.sqlite").path),
+                "store lands under $NEEDLETAIL_STATE_DIR")
+        #expect(!FileManager.default.fileExists(atPath: xdgBase.appendingPathComponent("needletail").path),
+                "XDG location untouched when the override is set")
     }
 
     @Test("A5-1 cli sealed trace stays private and storeless")
@@ -513,4 +615,5 @@ struct ProductionCLIWiringTests {
 private enum WiringError: Error {
     case missingBinary
     case unparseableStdout
+    case childCrashed(Int32)
 }
