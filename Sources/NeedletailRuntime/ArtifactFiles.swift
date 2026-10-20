@@ -78,8 +78,8 @@ func syncArtifactDirectory(atPath path: String) throws {
 }
 
 /// Orphan-scan report: `orphaned` are final-named files with no committed
-/// database reference (renamed but never referenced — NOT completed
-/// artifacts, never auto-attached, never silently deleted);
+/// reference (renamed but never referenced — NOT completed artifacts,
+/// never auto-attached, never silently deleted);
 /// `interrupted` are tmp leftovers whose write/rename never finished.
 public struct ArtifactOrphans: Sendable, Equatable {
     public let orphaned: [String]
@@ -89,4 +89,54 @@ public struct ArtifactOrphans: Sendable, Equatable {
         self.orphaned = orphaned
         self.interrupted = interrupted
     }
+}
+
+/// Fail-closed snapshot read of a regular file (S1 pattern, shared with
+/// `readBoundedFile`): opens `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`,
+/// requires `fstat` `S_ISREG`, and copies at most `bound + 1` bytes into
+/// memory — never follows symlinks, never mmaps (no SIGBUS on
+/// truncation), never hangs on FIFOs, never reads unbounded. Short reads,
+/// overruns and I/O errors are typed `.integrity`, never partial bytes.
+func readBoundedFD(_ fd: Int32, bound: Int) throws -> Data {
+    var bytes = Data()
+    var chunk = [UInt8](repeating: 0, count: 8192)
+    while true {
+        let readCount = chunk.withUnsafeMutableBytes { pointer in
+            read(fd, pointer.baseAddress, pointer.count)
+        }
+        guard readCount >= 0 else {
+            throw StoreError.integrity("artifact file cannot be read")
+        }
+        if readCount == 0 { break }
+        guard bytes.count + readCount <= bound + 1 else {
+            throw StoreError.integrity("artifact file exceeds its bound")
+        }
+        bytes.append(contentsOf: chunk.prefix(readCount))
+    }
+    return bytes
+}
+
+/// Opens `path` for a snapshot read and checks it is a regular file.
+/// Symlinks (including swaps planted before the open), FIFOs, sockets,
+/// devices and directories fail closed here, before any byte is read.
+func openRegularFile(atPath path: String) throws -> Int32 {
+    let fd: Int32 = path.withCString { open($0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) }
+    guard fd >= 0 else {
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: path)) != nil {
+            throw StoreError.integrity("artifact path is a symlink; refusing escape: \(path)")
+        }
+        throw StoreError.integrity("artifact file absent or unreadable: \(path)")
+    }
+    var status = stat()
+    guard fstat(fd, &status) == 0, (status.st_mode & S_IFMT) == S_IFREG else {
+        close(fd)
+        throw StoreError.integrity("artifact path is not a regular file: \(path)")
+    }
+    return fd
+}
+
+/// Closes an artifact file descriptor. The wrapper exists because bare
+/// `close` collides with `GRDBSessionStore.close()` inside store methods.
+func closeArtifactFD(_ fd: Int32) {
+    close(fd)
 }

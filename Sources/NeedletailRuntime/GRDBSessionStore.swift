@@ -1,6 +1,12 @@
 import Foundation
 import GRDB
 import NeedletailCore
+#if canImport(Glibc)
+import Glibc
+#endif
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// M2-A A1/A2: the PRODUCTION durable session store (SPEC §9, M2-A line).
 /// GRDB over a real SQLite file; WAL journal with `synchronous=FULL`
@@ -540,29 +546,36 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
 
     /// A4-1 publication, read-back and orphan-scan for immutable
     /// artifacts (SPEC §9.1). Bytes live content-addressed under a
-    /// private managed root beside the database (`<base>-artifacts`,
+    /// private managed root beside the database (`<dbfile>-artifacts`,
     /// mode 0700; files 0600); the database stores only the reference.
-    private var artifactsRoot: String {
-        (path as NSString).deletingPathExtension + "-artifacts"
+    /// The root derives from the FULL database filename, so distinct
+    /// stores never share a root (and an orphan scan never misreports
+    /// another store's referenced artifacts as orphans).
+    static func artifactsRoot(for dbPath: String) -> String {
+        let url = URL(fileURLWithPath: dbPath)
+        return url.deletingLastPathComponent().appendingPathComponent(
+            url.lastPathComponent + "-artifacts").path
     }
 
-    /// Reads a final artifact file and verifies it against its digest.
-    /// Absent files, symlinks, unreadable files and digest mismatches all
-    /// fail typed `.integrity` — partial or substituted bytes are never
-    /// returned. (TOCTOU note: a concurrent replacement races this check,
-    /// but only bytes hashing to the digest pass it.)
-    private func readVerifiedArtifact(atPath filePath: String, digest: String) throws -> Data {
-        guard FileManager.default.fileExists(atPath: filePath) else {
-            throw StoreError.integrity("artifact file absent for digest \(digest)")
+    private var artifactsRoot: String { Self.artifactsRoot(for: path) }
+
+    /// Fail-closed snapshot read of a final artifact file: fd-based
+    /// (`O_NOFOLLOW`, `fstat` regular-file, bounded in-memory copy), then
+    /// size and digest verification. Absence, symlinks, non-regular
+    /// files, unreadable files, size drift and digest mismatches all fail
+    /// typed `.integrity` — partial or substituted bytes are never
+    /// returned, and mmaps (SIGBUS on truncation) are never used.
+    private func readVerifiedArtifact(
+        atPath filePath: String, digest: String, expectedSize: Int
+    ) throws -> Data {
+        guard expectedSize >= 0, expectedSize <= artifactByteLimit else {
+            throw StoreError.integrity("artifact size out of bounds for digest \(digest)")
         }
-        if (try? FileManager.default.destinationOfSymbolicLink(atPath: filePath)) != nil {
-            throw StoreError.integrity("artifact path is a symlink; refusing escape for digest \(digest)")
-        }
-        let bytes: Data
-        do {
-            bytes = try Data(contentsOf: URL(fileURLWithPath: filePath), options: .mappedIfSafe)
-        } catch {
-            throw StoreError.integrity("artifact file unreadable for digest \(digest): \(error)")
+        let fd = try openRegularFile(atPath: filePath)
+        defer { closeArtifactFD(fd) }
+        let bytes = try readBoundedFD(fd, bound: min(expectedSize, artifactByteLimit))
+        guard bytes.count == expectedSize else {
+            throw StoreError.integrity("artifact size mismatch for digest \(digest)")
         }
         guard artifactSHA256Hex(bytes) == digest else {
             throw StoreError.integrity("artifact digest mismatch for \(digest): stored bytes do not match")
@@ -594,13 +607,23 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         guard bytes.count <= artifactByteLimit else {
             throw StoreError.quotaExceeded(limit: artifactByteLimit)
         }
-        // Fencing BEFORE any filesystem work (A4-1 req 6): a stale writer
-        // creates no files and commits no reference.
-        let preHolder = try queue.read { db in
-            try String.fetchOne(
-                db, sql: "SELECT writer FROM writer WHERE session = ?",
-                arguments: [identity.session.raw])
+        // One source of truth: the session comes from the fenced identity.
+        // A caller passing a different session alongside the identity is a
+        // programming error — fail closed before any I/O.
+        guard session == identity.session else {
+            throw StoreError.integrity("publish session/identity mismatch")
         }
+        // Fencing BEFORE any filesystem work (A4-1 req 6): a stale writer
+        // creates no files and commits no reference. Translated like every
+        // other DB access (typed contention, never raw GRDB errors).
+        let preHolder: String?
+        do {
+            preHolder = try queue.read { db in
+                try String.fetchOne(
+                    db, sql: "SELECT writer FROM writer WHERE session = ?",
+                    arguments: [identity.session.raw])
+            }
+        } catch { throw Self.translate(error) }
         guard preHolder == identity.writer else {
             throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
         }
@@ -612,13 +635,21 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 attributes: [.posixPermissions: 0o700])
         } catch {
             // createDirectory throws when the root exists AND when it
-            // cannot be created — a pre-existing root is fine (repaired
-            // private below); anything else fails closed.
+            // cannot be created — a pre-existing root is fine (verified
+            // below); anything else fails closed.
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: root, isDirectory: &isDir),
                   isDir.boolValue else {
                 throw StoreError.integrity("artifact root is not a directory: \(root)")
             }
+        }
+        // lstat never follows symlinks: a symlinked or non-directory root
+        // (planted to escape the managed tree or redirect writes) fails
+        // closed here instead of being chmodded and used.
+        var rootStatus = stat()
+        guard lstat(root, &rootStatus) == 0,
+              (rootStatus.st_mode & S_IFMT) == S_IFDIR else {
+            throw StoreError.integrity("artifact root is not a real directory: \(root)")
         }
         do {
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root)
@@ -627,13 +658,36 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         }
         let finalPath = try resolveArtifactPath(root: root, name: digest)
         if FileManager.default.fileExists(atPath: finalPath) {
-            // Dedup path: identical bytes already durable. Verify rather
-            // than trust — a squatter with colliding content fails closed
-            // and is never overwritten.
-            let existing = try readVerifiedArtifact(atPath: finalPath, digest: digest)
-            guard existing.count == bytes.count else {
+            // Dedup path: identical bytes may already be durable — but a
+            // final-named file can exist WITHOUT established durability
+            // (crash between a previous rename and its dirsync, or
+            // out-of-band placement). Re-establish it now: open WITHOUT
+            // following links, require a regular file, verify the digest,
+            // repair private mode, fsync the file AND the root — only then
+            // is the reference committable. A squatter with colliding
+            // content fails closed and is never overwritten.
+            let fd: Int32 = finalPath.withCString { open($0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) }
+            guard fd >= 0 else {
+                throw StoreError.integrity("artifact file cannot be opened (symlink?): \(digest)")
+            }
+            defer { closeArtifactFD(fd) }
+            var fileStatus = stat()
+            guard fstat(fd, &fileStatus) == 0,
+                  (fileStatus.st_mode & S_IFMT) == S_IFREG else {
+                throw StoreError.integrity("artifact path is not a regular file: \(digest)")
+            }
+            let existing = try readBoundedFD(fd, bound: min(bytes.count, artifactByteLimit))
+            guard existing.count == bytes.count,
+                  artifactSHA256Hex(existing) == digest else {
                 throw StoreError.integrity("artifact collision at digest \(digest): stored bytes differ")
             }
+            guard fchmod(fd, mode_t(0o600)) == 0 else {
+                throw StoreError.integrity("artifact file mode cannot be repaired: \(digest)")
+            }
+            guard fsync(fd) == 0 else {
+                throw StoreError.integrity("artifact file sync failed: \(digest)")
+            }
+            try syncArtifactDirectory(atPath: root)
         } else {
             let tmpPath = try resolveArtifactPath(
                 root: root, name: artifactTmpPrefix + UUID().uuidString)
@@ -659,7 +713,8 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 // Verify what was actually published, before any reference
                 // exists: the committed reference can never point at an
                 // absent, incomplete or mismatched file.
-                let published = try readVerifiedArtifact(atPath: finalPath, digest: digest)
+                let published = try readVerifiedArtifact(
+                    atPath: finalPath, digest: digest, expectedSize: bytes.count)
                 guard published.count == bytes.count else {
                     throw StoreError.integrity("published artifact failed verification for digest \(digest)")
                 }
@@ -704,9 +759,13 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     }
 
     /// Reads a published artifact by reference. The digest, not the
-    /// database, is the authority: absent files, symlinks, size drift and
-    /// digest mismatches fail typed `.integrity` — never partial or
-    /// substituted bytes.
+    /// database, is the authority: absent files, symlinks, non-regular
+    /// files, unreadable files, size drift and digest mismatches all fail
+    /// typed `.integrity` — partial or substituted bytes are never
+    /// returned. The read is a fail-closed fd snapshot (`O_NOFOLLOW`,
+    /// `fstat` regular-file, bounded in-memory copy — no mmaps), so a
+    /// concurrent swap or truncation races into an error, never into
+    /// wrong bytes.
     public func readArtifact(_ ref: ArtifactRef) throws -> Data {
         gate.lock()
         defer { gate.unlock() }
@@ -720,11 +779,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             throw StoreError.integrity("artifact size is negative")
         }
         let filePath = try resolveArtifactPath(root: artifactsRoot, name: ref.digest)
-        let bytes = try readVerifiedArtifact(atPath: filePath, digest: ref.digest)
-        guard bytes.count == ref.size else {
-            throw StoreError.integrity("artifact size mismatch for digest \(ref.digest)")
-        }
-        return bytes
+        return try readVerifiedArtifact(atPath: filePath, digest: ref.digest, expectedSize: ref.size)
     }
 
     /// Orphan scan (recovery tooling, never fed to a model): final-named
@@ -734,6 +789,9 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// a session-scoped scan would misreport every other session's
     /// artifacts as orphans). No gate across the paging loop (precedent:
     /// `reconcile`); each page is atomic and close interleaves typed.
+    /// Point-in-time tooling: a publication racing the scan (reference
+    /// committed after the last page, or file renamed after the listing)
+    /// can be transiently reported — run it offline for decisions.
     public func detectArtifactOrphans() throws -> ArtifactOrphans {
         var referenced = Set<String>()
         var cursor: UInt64 = 0

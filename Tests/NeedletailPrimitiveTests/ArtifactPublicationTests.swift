@@ -2,6 +2,11 @@ import Testing
 import Foundation
 import NeedletailCore
 @testable import NeedletailRuntime
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 /// A4-1 artifact publication, read-back and orphan-scan over the
 /// production GRDB store. Every test drives real files beside a real
@@ -21,7 +26,7 @@ struct ArtifactPublicationTests {
     private static func payload(_ text: String) -> Data { Data(text.utf8) }
 
     private static func artifactsRoot(for path: String) -> String {
-        (path as NSString).deletingPathExtension + "-artifacts"
+        GRDBSessionStore.artifactsRoot(for: path)
     }
 
     @Test("A4-1 sqlite publication round-trips bytes with a fenced reference")
@@ -219,6 +224,13 @@ struct ArtifactPublicationTests {
         // Truncation (size drift) fails too.
         try Self.payload("short").write(to: URL(fileURLWithPath: filePath))
         #expect(throws: StoreError.self) { try store.readArtifact(ref) }
+        // And re-publishing the genuine bytes refuses to attach a
+        // reference to the squatter (dedup verifies, never trusts).
+        #expect(throws: StoreError.self) {
+            try store.publishArtifact(
+                session: session, as: identity, kind: "exec-output",
+                operationID: nil, bytes: Self.payload("genuine bytes"))
+        }
         try store.close()
     }
 
@@ -261,6 +273,133 @@ struct ArtifactPublicationTests {
         }
         #expect(try resolveArtifactPath(root: "/root", name: ref.digest) == "/root/" + ref.digest)
         #expect(try resolveArtifactPath(root: "/root", name: ".tmp-abc") == "/root/.tmp-abc")
+        try store.close()
+    }
+
+    @Test("A4-1 sqlite session and identity must agree")
+    func sessionAndIdentityMustAgree() throws {
+        let (directory, path) = try Self.freshPath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = SessionID("s-bind")
+        let store = try GRDBSessionStore(path: path)
+        try store.claimWriterOwnership(session: session, writer: "w-1")
+        // The session argument is not decorative: a mismatched identity
+        // fails closed before any I/O, never publishes under the other
+        // session.
+        #expect(throws: StoreError.self) {
+            try store.publishArtifact(
+                session: SessionID("s-other"),
+                as: WriterIdentity(session: session, writer: "w-1"),
+                kind: "exec-output", operationID: nil, bytes: Self.payload("x"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: Self.artifactsRoot(for: path)),
+                "binding refusal creates nothing")
+        try store.close()
+    }
+
+    @Test("A4-1 sqlite symlinked root is refused")
+    func symlinkedRootRefused() throws {
+        let (directory, path) = try Self.freshPath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = SessionID("s-linkroot")
+        let store = try GRDBSessionStore(path: path)
+        try store.claimWriterOwnership(session: session, writer: "w-1")
+        let identity = WriterIdentity(session: session, writer: "w-1")
+        // Plant a symlinked root before first publication.
+        let elsewhere = directory.appendingPathComponent("elsewhere").path
+        try FileManager.default.createDirectory(atPath: elsewhere, withIntermediateDirectories: false)
+        try FileManager.default.createSymbolicLink(
+            atPath: Self.artifactsRoot(for: path), withDestinationPath: elsewhere)
+        #expect(throws: StoreError.self) {
+            try store.publishArtifact(
+                session: session, as: identity, kind: "exec-output",
+                operationID: nil, bytes: Self.payload("nope"))
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: elsewhere).isEmpty,
+                "refused publication writes nothing through the link")
+        try store.close()
+    }
+
+    @Test("A4-1 sqlite distinct stores never share an artifacts root")
+    func distinctStoresNeverShareRoots() throws {
+        let (directory, _) = try Self.freshPath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pathA = directory.appendingPathComponent("store.sqlite").path
+        let pathB = directory.appendingPathComponent("store.db").path
+        let rootA = GRDBSessionStore.artifactsRoot(for: pathA)
+        let rootB = GRDBSessionStore.artifactsRoot(for: pathB)
+        #expect(rootA != rootB, "full filenames distinguish roots: \(rootA) vs \(rootB)")
+        let storeA = try GRDBSessionStore(path: pathA)
+        let storeB = try GRDBSessionStore(path: pathB)
+        let session = SessionID("s-shared")
+        try storeA.claimWriterOwnership(session: session, writer: "w-1")
+        try storeB.claimWriterOwnership(session: session, writer: "w-1")
+        let bytes = Self.payload("shared bytes")
+        let refA = try storeA.publishArtifact(
+            session: session, as: WriterIdentity(session: session, writer: "w-1"),
+            kind: "exec-output", operationID: nil, bytes: bytes)
+        let refB = try storeB.publishArtifact(
+            session: session, as: WriterIdentity(session: session, writer: "w-1"),
+            kind: "exec-output", operationID: nil, bytes: bytes)
+        #expect(refA.digest == refB.digest, "identical bytes, identical digest")
+        let orphansA = try storeA.detectArtifactOrphans()
+        let orphansB = try storeB.detectArtifactOrphans()
+        #expect(orphansA.orphaned.isEmpty && orphansB.orphaned.isEmpty,
+                "each store sees only its own references")
+        try storeA.close()
+        try storeB.close()
+    }
+
+    @Test("A4-1 sqlite dedup re-establishes durability and repairs mode")
+    func dedupReestablishesDurability() throws {
+        let (directory, path) = try Self.freshPath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = SessionID("s-dedup")
+        let store = try GRDBSessionStore(path: path)
+        try store.claimWriterOwnership(session: session, writer: "w-1")
+        let identity = WriterIdentity(session: session, writer: "w-1")
+        let bytes = Self.payload("durable bytes")
+        let first = try store.publishArtifact(
+            session: session, as: identity, kind: "exec-output",
+            operationID: nil, bytes: bytes)
+        // Weaken the file out-of-band; the dedup path must repair mode
+        // (and re-sync) rather than trust it.
+        let filePath = Self.artifactsRoot(for: path) + "/" + first.digest
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: filePath)
+        let second = try store.publishArtifact(
+            session: session, as: identity, kind: "exec-output",
+            operationID: OperationID("e2/c1"), bytes: bytes)
+        #expect(second.digest == first.digest, "dedup returns the same identity")
+        let attrs = try FileManager.default.attributesOfItem(atPath: filePath)
+        #expect((attrs[.posixPermissions] as? Int) == 0o600, "dedup repairs private mode")
+        #expect(try store.readArtifact(second) == bytes)
+        try store.close()
+    }
+
+    @Test("A4-1 sqlite non-regular files fail closed on read and republish")
+    func nonRegularFilesFailClosed() throws {
+        let (directory, path) = try Self.freshPath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = SessionID("s-fifo")
+        let store = try GRDBSessionStore(path: path)
+        try store.claimWriterOwnership(session: session, writer: "w-1")
+        let identity = WriterIdentity(session: session, writer: "w-1")
+        let ref = try store.publishArtifact(
+            session: session, as: identity, kind: "exec-output",
+            operationID: nil, bytes: Self.payload("real bytes"))
+        let filePath = Self.artifactsRoot(for: path) + "/" + ref.digest
+        try FileManager.default.removeItem(atPath: filePath)
+        let made = filePath.withCString { mkfifo($0, mode_t(0o600)) }
+        try #require(made == 0, "fixture needs a FIFO at the digest path")
+        // The read never blocks on the FIFO and never returns from it.
+        #expect(throws: StoreError.self) { try store.readArtifact(ref) }
+        // The dedup path refuses non-regular squatters instead of
+        // attaching a reference to them.
+        #expect(throws: StoreError.self) {
+            try store.publishArtifact(
+                session: session, as: identity, kind: "exec-output",
+                operationID: nil, bytes: Self.payload("real bytes"))
+        }
         try store.close()
     }
 
