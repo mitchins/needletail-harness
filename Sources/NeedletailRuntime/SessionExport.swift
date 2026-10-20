@@ -434,6 +434,7 @@ public enum SessionExport {
                 try handle.synchronize()
                 try handle.close()
             } catch {
+                try? handle.close()
                 try? FileManager.default.removeItem(atPath: tmp)
                 throw ExportError.outputUnwritable("cannot write \(target): \(error)")
             }

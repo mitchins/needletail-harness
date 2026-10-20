@@ -66,6 +66,7 @@ struct SessionExportTests {
         try store.appendBatch([
             .sessionOpened(session: sessionA, atMillis: 1000),
             .epochOpened(epoch),
+            .checkpointCommitted(epoch),
             .transcriptAppended(.user("hello ALPHA-111")),
             .transcriptAppended(.assistantText("answer BETA-222")),
             .transcriptAppended(.user("my token is hunter2-CRED-999")),
