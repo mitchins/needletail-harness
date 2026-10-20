@@ -197,17 +197,26 @@ struct RunCommand: ParsableCommand {
         throw ExitCode(2)
     }
 
+    /// Enforces private mode on a managed path, failing closed instead of
+    /// silently keeping lax permissions (a file the process can write but
+    /// not chmod — foreign owner, ACL/FUSE setup — must refuse the run,
+    /// not complete it on a world-readable database).
+    private static func enforcePrivateFile(_ path: String) throws {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        let mode = try? FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int
+        guard mode == 0o600 else {
+            eprint("store error: cannot establish private permissions on \(terminalSafe(path)). Refusing to run on a non-private store.")
+            throw ExitCode(6)
+        }
+    }
+
     /// Opens (never creates-over) the production store at the resolved
     /// state directory. The directory is created private (0700, repaired
     /// when pre-existing); the database file itself is enforced 0600.
     /// An existing incompatible store fails closed — never overwritten,
     /// never silently replaced with memory.
     static func openProductionStore() throws -> GRDBSessionStore {
-        #if canImport(Glibc)
-        // Private-by-default file creation (SPEC §9.2: dirs 0700, files
-        // 0600) for the database, WAL files, artifacts and trace output.
-        _ = Glibc.umask(0o077)
-        #endif
         let directory = try resolveStateDirectory()
         do {
             try FileManager.default.createDirectory(
@@ -229,17 +238,30 @@ struct RunCommand: ParsableCommand {
             eprint("store error: cannot open durable store at \(terminalSafe(dbPath)): \(terminalSafe(String(describing: error)))")
             throw ExitCode(6)
         }
-        // Enforce private database files (covers pre-existing lax modes;
-        // fresh files are already 0600 via the umask above).
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dbPath)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dbPath + "-wal")
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dbPath + "-shm")
+        // Enforce 0600 on the database and any live sidecars (covers
+        // pre-existing lax modes; fresh files are already 0600 via the
+        // process umask set at startup).
+        try enforcePrivateFile(dbPath)
+        try enforcePrivateFile(dbPath + "-wal")
+        try enforcePrivateFile(dbPath + "-shm")
         return store
     }
 
     private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, isJSONL: Bool) async throws {
         // Unused format param kept for future envelope versioning
         _ = format
+        // Private-by-default file creation for EVERYTHING this process
+        // writes (SPEC §9.2: dirs 0700, files 0600 — database, WAL,
+        // artifacts, trace output). Set once, up front: sealed runs never
+        // reach openProductionStore, but their trace output (and any
+        // future file) falls under the same rule. Fresh files created
+        // under this mask are private by construction; pre-existing lax
+        // files are repaired-and-verified below, never silently kept.
+        #if canImport(Glibc)
+        _ = Glibc.umask(0o077)
+        #elseif canImport(Darwin)
+        _ = Darwin.umask(0o077)
+        #endif
         // 1. Load and validate config
         let configPath: String
         if let explicit = config {
@@ -476,9 +498,13 @@ struct RunCommand: ParsableCommand {
         // work, so the run is identifiable and inspectable after restart
         // (fresh-handle reads, exports). The actor already fenced this
         // writer identity at init; these rows ride the same claim.
-        // Reconcile the (fresh) session through the real contract: a
-        // non-clean report here is impossible for a fresh UUID and fails
-        // closed rather than starting on a corrupt ledger.
+        // Then run the fresh session through the real reconcile contract:
+        // this proves the just-committed rows read back through the
+        // classifier (read-your-write), and a non-clean report — impossible
+        // for fresh UUIDs — fails closed as corruption evidence rather
+        // than starting on a suspect ledger. (Resumed-session
+        // reconciliation with prior holds belongs to explicit recovery
+        // tooling, not to headless runs, which always mint fresh sessions.)
         if let production = grdb {
             let runIdentity = WriterIdentity(session: state.sessionID, writer: writerID)
             do {
@@ -488,7 +514,9 @@ struct RunCommand: ParsableCommand {
                 ], as: runIdentity)
                 let report = try production.reconcile(session: state.sessionID)
                 guard report.completed.isEmpty, report.heldOperations.isEmpty,
-                      report.unmatchedMutating.isEmpty, report.orphanResults.isEmpty else {
+                      report.unmatchedMutating.isEmpty, report.unmatchedNonMutating.isEmpty,
+                      report.explicitUnknown.isEmpty, report.orphanResults.isEmpty,
+                      report.admissionIntents == 0, report.nonToolResults == 0 else {
                     eprint("store error: fresh session reconciles unclean; refusing to run on a corrupt ledger.")
                     throw ExitCode(6)
                 }

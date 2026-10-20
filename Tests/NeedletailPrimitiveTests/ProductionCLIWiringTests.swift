@@ -18,9 +18,23 @@ import Darwin
 struct ProductionCLIWiringTests {
 
     private static func binary() throws -> String {
+        // NEEDLETAIL_BIN (dev/CI explicit) wins; otherwise resolve the
+        // product beside THIS test runner — the executable-target edge
+        // guarantees it was built fresh from the same revision, whatever
+        // the build configuration or scratch path is. The legacy
+        // .build/debug fallback remains for hand-invoked runs.
         if let env = ProcessInfo.processInfo.environment["NEEDLETAIL_BIN"],
            FileManager.default.isExecutableFile(atPath: env) {
             return env
+        }
+        var runner = URL(fileURLWithPath: CommandLine.arguments[0])
+        if !runner.path.hasPrefix("/") {
+            runner = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(CommandLine.arguments[0])
+        }
+        let sibling = runner.deletingLastPathComponent().appendingPathComponent("needletail").path
+        if FileManager.default.isExecutableFile(atPath: sibling) {
+            return sibling
         }
         let fallback = root() + "/.build/debug/needletail"
         guard FileManager.default.isExecutableFile(atPath: fallback) else {
@@ -40,6 +54,13 @@ struct ProductionCLIWiringTests {
         var env = ProcessInfo.processInfo.environment
         env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
         env["NEEDLETAIL_STATE_DIR"] = stateDir.path
+        return env
+    }
+
+    private static func environmentWithout(keys: Set<String>) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        for key in keys { env.removeValue(forKey: key) }
+        env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
         return env
     }
 
@@ -186,6 +207,18 @@ struct ProductionCLIWiringTests {
         defer { try? store.close() }
         let (page, _) = try store.records(session: SessionID(sessions[0]), since: 0, limit: 1000)
         let kinds = page.map(\.record)
+        // Identity rows come FIRST: nothing provider- or tool-driven may
+        // precede them, so the run is identifiable even if it dies next.
+        if case .sessionOpened(let openedSession, _) = kinds.first {
+            #expect(openedSession.raw == sessions[0], "sessionOpened names this run's session")
+        } else {
+            Issue.record("first durable record must be sessionOpened, got \(String(describing: kinds.first))")
+        }
+        if kinds.count > 1, case .epochOpened(let openedEpoch) = kinds[1] {
+            #expect(openedEpoch.epochID.raw.hasPrefix("epoch-run-"), "epochOpened follows")
+        } else {
+            Issue.record("second durable record must be epochOpened")
+        }
         #expect(kinds.contains { if case .sessionOpened = $0 { return true }; return false },
                 "session identity persisted before provider work")
         #expect(kinds.contains { if case .epochOpened = $0 { return true }; return false },
@@ -203,6 +236,12 @@ struct ProductionCLIWiringTests {
         // Clean completion released the claim: no writer row remains.
         #expect(try Self.writerHolders(dbPath: dbPath).isEmpty,
                 "proven-clean run releases its ownership claim")
+        // Post-hoc fencing: the released session refuses foreign writers —
+        // identity rows were committed through the fenced path.
+        #expect(throws: StoreError.notWriter(session: sessions[0], writer: "intruder")) {
+            try store.append(.transcriptAppended(.user("intrusion")),
+                             as: WriterIdentity(session: SessionID(sessions[0]), writer: "intruder"))
+        }
         // And the session reconciles clean.
         let report = try store.reconcile(session: SessionID(sessions[0]))
         #expect(report.heldOperations.isEmpty && report.completed.isEmpty,
@@ -210,8 +249,7 @@ struct ProductionCLIWiringTests {
     }
 
     @Test("A5-1 cli refuses corrupt store without overwrite")
-    func refusesCorruptStoreWithoutOverwrite() throws {
-        let directory = try Self.freshDirectory()
+    func refusesCorruptStoreWithoutOverwrite() throws {        let directory = try Self.freshDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let stateDir = directory.appendingPathComponent("state")
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
@@ -226,7 +264,7 @@ struct ProductionCLIWiringTests {
         let result = try Self.run(
             ["run", "--config", config, "--prompt", "hello", "--format", "jsonl", "--alias", "loop"],
             env: Self.environment(stateDir: stateDir))
-        #expect(result.exit != 0, "corrupt store refuses to run (exit \(result.exit))")
+        #expect(result.exit == 6, "corrupt store fails closed with integrity exit, got \(result.exit): \(result.stderr.prefix(300))")
         #expect(result.stderr.lowercased().contains("store"), "honest store diagnostic, got: \(result.stderr.prefix(300))")
         #expect(try Data(contentsOf: URL(fileURLWithPath: dbPath)) == garbage,
                 "incompatible store is never overwritten")
@@ -393,6 +431,82 @@ struct ProductionCLIWiringTests {
         // own claim at its proven-clean boundary.
         #expect(try Self.writerHolders(dbPath: dbPath) == retained,
                 "retention + clean-release, not takeover")
+    }
+
+    @Test("A5-1 cli state directory resolution and repair")
+    func stateDirectoryResolutionAndRepair() throws {
+        let server = try LoopbackSSEServer()
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("x").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Self.writeConfig(directory, port: Int(server.port))
+        let args = ["run", "--config", config, "--prompt", "hello", "--format", "jsonl", "--alias", "loop"]
+
+        // A path pointing at a regular FILE is not a usable directory —
+        // deterministic for every user (unlike permission bits under root):
+        // establishment fails closed with exit 4.
+        let fileAsDir = directory.appendingPathComponent("not-a-dir")
+        try Data("x".utf8).write(to: fileAsDir)
+        let blocked = try Self.run(args, env: Self.environment(stateDir: fileAsDir))
+        #expect(blocked.exit == 4, "file-as-state-dir fails closed, got \(blocked.exit)")
+
+        // XDG_DATA_HOME is honored when no override is set.
+        var xdgEnv = Self.environmentWithout(keys: ["NEEDLETAIL_STATE_DIR"])
+        let xdgHome = directory.appendingPathComponent("xdg")
+        xdgEnv["XDG_DATA_HOME"] = xdgHome.path
+        xdgEnv.removeValue(forKey: "HOME")
+        let xdgRun = try Self.run(args, env: xdgEnv)
+        #expect(xdgRun.exit == 0, "XDG state home works: \(xdgRun.stderr.prefix(200))")
+        #expect(FileManager.default.fileExists(
+            atPath: xdgHome.appendingPathComponent("needletail/store.sqlite").path),
+                "store lands under $XDG_DATA_HOME/needletail")
+
+        // No HOME, no XDG, no override: fail closed, never scatter state.
+        let noHomeEnv = Self.environmentWithout(
+            keys: ["NEEDLETAIL_STATE_DIR", "XDG_DATA_HOME", "HOME"])
+        let noHome = try Self.run(args, env: noHomeEnv)
+        #expect(noHome.exit == 2, "missing state home fails closed, got \(noHome.exit)")
+
+        // Pre-existing lax modes are repaired, then the run succeeds.
+        let laxDir = directory.appendingPathComponent("lax")
+        try FileManager.default.createDirectory(at: laxDir, withIntermediateDirectories: true)
+        let laxDB = laxDir.appendingPathComponent("store.sqlite").path
+        do {
+            let seed = try GRDBSessionStore(path: laxDB)
+            try seed.close()
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: laxDir.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: laxDB)
+        var laxEnv = Self.environment(stateDir: laxDir)
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("ok").utf8))]))
+        let repaired = try Self.run(args, env: laxEnv)
+        #expect(repaired.exit == 0, "repaired state dir runs: \(repaired.stderr.prefix(200))")
+        #expect(try Self.posixMode(laxDir.path) == 0o700, "directory repaired private")
+        #expect(try Self.posixMode(laxDB) == 0o600, "database repaired private")
+    }
+
+    @Test("A5-1 cli sealed trace stays private and storeless")
+    func sealedTraceStaysPrivateAndStoreless() throws {
+        let server = try LoopbackSSEServer()
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("sealed answer").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Self.writeConfig(directory, port: Int(server.port))
+        let stateDir = directory.appendingPathComponent("state")
+        let traceURL = directory.appendingPathComponent("trace.jsonl")
+        let result = try Self.run(
+            ["run", "--config", config, "--prompt", "hello", "--format", "jsonl", "--alias", "loop",
+             "--sealed", "--trace", traceURL.path],
+            env: Self.environment(stateDir: stateDir))
+        #expect(result.exit == 0, "sealed run completes: \(result.stderr.prefix(200))")
+        #expect(FileManager.default.fileExists(atPath: traceURL.path), "explicit trace file is written")
+        #expect(try Self.posixMode(traceURL.path) == 0o600, "operator-requested trace is private")
+        #expect(!FileManager.default.fileExists(atPath: stateDir.path),
+                "sealed runs create no state directory at all")
     }
 }
 
