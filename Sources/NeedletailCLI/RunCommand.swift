@@ -462,7 +462,51 @@ struct RunCommand: ParsableCommand {
         }
         let backend = ScriptedToolBackend(script: scriptEntries, caps: effective.tools)
 
-        // 5. Transport with transcript-based messageProvider
+        // 5. Run identities BEFORE any network client exists. The explicit
+        // claim fences this writer; the actor re-claims the same identity
+        // idempotently at init. Persisting + verifying + reconciling here
+        // (rather than after transport setup) guarantees no store failure
+        // can strand a live HTTP client: every failure below this point
+        // happens before the client is constructed, so there is nothing
+        // to leak (an un-shut-down client fatals the process on deinit).
+        let writerID = UUID().uuidString
+        if let production = grdb {
+            let runIdentity = WriterIdentity(session: state.sessionID, writer: writerID)
+            do {
+                try production.claimWriterOwnership(session: state.sessionID, writer: writerID)
+                try production.appendBatch([
+                    .sessionOpened(session: state.sessionID, atMillis: SystemClock().nowMillis()),
+                    .epochOpened(epoch),
+                ], as: runIdentity)
+                // Read-your-write: the two identity rows must come back
+                // first through a fresh session-scoped read. Reconcile
+                // ignores non-operation records by design, so only this
+                // read proves they persisted.
+                let (prefix, _) = try production.records(session: state.sessionID, since: 0, limit: 10)
+                guard prefix.count >= 2,
+                      case .sessionOpened(let openedSession, _) = prefix[0].record,
+                      openedSession == state.sessionID,
+                      case .epochOpened = prefix[1].record else {
+                    eprint("store error: run identities did not persist; refusing to run without durable session.")
+                    throw ExitCode(6)
+                }
+                let report = try production.reconcile(session: state.sessionID)
+                guard report.completed.isEmpty, report.heldOperations.isEmpty,
+                      report.unmatchedMutating.isEmpty, report.unmatchedNonMutating.isEmpty,
+                      report.explicitUnknown.isEmpty, report.orphanResults.isEmpty,
+                      report.admissionIntents == 0, report.nonToolResults == 0 else {
+                    eprint("store error: fresh session reconciles unclean; refusing to run on a corrupt ledger.")
+                    throw ExitCode(6)
+                }
+            } catch let error as ExitCode {
+                throw error
+            } catch {
+                eprint("store error: cannot persist run identities: \(terminalSafe(String(describing: error)))")
+                throw ExitCode(6)
+            }
+        }
+
+        // 6. Transport with transcript-based messageProvider
         let httpClient = HTTPClient(eventLoopGroupProvider: .singleton,
                                     configuration: ChatTransportPolicy.configuration(profile: profile))
         // Use the session store (GRDB production or sealed-volatile) for transcript paging
@@ -486,46 +530,25 @@ struct RunCommand: ParsableCommand {
             credentialProvider: { ref, op in try credentialStore.resolve(ref, for: op) },
             snapshotProvider: { snapshot })
 
-        // 6. Actor
-        // A2 fencing: the actor claims this session for a unique
-        // per-process writer identity in its own (throwing) init.
-        let writerID = UUID().uuidString
-        let actor = try SessionActor(
-            state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
-            transport: transport, executor: backend, store: store,
-            approvals: HeadlessApprovals(), sink: sink, writer: writerID)
-        // A5-1: persist the session + epoch identities BEFORE provider
-        // work, so the run is identifiable and inspectable after restart
-        // (fresh-handle reads, exports). The actor already fenced this
-        // writer identity at init; these rows ride the same claim.
-        // Then run the fresh session through the real reconcile contract:
-        // this proves the just-committed rows read back through the
-        // classifier (read-your-write), and a non-clean report — impossible
-        // for fresh UUIDs — fails closed as corruption evidence rather
-        // than starting on a suspect ledger. (Resumed-session
-        // reconciliation with prior holds belongs to explicit recovery
-        // tooling, not to headless runs, which always mint fresh sessions.)
-        if let production = grdb {
-            let runIdentity = WriterIdentity(session: state.sessionID, writer: writerID)
-            do {
-                try production.appendBatch([
-                    .sessionOpened(session: state.sessionID, atMillis: SystemClock().nowMillis()),
-                    .epochOpened(epoch),
-                ], as: runIdentity)
-                let report = try production.reconcile(session: state.sessionID)
-                guard report.completed.isEmpty, report.heldOperations.isEmpty,
-                      report.unmatchedMutating.isEmpty, report.unmatchedNonMutating.isEmpty,
-                      report.explicitUnknown.isEmpty, report.orphanResults.isEmpty,
-                      report.admissionIntents == 0, report.nonToolResults == 0 else {
-                    eprint("store error: fresh session reconciles unclean; refusing to run on a corrupt ledger.")
-                    throw ExitCode(6)
-                }
-            } catch let error as ExitCode {
-                throw error
-            } catch {
-                eprint("store error: cannot persist run identities: \(terminalSafe(String(describing: error)))")
-                throw ExitCode(6)
-            }
+        // 7. Actor
+        // The fencing claim above already established this writer identity;
+        // the actor re-claims it idempotently here (same-identity re-claim
+        // is the documented crash-recovery re-acquire, never a conflict).
+        // Actor init is the last throwing call before provider work: on the
+        // (near-impossible) failure path the client is shut down first, so
+        // a store fault can never strand it into a deinit fatalError.
+        let actor: SessionActor<
+            ChatCompletionsTransport, ScriptedToolBackend, CLIStore,
+            HeadlessApprovals, SystemClock, DeterministicIDSource
+        >
+        do {
+            actor = try SessionActor(
+                state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
+                transport: transport, executor: backend, store: store,
+                approvals: HeadlessApprovals(), sink: sink, writer: writerID)
+        } catch {
+            try? await httpClient.shutdown().get()
+            throw error
         }
 
         // H2: catchable SIGINT drives production cancellation (not a default
@@ -544,7 +567,7 @@ struct RunCommand: ParsableCommand {
         sigintSource.resume()
         defer { sigintSource.cancel() }
 
-        // 7. Submit and wait for completion (multi-turn loop)
+        // 8. Submit and wait for completion (multi-turn loop)
         await actor.submitText(commandID: CommandID("cmd-run"), text: prompt, kind: .followUp, sealed: sealed)
         // Poll for terminal phase with timeout (max 60s per run, plus turn budget)
         let deadline = Date().addingTimeInterval(max(60.0, Double(maxTurns ?? 80) * Double(max(1, profile.requestTimeout))))
@@ -604,6 +627,9 @@ struct RunCommand: ParsableCommand {
                 try? await sink.emitTerminal(outcome: "approval_required", detail: reason)
             }
             eprint("approval required: \(terminalSafe(reason))")
+            // Shut down before throwing: every post-client exit path must
+            // release the client, or its deinit fatals the process.
+            try? await httpClient.shutdown().get()
             throw ExitCode(3)
         }
         // Also emit terminal run_finished envelope if JSONL
