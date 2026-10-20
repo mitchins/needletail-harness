@@ -115,15 +115,22 @@ aggregate CodeRabbit review + merge-readiness disposition.
   no production impact; covered by local gates (no delta review
   required per mission §6).
 
-## 8. CI qualification (filled post-push)
+## 8. CI qualification (verified post-push on the exact head)
 
-- Candidate head pushed to `origin:m2-a-store`; `gh pr checks 5`
-  verified green on the EXACT pushed SHA (offline build+tests,
-  release bundle smoke, GitGuardian).
-- SonarQube Cloud quality gate: RED — reported separately, never
-  counted toward green. Known pre-existing coverage-import gate
-  defect on `main` + PRs (tracked separately, not an M2-A blocker):
-  [run IDs recorded in the push-qualification commit].
+- Candidate head `6e848f4` pushed to `origin:m2-a-store`; `gh pr checks 5`
+  verified green on that SHA:
+  - `offline build and tests (Linux x86_64)`: PASS 12m59s
+    (run 39496187719, job 118881719026).
+  - `release bundle smoke (clean host)`: PASS 6m26s
+    (run 39496187719, job 118881718603).
+  - GitGuardian Security Checks: pass. CodeRabbit: pass (paused —
+    final aggregate round explicitly not invoked; next session owns it).
+- SonarQube Cloud quality gate: FAIL (run 39496187640,
+  job 118881718311; SonarCloud analysis fail) — reported separately,
+  never counted toward green. Known pre-existing coverage-import
+  gate defect on `main` + PRs (tracked separately, not an M2-A
+  blocker). The PR as a whole is therefore NOT called green while
+  this gate fails; the code gates above are green on the exact SHA.
 
 ## 9. Unresolved risks / non-blockers
 
