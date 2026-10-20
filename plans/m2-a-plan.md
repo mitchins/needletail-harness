@@ -337,3 +337,39 @@ emptied PORT-04 body).
 
 Scope guard: CLI production-store wiring (A5) NOT started.
 M2-A remaining: A5, then epic review.
+
+## 20. A5-1 CLOSED — independent review APPROVED (2026-10-20)
+
+Implementing commits `5959817..063b666` (XDG-compatible private
+state, GRDB wiring with no silent fallback, sealed volatile
+exception, session/epoch persistence + reconcile before provider work,
+release-on-clean with retention policy, CLIStore dispatch enum,
+executable-target build edge) plus folds `54a82ac` (verified private
+modes, umask-first, complete guard, binary resolution, evidence
+gaps), `0126809`/`b40d5f2` (SIGILL-class shutdown discipline +
+integration hardening), `1ebb3b7` (serialized process suites, longer
+reap deadlines) and `a1bc89f` (Darwin umask import, trap-safe
+lookup). Reviewer: `deepseek-reviewer`, three rounds. Rounds 1–2
+NEEDS_CHANGES (6 + 2 findings: unverified chmod, umask placement,
+incomplete guard, binary resolution, evidence gaps, unpinned union;
+overclaimed read-back, untested override precedence); final round
+APPROVED with two non-blocking nits, both fixed in-tree.
+
+Delivered: ordinary `needletail run` persists sessions/epochs/
+transcripts to the production GRDB store (0700 dir, 0600 files);
+corrupt stores refuse without overwrite (exit 6); sealed runs stay
+fully volatile; failed/ambiguous runs keep claims and holds; only
+proven-clean runs release ownership; no recovery surface in the CLI
+(import-gated); stdout JSONL stays parseable. A latent SIGILL-class
+defect found during counterfactuals (un-shut-down HTTP client on
+post-client store failure) was eliminated by construction: identity
+work precedes client creation, actor init is guarded, every
+post-client exit shuts down first. Gates at HEAD: quick + native
+green (94 tests), coverage `executed=198 failed=0 satisfied=23`.
+RED/GREEN: 5 implementation counterfactuals (sealed persistence,
+missing release/identities, silent fallback, recovery mention) + 8
+pin counterfactuals incl. SIGILL-scenario coverage proving clean
+exit-6 with no crash.
+
+Scope guard: STORE-08 support export (A5-2) and M2-A epic closeout
+(A5-final) NOT started.
