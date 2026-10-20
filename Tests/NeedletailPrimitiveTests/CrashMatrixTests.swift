@@ -53,20 +53,24 @@ struct CrashMatrixTests {
 
         func writeReady(_ marker: String) throws {
             try Data(marker.utf8).write(to: readyURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                  ofItemAtPath: readyURL.path)
         }
         func appendSentinel() throws {
+            let sentinelPath = sentinelURL.path
             let handle: FileHandle
-            if FileManager.default.fileExists(atPath: sentinelURL.path) {
-                guard let open = FileHandle(forWritingAtPath: sentinelURL.path) else {
+            if FileManager.default.fileExists(atPath: sentinelPath) {
+                guard let open = FileHandle(forWritingAtPath: sentinelPath) else {
                     throw CrashSetupError.sentinelUnwritable
                 }
                 handle = open
                 try handle.seekToEnd()
             } else {
-                guard FileManager.default.createFile(atPath: sentinelURL.path, contents: nil) else {
+                guard FileManager.default.createFile(atPath: sentinelPath, contents: nil,
+                                                     attributes: [.posixPermissions: 0o600]) else {
                     throw CrashSetupError.sentinelUnwritable
                 }
-                guard let open = FileHandle(forWritingAtPath: sentinelURL.path) else {
+                guard let open = FileHandle(forWritingAtPath: sentinelPath) else {
                     throw CrashSetupError.sentinelUnwritable
                 }
                 handle = open
@@ -232,7 +236,12 @@ struct CrashMatrixTests {
         static func spawn(stage: String) throws -> CrashChild {
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("needletail-kill-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            // Private fixture root (0700): UUIDs prevent accidental
+            // collisions; mode bits prevent other local users from
+            // reading or tampering with the staged DB/sentinel/markers.
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700])
             var argv0 = CommandLine.arguments[0]
             if !argv0.hasPrefix("/") {
                 argv0 = FileManager.default.currentDirectoryPath + "/" + argv0
@@ -249,8 +258,10 @@ struct CrashMatrixTests {
             child.environment = env
             let outURL = directory.appendingPathComponent("child-out.log")
             let errURL = directory.appendingPathComponent("child-err.log")
-            guard FileManager.default.createFile(atPath: outURL.path, contents: nil),
-                  FileManager.default.createFile(atPath: errURL.path, contents: nil),
+            guard FileManager.default.createFile(atPath: outURL.path, contents: nil,
+                                                     attributes: [.posixPermissions: 0o600]),
+                  FileManager.default.createFile(atPath: errURL.path, contents: nil,
+                                                     attributes: [.posixPermissions: 0o600]),
                   let outHandle = FileHandle(forWritingAtPath: outURL.path),
                   let errHandle = FileHandle(forWritingAtPath: errURL.path) else {
                 throw CrashSetupError.binaryUnusable("cannot create child logs")
@@ -278,36 +289,43 @@ struct CrashMatrixTests {
                 "child never acknowledged stage \(marker); running=\(process.isRunning)")
         }
 
-        /// Deliver SIGKILL and verify signal termination via waitpid: the
-        /// child MUST die from SIGKILL (never exit, never another signal).
-        /// Returns the terminating signal number.
+        /// Bounded raw reap: WNOHANG poll loop with a deadline. Returns the
+        /// raw wait status if this call reaped the child; nil on timeout
+        /// or when someone else already reaped (ECHILD). NEVER blocks:
+        /// callers fail loudly on timeout instead of hanging, and never
+        /// signal a possibly-recycled PID afterwards.
+        func reapBounded(pid: Int32, deadline: TimeInterval) -> Int32? {
+            let stop = Date().addingTimeInterval(deadline)
+            var status: Int32 = 0
+            while Date() < stop {
+                let waited = waitpid(pid, &status, WNOHANG)
+                if waited == pid { return status }
+                if waited < 0 {
+                    let err = errno
+                    if err == EINTR { continue }
+                    return nil
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            return nil
+        }
+
+        /// Deliver SIGKILL and verify signal termination. Bounded
+        /// throughout: the kill return is checked, the reap has a
+        /// deadline, and `waitUntilExit` is only ever reached when the
+        /// child is certainly dead (reaped by us, or reaped elsewhere and
+        /// therefore gone). A live child past the deadline fails loudly —
+        /// never hangs the run.
         func killAndVerifySIGKILL(deadline: TimeInterval = 10) throws -> Int32 {
             let pid = process.processIdentifier
             guard process.isRunning else {
                 throw CrashSetupError.childDied("child exited before the kill landed")
             }
-            kill(pid, SIGKILL)
-            let stop = Date().addingTimeInterval(deadline)
-            var status: Int32 = 0
-            var reapedByUs = false
-            while Date() < stop {
-                let waited = waitpid(pid, &status, WNOHANG)
-                if waited == pid {
-                    reapedByUs = true
-                    break
-                }
-                if waited < 0 {
-                    let err = errno
-                    if err == EINTR { continue }
-                    // ECHILD: someone else reaped our child (e.g. the
-                    // framework's own process monitor won the race) —
-                    // fall back to the framework's observed state below.
-                    if err == ECHILD { break }
-                    throw CrashSetupError.childDied("waitpid failed: errno \(err)")
-                }
-                Thread.sleep(forTimeInterval: 0.01)
+            guard kill(pid, SIGKILL) == 0 else {
+                throw CrashSetupError.childDied(
+                    "SIGKILL delivery failed (errno \(errno)); cannot verify the crash point")
             }
-            if reapedByUs {
+            if let status = reapBounded(pid: pid, deadline: deadline) {
                 // Manual POSIX decode (no macro imports): low 7 bits hold
                 // the outcome — 0 means clean exit, 0x7f means stopped,
                 // anything else is the terminating signal (bit 0x80 is the
@@ -324,32 +342,38 @@ struct CrashMatrixTests {
                 process.waitUntilExit()
                 return low
             }
-            // Fallback: the framework reaped first. Its reason must still
-            // be an uncaught signal, and the run must be over.
+            // Not reaped by us: either reaped elsewhere (ECHILD — the
+            // child is dead by definition) or still alive past the
+            // deadline. A live child here is a hard failure, not a longer
+            // wait; `waitUntilExit` below is only safe because the ECHILD
+            // branch guarantees death, and the live branch throws first.
+            if process.isRunning {
+                throw CrashSetupError.childDied(
+                    "child survived SIGKILL past the deadline; refusing to hang or signal further")
+            }
             process.waitUntilExit()
-            guard !process.isRunning,
-                  process.terminationReason == .uncaughtSignal else {
+            guard process.terminationReason == .uncaughtSignal else {
                 throw CrashSetupError.notSignaled(
                     "child was not signal-terminated (reason \(process.terminationReason), status \(process.terminationStatus))")
             }
+            // Framework-reaped path: the only signal a parked child with
+            // no handlers can have died from is the SIGKILL delivered
+            // after verifying it parked — recorded as observed.
             return process.terminationStatus
         }
 
-        /// Bounded teardown: a still-running child is killed and reaped.
+        /// Bounded teardown: a still-running child is SIGKILLed and
+        /// reaped with a deadline. Never hangs: if the child somehow
+        /// survives, the failure is recorded loudly and the run moves on
+        /// (the zombie, if any, dies with the test process).
         func ensureReaped() {
             if process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
             }
-            let stop = Date().addingTimeInterval(10)
-            var status: Int32 = 0
-            while process.isRunning, Date() < stop {
-                if waitpid(process.processIdentifier, &status, WNOHANG) != 0 { break }
-                Thread.sleep(forTimeInterval: 0.01)
+            if reapBounded(pid: process.processIdentifier, deadline: 10) == nil,
+               process.isRunning {
+                Issue.record("crash child survived SIGKILL past the teardown deadline")
             }
-            if process.isRunning {
-                process.terminate()
-            }
-            process.waitUntilExit()
         }
     }
 
@@ -379,14 +403,25 @@ struct CrashMatrixTests {
 
     /// Fresh-handle writability via the SAME writer identity (the
     /// documented crash-recovery re-acquire): proves the ownership row
-    /// and the record log survived the kill and accept new work.
+    /// and the record log survived the kill and accept new work. The
+    /// holder is asserted via raw SQL BEFORE re-claiming — a lost
+    /// ownership row fails loudly here instead of being silently
+    /// recreated by the idempotent claim.
     private static func assertWritableAfterReopen(dbPath: String) throws {
+        let probe = try DatabaseQueue(path: dbPath)
+        let holder = try probe.read { db in
+            try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [session.raw])
+        }
+        try probe.close()
+        #expect(holder == writer, "ownership row survived the kill (holder \(holder ?? "none"))")
         let store = try GRDBSessionStore(path: dbPath)
         defer { try? store.close() }
-        try store.claimWriterOwnership(session: Self.session, writer: Self.writer)
+        try store.claimWriterOwnership(session: session, writer: writer)
         try store.append(.transcriptAppended(.user("post-reopen")),
-                         as: WriterIdentity(session: Self.session, writer: Self.writer))
-        let (page, _) = try store.records(session: Self.session, since: 0, limit: 10_000)
+                         as: WriterIdentity(session: session, writer: writer))
+        let (page, _) = try store.records(session: session, since: 0, limit: 10_000)
         #expect(page.contains { $0.record == .transcriptAppended(.user("post-reopen")) },
                 "fresh handle writes and reads back after the kill")
     }
@@ -413,7 +448,11 @@ struct CrashMatrixTests {
 
     @Test("STORE-02 sqlite kill before intent commit leaves nothing")
     func STORE_02_sqliteKillBeforeIntentCommitLeavesNothing() throws {
-        try Self.withKilledChild(stage: "s1") { _, dbPath in
+        try Self.withKilledChild(stage: "s1") { directory, dbPath in
+            // Private fixture root (hermetic even on shared /tmp).
+            let dirAttrs = try FileManager.default.attributesOfItem(atPath: directory.path)
+            #expect((dirAttrs[.posixPermissions] as? Int) == 0o700,
+                    "crash fixture directory is private")
             // The conversation row proves the database itself survived;
             // no operation records of any kind were invented.
             let store = try GRDBSessionStore(path: dbPath)
@@ -476,8 +515,13 @@ struct CrashMatrixTests {
                 revision: 1, sealed: false, atMillis: 1_000_000), &ids)
             #expect(blocked.state.activeRun == nil, "no new run while the kill's outcome is unknown")
             #expect(blocked.state.liveReservations.isEmpty, "nothing dispatched")
+            // Sentinel stability (occurrence/once-ness only): it still
+            // reads exactly once, as before. Non-replay is proven by the
+            // state check above — the refused transition is pure and
+            // could never write the sentinel, so this re-read is a
+            // stability check, not replay evidence.
             #expect(Self.sentinelText(in: directory) == "effect-1\n",
-                    "no replay: sentinel still exactly once after the refused submission")
+                    "sentinel unchanged after the refused submission")
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
@@ -526,15 +570,18 @@ struct CrashMatrixTests {
     func STORE_02_sqliteKillAfterResultCommitSurvivesComplete() throws {
         try Self.withKilledChild(stage: "s5") { directory, dbPath in
             #expect(Self.sentinelText(in: directory) == "effect-1\n")
-            let store = try GRDBSessionStore(path: dbPath)
-            defer { try? store.close() }
-            // Production format survived process death: still WAL.
+            // Production format check FIRST: a raw handle reads the file
+            // header before any production store open could convert it —
+            // otherwise the store's own WAL setup would make this probe
+            // vacuous.
             let probe = try DatabaseQueue(path: dbPath)
             let mode = try probe.read { db in
                 try String.fetchOne(db, sql: "PRAGMA journal_mode") ?? "?"
             }
             try probe.close()
             #expect(mode.lowercased() == "wal", "production WAL format, got \(mode)")
+            let store = try GRDBSessionStore(path: dbPath)
+            defer { try? store.close() }
             let report = try store.reconcile(session: Self.session)
             #expect(report.completed == [OperationID("e1/c1")], "committed result survives")
             #expect(report.heldOperations.isEmpty, "no false unknown classification")
@@ -603,12 +650,13 @@ struct CrashMatrixTests {
         }
     }
 
-    @Test("PORT-04 sqlite native kill reopen leg must execute")
-    func PORT_04_sqliteNativeKillReopenLegMustExecute() throws {
-        // In-memory contrast: the same ledger reconciles trivially — with
-        // no process, no signal and no file there is NOTHING here that
-        // could certify crash durability. This half passes without
-        // proving anything about kills.
+    @Test("in-memory contrast cannot prove kill survival")
+    func inMemoryContrastCannotProveKillSurvival() throws {
+        // PORT-04 contrast, deliberately UNLABELED (no case prefix, no
+        // sqlite/sigkill token): the in-memory ledger reconciles trivially
+        // with no process, no signal and no file — there is NOTHING here
+        // that could certify crash durability. This test documents what
+        // the native leg below adds; it can never satisfy PORT-04 itself.
         let memory = InMemorySessionStore()
         let memSession = SessionID("s-mem")
         try memory.claimWriterOwnership(session: memSession, writer: "w-1")
@@ -621,10 +669,17 @@ struct CrashMatrixTests {
             state: .done, mutating: true), outcome: "ok"), as: memIdentity)
         let (memPage, _) = try memory.records(session: memSession, since: 0, limit: 100)
         #expect(memPage.count == 2, "in-memory ledger completes with no kill involved")
-        // Native leg: a REAL child dies from a REAL SIGKILL and a FRESH
-        // handle recovers — the only evidence PORT-04 accepts. If this
-        // leg is missing, skipped or broken, requiredEvidence has no
-        // passing native variant and the case stays unsatisfied.
+    }
+
+    @Test("PORT-04 sqlite native kill reopen leg must execute")
+    func PORT_04_sqliteNativeKillReopenLegMustExecute() throws {
+        // PORT-04 native leg, and ONLY the native leg: a REAL child dies
+        // from a REAL SIGKILL (verified signal termination) and a FRESH
+        // handle recovers. In-memory success cannot mask this leg — the
+        // required variant is this native function, and the maps pin plus
+        // the ingestion gate fail loudly if it is missing, skipped or
+        // broken. (Body removal is covered structurally: the contrast
+        // above lives in a separate, unlabeled, non-qualifying test.)
         try Self.withKilledChild(stage: "port04") { directory, dbPath in
             #expect(Self.sentinelText(in: directory) == "effect-1\n")
             let store = try GRDBSessionStore(path: dbPath)
