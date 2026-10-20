@@ -505,7 +505,9 @@ struct ProductionCLIWiringTests {
         // Ledger prefix intact; claim row retained (never discarded).
         let survivors = try GRDBSessionStore(path: dbPath)
         defer { try? survivors.close() }
-        let (kept, _) = try survivors.records(session: SessionID(try Self.sessions(in: dbPath)[0]), since: 0, limit: 100_000)
+        let survivorSessions = try Self.sessions(in: dbPath)
+        let survivorID = try #require(survivorSessions.first, "killed run must leave session rows behind")
+        let (kept, _) = try survivors.records(session: SessionID(survivorID), since: 0, limit: 100_000)
         #expect(kept.count >= committed, "no committed row lost to the kill")
         #expect(try Self.writerHolders(dbPath: dbPath).count == 1,
                 "interrupted run keeps its ownership claim")
