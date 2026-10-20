@@ -49,15 +49,20 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// STORE-09 quotas, enforced INSIDE each fenced append transaction.
     public let sessionRecordLimit: Int
     public let globalRecordLimit: Int
+    /// A4-1 per-artifact byte cap (SPEC §9.2 default: 32 MiB per exec
+    /// artifact). Publication above the cap fails closed before touching
+    /// the filesystem.
+    public let artifactByteLimit: Int
     private var closed = false
     /// Serializes every operation against `close` so the typed
     /// closed-store contract holds atomically (A1 stabilization).
     private let gate = NSLock()
 
-    public init(path: String, sessionRecordLimit: Int = 10_000, globalRecordLimit: Int = 100_000) throws {
+    public init(path: String, sessionRecordLimit: Int = 10_000, globalRecordLimit: Int = 100_000, artifactByteLimit: Int = 32 * 1024 * 1024) throws {
         self.path = path
         self.sessionRecordLimit = sessionRecordLimit
         self.globalRecordLimit = globalRecordLimit
+        self.artifactByteLimit = artifactByteLimit
         var configuration = Configuration()
         configuration.journalMode = .wal
         // A2 review: bound lock contention (typed failures, never raw
@@ -531,6 +536,237 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 arguments: [last + 1, session.raw,
                             String(decoding: encoded, as: UTF8.self)])
         } } catch { throw Self.translate(error) }
+    }
+
+    /// A4-1 publication, read-back and orphan-scan for immutable
+    /// artifacts (SPEC §9.1). Bytes live content-addressed under a
+    /// private managed root beside the database (`<base>-artifacts`,
+    /// mode 0700; files 0600); the database stores only the reference.
+    private var artifactsRoot: String {
+        (path as NSString).deletingPathExtension + "-artifacts"
+    }
+
+    /// Reads a final artifact file and verifies it against its digest.
+    /// Absent files, symlinks, unreadable files and digest mismatches all
+    /// fail typed `.integrity` — partial or substituted bytes are never
+    /// returned. (TOCTOU note: a concurrent replacement races this check,
+    /// but only bytes hashing to the digest pass it.)
+    private func readVerifiedArtifact(atPath filePath: String, digest: String) throws -> Data {
+        guard FileManager.default.fileExists(atPath: filePath) else {
+            throw StoreError.integrity("artifact file absent for digest \(digest)")
+        }
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: filePath)) != nil {
+            throw StoreError.integrity("artifact path is a symlink; refusing escape for digest \(digest)")
+        }
+        let bytes: Data
+        do {
+            bytes = try Data(contentsOf: URL(fileURLWithPath: filePath), options: .mappedIfSafe)
+        } catch {
+            throw StoreError.integrity("artifact file unreadable for digest \(digest): \(error)")
+        }
+        guard artifactSHA256Hex(bytes) == digest else {
+            throw StoreError.integrity("artifact digest mismatch for \(digest): stored bytes do not match")
+        }
+        return bytes
+    }
+
+    /// A4-1 publication with ordering: private tmp file → write → flush +
+    /// fsync → atomic rename on the same filesystem → directory sync →
+    /// post-rename re-verification → ONLY THEN the fenced database
+    /// reference commit. Fencing is checked BEFORE any filesystem work (a
+    /// stale writer creates nothing) and re-checked inside the reference
+    /// transaction. A crash between rename and commit leaves a file with
+    /// no reference — an orphan, reported by `detectArtifactOrphans`,
+    /// never auto-attached.
+    public func publishArtifact(
+        session: SessionID, as identity: WriterIdentity,
+        kind: String, operationID: OperationID?, bytes: Data
+    ) throws -> ArtifactRef {
+        gate.lock()
+        defer { gate.unlock() }
+        try assertOpenLocked()
+        guard !kind.isEmpty else {
+            throw StoreError.integrity("artifact kind must not be empty")
+        }
+        guard !bytes.isEmpty else {
+            throw StoreError.integrity("artifact bytes must not be empty")
+        }
+        guard bytes.count <= artifactByteLimit else {
+            throw StoreError.quotaExceeded(limit: artifactByteLimit)
+        }
+        // Fencing BEFORE any filesystem work (A4-1 req 6): a stale writer
+        // creates no files and commits no reference.
+        let preHolder = try queue.read { db in
+            try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [identity.session.raw])
+        }
+        guard preHolder == identity.writer else {
+            throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+        }
+        let digest = artifactSHA256Hex(bytes)
+        let root = artifactsRoot
+        do {
+            try FileManager.default.createDirectory(
+                atPath: root, withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700])
+        } catch {
+            // createDirectory throws when the root exists AND when it
+            // cannot be created — a pre-existing root is fine (repaired
+            // private below); anything else fails closed.
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: root, isDirectory: &isDir),
+                  isDir.boolValue else {
+                throw StoreError.integrity("artifact root is not a directory: \(root)")
+            }
+        }
+        do {
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root)
+        } catch {
+            throw StoreError.integrity("artifact root is not private: \(root): \(error)")
+        }
+        let finalPath = try resolveArtifactPath(root: root, name: digest)
+        if FileManager.default.fileExists(atPath: finalPath) {
+            // Dedup path: identical bytes already durable. Verify rather
+            // than trust — a squatter with colliding content fails closed
+            // and is never overwritten.
+            let existing = try readVerifiedArtifact(atPath: finalPath, digest: digest)
+            guard existing.count == bytes.count else {
+                throw StoreError.integrity("artifact collision at digest \(digest): stored bytes differ")
+            }
+        } else {
+            let tmpPath = try resolveArtifactPath(
+                root: root, name: artifactTmpPrefix + UUID().uuidString)
+            do {
+                guard FileManager.default.createFile(
+                    atPath: tmpPath, contents: nil,
+                    attributes: [.posixPermissions: 0o600]) else {
+                    throw StoreError.integrity("artifact tmp file creation failed")
+                }
+                guard let handle = FileHandle(forWritingAtPath: tmpPath) else {
+                    throw StoreError.integrity("artifact tmp file is not writable")
+                }
+                do {
+                    try handle.write(contentsOf: bytes)
+                    try handle.synchronize()
+                    try handle.close()
+                } catch {
+                    try? FileManager.default.removeItem(atPath: tmpPath)
+                    throw StoreError.integrity("artifact tmp write/fsync failed: \(error)")
+                }
+                try FileManager.default.moveItem(atPath: tmpPath, toPath: finalPath)
+                try syncArtifactDirectory(atPath: root)
+                // Verify what was actually published, before any reference
+                // exists: the committed reference can never point at an
+                // absent, incomplete or mismatched file.
+                let published = try readVerifiedArtifact(atPath: finalPath, digest: digest)
+                guard published.count == bytes.count else {
+                    throw StoreError.integrity("published artifact failed verification for digest \(digest)")
+                }
+            } catch let error as StoreError {
+                throw error
+            } catch {
+                throw StoreError.integrity("artifact publication failed: \(error)")
+            }
+        }
+        // Fenced reference commit: holder re-checked, record quotas
+        // enforced, single insert — same transaction, same guarantees as
+        // every other durable mutation.
+        let ref = ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID)
+        let payload = try RecordCodec.encode(DurableRecord.artifactPublished(ref))
+        do { try queue.write { db in
+            let holder = try String.fetchOne(
+                db, sql: "SELECT writer FROM writer WHERE session = ?",
+                arguments: [identity.session.raw])
+            guard holder == identity.writer else {
+                throw StoreError.notWriter(
+                    session: identity.session.raw, writer: identity.writer)
+            }
+            let global = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM records") ?? 0
+            guard global + 1 <= globalRecordLimit else {
+                throw StoreError.quotaExceeded(limit: globalRecordLimit)
+            }
+            let sessionRows = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM records WHERE session = ?",
+                arguments: [identity.session.raw]) ?? 0
+            guard sessionRows + 1 <= sessionRecordLimit else {
+                throw StoreError.quotaExceeded(limit: sessionRecordLimit)
+            }
+            let last = try Int64.fetchOne(
+                db, sql: "SELECT MAX(seq) FROM records") ?? 0
+            try db.execute(
+                sql: "INSERT INTO records (seq, session, payload) VALUES (?, ?, ?)",
+                arguments: [last + 1, identity.session.raw,
+                            String(decoding: payload, as: UTF8.self)])
+        } } catch { throw Self.translate(error) }
+        return ref
+    }
+
+    /// Reads a published artifact by reference. The digest, not the
+    /// database, is the authority: absent files, symlinks, size drift and
+    /// digest mismatches fail typed `.integrity` — never partial or
+    /// substituted bytes.
+    public func readArtifact(_ ref: ArtifactRef) throws -> Data {
+        gate.lock()
+        defer { gate.unlock() }
+        try assertOpenLocked()
+        guard ref.digest.count == 64,
+              ref.digest.allSatisfy({ $0.isHexDigit }),
+              ref.digest == ref.digest.lowercased() else {
+            throw StoreError.integrity("artifact digest is not a lowercase SHA-256 hex string")
+        }
+        guard ref.size >= 0 else {
+            throw StoreError.integrity("artifact size is negative")
+        }
+        let filePath = try resolveArtifactPath(root: artifactsRoot, name: ref.digest)
+        let bytes = try readVerifiedArtifact(atPath: filePath, digest: ref.digest)
+        guard bytes.count == ref.size else {
+            throw StoreError.integrity("artifact size mismatch for digest \(ref.digest)")
+        }
+        return bytes
+    }
+
+    /// Orphan scan (recovery tooling, never fed to a model): final-named
+    /// files with no committed reference are orphans; tmp leftovers are
+    /// interrupted publications. Reported, never deleted, never attached.
+    /// References are enumerated store-wide (unscoped diagnostic read —
+    /// a session-scoped scan would misreport every other session's
+    /// artifacts as orphans). No gate across the paging loop (precedent:
+    /// `reconcile`); each page is atomic and close interleaves typed.
+    public func detectArtifactOrphans() throws -> ArtifactOrphans {
+        var referenced = Set<String>()
+        var cursor: UInt64 = 0
+        while true {
+            let (page, next) = try records(since: cursor, limit: 500)
+            for row in page {
+                if case .artifactPublished(let ref) = row.record {
+                    referenced.insert(ref.digest)
+                }
+            }
+            guard let advanced = next else { break }
+            cursor = advanced
+        }
+        let root = artifactsRoot
+        guard FileManager.default.fileExists(atPath: root) else {
+            return ArtifactOrphans(orphaned: [], interrupted: [])
+        }
+        let entries: [String]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(atPath: root)
+        } catch {
+            throw StoreError.integrity("artifact root is not listable: \(root): \(error)")
+        }
+        var orphaned: [String] = []
+        var interrupted: [String] = []
+        for entry in entries {
+            if entry.hasPrefix(artifactTmpPrefix) {
+                interrupted.append(entry)
+            } else if !referenced.contains(entry) {
+                orphaned.append(entry)
+            }
+        }
+        return ArtifactOrphans(orphaned: orphaned.sorted(), interrupted: interrupted.sorted())
     }
 
     /// A1 test/receipt support: an explicit close hands the file to a

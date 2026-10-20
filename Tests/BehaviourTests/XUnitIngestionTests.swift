@@ -139,6 +139,8 @@ struct XUnitIngestionTests {
         "STORE-07": ["STORE_07_sqliteProductionResumeAtScale": "NeedletailPrimitiveTests"],
         "STORE-09": ["STORE_09_sqliteProductionQuotasEnforceInTransaction": "NeedletailPrimitiveTests"],
         "STORE-02": ["STORE_02_sigkillMidTransactionRollsBack": "NeedletailPrimitiveTests"],
+        "STORE-03": ["STORE_03_sqliteRenamedArtifactWithoutReferenceIsReportedOrphan": "NeedletailPrimitiveTests"],
+        "STORE-04": ["STORE_04_sqliteReferenceToAbsentArtifactFailsTypedIntegrity": "NeedletailPrimitiveTests"],
     ]
 
     private static var requiredVariants: [String: Set<String>] {

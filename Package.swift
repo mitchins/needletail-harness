@@ -60,6 +60,10 @@ let package = Package(
                 // in Runtime (the I/O-bearing target). ImportGateTests keep
                 // GRDB out of Core/CLI; the linkage activates with A1.
                 .product(name: "GRDB", package: "GRDB.swift"),
+                // A4-1: SHA-256 for artifact fingerprints. Pre-authorized
+                // use (DEPENDENCIES.md): Core must not import Crypto, so
+                // the digest lives in Runtime with the store that needs it.
+                .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
         .target(

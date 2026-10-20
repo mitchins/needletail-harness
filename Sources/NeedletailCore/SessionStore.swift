@@ -21,6 +21,13 @@ public enum DurableRecord: Sendable, Equatable, Codable {
     /// travels in `WriterRecovery` (previous/new writer, operator
     /// authorization reference, and the held-operation evidence).
     case writerRecovered(WriterRecovery)
+    /// A4-1 artifact publication reference (SPEC §9.1): the database stores
+    /// the relative path, digest, size and identity/metadata — NEVER the
+    /// blob. The bytes live content-addressed under the managed artifacts
+    /// root; this record is committed only AFTER the file is durable
+    /// (write → fsync → atomic rename → dirsync → txn). Reads re-verify
+    /// size and digest and fail typed `.integrity` on any mismatch.
+    case artifactPublished(ArtifactRef)
 }
 
 public struct SequencedRecord: Sendable, Equatable {
@@ -153,6 +160,31 @@ public struct WriterRecovery: Sendable, Equatable, Codable {
         self.atMillis = atMillis
         self.unresolvedOperations = unresolvedOperations
     }
+}
+
+/// A4-1 artifact reference (SPEC §9.1): the database half of a published
+/// artifact. `digest` is the lowercase hex SHA-256 of the EXACT bytes;
+/// the file lives content-addressed at `relativePath` (== digest) under
+/// the store's managed artifacts root. `size` is the byte count;
+/// `kind` names the artifact class (non-empty, e.g. "exec-output");
+/// `operationID` optionally binds the artifact to the operation that
+/// produced it (metadata only — publication never infers operation
+/// outcomes from it). No credentials, no absolute paths, no blobs.
+public struct ArtifactRef: Sendable, Equatable, Codable {
+    public let digest: String
+    public let size: Int
+    public let kind: String
+    public let operationID: OperationID?
+
+    public init(digest: String, size: Int, kind: String, operationID: OperationID? = nil) {
+        self.digest = digest
+        self.size = size
+        self.kind = kind
+        self.operationID = operationID
+    }
+
+    /// Content-addressed relative path inside the managed root.
+    public var relativePath: String { digest }
 }
 
 public protocol SessionStore: Sendable {

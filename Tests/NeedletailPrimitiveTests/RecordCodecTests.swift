@@ -66,6 +66,9 @@ struct RecordCodecTests {
             .checkpointCommitted(try epoch(id: "epoch-3", parent: EpochID("epoch-1"),
                                            route: .allowed(endpoint: "http://127.0.0.1:11434/v1", alias: "local-coder"))),
             .transcriptAppended(.assistantText("covered here too, not only in the sibling test")),
+            .artifactPublished(ArtifactRef(
+                digest: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                size: 4, kind: "exec-output", operationID: opID)),
             .writerRecovered(WriterRecovery(
                 previousWriter: "w-old", newWriter: "w-new",
                 operatorID: "op-9", reference: "ticket-42", reason: "operator rotation",
@@ -89,6 +92,7 @@ struct RecordCodecTests {
         case .checkpointCommitted: return "checkpointCommitted"
         case .transcriptAppended: return "transcriptAppended"
         case .writerRecovered: return "writerRecovered"
+        case .artifactPublished: return "artifactPublished"
         }
     }
 
@@ -96,6 +100,7 @@ struct RecordCodecTests {
         "sessionOpened", "epochOpened", "eventAppended", "operationIntent",
         "operationResult", "queueAdmitted", "queueUpdated",
         "checkpointCommitted", "transcriptAppended", "writerRecovered",
+        "artifactPublished",
     ]
 
     /// The transcript shapes ride DurableRecord.transcriptAppended; every
@@ -125,7 +130,7 @@ struct RecordCodecTests {
         // The table must have exercised every case exactly by name; a new
         // case without a fixture fails here even before the build break.
         #expect(covered == Self.expectedCaseNames,
-                "fixture table must cover all ten cases, covered=\(covered.sorted())")
+                "fixture table must cover all eleven cases, covered=\(covered.sorted())")
     }
 
     @Test("record codec round-trips every TranscriptEntry case losslessly")
