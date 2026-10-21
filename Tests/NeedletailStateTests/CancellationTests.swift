@@ -59,7 +59,7 @@ struct CancellationTests {
         reservations.append(EffectReservation(
             effectID: EffectID("eff-live"), runID: streaming.activeRun!.runID,
             requestID: streaming.activeRun!.requestID, generation: streaming.activeRun!.revision,
-            revision: streaming.activeRun!.revision, mutating: true))
+            revision: streaming.activeRun!.revision, mutating: true, kind: .executor))
         streaming = streaming.replacing(liveReservations: reservations)
         let cancelled = transition(streaming, .cancelRequested(atMillis: 2000), &ids)
         #expect(cancelled.state.unresolvedOperations.count == 1, "one unknown marker retained")

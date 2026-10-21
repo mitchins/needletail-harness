@@ -125,8 +125,11 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             guard ref.state != .intent else {
                 throw StoreError.integrity("operation result \(ref.operationID.raw) carries intent state")
             }
-            // Last-record-wins for cancelledPendingMarker supersession: if a marker exists for this ID, the result supersedes it.
-            if pendingMarkers[ref.operationID] != nil {
+            // Last-record-wins for cancelledPendingMarker supersession: only a proven unstarted result may supersede.
+            if let _ = pendingMarkers[ref.operationID] {
+                guard outcome == "cancelled: unstarted" else {
+                    throw StoreError.integrity("marker supersession requires proof 'cancelled: unstarted' for \(ref.operationID.raw), got '\(outcome)'")
+                }
                 pendingMarkers.removeValue(forKey: ref.operationID)
             } else {
                 guard results[ref.operationID] == nil else {
@@ -153,11 +156,15 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
                 throw StoreError.integrity("cancelledPendingMarker \(ref.operationID.raw) carries intent state")
             }
             // Marker is HOLD-equivalent but supersedable; store separately and do not treat as duplicate result yet.
-            // If a result already exists for this ID, marker is ignored (result wins).
-            if results[ref.operationID] == nil && pendingMarkers[ref.operationID] == nil {
-                pendingMarkers[ref.operationID] = ref
-                toolIDs.insert(ref.operationID)
+            // If a result already exists for this ID, marker is ignored (result wins — last-record-wins).
+            if results[ref.operationID] != nil {
+                continue
             }
+            guard pendingMarkers[ref.operationID] == nil else {
+                throw StoreError.integrity("duplicate cancelledPendingMarker for operation \(ref.operationID.raw)")
+            }
+            pendingMarkers[ref.operationID] = ref
+            toolIDs.insert(ref.operationID)
         case .cancelledPendingError(let err):
             cancelledErrors.append(err)
         case .acknowledgedUnresolved, .artifactPublished, .transcriptAppended, .eventAppended, .queueAdmitted, .queueUpdated, .checkpointCommitted, .writerRecovered, .sessionOpened, .epochOpened:

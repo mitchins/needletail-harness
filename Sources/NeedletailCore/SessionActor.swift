@@ -41,6 +41,7 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// An entry is removed when its run is cancelled (after C3 retention
     /// records) or when its completion is first accepted (R3).
     private var reservations: [EffectID: EffectReservation] = [:]
+    private var cancelledPending: [EffectID: EffectReservation] = [:]
     private var inFlight: Task<Void, Never>?
     private var deltaDelivery: DeltaDeliveryQueue?
     private var deltaDeliveryTask: Task<Void, Never>?
@@ -191,8 +192,10 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             // means a possible side effect's outcome is now unresolved,
             // while a pure intent group means nothing executed yet.
             let leftResultUnpersisted = result.records.contains {
-                if case .operationResult = $0 { return true }
-                return false
+                switch $0 {
+                case .operationResult, .cancelledPendingMarker, .cancelledPendingError: return true
+                default: return false
+                }
             }
             let reason = leftResultUnpersisted
                 ? "store append failed; result unpersisted, outcome unresolved"
@@ -214,7 +217,13 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                 // failRun: nothing resumes behind the held queue.
                 var markers = prior.unresolvedOperations
                 for record in result.records {
-                    guard case .operationResult(let ref, _) = record, ref.mutating else { continue }
+                    let ref: OperationRef?
+                    switch record {
+                    case .operationResult(let r, _): ref = r.mutating ? r : nil
+                    case .cancelledPendingMarker(let r, _): ref = r.mutating ? r : nil
+                    default: ref = nil
+                    }
+                    guard let ref = ref else { continue }
                     guard markers.count < maxUnresolvedOperations else { break }
                     markers.append(OperationRef(
                         operationID: ref.operationID, callID: ref.callID,
@@ -243,8 +252,13 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             }
         }
         if case .cancelRequested = event {
-            // C3 order: retention records above were appended BEFORE this
-            // invalidation (cancelActive emits them first). Now drop.
+            // REV25: retain mutating executor reservations in cancelledPending, mirroring state.
+            for (id, res) in reservations where res.kind == .executor {
+                let hasMutating = res.batch.proposals.contains { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" } || (res.batch.proposals.isEmpty && res.mutating)
+                if hasMutating {
+                    cancelledPending[id] = res
+                }
+            }
             reservations = [:]
             inFlight?.cancel()
         }
@@ -473,15 +487,40 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
 
     /// Production executor dispatch (M1-D): exactly one `execute` call per
     /// batch reservation. Generation/revision pairing happens in
-    /// completeEffect/failEffect (stale outcomes drop); CancellationError
-    /// drops silently (cancelRequested already invalidated the run).
+    /// completeEffect/failEffect (stale outcomes drop).
     private func invokeExecutor(reservation: EffectReservation) async {
+        defer {
+            // REV25: termination cleanup — if the task ends without a report, promote pending markers.
+            // This runs on return, throw, or cancellation; it prunes both actor tables via event.
+            Task { await self.apply(.cancelledPendingRemoved(effectID: reservation.effectID, atMillis: self.clock.nowMillis())) }
+            // Also clean up inFlight tracking
+            if cancelledPending[reservation.effectID] != nil {
+                cancelledPending.removeValue(forKey: reservation.effectID)
+            }
+            reservations.removeValue(forKey: reservation.effectID)
+        }
         do {
             let result = try await executor.execute(batch: reservation.batch, reservation: reservation)
-            await self.completeEffect(reservation.effectID, outcome: .success(result.receipt.summary))
+            await self.completeEffect(reservation.effectID, outcome: .perCall(result))
+        } catch let err as ToolFailure {
+            switch err {
+            case .preDispatch(let status, let summary):
+                // Pre-dispatch typed failure: synthesize per-call done receipts preserving status
+                let calls = reservation.batch.proposals.map { ToolCallOutcome(callID: $0.callID, status: status, summary: summary, data: "", error: summary, started: false) }
+                let receipt = ExecutorReceipt(callID: reservation.effectID.raw, status: status, summary: summary)
+                let synth = ExecutorResult(receipt: receipt, calls: calls)
+                await self.completeEffect(reservation.effectID, outcome: .perCall(synth))
+            }
         } catch is CancellationError {
+            // Synthesize per-call cancelled with started==true for every proposal (fail-closed fallback)
+            let calls = reservation.batch.proposals.map { ToolCallOutcome(callID: $0.callID, status: "cancelled", summary: "cancelled: fallback", data: "", started: true) }
+            let receipt = ExecutorReceipt(callID: reservation.effectID.raw, status: "cancelled", summary: "cancelled")
+            let synth = ExecutorResult(receipt: receipt, calls: calls)
+            await self.completeEffect(reservation.effectID, outcome: .perCall(synth))
             return
         } catch {
+            // Other throw: per-call unknown for mutating, but we need to synthesize via perCall with failed status
+            // For now, use failEffect which will handle per-call unknown for mutating via separate path
             await self.failEffect(reservation.effectID, error: String(describing: error))
         }
     }
@@ -492,7 +531,10 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// production execution through `invokeExecutor` above, pairing through
     /// this same entry point.
     public func completeEffect(_ effectID: EffectID, outcome: EffectOutcome) async {
-        guard let reservation = reservations[effectID] else { return }
+        guard let reservation = reservations[effectID] ?? cancelledPending[effectID] else { return }
+        // Prune from both tables after forwarding (R3)
+        reservations.removeValue(forKey: effectID)
+        cancelledPending.removeValue(forKey: effectID)
         await apply(.effectCompleted(
             effectID: effectID,
             runID: reservation.runID, generation: reservation.generation,
@@ -501,7 +543,9 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     }
 
     public func failEffect(_ effectID: EffectID, error: String) async {
-        guard let reservation = reservations[effectID] else { return }
+        guard let reservation = reservations[effectID] ?? cancelledPending[effectID] else { return }
+        reservations.removeValue(forKey: effectID)
+        cancelledPending.removeValue(forKey: effectID)
         await apply(.effectFailed(
             effectID: effectID,
             runID: reservation.runID, generation: reservation.generation,

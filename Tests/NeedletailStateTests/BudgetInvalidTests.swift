@@ -54,7 +54,7 @@ struct BudgetInvalidTests {
         // Post-tool continuation at the limit must stop, not dispatch.
         let reservation = EffectReservation(
             effectID: EffectID("eff-t"), runID: run.runID, requestID: run.requestID,
-            generation: run.revision, revision: run.revision, mutating: false)
+            generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
         state = state.replacing(phase: .executing, liveReservations: [reservation])
         let over = transition(state, .effectCompleted(
             effectID: EffectID("eff-t"), runID: run.runID, generation: run.revision,

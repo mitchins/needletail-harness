@@ -73,7 +73,7 @@ public struct EffectReservation: Sendable, Equatable {
     public let batch: ToolBatch
     public let kind: Kind
 
-    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch(), kind: Kind = .executor) {
+    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch(), kind: Kind) {
         self.effectID = effectID
         self.runID = runID
         self.requestID = requestID
@@ -549,10 +549,18 @@ private func dropRetaining<I: IDSource>(_ state: SessionState, effectID: EffectI
             operationID: OperationID(effectID.raw), callID: effectID.raw,
             state: .unknown, mutating: mutating)]
     } else {
-        refs = proposals.map {
-            OperationRef(
+        refs = proposals.compactMap {
+            let isMutating = $0.tool != "read" && $0.tool != "search" && $0.tool != "consult"
+            guard isMutating else { return nil }
+            return OperationRef(
                 operationID: operationID(effectID: effectID, callID: $0.callID),
-                callID: $0.callID, state: .unknown, mutating: mutating)
+                callID: $0.callID, state: .unknown, mutating: true)
+        }
+        // If no mutating proposals, no retained markers (transcript-only)
+        if refs.isEmpty {
+            var live = state.liveReservations
+            live.removeAll(where: { $0.effectID == effectID })
+            return Transition(state: bumped(state, live: live), effects: [], records: [])
         }
     }
     var unresolved = state.unresolvedOperations
@@ -646,7 +654,7 @@ private func admitFreshRun<I: IDSource>(
     let run = RunDescriptor(runID: runID, requestID: requestID, revision: revision, startedAtMillis: atMillis, sealed: sealed)
     let reservation = EffectReservation(
         effectID: effectID, runID: runID, requestID: requestID,
-        generation: revision, revision: revision, mutating: false)
+        generation: revision, revision: revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(
         effectID: effectID, requestID: requestID, runID: runID, generation: revision,
         alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: sealed,
@@ -1095,7 +1103,7 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
     let run = RunDescriptor(runID: runID, requestID: requestID, revision: revision, startedAtMillis: atMillis, sealed: entry.sealed)
     let reservation = EffectReservation(
         effectID: effectID, runID: runID, requestID: requestID,
-        generation: revision, revision: revision, mutating: false)
+        generation: revision, revision: revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(
         effectID: effectID, requestID: requestID, runID: runID, generation: revision,
         alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: entry.sealed,
@@ -1284,7 +1292,7 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         let seq = ids.nextSequence()
         let reservation = EffectReservation(
             effectID: nextEffectID, runID: run.runID, requestID: run.requestID,
-            generation: run.revision, revision: run.revision, mutating: false)
+            generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
         let invocation = ProviderInvocation(
             effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
             alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,
@@ -1366,7 +1374,7 @@ private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: Too
     let mutating = batch.proposals.contains { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" }
     let reservation = EffectReservation(
         effectID: effectID, runID: run.runID, requestID: run.requestID,
-        generation: run.revision, revision: run.revision, mutating: mutating, batch: batch)
+        generation: run.revision, revision: run.revision, mutating: mutating, batch: batch, kind: .executor)
     let (s1, prefix) = sequenced(state, kind: "executing", digest: eventDigest("exec", run.requestID.raw), ids: &ids)
     let next = s1.replacing(
         phase: .executing, pendingApproval: .some(nil), pendingBatch: .some(nil),
@@ -1376,9 +1384,10 @@ private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: Too
     // atomically BEFORE performing `.reserveEffect`, so no external side
     // effect exists without its identifiable intent.
     let intents = batch.proposals.map {
-        DurableRecord.operationIntent(OperationRef(
+        let isMutating = $0.tool != "read" && $0.tool != "search" && $0.tool != "consult"
+        return DurableRecord.operationIntent(OperationRef(
             operationID: operationID(effectID: effectID, callID: $0.callID),
-            callID: $0.callID, state: .intent, mutating: mutating))
+            callID: $0.callID, state: .intent, mutating: isMutating))
     }
     return Transition(
         state: next,
@@ -1441,7 +1450,7 @@ private func continueAfterEffect<I: IDSource>(
     let seq = ids.nextSequence()
     let reservation = EffectReservation(
         effectID: nextEffectID, runID: run.runID, requestID: run.requestID,
-        generation: run.revision, revision: run.revision, mutating: false)
+        generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(
         effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
         alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,
@@ -1515,10 +1524,34 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
     var live = state.liveReservations.filter { $0.effectID != effectID }
     var unresolved = state.unresolvedOperations
 
-    // Build map from callID to outcome
-    var outcomeMap: [String: ToolCallOutcome] = [:]
+    // F5: duplicate callIDs fail closed before mapping
+    var seenCallIDs: Set<String> = []
     for call in result.calls {
+        if seenCallIDs.contains(call.callID) {
+            // Duplicate: treat as contract violation → unknown for mutating
+            let isMutating = proposals.first(where: { $0.callID == call.callID }).map { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" } ?? true
+            if isMutating {
+                let ref = OperationRef(operationID: operationID(effectID: effectID, callID: call.callID), callID: call.callID, state: .unknown, mutating: true)
+                let (markers, overflow) = appendUnresolved(unresolved, ref)
+                unresolved = markers
+                if overflow { return integrityStop(state, ids: &ids) }
+                records.append(.operationResult(ref, outcome: "unknown: duplicate callID \(call.callID)"))
+            }
+            transcript.append(.transcriptAppended(.toolResponse(callID: call.callID, text: "duplicate callID: \(call.callID)")))
+            // Do not insert into map again; keep first
+            continue
+        }
+        seenCallIDs.insert(call.callID)
+    }
+    // Build map from callID to outcome (first wins for duplicates already handled)
+    var outcomeMap: [String: ToolCallOutcome] = [:]
+    for call in result.calls where outcomeMap[call.callID] == nil {
         outcomeMap[call.callID] = call
+    }
+    // F5: unexpected callIDs (not in reservation) fail closed: do not create results for them, just transcript
+    for call in result.calls where !proposals.contains(where: { $0.callID == call.callID }) {
+        // Unexpected: transcript only, no durable result, but record as failure for visibility
+        transcript.append(.transcriptAppended(.toolResponse(callID: call.callID, text: "unexpected callID: \(call.callID)")))
     }
 
     for proposal in proposals {
@@ -1602,17 +1635,55 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         // Artifact handling: if outcome has artifactID, publish reference already done by executor; here we just record
     }
 
-    var nextState = state.replacing(consumedEffects: consumed, liveReservations: live, unresolvedOperations: unresolved)
-    // Concatenate records: operation results + transcript
-    let allRecords = records + transcript
-    // Also need to handle the case where reservation had no proposals (empty batch fallback)
+    // Handle empty batch fallback
     if proposals.isEmpty {
         let ref = OperationRef(operationID: OperationID(effectID.raw), callID: effectID.raw, state: .done, mutating: reservation.mutating)
-        // This case is rare; just add a result
         let newRecords: [DurableRecord] = [.operationResult(ref, outcome: result.receipt.summary)] + transcript
-        return Transition(state: nextState, effects: [], records: newRecords)
+        var fallbackState = state.replacing(consumedEffects: consumed, liveReservations: live, unresolvedOperations: unresolved)
+        // Continue or hold as per normal continuation
+        if !fallbackState.unresolvedOperations.isEmpty {
+            let (s1, prefix) = sequenced(fallbackState, kind: "continuation-blocked", digest: "markers", ids: &ids)
+            let next = s1.replacing(queueHeld: true, heldReason: .error("unresolved operations block continuation"))
+            return Transition(state: next, effects: [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + newRecords)
+        }
+        guard fallbackState.turnsUsed < fallbackState.turnLimit else {
+            return failRun(fallbackState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+        }
+        guard let run = fallbackState.activeRun else {
+            return failRun(fallbackState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+        }
+        let nextEffectID = ids.nextEffectID()
+        let seq = ids.nextSequence()
+        let nextReservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+        let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: fallbackState.epoch.profile.alias, epochID: fallbackState.epoch.epochID, sealed: run.sealed, turnsLeft: fallbackState.turnLimit - fallbackState.turnsUsed, deadlineMillis: fallbackState.runDeadlineMillis, historyDigest: fnv1aHex("\(fallbackState.sessionID.raw):\(seq.value):continue"))
+        var nextLive = fallbackState.liveReservations
+        nextLive.removeAll(where: { $0.effectID == effectID })
+        let (s1, prefix) = sequenced(fallbackState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
+        let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: fallbackState.turnsUsed + 1, liveReservations: nextLive, lastSequence: seq.value)
+        return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + newRecords)
     }
-    return Transition(state: nextState, effects: [], records: allRecords)
+
+    let allRecords = records + transcript
+    // F1: continuation policy — if unresolved (unknown) exists, hold; else continue to next turn
+    var interimState = state.replacing(consumedEffects: consumed, liveReservations: live, unresolvedOperations: unresolved)
+    if !unresolved.isEmpty {
+        let (s1, prefix) = sequenced(interimState, kind: "continuation-blocked", digest: "markers", ids: &ids)
+        let next = s1.replacing(queueHeld: true, heldReason: .error("unresolved operations block continuation"))
+        return Transition(state: next, effects: [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + allRecords)
+    }
+    guard interimState.turnsUsed < interimState.turnLimit else {
+        return failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+    }
+    guard let run = interimState.activeRun else {
+        return failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+    }
+    let nextEffectID = ids.nextEffectID()
+    let seq = ids.nextSequence()
+    let nextReservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+    let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: interimState.epoch.profile.alias, epochID: interimState.epoch.epochID, sealed: run.sealed, turnsLeft: interimState.turnLimit - interimState.turnsUsed, deadlineMillis: interimState.runDeadlineMillis, historyDigest: fnv1aHex("\(interimState.sessionID.raw):\(seq.value):continue"))
+    let (s1, prefix) = sequenced(interimState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
+    let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live + [nextReservation], lastSequence: seq.value)
+    return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + allRecords)
 }
 
 private func completeCancelledPending<I: IDSource>(_ state: SessionState, effectID: EffectID, outcome: EffectOutcome, ids: inout I) -> Transition {
@@ -1839,7 +1910,7 @@ private func consumeRetryDeadline<I: IDSource>(_ state: SessionState, nowMillis:
     let seq = ids.nextSequence()
     let reservation = EffectReservation(
         effectID: effectID, runID: run.runID, requestID: run.requestID,
-        generation: run.revision, revision: run.revision, mutating: false)
+        generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(
         effectID: effectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
         alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,

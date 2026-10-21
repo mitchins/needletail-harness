@@ -20,7 +20,7 @@ struct BackendTests {
     private static func reservation(batch: ToolBatch) -> EffectReservation {
         EffectReservation(
             effectID: EffectID("eff-b"), runID: RunID("run-b"), requestID: RequestID("req-b"),
-            generation: Revision(1), revision: Revision(1), mutating: false, batch: batch)
+            generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor)
     }
 
     private static func batch(_ proposals: (String, String, String)...) -> ToolBatch {
