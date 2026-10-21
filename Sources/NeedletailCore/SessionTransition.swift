@@ -1524,34 +1524,40 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
     var live = state.liveReservations.filter { $0.effectID != effectID }
     var unresolved = state.unresolvedOperations
 
-    // F5: duplicate callIDs fail closed before mapping
+    // F5: duplicate callIDs fail closed before mapping — track tainted IDs
     var seenCallIDs: Set<String> = []
+    var taintedCallIDs: Set<String> = []
     for call in result.calls {
         if seenCallIDs.contains(call.callID) {
-            // Duplicate: treat as contract violation → unknown for mutating
-            let isMutating = proposals.first(where: { $0.callID == call.callID }).map { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" } ?? true
-            if isMutating {
-                let ref = OperationRef(operationID: operationID(effectID: effectID, callID: call.callID), callID: call.callID, state: .unknown, mutating: true)
-                let (markers, overflow) = appendUnresolved(unresolved, ref)
-                unresolved = markers
-                if overflow { return integrityStop(state, ids: &ids) }
-                records.append(.operationResult(ref, outcome: "unknown: duplicate callID \(call.callID)"))
-            }
-            transcript.append(.transcriptAppended(.toolResponse(callID: call.callID, text: "duplicate callID: \(call.callID)")))
-            // Do not insert into map again; keep first
-            continue
+            taintedCallIDs.insert(call.callID)
+        } else {
+            seenCallIDs.insert(call.callID)
         }
-        seenCallIDs.insert(call.callID)
     }
-    // Build map from callID to outcome (first wins for duplicates already handled)
+    // For tainted IDs, the operation is contract violation → unknown for mutating, and we will not use the outcomeMap's first entry
+    for dupID in taintedCallIDs {
+        let isMutating = proposals.first(where: { $0.callID == dupID }).map { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" } ?? true
+        if isMutating {
+            let ref = OperationRef(operationID: operationID(effectID: effectID, callID: dupID), callID: dupID, state: .unknown, mutating: true)
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.operationResult(ref, outcome: "unknown: duplicate callID \(dupID)"))
+        }
+        transcript.append(.transcriptAppended(.toolResponse(callID: dupID, text: "duplicate callID: \(dupID)")))
+    }
+    // Build map from callID to outcome (first wins, but tainted IDs will be handled as unknown above and skipped below)
     var outcomeMap: [String: ToolCallOutcome] = [:]
-    for call in result.calls where outcomeMap[call.callID] == nil {
+    for call in result.calls where !taintedCallIDs.contains(call.callID) && outcomeMap[call.callID] == nil {
         outcomeMap[call.callID] = call
     }
-    // F5: unexpected callIDs (not in reservation) fail closed: do not create results for them, just transcript
+    // F5: unexpected callIDs (not in reservation) — transcript only, no durable result, and remove from map if any
     for call in result.calls where !proposals.contains(where: { $0.callID == call.callID }) {
-        // Unexpected: transcript only, no durable result, but record as failure for visibility
-        transcript.append(.transcriptAppended(.toolResponse(callID: call.callID, text: "unexpected callID: \(call.callID)")))
+        outcomeMap.removeValue(forKey: call.callID)
+        // Already handled tainted, but for unexpected, just transcript (already added via tainted? No, unexpected not tainted, so add transcript)
+        if !taintedCallIDs.contains(call.callID) {
+            transcript.append(.transcriptAppended(.toolResponse(callID: call.callID, text: "unexpected callID: \(call.callID)")))
+        }
     }
 
     for proposal in proposals {
@@ -1573,28 +1579,21 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         let started = outcome.started
         // Precedence per REV25 §3
         // (1) deterministic statuses with started != false → done, no hold
+        // Check if this proposal was tainted as duplicate — already handled as unknown
+        if taintedCallIDs.contains(proposal.callID) {
+            continue
+        }
         let deterministic: Set<String> = ["success", "no-match", "denied", "conflict", "invalid-arguments", "failed"]
         var stateForResult: OperationState = .done
         var hold = false
         var outcomeText = outcome.summary
         if deterministic.contains(status) {
-            if started == false {
-                // Contradictory input: claims result for never-run call → fail closed: unknown for mutating
-                if isMutating {
-                    stateForResult = .unknown
-                    hold = true
-                    outcomeText = "unknown: contradictory \(status) with started==false"
-                } else {
-                    // Non-mutating: transcript-only, no record
-                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
-                    continue
-                }
-            } else {
-                // started != false (true or nil) → done, no hold
-                stateForResult = .done
-                if status != "success" && status != "no-match" {
-                    outcomeText = "tool-failure: \(outcome.summary)"
-                }
+            // Deterministic statuses are always done, even with started==false (preDispatch never started is legitimate).
+            // The prior "contradictory" handling is withdrawn for B0: deterministic results are done regardless of started,
+            // except for the specific case of success with started==false which is still done (the executor attests unstarted but also success contradicts, but we treat as done per B0 fix).
+            stateForResult = .done
+            if status != "success" && status != "no-match" {
+                outcomeText = "tool-failure: \(outcome.summary)"
             }
         } else if status == "cancelled" || status == "timeout" {
             if started == false {
@@ -1709,15 +1708,14 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
                 mutating = call.callID == reservation.effectID.raw ? reservation.mutating : true
             }
             if !mutating { continue } // non-mutating never gets a record on cancel path
-            if call.status == "cancelled" && call.started == false {
-                // Unstarted: supersede pending marker with done
+            if (call.status == "cancelled" || call.status == "timeout") && call.started == false {
+                // Unstarted: supersede pending marker with done (both cancelled and timeout unstarted are valid proofs)
                 let ref = OperationRef(operationID: operationID(effectID: effectID, callID: call.callID), callID: call.callID, state: .done, mutating: true)
                 records.append(.operationResult(ref, outcome: "cancelled: unstarted"))
                 // Remove the pending marker from unresolved if present (supersession)
                 unresolved.removeAll(where: { $0.operationID == ref.operationID })
             } else {
                 // Started or unknown: keep marker, no new record (hold remains)
-                // For effectFailed path, we keep marker and add error via separate record below
                 continue
             }
         }
@@ -1748,19 +1746,18 @@ private func handleCancelledPendingRemoved<I: IDSource>(_ state: SessionState, e
     consumed.insert(effectID)
     var unresolved = state.unresolvedOperations
     var records: [DurableRecord] = []
-    // Promote pending markers to unknown for still-pending operationIDs
+    // Promote pending markers to unknown for still-pending operationIDs — always, even if marker already in unresolved (supersession)
     if let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) {
         for prop in reservation.batch.proposals {
             let isMutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
             if !isMutating { continue }
             let ref = OperationRef(operationID: operationID(effectID: effectID, callID: prop.callID), callID: prop.callID, state: .unknown, mutating: true)
-            // Only promote if not already superseded
-            if !unresolved.contains(where: { $0.operationID == ref.operationID }) {
-                let (markers, overflow) = appendUnresolved(unresolved, ref)
-                unresolved = markers
-                if overflow { return integrityStop(state, ids: &ids) }
-                records.append(.operationResult(ref, outcome: "unknown: cancelled pending terminated"))
-            }
+            // Remove the pending marker from unresolved if present, then add the unknown (supersession)
+            unresolved.removeAll(where: { $0.operationID == ref.operationID })
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.operationResult(ref, outcome: "unknown: cancelled pending terminated"))
         }
     }
     let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending, unresolvedOperations: unresolved)

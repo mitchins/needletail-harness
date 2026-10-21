@@ -125,10 +125,10 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             guard ref.state != .intent else {
                 throw StoreError.integrity("operation result \(ref.operationID.raw) carries intent state")
             }
-            // Last-record-wins for cancelledPendingMarker supersession: only a proven unstarted result may supersede.
+            // Last-record-wins for cancelledPendingMarker supersession: only proven unstarted or termination promotion may supersede.
             if let _ = pendingMarkers[ref.operationID] {
-                guard outcome == "cancelled: unstarted" else {
-                    throw StoreError.integrity("marker supersession requires proof 'cancelled: unstarted' for \(ref.operationID.raw), got '\(outcome)'")
+                guard outcome == "cancelled: unstarted" || outcome == "unknown: cancelled pending terminated" else {
+                    throw StoreError.integrity("marker supersession requires proof 'cancelled: unstarted' or 'unknown: cancelled pending terminated' for \(ref.operationID.raw), got '\(outcome)'")
                 }
                 pendingMarkers.removeValue(forKey: ref.operationID)
             } else {
