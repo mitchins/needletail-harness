@@ -519,9 +519,11 @@ any merge in this planning track.
 - Byte quotas are new store accounting: kept in the existing
   mutation transaction (same fail-closed shape as count quotas);
   DeepSeek reviews the store delta.
-- Mixed-batch UX: a mutating unknown holds the queue even when
-  sibling reads succeeded — conservative by design (abandoned
-  batch ⇒ explicit resume); documented, not tuned.
+- Mixed-batch UX: only genuine outcome uncertainty holds the queue
+  (mutating timeout/cancelled-mid-execution/failed-ambiguous/
+  no-entry/contract-violation); deterministic incompleteness
+  (conflict, denial, unstarted) completes with full per-call
+  evidence and no hold. Documented, not tuned.
 - Review load: 19-finding rounds are expensive; slices stay small
   so each delta review covers one contract area.
 
