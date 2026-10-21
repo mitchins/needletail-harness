@@ -1697,16 +1697,25 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
 
     switch outcome {
     case .perCall(let result):
+        // F5: duplicate and unexpected handling for cancelled-pending path
+        var seen: Set<String> = []
+        var tainted: Set<String> = []
         for call in result.calls {
-            let isMutating = call.callID == reservation.effectID.raw ? reservation.mutating : false
-            // For per-call in cancelled pending, we need to find the proposal to know mutating; use reservation batch
+            if seen.contains(call.callID) { tainted.insert(call.callID) } else { seen.insert(call.callID) }
+        }
+        for dup in tainted {
+            // Duplicate in cancelled-pending path: keep marker (unknown) and do not discharge
+            // No new result for tainted IDs, marker remains held
+            continue
+        }
+        for call in result.calls {
+            if tainted.contains(call.callID) { continue }
             let proposal = reservation.batch.proposals.first(where: { $0.callID == call.callID })
-            let mutating: Bool
-            if let prop = proposal {
-                mutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
-            } else {
-                mutating = call.callID == reservation.effectID.raw ? reservation.mutating : true
+            guard let prop = proposal else {
+                // Unexpected callID: ignore, no result for non-reserved operation (authoritative discharge only described)
+                continue
             }
+            let mutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
             if !mutating { continue } // non-mutating never gets a record on cancel path
             if (call.status == "cancelled" || call.status == "timeout") && call.started == false {
                 // Unstarted: supersede pending marker with done (both cancelled and timeout unstarted are valid proofs)
