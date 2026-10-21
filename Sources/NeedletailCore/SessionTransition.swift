@@ -1786,19 +1786,13 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
     case .preDispatchFailure, .success, .failureReceipt:
         break
     case .perCall(let result):
-        // F5: duplicate and unexpected handling for cancelled-pending path
+        // F5: duplicate and unexpected handling for cancelled-pending path — tainted IDs never supersede
         var seen: Set<String> = []
         var tainted: Set<String> = []
         for call in result.calls {
             if seen.contains(call.callID) { tainted.insert(call.callID) } else { seen.insert(call.callID) }
         }
-        for dup in tainted {
-            // Duplicate in cancelled-pending path: keep marker (unknown) and do not discharge
-            // No new result for tainted IDs, marker remains held
-            continue
-        }
         for call in result.calls {
-            if tainted.contains(call.callID) { continue }
             if tainted.contains(call.callID) { continue }
             let proposal = reservation.batch.proposals.first(where: { $0.callID == call.callID })
             guard let prop = proposal else {
