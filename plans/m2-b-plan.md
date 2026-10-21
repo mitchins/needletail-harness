@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV19, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV20, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -285,15 +285,26 @@ per batch, calls executed sequentially in order):
   repeat `cancelRequested` is idempotent: if
   `cancelledPendingReservations` already holds the effectIDs
   and `liveReservations` is empty, no duplicate markers are
-  emitted (filter on not-already-unresolved); (c) actor's
+  emitted (filter on not-already-unresolved);   (c) actor's
   `cancelRequested` handling mirrors the same retention
   (`reservations` entries moved to a `cancelledPending`
   table, NOT `= [:]`; generation bump blocks dispatch);
-  `completeEffect`/`failEffect` now prune the accepted
-  entry from BOTH tables (actor `reservations` +
-  state-consistent view — `consumedEffects` set already
-  prevents replay, but pruning makes "every live entry"
-  well-defined); (d) new pure transition handler
+  `completeEffect`/`failEffect` lookup changes from
+  `guard let reservation = reservations[effectID] else { return }`
+  (SessionActor.swift:494–510) to
+  `guard let reservation = reservations[effectID] ?? cancelledPending[effectID] else { return }`
+  (new `cancelledPending: [EffectID: EffectReservation]`
+  table keyed by effectID), so a late kill-switch report is
+  NOT dropped in the actor before `transition`/`checkStale`
+  runs — it is stamped with the retained reservation's
+  runID/generation/revision and forwarded to `transition`;
+  after the transition returns, `completeEffect`/`failEffect`
+  prune the accepted entry from BOTH actor tables
+  (`reservations` + `cancelledPending` plus `consumedEffects`
+  set — the set already prevents replay, but pruning makes
+  "every live entry" well-defined) and assert the state-side
+  `SessionState.cancelledPendingReservations` is removed in the
+  kill-switch-then-late-report actor test; (d) new pure transition handler
   `completeCancelledPending` performing SELECTIVE marker
   replacement only — `started == false` entries: marker
   removed, done-cancelled recorded; `started == true`/omitted:
@@ -314,7 +325,11 @@ per batch, calls executed sequentially in order):
   end (return, throw, fallback-synthesizer paths all
   terminate the task via the existing `inFlight` handle), so
   cancelled-pending entries cannot leak after the executor
-  fully terminates without a report; (h) tests: direct
+  fully terminates without a report; the `defer` also prunes
+  the state-side `cancelledPendingReservations` via a
+  `cancelledPendingRemoved` marker event if the transition
+  did not already (so the state cannot retain a dangling
+  entry after the in-flight task is gone); (h) tests: direct
   transition tests (cancelled-pending + late started-false →
   replaced; + late started-true → kept; + stale generation
   still routes to the new handler, never `dropRetaining`;
@@ -322,7 +337,9 @@ per batch, calls executed sequentially in order):
   consumed → no second replacement) and an actor
   kill-switch-then-late-report test proving `SessionState.
   liveReservations` is empty but
-  `cancelledPendingReservations` is retained.
+  `cancelledPendingReservations` is retained AND that the
+  late report is forwarded (lookup includes cancelledPending)
+  and then pruned from both actor tables and state.
   A late per-call result arriving after cancel for a
   started/uncertain call is still dropped at `completeEffect`
   against already-written unknown markers for the same
@@ -556,12 +573,15 @@ per batch, calls executed sequentially in order):
   if rg ever descends; a file INSIDE `.git/` would be pruned and
   proves nothing — corrected from the previous inside-file
   sentinel, which was invalid because its parent `.git` is
-  pruned); complementary open-audit leg where available
-  (LD_PRELOAD/`rg --trace` or `strace` capture showing no
-  `openat` on a protected path); prune-regression probe
-  (removing the bare `!.git/` glob must cause the `.git`-hit
-  exclusion test to fail — proves the prune glob is load-
-  bearing).
+  pruned);    complementary open-audit leg where available
+  (strace/open capture showing no `openat` on a protected
+  path); prune-regression probe that actually goes RED:
+  removing the bare `!.git/` glob (keeping `!**/.git/**`)
+  must cause the 000-directory descend proof to FAIL (rg
+  attempts `opendir` on `.git` and the permission error is
+  observed) — the prior hit-exclusion probe with only
+  `!**/.git/**` still passes even without the bare prune, so
+  it cannot prove pruneness (Finding 8).
 - Counterfactuals: ambient-config inheritance (must fail TOOL-03);
   model-flag passthrough (must fail); PATH-shim execution (must
   fail); unfiltered `.git` hit (must fail); artifact-ID-as-
@@ -584,71 +604,95 @@ per batch, calls executed sequentially in order):
 - Write: `create_new` exclusive (exists → error); replacement =
   same boundary/checks/artifacts as edit; explicit confined parent
   creation; no deletion tool.
-- Per-call receipt metadata (no schema change): the canonical
+ - Per-call receipt metadata (no schema change): the canonical
   outcome JSON carries path, mode, before/after hashes
   (§3 outcome mapping above); the preimage BYTES go through
   `publishArtifact` (32 MiB cap). Zero-byte originals: hash-only
-  receipt (sha256-empty is constant), no empty publish. Order
-  under the lock: re-read/hash → pre-publish quota PREFLIGHT
+  receipt (sha256-empty is constant), no empty publish. NEW
+  cross-process artifact lock (B3 — does NOT exist today:
+  GRDBSessionStore.swift has only a process-local `NSLock gate`
+  at :65 and no flock/LOCK_EX anywhere; `queue.write`
+  serializes DB rows but NOT the artifact filesystem at
+  :661–728 vs :733–759): new file `<db>-artifacts.lock` with
+  `flock(LOCK_EX)` (blocking, fail-closed on error), acquired
+  BEFORE the in-process `gate`, held through the entire tmp
+  create → verify → rename → DB commit → conditional cleanup
+  sequence, released after (acquisition order: artifact lock →
+  gate → queue.write; never gate before artifact lock — total
+  order prevents deadlock with `reconcileByteUsage` which
+  acquires the same two locks in the same order). Order under
+  BOTH locks: re-read/hash → pre-publish quota PREFLIGHT
   estimate (fail fast, nothing written — advisory only, using
-  per-session logical + global physical estimates) → publish
-  preimage ATOMICALLY: file bytes are written to a tmp name,
-  then the tmp is verified + renamed + reference + physical
-  upsert ALL inside the SAME `queue.write` transaction under
-  the store's cross-process file lock (re-verify inside the
-  transaction: re-open the tmp `O_NOFOLLOW`, `fstat` regular-
-  file, `fsync` it, then check `artifact_physical`/existing
-  reference BEFORE rename; if another publisher committed the
-  digest between this call's tmp creation and its transaction,
-  the transaction sees the existing physical row + reference
-  and treats this as dedup — no second file, no deletion of
-  the winner's bytes). BEFORE this, GRDBSessionStore.swift
-  split verification (:661–692) and commit (:733–759) into
-  two unsynchronized steps — a second publisher could verify
-  the existing file (:661–692) before this cleanup deletes it
-  after a failed transaction, leaving a dangling reference
-  (Finding 7). Closure: dedup verification, `artifactPublished`
-  reference insert, `artifact_physical` upsert, byte-quota
-  increments, and the conditional cleanup check/unlink are all
-  inside ONE `queue.write` under the same file lock (the gate
-  already serializes the file-write + rename — :693–728 — and
-  the reference commit — :733–759 — now joined). On reference-
-  commit failure (quota or otherwise) the just-written tmp is
-  deleted ONLY when NO `artifactPublished` reference for this
-  digest exists AND no `artifact_physical` row for it is live
-  — checked UNDER THE SAME lock/transaction after the failure,
-  not merely `createdNewFile` (a second session may have dedup-
-  referenced the digest after this call created the file but
-  before its commit failed; `createdNewFile` alone would delete
-  bytes backing that live reference; `artifact_physical` is the
-  physical ground truth, `artifactPublished` the logical);
-  a barrier-coordinated test proves the race is closed (A holds
-  the transaction open on a gate, B verifies the existing file at
-  :661–692, A cleans up but finds B's committed reference/
-  physical row and keeps the bytes — no dangling reference;
-  the complementary order where A cleans before B commits is
-  covered by the atomic re-verify: B's verification is re-run
-  inside its transaction and sees the deletion, so B writes
-  the file anew rather than referencing a deleted inode) —
-  best-effort → rename → receipt. Crash between rename and
-  reference commit orphans bytes that NEVER incremented
-  `byte_usage` or `artifact_physical` (under-counted); crash-
-  orphans are explicitly allowed (SPEC §9), documented, not
-  tested as impossible. Pre-publish free-space check: refuse
-  (denied result, not a crash) when the artifact filesystem has
-  less than the SPEC §9.2 256 MiB reserve. Dedup/reference
-  tests: two sessions publish identical bytes → second session's
-  reference-commit failure must leave the first session's bytes
-  and reference intact; first-publisher-fails-after-second-dedup
-  leg (A creates the file, B dedup-references it, A's commit
-  fails → A's cleanup finds B's reference/`artifact_physical`
-  and keeps the bytes); barrier TOCTOU leg (A verifies, B
-  commits, A cleanup sees B — kept; A deletes, B re-verifies
-  inside txn and re-creates).
+  per-session logical + global physical estimates) → create tmp
+  file outside the transaction but still under the artifact
+  lock (so no other publisher can race the filesystem) →
+  ATOMIC commit inside ONE `queue.write` under the same
+  artifact lock + gate: (1) authoritative quota check
+  (session logical + global physical distinct) — if over quota,
+  throw BEFORE any rename/insert (tmp remains, will be
+  cleaned); (2) re-verify tmp `O_NOFOLLOW`/`fstat`/`fsync`;
+  (3) check `artifact_physical`/existing `artifactPublished`
+  reference — if another publisher committed the digest
+  between this tmp creation and the transaction, treat as dedup
+  (no rename, no physical growth, only session logical
+  reference if this session hasn't referenced it); (4) rename
+  tmp→final + `syncArtifactDirectory`; (5) insert
+  `artifactPublished` reference + upsert `artifact_physical`
+  (insert-or-ignore) + increment `byte_usage` (only if this
+  session hadn't referenced the digest) + envelope records.
+  BEFORE this, GRDBSessionStore split verification (:661–692)
+  and commit (:733–759) with file ops outside the DB txn — a
+  second publisher could verify the existing file before this
+  cleanup deletes it, leaving a dangling reference (Finding 7).
+  Closure by joining: dedup re-verify, file rename,
+  reference insert, physical upsert, and quota increments are
+  inside the single artifact-locked `queue.write`. On quota or
+  insert failure the `queue.write` throws and rolls back (no
+  reference/physical row is committed); the just-written tmp
+  (or newly renamed final, if rename happened before the throw)
+  is then checked in a SECOND `queue.write` + same artifact
+  lock STILL HELD across the rollback-to-cleanup boundary
+  (the artifact lock is NOT released on transaction failure —
+  it is held for the whole publish call), so the check sees
+  committed state: delete ONLY when NO committed
+  `artifactPublished` reference for this digest exists AND no
+  committed `artifact_physical` row for it is live — NOT merely
+  `createdNewFile` (a second session may have committed the
+  digest between this tmp creation and the failure;
+  `createdNewFile` alone would delete the winner's bytes;
+  `artifact_physical` is physical ground truth,
+  `artifactPublished` logical). The lock held across the two
+  transactions guarantees no third publisher can commit between
+  the rollback and the cleanup check. Two serialized barrier
+  legs (each under the real locks, no "holds transaction
+  open while B commits" impossibility — Finding 3): (A) B
+  commits fully before A acquires the artifact lock → A
+  acquires, sees B's committed reference/physical, dedups and
+  keeps B's bytes (no second file); (B) A commits then rolls
+  back and cleans (deletes tmp/final because no reference
+  exists) before B acquires → B acquires, re-verifies inside
+  its txn, sees the deletion (no final file, no physical
+  row), and writes the file anew rather than referencing a
+  deleted inode; plus a blocking leg proving B blocks while A
+  holds the artifact lock (deterministic via gate). Crash
+  between rename and reference commit orphans bytes that NEVER
+  incremented `byte_usage` or `artifact_physical`
+  (under-counted); crash-orphans are explicitly allowed
+  (SPEC §9), documented, not tested as impossible.
+  Pre-publish free-space check: refuse (denied result, not a
+  crash) when the artifact filesystem has less than the SPEC
+  §9.2 256 MiB reserve. Dedup/reference tests: two sessions
+  publish identical bytes → second session's reference-commit
+  failure must leave the first session's bytes and reference
+  intact; first-publisher-fails-after-second-dedup leg (B
+  commits fully before A's cleanup → A sees B's committed
+  reference/`artifact_physical` and keeps); barrier TOCTOU
+  legs as above (serialized A-then-B and B-then-A, no
+  impossible concurrent hold).
  - Byte quotas (new store accounting — two-stage, coherent —
-  fixes prior under-specification + double-count): 1 GiB per-
-  session logical / 5 GiB global physical over records +
-  artifacts + preimages. Schema (new, explicit):
+  fixes prior under-specification + double-count + missing
+  paths): 1 GiB per-session logical / 5 GiB global physical
+  over records + artifacts + preimages. Schema (new, explicit):
   `byte_usage(session TEXT PRIMARY KEY, bytes INTEGER NOT NULL)`
   added to the store's declared shape (per-session LOGICAL
   bytes: sum of record payload sizes already committed for that
@@ -658,52 +702,87 @@ per batch, calls executed sequentially in order):
   TEXT PRIMARY KEY, size INTEGER NOT NULL)` for GLOBAL
   physical distinct bytes (one row per distinct digest ever
   published, regardless of how many sessions reference it);
-  `schemaVersion` 2→3 with a migration creating both tables;
-  FORWARD-ONLY incompatibility stated honestly (old binaries
-  fail closed on a newer `user_version` —
-  GRDBSessionStore.swift:50, :109–113 — and on shape mismatch
-  — :121–124 declaration is the v0 foreign-table branch while
-  :204–245 is `assertSchemaShape` — so a v3 store is unreadable
-  to v2 binaries; the v0 foreign-table check and
-  `assertSchemaShape` follow `declaredShape`, covering the new
-  tables; an old-binary/new-store test pins the fail-closed
-  integrity error). Record bytes: EVERY durable mutation path
-  (`append`/`appendBatch` for records, and the artifact
-  reference-commit) updates `byte_usage` inside its SAME
-  `queue.write` transaction (record path: increment by payload
-  size; artifact path: increment by size iff this session did
-  not already reference the digest — dedup-aware per-session).
-  Global physical: `artifact_physical` is inserted (or ignored
-  if digest already present) inside the SAME transaction as the
-  `artifactPublished` reference — global check reads
-  `SUM(size) FROM artifact_physical` + physical orphan scan
-  (see orphan attribution), NOT `SUM(byte_usage)` (which would
-  double-count cross-session dedup — the prior `SUM(byte_usage)`
-  implied global was corrected here to `SUM(artifact_physical)`
-  + records). Preflight (advisory, pre-publish): computes this
-  call's logical new bytes (dedup-aware per-session) and
-  session logical + global physical estimates, fails fast with
-  nothing written. Authoritative session + global checks +
-  increments run inside the reference-commit `queue.write`
-  transaction (same fail-closed shape as count quotas), with
-  cross-session dedup already accounted via
-  `artifact_physical` distinctness (a second session referencing
-  an already-physical digest increments `byte_usage` but NOT
-  `artifact_physical` — no global double-count). Orphan
-  attribution: orphan files have no `byte_usage` row (no owning
-  session) and no `artifact_physical` row (never committed);
-  they contribute to global physical only after reconciliation
-  (next item). Orphan accounting: crash-orphaned bytes are
-  UNDER-counted in both tables (never incremented); the orphan
-  scan (`detectArtifactOrphans`, which today only reports —
-  :787–789 with point-in-time/offline warning — :787–796) gains
-  a SEPARATE `reconcileByteUsage` step run BEFORE the read-only
+  `schemaVersion` 2→3 with a migration creating both tables
+  AND backfilling existing data (scan all committed
+  `artifactPublished` rows → insert distinct digests into
+  `artifact_physical`; scan all `records` payloads → sum per-
+  session bytes into `byte_usage`; empty tables for a fresh
+  store — migration is idempotent, old binaries still fail
+  closed on the new version/shape). FORWARD-ONLY
+  incompatibility stated honestly (old binaries fail closed on
+  a newer `user_version` — GRDBSessionStore.swift:50, :109–113
+  — and on shape mismatch — :121–124 declaration is the v0
+  foreign-table branch while :204–245 is `assertSchemaShape`
+  — so a v3 store is unreadable to v2 binaries; the v0
+  foreign-table check and `assertSchemaShape` follow
+  `declaredShape`, covering the new tables; an old-binary/new-
+  store test pins the fail-closed integrity error). Record
+  bytes: EVERY durable record-insert path updates `byte_usage`
+  inside its SAME `queue.write` transaction — `append`,
+  `appendBatch`, `publishArtifact` reference-commit, AND the
+  direct `INSERT INTO records` at `recoverWriterOwnership`
+  :540–545 (previously missed — Finding 5), plus any future
+  direct inserts must follow the same rule (enforced by a
+  helper `insertRecordWithQuota` used by all paths). Each path
+  increments by the encoded payload size; artifact path
+  increments `byte_usage` only if this session hadn't already
+  referenced the digest (dedup-aware per-session) and upserts
+  `artifact_physical` (insert-or-ignore) for the global
+  distinct. Global physical: `artifact_physical` is inserted
+  (or ignored if digest already present) inside the SAME
+  transaction as the `artifactPublished` reference — global
+  check reads `SUM(size) FROM artifact_physical` + sum of
+  `LENGTH(payload)` from `records` (records are not deduped)
+  + physical orphan files still on disk but not yet in
+  `artifact_physical` (see orphan attribution), NOT
+  `SUM(byte_usage)` (which would double-count cross-session
+  dedup — the prior `SUM(byte_usage)` implied global was
+  corrected here to `SUM(artifact_physical)` + records).
+  Preflight (advisory, pre-publish): computes this call's
+  logical new bytes (dedup-aware per-session) and session
+  logical + global physical estimates, fails fast with nothing
+  written. Authoritative session + global checks + increments
+  run inside the reference-commit `queue.write` transaction
+  (same fail-closed shape as count quotas), with cross-session
+  dedup already accounted via `artifact_physical` distinctness
+  (a second session referencing an already-physical digest
+  increments `byte_usage` but NOT `artifact_physical` — no
+  global double-count). Orphan attribution (split rule —
+  Finding 6): an orphan file (on-disk final bytes with no
+  committed `artifactPublished` reference) has no `byte_usage`
+  row (no owning session) and no `artifact_physical` row
+  (never committed) — it is counted ONLY in the global
+  physical via the orphan scan, never in any session's
+  `byte_usage`; a committed reference whose session's
+  `byte_usage` was never bumped (crash between reference
+  insert and `byte_usage` increment — now impossible inside
+  the single txn, but historically via migration) is healed
+  by `reconcileByteUsage` inserting the missing
+  `artifact_physical` row and bumping THAT session's
+  `byte_usage` — orphan → `artifact_physical` only,
+  missing logical → that session's `byte_usage`. Orphan
+  accounting: crash-orphaned bytes are UNDER-counted in both
+  tables (never incremented); the orphan scan
+  (`detectArtifactOrphans`, which today only reports — :787–789
+  with point-in-time/offline warning — :787–796) gains a
+  SEPARATE `reconcileByteUsage` step run BEFORE the read-only
   B5 gate under the store's cross-process lock + `queue.write`
-  (see B5 for ordering/serialization/failure mode) — idempotent,
-  raises toward physical reality, never lowers; a seeded-orphan
-  test pins upward reconciliation. Record-byte + dedup tests:
-  append path increments `byte_usage`; second session dedup does
-  not grow `artifact_physical`; orphan has no `byte_usage` row.
+  (see B5 for ordering/serialization/failure mode) — it does
+  NOT call `detectArtifactOrphans` under that lock (Finding 7:
+  that method pages `records(since:)` which re-enters `gate`
+  + `queue.read` :378–396 and would deadlock) — instead it
+  runs raw SQL inside the transaction
+  (`SELECT DISTINCT substr(payload,...)` via `RecordCodec` scan
+  or a direct `SELECT digest FROM artifact_physical` plus
+  `SELECT payload FROM records` plus `FileManager` directory
+  listing inside the same `queue.write` before any DB reads
+  that would re-enter the gate). It is idempotent, raises
+  toward physical reality, never lowers; a seeded-orphan test
+  pins upward reconciliation. Record-byte + dedup + migration
+  tests: append path increments `byte_usage`; `recoverWriter-
+  Ownership` audit increments; second session dedup does not
+  grow `artifact_physical`; orphan has no `byte_usage` row;
+  migration backfills existing records/digests.
 - Tests: `TOOL_04_…` zero/one/multiple/empty legs;
   `TOOL_05_…` injected change between read and commit → conflict
   receipt, file untouched, no preimage; `TOOL_06_…` CRLF/no-final-
@@ -863,9 +942,7 @@ per batch, calls executed sequentially in order):
   552–560 while `ToolExecutor.execute`/`EffectReservation` carry
   no session/store/writer — SessionTransition.swift:62–79,
   125–129 — yet `publishArtifact` requires a session and
-   `WriterIdentity` — GRDBSessionStore.swift:596–599, which is
-  why the previous "read-only under sealed resolves ephemeral
-  artifacts" was vacuous): new
+   `WriterIdentity` — GRDBSessionStore.swift:596–599): new
   `FileToolRuntime` enum (`scripted(ScriptedToolBackend)` |
   `native(NativeToolExecutor)`) + `NativeToolExecutor` struct
   capturing the claimed session, store writer identity, artifact
@@ -921,27 +998,37 @@ per batch, calls executed sequentially in order):
   across runs, not in-session): SEPARATED into (i) a WRITE
   reconciliation step and (ii) a READ-ONLY gate (correcting the
   prior conflation — Finding 6). (i) BEFORE the gate, a
-  distinct `reconcileByteUsage` write runs under the store's
-  cross-process file lock + `queue.write` transaction: it scans
-  `detectArtifactOrphans` (today report-only — :787–796, with
-  the doc warning it is point-in-time and should run offline) +
-  `SELECT DISTINCT digest FROM records WHERE ...` to enumerate
-  committed `artifactPublished` digests, re-verifies each orphan
-  file's existence/size under the same lock, and inserts missing
-  `artifact_physical` rows / bumps `byte_usage` additively
-  (never decrements — a file whose bytes were never counted is
-  added; a file whose digest already has a physical row is left
-  alone). This step SERIALIZES with live `publishArtifact`
-  callers via the same `GRDBSessionStore` gate + artifact-root
-  lock (the lock that today serializes the file-write + rename
-  — the same lock is held for the scan+insert), so a live
-  publication racing the scan cannot be double-counted or lost:
-  either the publication's transaction commits first (then the
-  scan sees the new reference/physical row and does nothing) or
-  the scan inserts first (then the publication's physical insert
-  is a no-op dedup). Failure of this step fails the run closed
-  (exit 6: store integrity — the quota tables are unwritable) and
-  the gate does not run. Ordering: claim → sessionOpened →
+  distinct `reconcileByteUsage` write runs under the NEW
+  artifact-root lock + in-process `gate` + `queue.write`
+  transaction (the artifact lock is the same `<db>-artifacts.lock`
+  defined in B3 — acquired before `gate`, held through the
+  `queue.write` — Finding 2): it does NOT call
+  `detectArtifactOrphans` (Finding 7: that method pages
+  `records(since:)` which re-enters `gate` + `queue.read`
+  :378–396 and would deadlock under the lock) — instead it
+  runs raw SQL inside the transaction
+  (`SELECT payload FROM records` scanning for
+  `artifactPublished` digests, plus a `SELECT digest, size FROM
+  artifact_physical` plus a `FileManager` directory listing of
+  the artifact root, all inside the single `queue.write`
+  before any re-entrant `records(since:)` call), re-verifies
+  each orphan file's existence/size under the same lock, and
+  inserts missing `artifact_physical` rows / bumps the
+  AFFECTED session's `byte_usage` additively (never decrements
+  — an uncommitted orphan file → `artifact_physical` only,
+  never a `byte_usage` row; a committed reference whose
+  `byte_usage` is missing → that session's row — Finding 6).
+  This step SERIALIZES with live `publishArtifact` callers via
+  the same artifact lock + `gate` + `queue.write` (the lock
+  that B3's publish holds for its entire tmp→rename→commit
+  sequence), so a live publication racing the scan cannot be
+  double-counted or lost: either the publication's transaction
+  commits first (then the scan's raw SQL sees the new
+  reference/physical row and does nothing) or the scan inserts
+  first (then the publication's physical insert is a no-op
+  dedup). Failure of this step fails the run closed (exit 6:
+  store integrity — the quota tables are unwritable) and the
+  gate does not run. Ordering: claim → sessionOpened →
   reconcileByteUsage → gate. (ii) THEN the gate runs READ-ONLY:
   the CLI runs the existing `reconcileOperations` classifier over
   every session's durable stream in the state store (read-only,
@@ -1454,6 +1541,36 @@ NOT non-goals.)
   under the file lock with re-verify inside txn + barrier
   gate-test proving both orders (A cleans/B verifies re-creates
   and B commits/A keeps).
-- REV19 → deepseek-reviewer: _pending_.
+- REV19 → deepseek-reviewer: NEEDS-EVIDENCE (8 findings:
+  actor lookup still drops late report before transition;
+  store gate is NSLock not cross-process; barrier test
+  impossible interleaving; post-failure check not same txn;
+  `recoverWriterOwnership` record path + migration backfill
+  missing; orphan `byte_usage` attribution contradiction;
+  `detectArtifactOrphans` re-enters gate/queue.read; prune-
+  regression via hit-exclusion never goes RED).
+- REV20 (this revision): actor `completeEffect`/`failEffect`
+  lookup `reservations[effectID] ?? cancelledPending[effectID]`
+  with new `cancelledPending` actor table + pruning of both
+  tables + state-side `cancelledPendingReservations` + deferred
+  marker-event cleanup + forwarded-lookup test; NEW artifact-
+  root file lock `<db>-artifacts.lock` `flock(LOCK_EX)` BEFORE
+  `gate` through the whole tmp→verify→rename→commit→cleanup
+  sequence (ordering artifact→gate→queue.write) for both
+  publish and `reconcileByteUsage`; serialized barrier legs
+  (B-before-A and A-before-B, no impossible concurrent hold) +
+  blocking leg; post-failure cleanup in SECOND `queue.write`
+  but SAME artifact lock held across rollback boundary with
+  committed-state check (`artifact_physical` ground truth);
+  quota check before physical insert with dedicated ordering;
+  `recoverWriterOwnership` :540–545 added as
+  `insertRecordWithQuota` path + migration backfills
+  `artifact_physical` distinct + per-session `byte_usage`;
+  orphan split (orphan→`artifact_physical` only,
+  missing-logical→that session `byte_usage`); `reconcileByteUsage`
+  raw SQL inside txn (no `detectArtifactOrphans` re-entry) with
+  raw `SELECT payload`/`FileManager` listing; prune-regression
+  via 000-directory descend failure (not hit-exclusion).
+- REV20 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
