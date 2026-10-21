@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV21, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV22, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -280,13 +280,22 @@ per batch, calls executed sequentially in order):
   but routing keys on STATE membership, not on the flag alone);
    (b) `cancelActive` (pure transition) MOVES only
   live EXECUTOR reservations to `cancelledPendingReservations`
-  (filter `reservation.effectKind == .executor` — the actual
-  `liveReservations` also contains provider reservations per
-  SessionTransition.swift:1208–1219, :1542–1554, and a cancel
-  during provider flight must NOT leave a dangling executor
-  pending entry — Finding 1; provider reservations are dropped
-  via the existing `consumedEffects` path, never retained) and
-  writes unknown markers only for those executor entries —
+  — discriminator is a NEW `EffectReservation.Kind` enum
+  (`executor` vs `provider`) added to `EffectReservation`
+  (current type at SessionTransition.swift:62–80 has only
+  `effectID/runID/requestID/generation/revision/mutating/batch`
+  and no kind field — Finding 1 — so every construction site
+  is updated: :570, :1019, :1208, :1290, :1365, :1542 — tool
+  batches pass `.executor`, provider paths pass `.provider`;
+  the actor `reservations` table is likewise ` [EffectID:
+  EffectReservation]` with the same kind) — provider
+  reservations are NOT retained: they are removed from
+  `liveReservations` and their `effectID` is inserted into
+  `state.consumedEffects` (the set `checkStale` already reads
+  at :414–429, which today `cancelActive` never populates at
+  :1473–1479), so a cancel during provider flight leaves no
+  dangling executor pending entry; `cancelActive` writes
+  unknown markers only for the retained executor entries —
   generation bump still blocks any new dispatch on those IDs;
   repeat `cancelRequested` is idempotent: if
   `cancelledPendingReservations` already holds the effectIDs
@@ -294,10 +303,13 @@ per batch, calls executed sequentially in order):
   duplicate markers are emitted (filter on not-already-
   unresolved); actor's `invokeTransport` path keeps its
   existing `catch is CancellationError { return }`
-  (SessionActor.swift:390–394) with no new cleanup needed
-  because provider reservations are never retained — an
-  additional test `cancel-during-provider-flight leaves no
-  cancelledPending` proves this;   (c) actor's
+  (SessionActor.swift:390–394) with explicit cleanup: the
+  `catch` removes the provider `effectID` from the actor's
+  `reservations` and the transition inserts it into
+  `consumedEffects` (so the actor table matches the state) —
+  an additional test `cancel-during-provider-flight leaves no
+  cancelledPending and provider effectID is consumed` proves
+  this (both state and actor tables);   (c) actor's
   `cancelRequested` handling mirrors the same retention
   (EXECUTOR `reservations` entries moved to a `cancelledPending`
   table, NOT `= [:]`; generation bump blocks dispatch);
@@ -315,19 +327,54 @@ per batch, calls executed sequentially in order):
   (`reservations` + `cancelledPending` plus `consumedEffects`
   set — the set already prevents replay, but pruning makes
   "every live entry" well-defined) and assert the state-side
-   `SessionState.cancelledPendingReservations` is removed in the
-  kill-switch-then-late-report actor test; (d) new pure transition handler
+  `SessionState.cancelledPendingReservations` is removed in the
+  kill-switch-then-late-report actor test; DURABLE supersession
+  (Finding 2): today's `cancelActive` writes durable
+  `operationResult(unknown)` at :1457–1464 and `OperationRef`
+  has no message field (SessionState.swift:242–253) while
+  `DurableRecord` is append-only `operationResult(OperationRef,
+  outcome:)` (SessionStore.swift:11) and `reconcileOperations`
+  rejects a second result for the same `operationID` as
+  `.integrity("duplicate result...")` at
+  OperationReconcile.swift:119–125, so "marker removed,
+  done-cancelled recorded" has no durable path as written.
+  Fix (all in B4, same `SessionState.cancelledPending-
+  Reservations` seam): `cancelActive` for retained executor
+  reservations does NOT write durable `operationResult(unknown)`
+  immediately — it writes a NEW durable record type
+  `DurableRecord.cancelledPendingMarker(OperationRef)` (marker
+  is DURABLE but is NOT a `operationResult`; it carries the
+  per-call `OperationRef` + a placeholder outcome for §9.1)
+  and the matching `RecordCodec` case + `SessionExport.project`
+  arm (redacted by default). `reconcileOperations` treats
+  `cancelledPendingMarker` as HOLD-equivalent (same as
+  unknown) but ALLOWS a later `operationResult(done)` for the
+  same `operationID` to SUPERSEDE it (no duplicate-result
+  error; the marker is replaced). `completeCancelledPending`
+  for `started == false` appends `operationResult(done,
+  outcome: "cancelled: unstarted")` which supersedes the
+  pending marker durably; for `started == true`/omitted it
+  leaves the marker in place (no second record), and for
+  `effectFailed` it keeps the pending marker and appends an
+  auxiliary `DurableRecord.cancelledPendingError(effectID,
+  error)` carrying the error string (since `OperationRef`
+  has no message field); `reconcileOperations` aggregates the
+  error string into the hold reason. Termination cleanup
+  (task ends without a report) promotes the pending marker
+  to `operationResult(unknown)` via the same `defer` + marker
+  event, so no dangling pending marker remains. Tests:
+  `cancelledPending + started-false supersedes to done` pins
+  the durable supersession (reconcile passes), `effectFailed
+  on cancelledPending keeps pending marker + error record`
+  pins the error embedding, and the old "marker removed,
+  done recorded" is withdrawn as durable-append would fail; (d) new pure transition handler
   `completeCancelledPending` performing SELECTIVE marker
   replacement only for `effectCompleted` — `started == false`
-  entries: marker removed, done-cancelled recorded; `started ==
-  true`/omitted: marker kept — `effectFailed` is NOT selective:
-  it carries only `error: String` (SessionEvent.swift:31–32) with
-  no per-call `started` flags, so the handler keeps ALL markers
-  (fail-closed: an error during a cancelled flight cannot
-  certify any call was unstarted) and embeds the error string
-  in the marker message for §9.1 evidence; both cases have NO
-  `continueAfterEffect` fan-out and no transcript emission
-  (Finding 2); (e) routing: `checkStale` tests
+  entries: marker removed (durably via supersession above),
+  done-cancelled recorded; `started == true`/omitted: marker
+  kept — `effectFailed` is NOT selective but keeps the pending
+  marker + error record as above; both cases have NO
+  `continueAfterEffect` fan-out and no transcript emission; (e) routing: `checkStale` tests
   `state.cancelledPendingReservations` FIRST — if the
   effectID is in that set, route to
   `completeCancelledPending` regardless of generation and
@@ -736,8 +783,9 @@ per batch, calls executed sequentially in order):
   in `records.session` per 204–214, :755–758 — NOT in the ref),
   build per-session distinct digest sets, join to
   `artifact_physical.size` to compute per-session distinct
-  artifact sums + `SUM(LENGTH(payload))` for record bytes, and
-  insert into `byte_usage`; insert distinct digests into
+  artifact sums + `SUM(length(CAST(payload AS BLOB)))` for
+  record bytes (bytes, not characters — Finding 4), and insert
+  into `byte_usage`; insert distinct digests into
   `artifact_physical` (distinct, not raw payload sum — the prior
   "scan records payloads → sum per-session bytes" omitted
   artifacts and proved non-idempotent additive bumps; now
@@ -770,13 +818,16 @@ per batch, calls executed sequentially in order):
   (or ignored if digest already present) inside the SAME
   transaction as the `artifactPublished` reference — global
   check reads `SUM(size) FROM artifact_physical` + sum of
-  `LENGTH(payload)` from `records` (records are not deduped)
-  + physical orphan files still on disk but not yet in
-  `artifact_physical` (see orphan attribution), NOT
+  `length(CAST(payload AS BLOB))` from `records` (SQLite
+  `length()` on TEXT counts characters per 204–214, 755–758;
+  byte quotas require UTF-8 bytes per SessionExport.swift:349,
+  375 convention — `length(CAST(payload AS BLOB))` counts bytes
+  in SQL, `payload.utf8.count` in Swift — Finding 4 — records
+  are not deduped) + physical orphan files still on disk but
+  not yet in `artifact_physical` (see orphan attribution), NOT
   `SUM(byte_usage)` (which would double-count cross-session
   dedup — the prior `SUM(byte_usage)` implied global was
-  corrected here to `SUM(artifact_physical)` + records).
-  Preflight (advisory, pre-publish): computes this call's
+  corrected here).
   logical new bytes (dedup-aware per-session) and session
   logical + global physical estimates, fails fast with nothing
   written. Authoritative session + global checks + increments
@@ -809,28 +860,35 @@ per batch, calls executed sequentially in order):
   NOT call `detectArtifactOrphans` under that lock (Finding 7:
   that method pages `records(since:)` which re-enters `gate`
   + `queue.read` :378–396 and would deadlock) — instead it
-  runs raw SQL inside the transaction
-  (`SELECT session, payload, LENGTH(payload) FROM records` —
-  Finding 5: session is in `records.session`, not in
-  `ArtifactRef` — plus `SELECT digest, size FROM
-  artifact_physical` plus `FileManager` directory listing, all
-  inside the same `queue.write` before any re-entrant
-  `records(since:)`), decodes each `artifactPublished`
-  digest, joins to `artifact_physical.size`, aggregates per-
-  session distinct sizes (so a missing logical attribution is
-  per-session, not global), and recomputes-to-expected (Finding
-  4: sets `byte_usage`/`artifact_physical` to the computed
-  expected totals, not blindly "bumps additively" — second run
-  is demonstrably idempotent). It is idempotent, raises toward
-  physical reality, never lowers; a seeded-orphan test pins
-  `artifact_physical` creation with no `byte_usage` row, and a
+   runs raw SQL inside the transaction
+  (`SELECT session, payload, length(CAST(payload AS BLOB))
+  FROM records` — Finding 4 bytes via `CAST AS BLOB`, Finding
+  5 session in `records.session` not `ArtifactRef` — plus a
+  `SELECT digest, size FROM artifact_physical` plus a
+  `FileManager` directory listing, all inside the single
+  `queue.write` before any re-entrant `records(since:)` call),
+  decodes each `artifactPublished` digest per RecordCodec, joins
+  to `artifact_physical.size`, aggregates per-session distinct
+  sizes, and recomputes-to-expected (Finding 4: sets
+  `byte_usage`/`artifact_physical` to the computed expected
+  totals, not blindly "bumps additively"; second run is
+  demonstrably idempotent). Authoritative semantics
+  (Finding 5): set-to-expected INCLUDING removal — a stale
+  `artifact_physical` row for a deleted orphan or an overcounted
+  `byte_usage` from the prior additive bug is LOWERED/removed to
+  match ground truth (so "never lowers" is withdrawn; the step
+  is authoritative, not monotonic). A seeded-orphan test pins
+  `artifact_physical` creation with no `byte_usage` row, a
   two-session missing-logical test pins the per-session
-  `session`/`payload` attribution. Record-byte + dedup +
+  `session`/`payload` attribution, an overcounted-row test seeds
+  an inflated `byte_usage` and verifies the recompute lowers it,
+  and a non-ASCII fixture verifies byte counting via
+  `length(CAST(payload AS BLOB))`. Record-byte + dedup +
   migration tests: append path increments `byte_usage`;
   `recoverWriterOwnership` audit increments; second session dedup
   does not grow `artifact_physical`; orphan has no `byte_usage`
   row; migration backfills per-session distinct artifact sizes
-  via the `records.session` join.
+  via the `records.session` join + non-ASCII byte fixture.
 - Tests: `TOOL_04_…` zero/one/multiple/empty legs;
   `TOOL_05_…` injected change between read and commit → conflict
   receipt, file untouched, no preimage; `TOOL_06_…` CRLF/no-final-
@@ -1057,24 +1115,27 @@ per batch, calls executed sequentially in order):
   `detectArtifactOrphans` (Finding 7: that method pages
   `records(since:)` which re-enters `gate` + `queue.read`
   :378–396 and would deadlock under the lock) — instead it
-   runs raw SQL inside the transaction
-  (`SELECT session, payload, LENGTH(payload) FROM records`
-  scanning for `artifactPublished` digests — Finding 5: session
-  is in `records.session`, not in `ArtifactRef` per
+    runs raw SQL inside the transaction
+  (`SELECT session, payload, length(CAST(payload AS BLOB))
+  FROM records` — Finding 4 bytes via `CAST AS BLOB`, Finding
+  5 session in `records.session` not `ArtifactRef` per
   SessionStore.swift:173–187 — plus a
   `SELECT digest, size FROM artifact_physical` plus a
   `FileManager` directory listing of the artifact root, all
   inside the single `queue.write` before any re-entrant
-  `records(since:)` call), decodes each digest, joins to
-  `artifact_physical.size`, aggregates per-session distinct
-  sizes, and recomputes-to-expected (Finding 4: sets
+  `records(since:)` call), decodes each digest per RecordCodec,
+  joins to `artifact_physical.size`, aggregates per-session
+  distinct sizes, and recomputes-to-expected (Finding 4: sets
   `byte_usage`/`artifact_physical` to the computed expected
   totals, not blindly "bumps additively"; second run is
-  demonstrably idempotent) — an uncommitted orphan file →
-  `artifact_physical` only (never a `byte_usage` row), a
-  committed reference whose `byte_usage` is missing → that
-  session's row via the `records.session` join (Finding 6,
-  Finding 5).
+  demonstrably idempotent, and stale/overcounted rows are
+  lowered/removed — authoritative, not monotonic — Finding 5)
+  — an uncommitted orphan file → `artifact_physical` only
+  (never a `byte_usage` row), a committed reference whose
+  `byte_usage` is missing → that session's row via the
+  `records.session` join (Finding 6), an overcounted
+  `byte_usage` or stale `artifact_physical` row → lowered to
+  expected + non-ASCII fixture verifies byte counting.
   This step SERIALIZES with live `publishArtifact` callers via
   the same artifact lock + `gate` + `queue.write` (the lock
   that B3's publish holds for its entire tmp→rename→commit
@@ -1651,6 +1712,30 @@ NOT non-goals.)
   `byte_usage`); B3+B5 raw SQL `SELECT session, payload,
   LENGTH(payload)` inside txn, no `detectArtifactOrphans` re-entry,
   per-session aggregation.
-- REV21 → deepseek-reviewer: _pending_.
+- REV21 → deepseek-reviewer: NEEDS-EVIDENCE (5 findings:
+  missing `effectKind` discriminator (no field exists); selective
+  marker replacement has no durable path (`OperationRef` no
+  message, append-only `operationResult`, duplicate-result
+  error); migration joins `artifact_physical.size` before it has
+  rows; `LENGTH(payload)` counts characters not bytes;
+  recompute-to-expected contradicts never-lowers).
+- REV22 (this revision): NEW `EffectReservation.Kind`
+  (`executor` vs `provider`) on every construction site
+  (:570/:1019/:1208/:1290/:1365/:1542) + actor table filtering +
+  provider `consumedEffects` insertion + provider-cancel test;
+  DURABLE supersession via NEW `DurableRecord.
+  cancelledPendingMarker` + `cancelledPendingError` with
+  `reconcileOperations` supersession rule (marker HOLD-equivalent
+  but supersedable by `operationResult(done)`, error aggregated)
+  + termination promotion + supersession/error tests; migration
+  populates `artifact_physical` first from decoded
+  `ArtifactRef.size` then joins per-session
+  (`records.session` — ArtifactRef has no session) with
+  `length(CAST(payload AS BLOB))` bytes + v2-with-artifact test;
+  B3/B5 raw SQL `SELECT session, payload,
+  length(CAST(payload AS BLOB))` + per-session distinct join +
+  authoritative set-to-expected including stale-row removal +
+  overcounted-row + non-ASCII tests.
+- REV22 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
