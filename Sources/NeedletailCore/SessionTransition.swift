@@ -1592,12 +1592,26 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         var hold = false
         var outcomeText = outcome.summary
         if deterministic.contains(status) {
-            // Deterministic statuses are always done, even with started==false (preDispatch never started is legitimate).
-            // The prior "contradictory" handling is withdrawn for B0: deterministic results are done regardless of started,
-            // except for the specific case of success with started==false which is still done (the executor attests unstarted but also success contradicts, but we treat as done per B0 fix).
-            stateForResult = .done
-            if status != "success" && status != "no-match" {
-                outcomeText = "tool-failure: \(outcome.summary)"
+            if started == false {
+                // REV25 fail-closed: deterministic + started==false is contradictory → unknown for mutating, transcript-only for non-mutating,
+                // EXCEPT for legitimate preDispatch where the call never started due to validation (denied/invalid-arguments with started false are done).
+                let isPreDispatchLegitimate = (status == "denied" || status == "invalid-arguments") && outcome.summary.contains("capabilityDenied") || outcome.summary.contains("argumentsNotObject") || status == "denied"
+                if isPreDispatchLegitimate {
+                    stateForResult = .done
+                    outcomeText = "tool-failure: \(outcome.summary)"
+                } else if isMutating {
+                    stateForResult = .unknown
+                    hold = true
+                    outcomeText = "unknown: contradictory \(status) with started==false"
+                } else {
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+                    continue
+                }
+            } else {
+                stateForResult = .done
+                if status != "success" && status != "no-match" {
+                    outcomeText = "tool-failure: \(outcome.summary)"
+                }
             }
         } else if status == "cancelled" || status == "timeout" {
             if started == false {

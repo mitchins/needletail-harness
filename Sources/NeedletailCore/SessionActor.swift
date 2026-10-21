@@ -517,17 +517,16 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             await self.completeEffect(reservation.effectID, outcome: .perCall(synth))
             return
         } catch {
-            // Untyped throw from mutating batch → per-call unknown+hold for each mutating proposal, transcript-only for non-mutating
+            // Untyped throw → per-call unknown+hold for mutating (must not be done). Synthesize timeout+started true which the reducer treats as unknown for mutating.
             let calls = reservation.batch.proposals.map { prop in
                 let isMutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
                 if isMutating {
-                    return ToolCallOutcome(callID: prop.callID, status: "failed", summary: "untyped throw: \(error)", data: "", error: "\(error)", started: true)
+                    return ToolCallOutcome(callID: prop.callID, status: "timeout", summary: "untyped throw: \(error)", data: "", error: "\(error)", started: true)
                 } else {
-                    return ToolCallOutcome(callID: prop.callID, status: "failed", summary: "untyped throw", data: "", started: true)
+                    return ToolCallOutcome(callID: prop.callID, status: "timeout", summary: "untyped throw", data: "", started: true)
                 }
             }
-            // For the reducer, we need to mark mutating as unknown; we synthesize a perCall result where mutating will become unknown via the reducer's handling of failed+started true
-            let receipt = ExecutorReceipt(callID: reservation.effectID.raw, status: "failed", summary: "untyped throw")
+            let receipt = ExecutorReceipt(callID: reservation.effectID.raw, status: "timeout", summary: "untyped throw")
             let synth = ExecutorResult(receipt: receipt, calls: calls)
             await self.completeEffect(reservation.effectID, outcome: .perCall(synth))
         }
