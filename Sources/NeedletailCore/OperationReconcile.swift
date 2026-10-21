@@ -100,6 +100,7 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
     var denialIDs: Set<OperationID> = []
 
     var pendingMarkers: [OperationID: OperationRef] = [:]
+    var pendingMarkerOrder: [OperationID] = []
     var cancelledErrors: [CancelledPendingError] = []
     for record in records {
         switch record {
@@ -164,6 +165,7 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
                 throw StoreError.integrity("duplicate cancelledPendingMarker for operation \(ref.operationID.raw)")
             }
             pendingMarkers[ref.operationID] = ref
+            pendingMarkerOrder.append(ref.operationID)
             toolIDs.insert(ref.operationID)
         case .cancelledPendingError(let err):
             cancelledErrors.append(err)
@@ -245,7 +247,8 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
                 state: .unknown, mutating: true))
         }
     }
-    for (id, marker) in pendingMarkers where intents[id] == nil {
+    for id in pendingMarkerOrder where intents[id] == nil {
+        guard let marker = pendingMarkers[id] else { continue }
         orphanResults.append(marker)
         held.append(marker)
     }

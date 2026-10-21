@@ -344,8 +344,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.cancelling, .effectCompleted(let effectID, _, _, _, _, let outcome, _)):
         return completeCancelledPending(state, effectID: effectID, outcome: outcome, ids: &ids)
-    case (.cancelling, .effectFailed(let effectID, _, _, _, _, let error, _)):
-        return completeCancelledPendingFailed(state, effectID: effectID, error: error, ids: &ids)
+    case (.cancelling, .effectFailed(let effectID, _, _, _, _, let error, let at)):
+        return completeCancelledPendingFailed(state, effectID: effectID, error: error, atMillis: at, ids: &ids)
     case (.cancelling, .tick(let now)):
         return tickCancelling(state, nowMillis: now, ids: &ids)
     case (.cancelling, .transportFailed(_, _, _, _, let at)):
@@ -1561,6 +1561,10 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
     }
 
     for proposal in proposals {
+        // Tainted IDs already carry their unknown marker + result above.
+        if taintedCallIDs.contains(proposal.callID) {
+            continue
+        }
         guard let outcome = outcomeMap[proposal.callID] else {
             // No-entry: contract violation, treat as unknown for mutating, transcript-only for non-mutating
             let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
@@ -1737,14 +1741,14 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
     return Transition(state: next, effects: [], records: records)
 }
 
-private func completeCancelledPendingFailed<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, ids: inout I) -> Transition {
+private func completeCancelledPendingFailed<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, atMillis: UInt64, ids: inout I) -> Transition {
     guard let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) else {
         return Transition(state: state, effects: [], records: [])
     }
     var pending = state.cancelledPendingReservations.filter { $0.effectID != effectID }
     var consumed = state.consumedEffects
     consumed.insert(effectID)
-    let errRecord = CancelledPendingError(effectID: effectID, operationIDs: reservation.batch.proposals.map { operationID(effectID: effectID, callID: $0.callID) }, error: error, atMillis: 0)
+    let errRecord = CancelledPendingError(effectID: effectID, operationIDs: reservation.batch.proposals.map { operationID(effectID: effectID, callID: $0.callID) }, error: error, atMillis: atMillis)
     let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending)
     return Transition(state: next, effects: [], records: [.cancelledPendingError(errRecord)])
 }

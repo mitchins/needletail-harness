@@ -490,14 +490,12 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// completeEffect/failEffect (stale outcomes drop).
     private func invokeExecutor(reservation: EffectReservation) async {
         defer {
-            // REV25: termination cleanup — if the task ends without a report, promote pending markers.
-            // This runs on return, throw, or cancellation; it prunes both actor tables via event.
-            Task { await self.apply(.cancelledPendingRemoved(effectID: reservation.effectID, atMillis: self.clock.nowMillis())) }
-            // Also clean up inFlight tracking
-            if cancelledPending[reservation.effectID] != nil {
-                cancelledPending.removeValue(forKey: reservation.effectID)
-            }
+            let stillPending = cancelledPending[reservation.effectID] != nil || state.cancelledPendingReservations.contains(where: { $0.effectID == reservation.effectID })
             reservations.removeValue(forKey: reservation.effectID)
+            cancelledPending.removeValue(forKey: reservation.effectID)
+            if stillPending {
+                Task { await self.apply(.cancelledPendingRemoved(effectID: reservation.effectID, atMillis: self.clock.nowMillis())) }
+            }
         }
         do {
             let result = try await executor.execute(batch: reservation.batch, reservation: reservation)
