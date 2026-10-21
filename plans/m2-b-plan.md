@@ -866,9 +866,9 @@ NOT non-goals.)
   mutating; lock granularity mixed case; missing legs incl.
   post-commit-timeout; citations incl. performedEffects body
   mentions, §7 failed-ambiguous, openat, §8 accuracy).
-- REV11 (this revision): no `performedEffects` anywhere in the
-  body (mechanism explicitly rejected with the single-threaded
-  executor + async-boundary rationale); §3 cancel/stale path
+- REV11 (this revision): no `performedEffects` mechanism
+  anywhere (the single body mention explicitly rejects it with
+  rationale); §3 cancel/stale path
   pins the attested/unattested line (executor-reported unstarted
   → done-cancelled; everything else unknown+hold for mutating);
   mixed-cancel + stale tests with same-IDs/summary assertions;
