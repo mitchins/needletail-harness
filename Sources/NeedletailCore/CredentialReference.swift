@@ -3,8 +3,8 @@
 /// secret value. Resolution is a separate explicit call scoped to one
 /// operation; diagnostics render the reference only. No filesystem,
 /// environment or network access in this file: stores live in Runtime.
-public struct CredentialReference: Sendable, Equatable {
-    public enum Kind: Sendable, Equatable {
+public struct CredentialReference: Sendable, Equatable, Codable {
+    public enum Kind: Sendable, Equatable, Codable {
         case env(name: String)
         case file(path: String)
         case keychain(account: String)

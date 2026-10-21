@@ -34,6 +34,9 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     private let store: Store
     private let approvals: Approvals
     private let sink: any UISink
+    /// Durable-mutation writer identity (A2 fencing): identifies THIS live
+    /// actor instance; the session side comes from the actor's state.
+    private let writer: String
     /// Reservation table (effectID → reservation), captured pre-await.
     /// An entry is removed when its run is cancelled (after C3 retention
     /// records) or when its completion is first accepted (R3).
@@ -55,11 +58,14 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     private var rawRingMaxCount: Int { 8 }
     private var rawRingMaxBytes: Int { 16 * 1024 * 1024 }
 
+    /// Throws when the fencing claim cannot be established: constructing a
+    /// live writer against a session held by a DIFFERENT writer is a loud
+    /// failure, never a silently unfenced actor.
     public init(
         state: SessionState, ids: IDs, clock: ClockType,
         transport: Transport, executor: Executor, store: Store, approvals: Approvals,
-        sink: any UISink = NoopUISink()
-    ) {
+        sink: any UISink = NoopUISink(), writer: String
+    ) throws {
         self.state = state
         self.ids = ids
         self.clock = clock
@@ -68,6 +74,12 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         self.store = store
         self.approvals = approvals
         self.sink = sink
+        self.writer = writer
+        // A2 fencing: this live actor instance establishes its writer
+        // identity BEFORE any durable mutation. Idempotent for a same-
+        // identity restart; a competing live writer fails here, loudly —
+        // never silently unfenced.
+        try store.claimWriterOwnership(session: state.sessionID, writer: writer)
     }
 
     public var rawRecords: [RawProviderRecord] { rawRing }
@@ -156,18 +168,73 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         let prior = state
         let result = transition(state, event, &ids)
         state = result.state
-        // S2: the outer transition's records append BEFORE any pump-driven
-        // follow-up — cause precedes consequence in the store log (M2 replays
-        // this order).
+        // S2 + A3-1: the transition's whole record group commits ATOMICALLY
+        // before ANY effect performs — cause precedes consequence, and an
+        // intent group either commits whole (dispatch may proceed) or not
+        // at all (no external side effect exists). A failed RESULT commit
+        // after a possible side effect stops here: no success asserted, no
+        // continuation performed — the earlier-committed intents stand
+        // alone, which is exactly the evidence later reconciliation needs
+        // to classify them unknown.
         do {
-            for record in result.records {
-                try store.append(record)
+            if !result.records.isEmpty {
+                try store.appendBatch(result.records, as: WriterIdentity(
+                    session: state.sessionID, writer: writer))
             }
         } catch {
             // Integrity-visible halt (never silent divergence): the computed
             // records are unpersisted, so the run cannot continue on them.
             // M2 owns recovery; M1-B fails the run visibly here.
-            state = prior.replacing(phase: .failed(.integrityStopped("store append failed; intent unpersisted")))
+            // A3-1: the reason is classified from the UNPERSISTED GROUP, not
+            // the event kind — any group carrying an operation result (done
+            // completions, failure receipts, cancel/ambiguous unknowns)
+            // means a possible side effect's outcome is now unresolved,
+            // while a pure intent group means nothing executed yet.
+            let leftResultUnpersisted = result.records.contains {
+                if case .operationResult = $0 { return true }
+                return false
+            }
+            let reason = leftResultUnpersisted
+                ? "store append failed; result unpersisted, outcome unresolved"
+                : "store append failed; intent unpersisted"
+            if leftResultUnpersisted {
+                // Unpersisted MUTATING results are possible side effects
+                // with no durable outcome: each becomes an unknown marker
+                // (bounded like every other marker site) and the queue
+                // holds, so a later fresh admission cannot silently proceed
+                // past them (admitFreshRun blocks on unresolvedOperations,
+                // and the terminal-phase reset to idle does not clear
+                // markers). Non-mutating results (read-only outcomes,
+                // callID-less denial receipts) carry no side effect: the
+                // durable classifier treats them as re-runnable, so they
+                // take no markers — and with no markers the run fails
+                // plainly instead of holding an empty queue. An
+                // intent-only group means nothing executed: failed phase
+                // alone, no markers. Volatile run fields are cleared like
+                // failRun: nothing resumes behind the held queue.
+                var markers = prior.unresolvedOperations
+                for record in result.records {
+                    guard case .operationResult(let ref, _) = record, ref.mutating else { continue }
+                    guard markers.count < maxUnresolvedOperations else { break }
+                    markers.append(OperationRef(
+                        operationID: ref.operationID, callID: ref.callID,
+                        state: .unknown, mutating: ref.mutating))
+                }
+                if markers.count > prior.unresolvedOperations.count {
+                    state = prior.replacing(
+                        phase: .failed(.integrityStopped(reason)),
+                        activeRun: .some(nil), activeRequest: .some(nil),
+                        queueHeld: true, heldReason: .error(reason),
+                        pendingApproval: .some(nil), pendingBatch: .some(nil),
+                        retryDeadlineMillis: .some(nil),
+                        liveReservations: [],
+                        unresolvedOperations: markers)
+                } else {
+                    state = prior.replacing(phase: .failed(.integrityStopped(reason)))
+                }
+            } else {
+                state = prior.replacing(phase: .failed(.integrityStopped(reason)))
+            }
             return
         }
         for effect in result.effects {

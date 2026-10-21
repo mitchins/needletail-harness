@@ -57,4 +57,23 @@ struct ImportGateTests {
                     "NeedletailCLI/\(file): offline bootstrap paths must not link the HTTP client")
         }
     }
+
+    @Test("A5-1 CLI exposes no ownership-recovery surface")
+    func CLINoRecoverySurface() throws {
+        // RecoveryAuthorization is a scope-bound audit value, not
+        // independent authentication — and no later user-facing recovery
+        // command exists. The CLI composition root must never reference
+        // the takeover operation: any mention here is a new user-facing
+        // recovery path without a trusted operator boundary. Fail closed.
+        var testFile = URL(fileURLWithPath: #filePath)
+        for _ in 0..<3 { testFile.deleteLastPathComponent() }
+        let cli = testFile.appendingPathComponent("Sources/NeedletailCLI").path
+        for file in try FileManager.default.contentsOfDirectory(atPath: cli).filter({ $0.hasSuffix(".swift") }) {
+            let text = try String(contentsOfFile: cli + "/" + file, encoding: .utf8)
+            #expect(!text.contains("recoverWriterOwnership"),
+                    "NeedletailCLI/\(file): CLI must not expose ownership takeover")
+            #expect(!text.contains("RecoveryAuthorization"),
+                    "NeedletailCLI/\(file): CLI must not reference recovery authorization")
+        }
+    }
 }

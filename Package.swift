@@ -56,6 +56,14 @@ let package = Package(
             dependencies: [
                 "NeedletailCore",
                 .product(name: "SystemPackage", package: "swift-system"),
+                // M2-A decision D-2 extension: the durable GRDB store lives
+                // in Runtime (the I/O-bearing target). ImportGateTests keep
+                // GRDB out of Core/CLI; the linkage activates with A1.
+                .product(name: "GRDB", package: "GRDB.swift"),
+                // A4-1: SHA-256 for artifact fingerprints. Pre-authorized
+                // use (DEPENDENCIES.md): Core must not import Crypto, so
+                // the digest lives in Runtime with the store that needs it.
+                .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
         .target(
@@ -100,6 +108,16 @@ let package = Package(
             dependencies: [
                 "NeedletailCore",
                 "NeedletailTestSupport",
+                // M2-A A0: native-tier reach for the production store — the
+                // STORE certification tests must execute the real Runtime
+                // store, and the ingestion tier map classifies this target.
+                "NeedletailRuntime",
+                // A5-1: CLI wiring evidence runs the real `needletail`
+                // product binary. Depending on the executable target makes
+                // `swift test` build it fresh first, so spawn-binary tests
+                // can never pass against a stale binary (no silent
+                // staleness; a missing binary still fails loudly).
+                "NeedletailCLI",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
                 .product(name: "Subprocess", package: "swift-subprocess"),

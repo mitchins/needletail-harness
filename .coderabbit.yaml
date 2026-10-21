@@ -43,9 +43,13 @@ reviews:
         case into a pass (BDD-01..04).
     - path: "Tests/**"
       instructions: |
-        Behaviour-labelled Swift Testing. Display names begin with the
-        stable catalogue case ID (TESTING section 2). No sleeps in place of
-        readiness; no oracle regenerated from the code under test.
+        Swift Testing. CASE-BEARING tests (function names carrying a
+        catalogue case ID) begin their display names with that stable case
+        ID (TESTING section 2). Support/oracle tests that certify no
+        catalogue case are UNLABELED support evidence and are reconciled
+        as such — do NOT assign unrelated case IDs to them. No sleeps in
+        place of readiness; no oracle regenerated from the code under
+        test.
     - path: "Sources/CReplxx/**"
       instructions: |
         Vendored third-party sources: files under `replxx/` are upstream

@@ -22,11 +22,11 @@ struct TimerLoopbackTests {
     ) async throws -> (LoopActor, FlakyTransport<ChatCompletionsTransport>, ChatCompletionsTransport) {
         let (inner, snapshot) = try LoopbackFixtures.transport(server: server)
         let flaky = FlakyTransport(inner: inner, failFirst: failFirst)
-        let actor = SessionActor(
+        let actor = try SessionActor(
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: prefix), clock: VirtualClock(now: 3_000_000),
             transport: flaky, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals())
+            store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "test-writer")
         return (actor, flaky, inner)
     }
 

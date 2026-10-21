@@ -132,10 +132,26 @@ struct XUnitIngestionTests {
     /// not assumed from the substring.
     private static let requiredEvidence: [String: [String: String]] = [
         "STATE-01": ["STATE_01_cancelledLateCompletionReplays": "NeedletailStateTests"],
-        "STORE-07": ["STORE_07_sqliteResumeListsInOrder": "NeedletailPrimitiveTests"],
-        "STORE-09": ["STORE_09_sqliteQuotaBoundary": "NeedletailPrimitiveTests"],
-        "STORE-01": ["STORE_01_sqliteReopenPersistsRecords": "NeedletailPrimitiveTests"],
-        "STORE-02": ["STORE_02_sigkillMidTransactionRollsBack": "NeedletailPrimitiveTests"],
+        "STORE-01": ["STORE_01_sqliteProductionStorePersistsAcrossReopen": "NeedletailPrimitiveTests",
+                     "STORE_01_sqliteDurabilityPragmasHoldOnOwnConnection": "NeedletailPrimitiveTests"],
+        "STORE-05": ["STORE_05_sqliteFutureOrCorruptStoreFailsClosed": "NeedletailPrimitiveTests"],
+        "STORE-06": ["STORE_06_sqliteTwoWritersCompeteForOneSession": "NeedletailPrimitiveTests"],
+        "STORE-07": ["STORE_07_sqliteProductionResumeAtScale": "NeedletailPrimitiveTests"],
+        "STORE-09": ["STORE_09_sqliteProductionQuotasEnforceInTransaction": "NeedletailPrimitiveTests"],
+        "STORE-02": ["STORE_02_sigkillMidTransactionRollsBack": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillBeforeIntentCommitLeavesNothing": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillAfterIntentCommitHoldsUnknown": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillAfterSideEffectHoldsWithoutRedispatch": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillBeforeResultCommitDerivesUncertainty": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteKillAfterResultCommitSurvivesComplete": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteInterruptedArtifactTmpReportsNoReference": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteRenamedArtifactWithoutReferenceIsOrphan": "NeedletailPrimitiveTests",
+                      "STORE_02_sqliteCommittedArtifactReferenceReadsVerified": "NeedletailPrimitiveTests"],
+        "STORE-08": ["STORE_08_sqliteRedactedExportOmitsConfidentialContent": "NeedletailPrimitiveTests",
+                     "STORE_08_sqliteContentExportPermitsOnlyDocumentedContent": "NeedletailPrimitiveTests"],
+        "PORT-04": ["PORT_04_sqliteNativeKillReopenLegMustExecute": "NeedletailPrimitiveTests"],
+        "STORE-03": ["STORE_03_sqliteRenamedArtifactWithoutReferenceIsReportedOrphan": "NeedletailPrimitiveTests"],
+        "STORE-04": ["STORE_04_sqliteReferenceToAbsentArtifactFailsTypedIntegrity": "NeedletailPrimitiveTests"],
     ]
 
     private static var requiredVariants: [String: Set<String>] {
@@ -143,16 +159,13 @@ struct XUnitIngestionTests {
     }
 
     /// Cases whose CERTIFYING evidence does not exist yet and is owed to a
-    /// later milestone (STORE-06 "two writers open same session": with the
-    /// current `SessionStore` interface, same-session claims are idempotent
-    /// and the slot has no writer identity, so two handles CAN both hold
-    /// "ownership" of one session — global-slot exclusion of a DIFFERENT
-    /// session is proven, but not same-session fencing). The named variant
-    /// is the exact test M2-A must add once writer identity/fencing exists;
-    /// until then STORE-06 must stay unsatisfied no matter what else passes.
-    private static let deferredToM2A: [String: Set<String>] = [
-        "STORE-06": ["STORE_06_twoWritersCompeteForOneSession"],
-    ]
+    /// later milestone. EMPTY as of A2: STORE-06 landed
+    /// (`STORE_06_sqliteTwoWritersCompeteForOneSession` — two independent
+    /// handles, fenced writes/releases in the mutation transaction) and
+    /// moved to `requiredEvidence`. The invariant below keeps this map and
+    /// `requiredEvidence` disjoint; a future deferral registers here and
+    /// hard-blocks its case from `satisfied` until the named test exists.
+    private static let deferredToM2A: [String: Set<String>] = [:]
     @Test("BDD-01 ingestion joins executed runner results to the catalogue",
           .enabled(if: ingestionEnabled, "run via ./dev coverage (sets NT_XUNIT_PATH)"))
     func BDD_01_ingestionReconcilesExecutedResults() throws {
@@ -236,5 +249,73 @@ struct XUnitIngestionTests {
             #expect(!report.satisfied.contains(caseID),
                     "deferred case \(caseID) is not certifiable in M2-0; satisfied=\(report.satisfied)")
         }
+        // Maps invariant (A2): a case is either required-here or deferred —
+        // never both, and every deferred case must be due eventually.
+        #expect(Set(Self.requiredEvidence.keys).isDisjoint(with: Self.deferredToM2A.keys),
+                "requiredEvidence and deferredToM2A must be disjoint")
+    }
+
+    @Test("native kill/reopen evidence is pinned to the production tier")
+    func nativeKillEvidencePinnedToProductionTier() {
+        // PORT-04 exists precisely to stop in-memory success from masking a
+        // missing native leg: deleting or re-pointing this entry must fail
+        // loudly here, not silently weaken the gate. Same for the STORE-02
+        // production matrix and the STORE-08 export evidence: the old
+        // DELETE-mode sqlite3-CLI probe alone must never satisfy the final
+        // contract again, and unwitnessed export variants must never count.
+        #expect(Self.requiredEvidence["PORT-04"] ==
+                ["PORT_04_sqliteNativeKillReopenLegMustExecute": "NeedletailPrimitiveTests"],
+                "PORT-04 must require the native kill/reopen variant")
+        let store02 = Self.requiredEvidence["STORE-02"] ?? [:]
+        for variant in [
+            "STORE_02_sqliteKillBeforeIntentCommitLeavesNothing",
+            "STORE_02_sqliteKillAfterIntentCommitHoldsUnknown",
+            "STORE_02_sqliteKillAfterSideEffectHoldsWithoutRedispatch",
+            "STORE_02_sqliteKillBeforeResultCommitDerivesUncertainty",
+            "STORE_02_sqliteKillAfterResultCommitSurvivesComplete",
+            "STORE_02_sqliteInterruptedArtifactTmpReportsNoReference",
+            "STORE_02_sqliteRenamedArtifactWithoutReferenceIsOrphan",
+            "STORE_02_sqliteCommittedArtifactReferenceReadsVerified",
+        ] {
+            #expect(store02[variant] == "NeedletailPrimitiveTests",
+                    "STORE-02 must require production variant \(variant)")
+        }
+        #expect(store02["STORE_02_sigkillMidTransactionRollsBack"] == "NeedletailPrimitiveTests",
+                "the original DELETE-mode probe stays as supplementary evidence")
+        #expect(Self.requiredEvidence["STORE-08"] == [
+            "STORE_08_sqliteRedactedExportOmitsConfidentialContent": "NeedletailPrimitiveTests",
+            "STORE_08_sqliteContentExportPermitsOnlyDocumentedContent": "NeedletailPrimitiveTests",
+        ], "STORE-08 must require the native export variants")
+    }
+
+    @Test("PORT-04 gating body performs a native kill")
+    func port04GatingBodyPerformsNativeKill() throws {
+        // The gate keys on function name + module + pass: an EMPTIED
+        // PORT-04 body would still satisfy it. This source pin (same
+        // pattern as PresentationGateTests/ImportGateTests) asserts the
+        // gating body actually spawns the crash child and never touches
+        // an in-memory store — body removal fails loudly here.
+        var matrixFile = URL(fileURLWithPath: #filePath)
+        for _ in 0..<3 { matrixFile.deleteLastPathComponent() }
+        let matrixPath = matrixFile
+            .appendingPathComponent("Tests/NeedletailPrimitiveTests/CrashMatrixTests.swift").path
+        let text = try String(contentsOfFile: matrixPath, encoding: .utf8)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let start = lines.firstIndex(where: {
+            $0.contains("func PORT_04_sqliteNativeKillReopenLegMustExecute")
+        }) else {
+            Issue.record("PORT-04 gating function missing from CrashMatrixTests.swift")
+            return
+        }
+        let rest = lines[(start + 1)...]
+        guard let end = rest.firstIndex(where: { $0 == "    }" }) else {
+            Issue.record("PORT-04 gating function body never closes")
+            return
+        }
+        let body = rest[..<end].joined(separator: "\n")
+        #expect(body.contains("withKilledChild"),
+                "PORT-04 gating body must perform the native kill cycle")
+        #expect(!body.contains("InMemorySessionStore"),
+                "PORT-04 gating body must not touch an in-memory store")
     }
 }

@@ -7,7 +7,7 @@
 
 /// One ordered conversation element. Tool calls carry the VERBATIM native
 /// arguments (never digests — digests must not feed execution, D2).
-public enum TranscriptEntry: Sendable, Equatable {
+public enum TranscriptEntry: Sendable, Equatable, Codable {
     case user(String)
     case assistantText(String)
     case toolCall(NativeToolCall)
@@ -64,11 +64,11 @@ public func transcriptMessages(_ records: [SequencedRecord]) throws -> [ChatMess
 /// Pages the transcript from the store and maps it. Over-limit pages fail
 /// honest (never silent truncation — unreachable at M1 turn budgets; the
 /// bound exists so growth can never silently drop history).
-public func loadTranscript(from store: SessionStore, limit: Int = 1024) throws -> [ChatMessage] {
+public func loadTranscript(from store: SessionStore, session: SessionID, limit: Int = 1024) throws -> [ChatMessage] {
     var cursor: UInt64 = 0
     var records: [SequencedRecord] = []
     while true {
-        let (page, next) = try store.records(since: cursor, limit: limit)
+        let (page, next) = try store.records(session: session, since: cursor, limit: limit)
         records.append(contentsOf: page.filter { if case .transcriptAppended = $0.record { return true } else { return false } })
         guard records.count <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
         guard let following = next else { break }

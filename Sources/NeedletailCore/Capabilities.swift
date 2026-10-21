@@ -4,7 +4,7 @@
 /// skills, tool outputs and model messages are not parameters and therefore
 /// cannot enlarge the result. `--sealed` and `--tools none` deny **tools
 /// only** — route authorization is independent (`RouteDecision`).
-public struct ToolCapabilities: Sendable, Equatable {
+public struct ToolCapabilities: Sendable, Equatable, Codable {
     public let read: Bool
     public let search: Bool
     public let edit: Bool
@@ -49,7 +49,7 @@ public struct ToolCapabilities: Sendable, Equatable {
     }
 }
 
-public enum ExecPolicy: String, Sendable, Equatable {
+public enum ExecPolicy: String, Sendable, Equatable, Codable {
     case denied
     case ask
     case allowed
@@ -63,7 +63,7 @@ public enum ExecPolicy: String, Sendable, Equatable {
     }
 }
 
-public enum RoutePolicy: String, Sendable, Equatable {
+public enum RoutePolicy: String, Sendable, Equatable, Codable {
     case none
     case localOnly
 }
@@ -75,7 +75,7 @@ public struct SealedRestrictions: Sendable, Equatable {
     public init(sealed: Bool) { self.sealed = sealed }
 }
 
-public struct EffectiveCapabilities: Sendable, Equatable {
+public struct EffectiveCapabilities: Sendable, Equatable, Codable {
     public let tools: ToolCapabilities
     /// M1-A routes local-only or denies per request (`selectRoute`); the
     /// policy field records the only routable class and never varies with

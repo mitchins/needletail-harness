@@ -118,11 +118,11 @@ struct BoundaryVerificationTests {
         let snapshot = try LoopbackFixtures.snapshot(alias: "loop", baseURL: server.baseURL)
         defer { await LoopbackFixtures.shutdown(chat.client) }
 
-        let actor = AuthorizedActor(
+        let actor = try AuthorizedActor(
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: "boundary"), clock: VirtualClock(now: 5_000_000),
             transport: chat, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals(), sink: sink)
+            store: InMemorySessionStore(), approvals: TrivialApprovals(), sink: sink, writer: "boundary-writer")
 
         await actor.submitText(commandID: CommandID("boundary-run"), text: "hi", kind: .followUp, sealed: false)
         // Poll (never sleep-standing-in-for-readiness): completion is held by
@@ -262,11 +262,11 @@ struct BoundaryVerificationTests {
         let chat: ChatCompletionsTransport = try LoopbackFixtures.transport(server: server).0
         let snapshot = try LoopbackFixtures.snapshot(alias: "loop", baseURL: server.baseURL)
         defer { await LoopbackFixtures.shutdown(chat.client) }
-        let actor = AuthorizedActor(
+        let actor = try AuthorizedActor(
             state: try ActorLoopback.idleState(snapshot: snapshot),
             ids: DeterministicIDSource(prefix: "ring"), clock: VirtualClock(now: 7_000_000),
             transport: chat, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals())
+            store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "boundary-writer")
 
         for index in 0..<9 {
             await actor.submitText(

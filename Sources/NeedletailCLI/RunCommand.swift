@@ -7,13 +7,16 @@ import AsyncHTTPClient
 import Dispatch
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Darwin)
+import Darwin
 #endif
 import NIOCore
 
 /// `needletail run` (M1-D): headless coding-agent loop via production
 /// `SessionActor` + `ChatCompletionsTransport` + `ScriptedToolBackend`.
-/// No real filesystem writes, no GRDB, no cloud fallback. The transcript
-/// lives as `DurableRecord.transcriptAppended` paged from the store.
+/// A5-1: ordinary runs persist to the production GRDB store (durable
+/// session/epoch/transcript records, fenced writer ownership); sealed
+/// runs keep the volatile in-memory exception. No cloud fallback.
 struct RunCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "run",
@@ -100,17 +103,54 @@ struct RunCommand: ParsableCommand {
     }
 
     // Ephemeral in-memory store for the CLI (production store is M2 GRDB).
-    final class EphemeralStore: SessionStore, @unchecked Sendable {
-        private let lock = NSLock()
+    // RETAINED narrowly for sealed runs only (req: sealed nonpersistence
+    // by default): ordinary runs use the production GRDB store below.
+    // A5-2 owns export; there is deliberately no promotion path here.
+    final class EphemeralStore: SessionStore, @unchecked Sendable {        private let lock = NSLock()
         private var log: [SequencedRecord] = []
+        private var sessions: [String] = []
         private var sequence: UInt64 = 0
-        func append(_ record: DurableRecord) throws {
+        private var claims: [String: String] = [:]
+        func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
             try lock.withLock {
+                guard claims[identity.session.raw] == identity.writer else {
+                    throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+                }
                 guard log.count < 10_000 else { throw StoreError.quotaExceeded(limit: 10_000) }
                 sequence += 1
                 log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
+                sessions.append(identity.session.raw)
             }
         }
+        /// A3-1 atomic override: the whole transition group is quota/fencing
+        /// checked BEFORE any row lands — a breached quota at the 10k
+        /// boundary fails the group whole, never partially committed.
+        func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {
+            try lock.withLock {
+                guard claims[identity.session.raw] == identity.writer else {
+                    throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+                }
+                guard log.count + records.count <= 10_000 else { throw StoreError.quotaExceeded(limit: 10_000) }
+                for record in records {
+                    sequence += 1
+                    log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
+                    sessions.append(identity.session.raw)
+                }
+            }
+        }
+        func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
+            guard limit > 0 else {
+                throw StoreError.integrity("invalid page limit \(limit); must be > 0")
+            }
+            return try lock.withLock {
+                let window = log.enumerated().filter {
+                    $0.element.sequence.value > since && sessions[$0.offset] == session.raw
+                }.prefix(limit).map { $0.element }
+                let next: UInt64? = window.count < limit ? nil : window.last?.sequence.value
+                return (window, next)
+            }
+        }
+        /// UNSCOPED diagnostic read (support tooling/tests only).
         func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
             try lock.withLock {
                 let matching = log.filter { $0.sequence.value > since }
@@ -121,13 +161,112 @@ struct RunCommand: ParsableCommand {
                 return (batch, next)
             }
         }
-        func claimWriterOwnership(session: SessionID) throws {}
-        func releaseWriterOwnership(session: SessionID) {}
+        func claimWriterOwnership(session: SessionID, writer: String) throws {
+            try lock.withLock {
+                if let current = claims[session.raw], current != writer {
+                    throw StoreError.alreadyOwned(session: session.raw, writer: current)
+                }
+                claims[session.raw] = writer
+            }
+        }
+        func releaseWriterOwnership(session: SessionID, writer: String) throws {
+            try lock.withLock {
+                guard claims[session.raw] == writer else {
+                    throw StoreError.notWriter(session: session.raw, writer: writer)
+                }
+                claims[session.raw] = nil
+            }
+        }
+    }
+
+    /// A5-1 production state location. Explicit, private, XDG-compatible:
+    /// `$NEEDLETAIL_STATE_DIR` wins (isolated test dirs and explicit
+    /// operator placement), else absolute `$XDG_DATA_HOME/needletail`,
+    /// else `~/.local/share/needletail`. A relative XDG value is invalid
+    /// per the XDG Base Directory specification and is ignored (falls
+    /// through to HOME) rather than scattering a store per working
+    /// directory. No silent fallback — without a home the run refuses
+    /// to start rather than scattering state.
+    static func resolveStateDirectory() throws -> String {
+        let environment = ProcessInfo.processInfo.environment
+        if let override = environment["NEEDLETAIL_STATE_DIR"], !override.isEmpty {
+            return override
+        }
+        if let xdg = environment["XDG_DATA_HOME"], xdg.hasPrefix("/") {
+            return xdg + "/needletail"
+        }
+        if let home = environment["HOME"], !home.isEmpty {
+            return home + "/.local/share/needletail"
+        }
+        eprint("error: cannot determine a private state directory (set NEEDLETAIL_STATE_DIR or HOME). Refusing to run without durable state.")
+        throw ExitCode(2)
+    }
+
+    /// Enforces private mode on a managed path, failing closed instead of
+    /// silently keeping lax permissions (a file the process can write but
+    /// not chmod — foreign owner, ACL/FUSE setup — must refuse the run,
+    /// not complete it on a world-readable database).
+    private static func enforcePrivateFile(_ path: String) throws {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        let mode = try? FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int
+        guard mode == 0o600 else {
+            eprint("store error: cannot establish private permissions on \(terminalSafe(path)). Refusing to run on a non-private store.")
+            throw ExitCode(6)
+        }
+    }
+
+    /// Opens (never creates-over) the production store at the resolved
+    /// state directory. The directory is created private (0700, repaired
+    /// when pre-existing); the database file itself is enforced 0600.
+    /// An existing incompatible store fails closed — never overwritten,
+    /// never silently replaced with memory.
+    static func openProductionStore() throws -> GRDBSessionStore {
+        let directory = try resolveStateDirectory()
+        do {
+            try FileManager.default.createDirectory(
+                atPath: directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory)
+        } catch {
+            eprint("error: cannot establish private state directory at \(terminalSafe(directory)): \(terminalSafe(String(describing: error)))")
+            throw ExitCode(4)
+        }
+        let dbPath = (directory as NSString).appendingPathComponent("store.sqlite")
+        let store: GRDBSessionStore
+        do {
+            store = try GRDBSessionStore(path: dbPath)
+        } catch {
+            // Corrupt, future-schema or foreign files fail closed here —
+            // the CLI never deletes or replaces them, and never falls
+            // back to memory (which would silently discard durability).
+            eprint("store error: cannot open durable store at \(terminalSafe(dbPath)): \(terminalSafe(String(describing: error)))")
+            throw ExitCode(6)
+        }
+        // Enforce 0600 on the database and any live sidecars (covers
+        // pre-existing lax modes; fresh files are already 0600 via the
+        // process umask set at startup).
+        try enforcePrivateFile(dbPath)
+        try enforcePrivateFile(dbPath + "-wal")
+        try enforcePrivateFile(dbPath + "-shm")
+        return store
     }
 
     private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, isJSONL: Bool) async throws {
         // Unused format param kept for future envelope versioning
         _ = format
+        // Private-by-default file creation for EVERYTHING this process
+        // writes (SPEC §9.2: dirs 0700, files 0600 — database, WAL,
+        // artifacts, trace output). Set once, up front: sealed runs never
+        // reach openProductionStore, but their trace output (and any
+        // future file) falls under the same rule. Fresh files created
+        // under this mask are private by construction; pre-existing lax
+        // files are repaired-and-verified below, never silently kept.
+        #if canImport(Glibc)
+        _ = Glibc.umask(0o077)
+        #elseif canImport(Darwin)
+        _ = Darwin.umask(0o077)
+        #endif
         // 1. Load and validate config
         let configPath: String
         if let explicit = config {
@@ -194,11 +333,80 @@ struct RunCommand: ParsableCommand {
                 throw ExitCode(2)
             }
         }
-        let store = EphemeralStore()
+        // A5-1: ordinary runs use the production GRDB store; sealed runs
+        // keep the narrowly scoped volatile exception (no sealed
+        // source/prompt bytes may land in persistent files).
+        // Existentials cannot bind SessionActor's Store parameter on this
+        // toolchain, so the choice is an explicit dispatch enum — one
+        // forwarding method per seam, no behavior of its own.
+        enum CLIStore: SessionStore {
+            case ephemeral(EphemeralStore)
+            case durable(GRDBSessionStore)
+
+            func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
+                switch self {
+                case .ephemeral(let s): try s.append(record, as: identity)
+                case .durable(let s): try s.append(record, as: identity)
+                }
+            }
+
+            func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {
+                switch self {
+                case .ephemeral(let s): try s.appendBatch(records, as: identity)
+                case .durable(let s): try s.appendBatch(records, as: identity)
+                }
+            }
+
+            func records(session: SessionID, since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
+                switch self {
+                case .ephemeral(let s): try s.records(session: session, since: since, limit: limit)
+                case .durable(let s): try s.records(session: session, since: since, limit: limit)
+                }
+            }
+
+            func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {
+                switch self {
+                case .ephemeral(let s): try s.records(since: since, limit: limit)
+                case .durable(let s): try s.records(since: since, limit: limit)
+                }
+            }
+
+            func claimWriterOwnership(session: SessionID, writer: String) throws {
+                switch self {
+                case .ephemeral(let s): try s.claimWriterOwnership(session: session, writer: writer)
+                case .durable(let s): try s.claimWriterOwnership(session: session, writer: writer)
+                }
+            }
+
+            func releaseWriterOwnership(session: SessionID, writer: String) throws {
+                switch self {
+                case .ephemeral(let s): try s.releaseWriterOwnership(session: session, writer: writer)
+                case .durable(let s): try s.releaseWriterOwnership(session: session, writer: writer)
+                }
+            }
+        }
+
+        let store: CLIStore
+        let grdb: GRDBSessionStore?
+        if sealed {
+            store = .ephemeral(EphemeralStore())
+            grdb = nil
+        } else {
+            let production = try openProductionStore()
+            store = .durable(production)
+            grdb = production
+        }
         let sink: any UISink
         let traceHandle: FileHandle?
         if let tracePath = trace {
-            FileManager.default.createFile(atPath: tracePath, contents: nil)
+            // Explicit operator output: created private (0600) at once
+            // rather than relying on umask alone, since sealed runs may
+            // carry sensitive prompts through this file.
+            guard FileManager.default.createFile(
+                atPath: tracePath, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                eprint("cannot create trace file \(tracePath)")
+                throw ExitCode(2)
+            }
             guard let handle = FileHandle(forWritingAtPath: tracePath) else {
                 eprint("cannot open trace file \(tracePath)")
                 throw ExitCode(2)
@@ -266,16 +474,60 @@ struct RunCommand: ParsableCommand {
         }
         let backend = ScriptedToolBackend(script: scriptEntries, caps: effective.tools)
 
-        // 5. Transport with transcript-based messageProvider
+        // 5. Run identities BEFORE any network client exists. The explicit
+        // claim fences this writer; the actor re-claims the same identity
+        // idempotently at init. Persisting + verifying + reconciling here
+        // (rather than after transport setup) guarantees no store failure
+        // can strand a live HTTP client: every failure below this point
+        // happens before the client is constructed, so there is nothing
+        // to leak (an un-shut-down client fatals the process on deinit).
+        let writerID = UUID().uuidString
+        if let production = grdb {
+            let runIdentity = WriterIdentity(session: state.sessionID, writer: writerID)
+            do {
+                try production.claimWriterOwnership(session: state.sessionID, writer: writerID)
+                try production.appendBatch([
+                    .sessionOpened(session: state.sessionID, atMillis: SystemClock().nowMillis()),
+                    .epochOpened(epoch),
+                ], as: runIdentity)
+                // Read-your-write: the two identity rows must come back
+                // first through a fresh session-scoped read. Reconcile
+                // ignores non-operation records by design, so only this
+                // read proves they persisted.
+                let (prefix, _) = try production.records(session: state.sessionID, since: 0, limit: 10)
+                guard prefix.count >= 2,
+                      case .sessionOpened(let openedSession, _) = prefix[0].record,
+                      openedSession == state.sessionID,
+                      case .epochOpened = prefix[1].record else {
+                    eprint("store error: run identities did not persist; refusing to run without durable session.")
+                    throw ExitCode(6)
+                }
+                let report = try production.reconcile(session: state.sessionID)
+                guard report.completed.isEmpty, report.heldOperations.isEmpty,
+                      report.unmatchedMutating.isEmpty, report.unmatchedNonMutating.isEmpty,
+                      report.explicitUnknown.isEmpty, report.orphanResults.isEmpty,
+                      report.admissionIntents == 0, report.nonToolResults == 0 else {
+                    eprint("store error: fresh session reconciles unclean; refusing to run on a corrupt ledger.")
+                    throw ExitCode(6)
+                }
+            } catch let error as ExitCode {
+                throw error
+            } catch {
+                eprint("store error: cannot persist run identities: \(terminalSafe(String(describing: error)))")
+                throw ExitCode(6)
+            }
+        }
+
+        // 6. Transport with transcript-based messageProvider
         let httpClient = HTTPClient(eventLoopGroupProvider: .singleton,
                                     configuration: ChatTransportPolicy.configuration(profile: profile))
-        // Use InMemory store for transcript paging
+        // Use the session store (GRDB production or sealed-volatile) for transcript paging
         let promptCopy = prompt
         let messageProvider: @Sendable (ProviderInvocation) async throws -> [ChatMessage] = { _ in
             // Paged transcript (M1-D D1): read from store, map to messages
             // Over-limit throws, which surfaces as preSend failure (honest)
             do {
-                let messages = try loadTranscript(from: store, limit: 1024)
+                let messages = try loadTranscript(from: store, session: state.sessionID, limit: 1024)
                 // If no transcript yet (should have user prompt), fallback to prompt
                 if messages.isEmpty {
                     return [ChatMessage(role: .user, text: promptCopy)]
@@ -290,11 +542,26 @@ struct RunCommand: ParsableCommand {
             credentialProvider: { ref, op in try credentialStore.resolve(ref, for: op) },
             snapshotProvider: { snapshot })
 
-        // 6. Actor
-        let actor = SessionActor(
-            state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
-            transport: transport, executor: backend, store: store,
-            approvals: HeadlessApprovals(), sink: sink)
+        // 7. Actor
+        // The fencing claim above already established this writer identity;
+        // the actor re-claims it idempotently here (same-identity re-claim
+        // is the documented crash-recovery re-acquire, never a conflict).
+        // Actor init is the last throwing call before provider work: on the
+        // (near-impossible) failure path the client is shut down first, so
+        // a store fault can never strand it into a deinit fatalError.
+        let actor: SessionActor<
+            ChatCompletionsTransport, ScriptedToolBackend, CLIStore,
+            HeadlessApprovals, SystemClock, DeterministicIDSource
+        >
+        do {
+            actor = try SessionActor(
+                state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
+                transport: transport, executor: backend, store: store,
+                approvals: HeadlessApprovals(), sink: sink, writer: writerID)
+        } catch {
+            try? await httpClient.shutdown().get()
+            throw error
+        }
 
         // H2: catchable SIGINT drives production cancellation (not a default
         // termination), so JSONL runs can emit terminal run_finished and
@@ -312,7 +579,7 @@ struct RunCommand: ParsableCommand {
         sigintSource.resume()
         defer { sigintSource.cancel() }
 
-        // 7. Submit and wait for completion (multi-turn loop)
+        // 8. Submit and wait for completion (multi-turn loop)
         await actor.submitText(commandID: CommandID("cmd-run"), text: prompt, kind: .followUp, sealed: sealed)
         // Poll for terminal phase with timeout (max 60s per run, plus turn budget)
         let deadline = Date().addingTimeInterval(max(60.0, Double(maxTurns ?? 80) * Double(max(1, profile.requestTimeout))))
@@ -356,7 +623,13 @@ struct RunCommand: ParsableCommand {
         }
         // Shutdown HTTP client before handling output (actor no longer needs it)
         try? await httpClient.shutdown().get()
-        if done.queueHeld && !done.unresolvedOperations.isEmpty {
+        if done.queueHeld && !done.unresolvedOperations.isEmpty && !done.phase.isTerminal {
+            // Non-terminal hold with unknown outcomes: ambiguous delivery
+            // needs explicit reconciliation (exit 4, provider-shaped).
+            // A TERMINAL phase (failed, interrupted, completed) falls
+            // through to the phase switch below (integrity → 6): a failed
+            // persistence commit must never masquerade as a provider
+            // outcome (SPEC §12.2).
             let marker = done.unresolvedOperations.compactMap { $0.callID }.joined(separator: ",")
             let reason = terminalSafe("ambiguous delivery; reconcile unresolved operation(s): \(marker)")
             if isJSONL {
@@ -372,6 +645,9 @@ struct RunCommand: ParsableCommand {
                 try? await sink.emitTerminal(outcome: "approval_required", detail: reason)
             }
             eprint("approval required: \(terminalSafe(reason))")
+            // Shut down before throwing: every post-client exit path must
+            // release the client, or its deinit fatals the process.
+            try? await httpClient.shutdown().get()
             throw ExitCode(3)
         }
         // Also emit terminal run_finished envelope if JSONL
@@ -383,10 +659,24 @@ struct RunCommand: ParsableCommand {
                 outcome = "completed"
                 detail = "turns=\(receipt.turnsUsed)"
                 try? await sink.emitTerminal(outcome: outcome, detail: detail)
+                // A5-1 claim retention: release ONLY at a proven quiescent,
+                // clean boundary (completed run, no unresolved operations).
+                // Failed, interrupted or held runs keep their claim row AND
+                // their holds — never auto-released, never silently
+                // discarded. Retention policy: claim rows accumulate until
+                // an explicit operator cleanup (A5-2 owns export/reconcile
+                // tooling); the ledger is the audit trail.
+                if done.unresolvedOperations.isEmpty {
+                    do {
+                        try store.releaseWriterOwnership(session: state.sessionID, writer: writerID)
+                    } catch {
+                        eprint("warning: completed run but ownership release failed: \(terminalSafe(String(describing: error)))")
+                    }
+                }
                 // Human final answer goes to stderr in JSONL mode and is
                 // terminal-safe: no control scalar reaches the terminal or
                 // JSON diagnostics.
-                if let last = try? loadTranscript(from: store).last, last.role == ChatRole.assistant {
+                if let last = try? loadTranscript(from: store, session: state.sessionID).last, last.role == ChatRole.assistant {
                     var err = StandardErrorStream()
                     print(terminalSafe(last.text), to: &err)
                 }
@@ -427,10 +717,19 @@ struct RunCommand: ParsableCommand {
             // Non-JSONL: print final assistant text to stdout, diagnostics to stderr
             switch done.phase {
             case .completed:
-                if let last = try? loadTranscript(from: store).last, last.role == ChatRole.assistant {
+                if let last = try? loadTranscript(from: store, session: state.sessionID).last, last.role == ChatRole.assistant {
                     print(terminalSafe(last.text))
-                } else if let transcript = try? loadTranscript(from: store), let lastAssistant = transcript.reversed().first(where: { $0.role == ChatRole.assistant }) {
+                } else if let transcript = try? loadTranscript(from: store, session: state.sessionID), let lastAssistant = transcript.reversed().first(where: { $0.role == ChatRole.assistant }) {
                     print(terminalSafe(lastAssistant.text))
+                }
+                // A5-1 claim retention (see JSONL path): release only on a
+                // proven-clean completed run.
+                if done.unresolvedOperations.isEmpty {
+                    do {
+                        try store.releaseWriterOwnership(session: state.sessionID, writer: writerID)
+                    } catch {
+                        eprint("warning: completed run but ownership release failed: \(terminalSafe(String(describing: error)))")
+                    }
                 }
                 return
             case .failed(let failure):
