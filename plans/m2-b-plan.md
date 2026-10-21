@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV3, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV5, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -112,7 +112,11 @@ per batch, calls executed sequentially in order):
   hashes). `observed_at_seq` is the durable stream position
   (implicit in stream order), NOT a separate field: the executor
   stamps status/summary/data/artifact/truncation/warnings/error;
-  sequencing is the reducer's stream order.
+  sequencing is the reducer's stream order. FLAGGED DEVIATION
+  from SPEC §8 (COMPLETE-SPEC.md:356 lists it as a shared field):
+  no emitter can know a record's future stream index, so M2-B
+  records stream position implicitly and proposes the SPEC
+  amendment for M2-C; no silent compliance is claimed.
 - `ExecutorResult` KEEPS aggregate `receipt` (transcript/UI compat)
   and gains `calls: [ToolCallOutcome]`. New `EffectOutcome`
   per-call case carries the WHOLE `ExecutorResult` (payload-only)
@@ -142,18 +146,29 @@ per batch, calls executed sequentially in order):
   invalid-arguments/failed-pre-commit → `.done` with
   `tool-failure:` outcome prefix (deterministic: the file-tool
   commit protocol makes pre-commit failure side-effect-free);
-  timeout/cancelled/failed-ambiguous →
+  timeout-mid-execution/cancelled-mid-execution/failed-ambiguous/
+  no-entry →
   mutating: `.unknown` + marker + hold (existing unknown
   machinery, POLICY-07: never auto-retry);
   non-mutating: NO `operationResult` — transcript-only evidence
   (intent alone reconciles to unstarted, re-runnable, no hold).
   No-entry (executor reported nothing for a dispatched call —
-  contract violation, testable by omission): same as timeout
-  (fail-closed toward unknown+hold for mutating). Cancel path and
-  stale-retention (`dropRetaining`) split per proposal the same
-  way (extending the existing mutating-only `cancelActive`
-  precedent); the empty-proposals fallback keeps reservation-level
-  classification (no proposals to classify — documented).
+  contract violation, testable by omission) counts as outcome-
+  uncertain: same row. Cancel path and stale-retention
+  (`dropRetaining`) split per proposal the same way (extending
+  the existing mutating-only `cancelActive` precedent); the
+  empty-proposals fallback keeps reservation-level classification
+  (no proposals to classify — documented).
+  NEVER-DISPATCHED is not unknown (R4 finding — a provably
+  unexecuted call must not claim unknowability, and an unexitable
+  hold would brick the session with no reconcile command
+  available): the executor reports halted-remaining calls with
+  status `cancelled`, summary `unstarted: halted after <callID>`,
+  and the reducer records `.done` with that cancelled receipt for
+  BOTH mutating and non-mutating calls — provably no side effect,
+  so no hold. The cancelled-mid-execution vs cancelled-before-
+  dispatch distinction is the executor's to report truthfully
+  (it knows which calls started); only the former can hold.
 - Dispatch policy (stated as POLICY CHOICE, not SPEC mandate):
   halt at the first outcome that is not success/no-match; the
   rest are reported by the executor as EXPLICIT unstarted entries
@@ -161,12 +176,12 @@ per batch, calls executed sequentially in order):
   <callID>` (cancellation of dispatch, SPEC-legal; no invented
   status), never omitted. Rationale: conflicts evidence external
   change; executing later mutations without revalidation compounds
-  it. The reducer maps unstarted-cancellation exactly like
-  timeout/cancelled above (mutating → marker+hold — conservative
-  policy for an abandoned batch, stated as such; the outcome
-  string stays truthful). The normative example stands as
-  specified behavior: [A ok, B conflict, C unstarted] with C never
-  dispatched — pinned by TOOL-09 tests.
+  it. The reducer records them `.done` (no hold — see above); the
+  batch COMPLETES with mixed receipts and the next turn is a new
+  model decision on full evidence, never an auto-retry. The
+  normative example stands as specified behavior: [A ok, B
+  conflict, C unstarted-cancelled-done] with C never dispatched —
+  pinned by TOOL-09 tests.
 - Transcript rule (SPEC §7.2:336 — every executed batch's
   proposals are evidenced): EVERY proposal in an executed batch
   gets a transcript `toolResponse` in order, including calls with
@@ -308,7 +323,7 @@ per batch, calls executed sequentially in order):
   creation; no deletion tool.
 - Per-call receipt metadata (no schema change): the canonical
   outcome JSON carries path, mode, before/after hashes
-  (§3 shape table); the preimage BYTES go through
+  (§3 outcome mapping above); the preimage BYTES go through
   `publishArtifact` (32 MiB cap). Zero-byte originals: hash-only
   receipt (sha256-empty is constant), no empty publish. Order
   under the lock: re-read/hash → preflight byte-quota check
@@ -353,14 +368,17 @@ per batch, calls executed sequentially in order):
   shim test; fault-injecting scripted delay test.
 - Behavior (§3 mapping, normative example pinned):
   [write A ok, write B conflict, C unstarted] → A done stands, B
-  done-with-`tool-failure:`, C explicit unknown (never dispatched).
-  Timeout injection → deadline outcome → same split. Mixed
-  read/write batch test pins per-class handling (mutating held,
-  non-mutating re-runnable). Throw policy: pre-dispatch
-  typed throw (denied/invalid-arguments/failed) → actor
+  done-with-`tool-failure:`, C done-with-cancelled-unstarted
+  (never dispatched, NO hold — provably no side effect).
+  Timeout injection → deadline outcome → unknown+hold for
+  mutating (genuine uncertainty), transcript-only for
+  non-mutating. Mixed read/write batch test pins per-class
+  handling. Throw policy: pre-dispatch typed throw → actor
   synthesizes per-call done receipts preserving status; any other
-  throw → mutating: unknown+hold (fail-closed), non-mutating:
-  transcript-only. Post-dispatch never throws. Migration (delib-
+  throw → mutating unknown+hold / non-mutating transcript-only.
+  Post-dispatch never throws. Lock contention (B1 lock) is a
+  deterministic pre-commit failure → `failed`, never unknown
+  (acquisition precedes any mutation for that call). Migration (delib-
   erate, RED/GREEN): per-proposal intent `mutating` (replacing the
   batch-wide flag), per-call cancel split (extending the mutating-
   only precedent; empty-proposals fallback unchanged),
@@ -368,12 +386,17 @@ per batch, calls executed sequentially in order):
   assert all-mutating intents are updated to per-tool
   expectations.
 - Tests: `TOOL_09_…` second-file-fails matrix (edit + write mixes);
-  prior-success-survives leg; unstarted-never-executed leg;
-  unknown-not-retried leg (second turn without reconcile stays
-  held); order-preservation leg (transcript order + log scan);
-  mixed-batch leg; no-entry leg (backend omits a dispatched
-  call → mutating: marker+hold, non-mutating: transcript-only);
-  pre-dispatch typed-denial leg (all done-denied, no hold);
+  prior-success-survives leg; unstarted leg (C done-cancelled, NO
+  hold, run continues to next turn — the old held-unstarted
+  expectation must FAIL against this code); unknown-not-retried
+  leg (timeout injection on a mutating call → held; second turn
+  without reconcile stays held); order-preservation leg
+  (transcript order + log scan); mixed-batch leg; no-entry leg
+  (backend omits a dispatched call → mutating: marker+hold,
+  non-mutating: transcript-only); pre-dispatch typed-denial leg
+  (all done-denied, no hold); pre-dispatch invalid-arguments leg
+  (all done-invalid, status preserved); pre-dispatch failed leg
+  (workspace-unusable/lock-broken fixture → all done-failed);
   pre-dispatch untyped-throw leg (mutating unknown+hold).
 - Counterfactuals: aggregate-receipt shim (must fail TOOL-09);
   unstarted-marked-done (must fail); unknown auto-retry (must
@@ -550,4 +573,6 @@ any merge in this planning track.
   quota + delete-on-ref-failure + SPEC-allowed crash residual;
   --read-root standalone rule; citation fixes (SPEC §7.2,
   1304/1443, shape-table home section).
-- REV4 → deepseek-reviewer: _pending_.
+- REV4 → deepseek-reviewer: NEEDS-EVIDENCE (R1 unstarted-as-unknown false claim + unexitable hold, R2 pre-dispatch status legs, R3 line refs, R4 preflight wording [fixed], R5 hardlink wording [fixed], R6 shape/citation/title fixes; new N1-N3 on C-status wording, explicit abandon, §3/B4 wording).
+- REV5 (this revision): holds ONLY for genuine uncertainty — never-dispatched calls complete as done-cancelled (no hold, provably no side effect); timeout-mid-execution/cancelled-mid-execution stay unknown+hold; pre-dispatch typed throws preserve status with invalid-arguments/failed/workspace-unusable legs; preflight quota + delete-on-ref-failure; hardlink behavior leg; `data` mandatory; observed_at_seq deviation flagged; §3 mapping/throw/halt/throw-policy wording aligned with B4 legs; title/refs/citations fixed.
+- REV5 → deepseek-reviewer: _pending_.
