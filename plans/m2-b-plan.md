@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV24, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV25, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -284,48 +284,67 @@ per batch, calls executed sequentially in order):
   (`executor` vs `provider`) added to `EffectReservation`
   (current type at SessionTransition.swift:62–80 has only
   `effectID/runID/requestID/generation/revision/mutating/batch`
-  and no kind field — Finding 1 — so every construction site
-  is updated: 6 PRODUCTION sites :570/:1019 (tool — `.executor`),
-  :1208 (provider — `.provider`), :1290 (tool — `.executor`),
-  :1365 (tool — `.executor`), :1542 (provider — `.provider`)
-  PLUS 7 TEST sites — `Tests/NeedletailProviderTests/
-  BackendTests.swift:21` (tool batch — `.executor`),
-  `Tests/NeedletailStateTests/StaleCompletionTests.swift:18`
-  (provider shape — `.provider`), `:69` (tool — `.executor`),
-  `CancellationTests.swift:59` (CORE-02/S1 live mutating —
-  `.executor` — retained), `ResidualFixTests.swift:14` (live
-  mutating — `.executor` — retained), `:115` (provider —
-  `.provider`), `BudgetInvalidTests.swift:55` (provider —
-  `.provider`) — 13 total; `StaleCompletionTests.liveTriple`
-  is `.provider` so it does NOT become executor; `CancellationTests:
-  59`/`ResidualFixTests:14`/`BackendTests:21` are `.executor`
-  (Finding 3); a `Kind` default is NOT used (required init param).
-  Moreover the retention scope is per-call MUTATING (Finding 1
-  mixed-batch + Finding 5 read-only): `cancelActive` does NOT use
-  the batch-wide `reservation.mutating` flag (computed at
-  :1289–1292 via `contains`) — it classifies EACH proposal with
-  the same per-tool predicate (`tool != read/search/consult`) and
-  retains/marking ONLY mutating proposals — non-mutating
-  proposals in the same mixed batch are inserted into
-  `state.consumedEffects` (so a late read report falls to the
-  consumed branch, and the mixed-cancel test's non-mutating-absent
-  assertion holds). Reservation-level `mutating` is used only for
-  the empty-proposal fallback. The actor `reservations` table is
-  likewise `[EffectID: EffectReservation]` with the same kind.
-  Provider reservations are NOT retained: they are removed from
-  `liveReservations` and their `effectID` is inserted into
-  `state.consumedEffects` (the set `checkStale` already reads
-  at :414–429, which today `cancelActive` never populates at
-  :1473–1479), so a cancel during provider flight leaves no
-  dangling entry; non-retained read-only executor entries are
-  likewise inserted into `consumedEffects` in `cancelActive` (so
-  a late read-only executor report is consumed via
-  `consumedEffects` at :414–416, not bare `drop(state)` —
-  Finding 2 — and a late-read-only-report test pins this);
-  `cancelActive` writes `cancelledPendingMarker` only for the
-  retained MUTATING executor proposals (per-call) — generation
-  bump still blocks any new dispatch; repeat `cancelRequested`
-  is idempotent: if
+  and no kind field — so every construction site is updated:
+  6 PRODUCTION sites :570 (admitFreshRun — provider,
+  `mutating: false` + `ProviderInvocation` :571–572 —
+  `.provider`), :1019 (admitReservedRun — provider,
+  `mutating: false` + `ProviderInvocation` :1020–1021 —
+  `.provider`), :1208 (provider — `.provider`), :1290 (tool
+  executor — `mutating: mutating, batch: batch` :1290–1292 —
+  `.executor` — the ONLY executor site), :1365
+  (continueAfterEffect — provider — `.provider`), :1542
+  (provider — `.provider`) PLUS 7 TEST sites —
+  `Tests/NeedletailProviderTests/BackendTests.swift:21` (tool
+  batch — `.executor`), `Tests/NeedletailStateTests/
+  StaleCompletionTests.swift:18` (provider shape — `.provider`),
+  `:69` (tool — `.executor`), `CancellationTests.swift:59`
+  (CORE-02/S1 live mutating — `.executor` — retained),
+  `ResidualFixTests.swift:14` (live mutating — `.executor` —
+  retained), `:115` (provider — `.provider`),
+  `BudgetInvalidTests.swift:55` (provider — `.provider`) — 13
+  total; as written in REV24, :570/:1019/:1365 were wrongly
+  labeled `.executor` — corrected here to `.provider` (Finding
+  1) so `cancelActive` does NOT retain provider reservations,
+  consistent with "provider reservations are NOT retained"
+  below; a `Kind` default is NOT used (required init param).
+  Moreover the retention scope is per-call MUTATING (Finding
+  2): `cancelActive` does NOT use the batch-wide
+  `reservation.mutating` flag (computed at :1289–1292 via
+  `contains { tool != read/search/consult }` — a mixed read+edit
+  batch would otherwise retain the read proposal as unknown) —
+  it classifies EACH proposal with the same per-tool predicate
+  (`tool != read/search/consult`) and retains/marking ONLY
+  mutating proposals — but `consumedEffects` is
+  `Set<EffectID>` per SessionState.swift:374, so it cannot hold
+  per-proposal granularity for a mixed batch; therefore for a
+  mixed batch where at least one mutating proposal is retained,
+  the whole `EffectID` is in `cancelledPendingReservations`
+  and `checkStale` routes the late mixed-batch report FIRST to
+  `completeCancelledPending` (which ignores non-mutating calls —
+  no record, transcript-only — so the mixed-cancel test's
+  non-mutating-absent assertion holds and the batch-wide
+  `consumedEffects` insertion does NOT apply). Only when NO
+  mutating proposal is retained (pure read-only reservation) is
+  the `EffectID` inserted into `state.consumedEffects` in
+  `cancelActive`, so a late read-only-only report falls to the
+  consumed branch at :414–416, not bare `drop(state)` — this
+  per-batch vs per-proposal distinction is stated explicitly
+  (Finding 2) — and a dedicated late-read-only-report test pins
+  the pure read-only consumed path plus a mixed-batch
+  late-report test pins `completeCancelledPending` ignoring the
+  read proposal. Reservation-level `mutating` is used only for
+  the empty-proposal fallback. The actor `reservations` table
+  is likewise `[EffectID: EffectReservation]` with the same
+  kind. Provider reservations are NOT retained: they are
+  removed from `liveReservations` and their `effectID` is
+  inserted into `state.consumedEffects` (the set `checkStale`
+  already reads at :414–429, which today `cancelActive` never
+  populates at :1473–1479), so a cancel during provider flight
+  leaves no dangling entry; `cancelActive` writes
+  `cancelledPendingMarker(OperationRef, outcome)` only for the
+  retained MUTATING executor proposals (per-call, per-proposal)
+  — generation bump still blocks any new dispatch; repeat
+  `cancelRequested` is idempotent: if
   `cancelledPendingReservations` already holds the effectIDs
   and `liveReservations` has no remaining executor entries, no
   duplicate markers are emitted (filter on not-already-
@@ -395,15 +414,18 @@ per batch, calls executed sequentially in order):
   construction at :232–234 is updated to append the error
   strings (e.g. `held reason: <count> pending + <error>`);
   `SessionExport.project` gains exhaustive arms for BOTH new
-  records (marker and error) plus `RecordCodec` cases and
-  schema notes, with redaction for the error free text; codec
-  tests are updated: `RecordCodecTests.caseName`/
+  records (marker with `operationID`+`outcome`, error with
+  `effectID`+`operationIDs`+`error`) plus `RecordCodec` cases
+  and schema notes, with redaction for the error free text —
+  the error record's `effectID` is structural identity and is
+  exported as `effectID` (Finding 4) so the `SessionExportTests`
+  allowlist at :152–166 gains `effectID` in addition to
+  `operationID`, `operationIDs`, `error`, `outcome` for the
+  marker; codec tests are updated: `RecordCodecTests.caseName`/
   `expectedCaseNames`/`allCases` at :83–104 gain the two new
   cases plus per-case `DurableRecord` fixtures (the suite's
   compile-forcing exhaustive switch, not `RecordCodec` itself at
-  :14–36 — Finding 7) and `SessionExportTests` allowlist at
-  :152–166 gains the new export keys (`operationID`,
-  `operationIDs`, `error`, `outcome` for the marker).
+  :14–36 — Finding 7).
   `reconcileOperations` treats `cancelledPendingMarker` as
   HOLD-equivalent (same as unknown) but ALLOWS a later
   `operationResult` for the same `operationID` to SUPERSEDE it:
@@ -851,10 +873,14 @@ per batch, calls executed sequentially in order):
   session + sum of distinct referenced artifact sizes for THAT
   session) + `artifact_physical(digest TEXT PRIMARY KEY, size
   INTEGER NOT NULL)` for GLOBAL physical distinct bytes (one row
-  per distinct digest CURRENTLY present — physical ground truth,
-  rows removed when no reference/orphan remains; the prior "ever
-  published" is withdrawn as it contradicts authoritative removal
-  — Finding 4); `schemaVersion` 2→3 with a migration creating
+  per distinct digest with at least one committed
+  `artifactPublished` reference — committed-reference ground
+  truth, NOT "ever published" and NOT including uncommitted
+  orphans until `reconcileByteUsage` inserts them; rows removed
+  when the last committed reference for that digest is gone AND
+  the file is deleted — Finding 4 — so "ever" is withdrawn and
+  stale-row removal is defined as reference-gone + file-gone);
+  `schemaVersion` 2→3 with a migration creating
   both tables AND backfilling BOTH via recompute-to-expected
   (Finding 3+4): FIRST insert distinct `(digest, size)` into
   `artifact_physical` directly from decoded
@@ -977,14 +1003,21 @@ per batch, calls executed sequentially in order):
   written; authoritative over-quota at commit → fail closed +
   just-written bytes cleaned up iff unreferenced, nothing
   renamed; orphan-reconcile leg (seeded orphan file →
-  `artifact_physical` created, no `byte_usage` row);
+  `artifact_physical` created, no `byte_usage` row — orphan is
+  under-counted before reconciliation, then gains a row);
   two-session missing-logical leg (committed reference without
   `byte_usage` → that session's row recomputed);
-  stale-row-removal leg (orphan file deleted → `artifact_physical`
-  row removed; overcounted `byte_usage` → lowered);
+  stale-row-removal leg (reconciled orphan file deleted →
+  `artifact_physical` row removed; committed digest whose last
+  `artifactPublished` reference is deleted and file gone →
+  row removed; overcounted `byte_usage` → lowered — so
+  `artifact_physical` is committed-reference ground truth plus
+  reconciled orphans, not "ever published", and removal is
+  defined);
   migration leg (v2 store with artifact → v3 backfills
-  `artifact_physical` first then per-session `byte_usage` via
-  `records.session` join with `length(CAST(payload AS BLOB))`);
+  `artifact_physical` first from `ArtifactRef.size` then
+  per-session `byte_usage` via `records.session` join with
+  `length(CAST(payload AS BLOB))`);
   old-binary/new-store leg (v2 binary on v3 store → fail-closed
   integrity error); sub-reserve free space → denied receipt,
   never a crash; non-ASCII byte fixture).
@@ -1856,17 +1889,35 @@ NOT non-goals.)
   retains only mutating proposals, read-only proposals
   consumed/dropped + mixed-cancel test; read-only executor
   `consumedEffects` insertion + late-read-only-report test;
-  Kind on all 13 sites enumerated with per-site assignments
-  (provider fixtures `.provider`, mutating fixtures `.executor`);
-  `artifact_physical` as current ground truth with stale-row
-  removal + B3 orphan language aligned; termination promotion
-  single handler (append-then-prune) with `SessionEvent.
-  cancelledPendingRemoved` defined + ordering test; marker
+  Kind on all 13 sites enumerated (but prod assignments wrong —
+  :570/:1019/:1365 mislabeled `.executor`); `artifact_physical`
+  as current ground truth but orphan "no row"/"physical orphan
+  scan"/stale-removal still contradictory; marker
   `cancelledPendingMarker(OperationRef, outcome: String)` with
   placeholder + `OperationReconciliation.cancelledPendingErrors`
-  field + `SessionExport`/`RecordCodec` exhaustive arms +
-  allowlist keys (`operationID`, `operationIDs`, `error`,
-  `outcome`) with redaction.
-- REV24 → deepseek-reviewer: _pending_.
+  field + `SessionExport`/`RecordCodec` exhaustive arms but
+  allowlist missing `effectID`; termination promotion single
+  handler.
+- REV24 → deepseek-reviewer: NEEDS-EVIDENCE (4 findings:
+  prod Kind assignments wrong (:570/:1019/:1365 are provider,
+  only :1290 is executor); mixed-batch consumedEffects not
+  representable per-proposal; artifact_physical orphan
+  semantics contradictory; export allowlist missing `effectID`).
+- REV25 (this revision): corrected prod Kind assignments
+  (:570/:1019/:1208/:1365/:1542 all `.provider`, only :1290
+  `.executor`) + 7 test sites with per-site Kind (provider
+  shape `.provider`, mutating CORE-02 `.executor`); per-proposal
+  mutating filter with `consumedEffects` effect-scoped
+  clarification (mixed batch routes to `completeCancelledPending`
+  which ignores non-mutating calls, pure read-only-only to
+  `consumedEffects`) + both tests; `artifact_physical` as
+  committed-reference ground truth (orphan under-counted before
+  reconciliation, then gains row; global = SUM(physical) +
+  orphan scan) + aligned B3/B5 + staged stale removal;
+  `SessionExport` allowlist now includes `effectID` with
+  redaction alongside `operationID`/`operationIDs`/`error`/
+  `outcome`; plus prior durable supersession last-record-wins
+  + report field + codec arms.
+- REV25 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
