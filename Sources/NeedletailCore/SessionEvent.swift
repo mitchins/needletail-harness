@@ -47,6 +47,7 @@ public enum EffectOutcome: Sendable, Equatable {
     case success(String)
     case failureReceipt(String)
     case perCall(ExecutorResult)
+    case preDispatchFailure(ToolFailure)
 }
 
 /// Minimal M1-C handoff (detail deferred to M1-C): the completion boundary
