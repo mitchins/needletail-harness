@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV18, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV19, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -224,13 +224,15 @@ per batch, calls executed sequentially in order):
   external `cancelRequested` arrives while the executor is
   unresponsive (kill-switch path) — `cancelActive` marks all
   live mutating calls unknown+hold AND retains the reservations
-  as cancelled-pending (REQUIRED change above: actor-table
-  retention + `cancelledPending` flag + `completeCancelledPending`
-  handler + routing + termination cleanup), so a late
-  executor report replaces markers ONLY for `started == false`
-  entries; late started/uncertain entries stay dropped against
-  the already-written markers (safe direction: the markers
-  subsume whatever uncertain truth arrives late). EITHER order
+  as `state.cancelledPendingReservations` + actor-table
+  retention (REQUIRED change above: SessionState field +
+  actor-table retention + `completeCancelledPending` handler +
+  `checkStale`-first routing + phase rows + termination
+  cleanup), so a late executor report replaces markers ONLY for
+  `started == false` entries; late started/uncertain entries
+  stay dropped against the already-written markers (safe
+  direction: the markers subsume whatever uncertain truth
+  arrives late). EITHER order
   is fail-closed: per-call truth where available, unknown+hold
   otherwise — never silent continuation and never a false
   done. `dropRetaining` takes NO structured outcome (stale
@@ -247,49 +249,80 @@ per batch, calls executed sequentially in order):
   in-flight or was killed mid-flight — genuinely uncertain →
   existing unknown path (consistent with pre-existing crash
   semantics: intent without result reconciles unknown). REQUIRED
-  actor change (current code cannot deliver the kill-switch
-  late-report path: `cancel()` applies `.cancelRequested` before
-  cancelling the task — SessionActor.swift:122–125; `apply` runs
-  `cancelActive` which writes unknown markers — then the actor
-  clears its OWN `reservations` dict — SessionActor.swift:240–250
-  — and transition `cancelActive` clears `state.liveReservations`
-  — SessionTransition.swift:1435–1459; `completeEffect` drops any
-  outcome whose effectID is no longer reserved —
-  SessionActor.swift:494–500; the phase switch has
-  `effectCompleted`/`effectFailed` rows only for `.executing`
-  (:291–294) with `.cancelling`/`.cancelled` falling to the
-  default no-op (:345–350)). SCOPE NOTE: the executor-handled
-  primary path (executor reports while the reservation is still
-  live — its own deadline/timeout catch) already works through
-  today's `completeEffect`; this change serves ONLY the
-  kill-switch path (external `cancelRequested` consumed, late
-  executor report arrives after). The change, all in B4:
-  (a) new `EffectReservation.cancelledPending: Bool = false`
-  field; (b) the actor's `cancelRequested` handling, instead of
-  `reservations = [:]`, marks every live entry
-  `cancelledPending = true` and retains it (the generation bump
-  still blocks any new dispatch on those IDs); (c) new pure
-  transition handler `completeCancelledPending` performing
-  SELECTIVE marker replacement only — `started == false`
-  entries: marker removed, done-cancelled recorded; `started ==
-  true`/omitted: marker kept — with NO `continueAfterEffect`
-  fan-out and no transcript emission; (d) routing: `checkStale`
-  tests the cancelled-pending set FIRST and routes those
-  effectIDs to the new handler regardless of generation
-  (before the `dropRetaining` branch); new phase-switch rows
-  `(.cancelling, .effectCompleted)` and `(.cancelling,
-  .effectFailed)` route to it (kill-switch lands the run in
-  `.cancelling`, whose rows today are tick/transport-failed/
-  cancel-requested only); (e) termination cleanup: the
-  `invokeExecutor` task removes its reservation entry in a
-  `defer` on task end (observed via the existing `inFlight`
-  handle — return, throw, and fallback-synthesizer paths all
-  terminate the task), so cancelled-pending entries cannot
-  leak; (f) tests: direct transition tests (cancelled-pending +
-  late started-false → replaced; + late started-true → kept; +
-  stale generation still routes to the new handler, never
-  `dropRetaining`) and an actor kill-switch-then-late-report
-  test.
+  state+actor change (current code has NO transition-side
+  cancelled-pending truth — see Finding 1: `transition` calls
+  `checkStale` first — SessionTransition.swift:213–219 — and
+  `checkStale` reads only `state.liveReservations` — :414–429;
+  `cancelActive` clears `state.liveReservations` — :1473–1479 —
+  and the actor clears its OWN `reservations` — SessionActor.
+  swift:240–250; `completeEffect` guards `reservations[effectID]`
+  — :494–500; phase switch has `effectCompleted`/`effectFailed`
+  only for `.executing` — :291–294 — with `.cancelling` falling
+  to default no-op — :345–350; events carry no
+  cancelledPending bit — SessionEvent.swift:31–32; accepted
+  entries are never removed from actor `reservations` —
+  SessionTransition `continueAfterEffect` removes state-only
+  :1375–1376, actor guards :494–510 only). Without state-side
+  retention the new `.cancelling` rows are unreachable and
+  `completeCancelledPending` has no production path. SCOPE NOTE:
+  the executor-handled primary path (executor reports while the
+  reservation is still live — its own deadline/timeout catch)
+  already works through today's `completeEffect`; this change
+  serves ONLY the kill-switch path (external `cancelRequested`
+  consumed, late executor report arrives after). The change, all
+  in B4: (a) new `SessionState.cancelledPendingReservations:
+  [EffectReservation] = []` field (state is source of truth —
+  SessionState.swift:393 comment; the actor mirrors it; the
+  `replacing` helper gains the new field with default `[]`,
+  backward compatible); each entry is a full
+  `EffectReservation` with `cancelledPending: Bool = true`
+  provenance (flag on the reservation itself for legibility,
+  but routing keys on STATE membership, not on the flag alone);
+  (b) `cancelActive` (pure transition) MOVES every live
+  `liveReservations` entry to `cancelledPendingReservations`
+  (clearing `liveReservations`) and writes the unknown markers
+  — generation bump still blocks any new dispatch on those IDs;
+  repeat `cancelRequested` is idempotent: if
+  `cancelledPendingReservations` already holds the effectIDs
+  and `liveReservations` is empty, no duplicate markers are
+  emitted (filter on not-already-unresolved); (c) actor's
+  `cancelRequested` handling mirrors the same retention
+  (`reservations` entries moved to a `cancelledPending`
+  table, NOT `= [:]`; generation bump blocks dispatch);
+  `completeEffect`/`failEffect` now prune the accepted
+  entry from BOTH tables (actor `reservations` +
+  state-consistent view — `consumedEffects` set already
+  prevents replay, but pruning makes "every live entry"
+  well-defined); (d) new pure transition handler
+  `completeCancelledPending` performing SELECTIVE marker
+  replacement only — `started == false` entries: marker
+  removed, done-cancelled recorded; `started == true`/omitted:
+  marker kept — with NO `continueAfterEffect` fan-out and no
+  transcript emission; (e) routing: `checkStale` tests
+  `state.cancelledPendingReservations` FIRST — if the
+  effectID is in that set, route to
+  `completeCancelledPending` regardless of generation and
+  before the `consumedEffects`/generation/`dropRetaining`
+  branches (so a stale-generation late report still reaches
+  the selective handler, never `dropRetaining`); (f) new
+  phase-switch rows `(.cancelling, .effectCompleted)` and
+  `(.cancelling, .effectFailed)` route to the same handler
+  (kill-switch lands the run in `.cancelling`, whose rows
+  today are tick/transport-failed/cancel-requested only);
+  (g) termination cleanup: `invokeExecutor` removes its
+  reservation from both actor tables in a `defer` on task
+  end (return, throw, fallback-synthesizer paths all
+  terminate the task via the existing `inFlight` handle), so
+  cancelled-pending entries cannot leak after the executor
+  fully terminates without a report; (h) tests: direct
+  transition tests (cancelled-pending + late started-false →
+  replaced; + late started-true → kept; + stale generation
+  still routes to the new handler, never `dropRetaining`;
+  repeat-cancel idempotence; `consumedEffects` already
+  consumed → no second replacement) and an actor
+  kill-switch-then-late-report test proving `SessionState.
+  liveReservations` is empty but
+  `cancelledPendingReservations` is retained.
   A late per-call result arriving after cancel for a
   started/uncertain call is still dropped at `completeEffect`
   against already-written unknown markers for the same
@@ -415,18 +448,23 @@ per batch, calls executed sequentially in order):
   NOT native reads — they never traverse the containment
   boundary (see B2/B5 carve-outs), so B5's diff does not need
   a grant.
-- Roots: explicit `--workspace` (must exist) + `--read-root`
-  (read-only; never write roots, never exec-cwds); without
-  `--workspace`, mutating tools are denied. `--read-root` works
-  standalone (reads/searches need no workspace); mutation
-  (edit/write, preimages, lock) requires `--workspace`. Grant
+- Roots: NEW B1 options `--workspace` (must exist) + `--read-root`
+  (read-only; never write roots, never exec-cwds) — both
+  absent today (RunCommand.swift:20–50) and added in this slice
+  with NEW exit-2 validations: `--workspace`+`--trusted` → exit 2,
+  `--workspace`+`--sealed` → exit 2, `--read-root`+`--sealed` →
+  exit 2 (each tested). Without `--workspace`, mutating tools are
+  denied. `--read-root` works standalone (reads/searches need no
+  workspace, but not with `--sealed` — see Production wiring
+  matrix); mutation (edit/write, preimages, lock) requires
+  `--workspace`. Grant
   derivation, per class (this resolves the blanket allDenied):
   read/search REQUIRE userConfig opt-in AND (workspace-designated
   `--workspace` OR at least one `--read-root`) AND invocation AND
   seal rules; edit/write REQUIRE userConfig opt-in AND
   `--workspace` present AND invocation AND per-batch approval;
-  exec/consult are denied regardless of flags. The CLI rejects
-  `--workspace` + `--trusted` together (exit 2).
+  exec/consult are denied regardless of flags. (Flag-conflict
+  rejections above are NEW validations, not "existing rules".)
 - Args: strict Codable + hand validators (unknown fields, duplicate
   keys, overlong strings, int ranges, enum values fail
   PRE-side-effect). Required capabilities computed from the
@@ -488,15 +526,18 @@ per batch, calls executed sequentially in order):
   files honored as user exclusions); env scrubbed
   (`RIPGREP_CONFIG_PATH` et al. removed); no `--pre`, no model
   flags, no symlink-follow outside root; harness-owned deny
-  globs are part of the FIXED argv (`--glob '!**/.git/**'`,
-  `--glob '!**/.env*'`,   `--glob '!**/.ssh/**'` — rg itself
-  never descends into them, so filtering is by non-traversal,
-  not post-filtering); `rg --files` for
-  discovery (empties listed, never read). Hits are additionally
-  post-filtered through the B1 protected-path predicate as
-  defense-in-depth (explicitly layered: non-traversal is the
-  guarantee, post-filter catches harness bugs — never the sole
-  mechanism). Continuations are single-session:
+  globs are part of the FIXED argv (TWO layers per protected
+  area — bare directory-prune + contents — because ripgrep
+  prunes a directory ONLY when the directory itself matches:
+  `--glob '!.git/'`, `--glob '!**/.git/**'`; `--glob '!.env*'`,
+  `--glob '!**/.env*'` plus bare `.env` variants; `--glob
+  '!.ssh/'`, `--glob '!**/.ssh/**'` — rg itself never
+  descends into pruned directories, not merely hides hits);
+  `rg --files` for discovery (empties listed, never read). Hits
+  are additionally post-filtered through the B1 protected-path
+  predicate as defense-in-depth (explicitly layered: prune is
+  the guarantee, post-filter catches harness bugs — never the
+  sole mechanism). Continuations are single-session:
   opaque token (query hash + offset + result-hash prefix); resume
   re-executes and prefix-verifies, else restarted-label (no
   stable-offset fiction, no stale reads).
@@ -506,15 +547,21 @@ per batch, calls executed sequentially in order):
   PATH — must be ignored), shim-`rg` shadowing leg, symlink-out
   leg, `.git`-hit exclusion leg, missing/too-old-rg fail-closed
   legs; `TOOL_11_…` cross-session denial + same-session allow.
-  Non-traversal proof legs (guarantee: rg never OPENS or reads
-  protected paths — open/read is the security property; descent
-  without open still cannot exfiltrate bytes): argv-capture test
-  asserting the fixed argv contains the deny globs for every
-  search invocation; 000-DIRECTORY sentinel inside `.git/`
-  (descent itself fails loudly — a 000 file would prove only
-  no-open, since readdir/lstat still succeed); prune-pattern
-  test proving the deny globs match the protected paths
-  (wrong-glob probe must fail).
+  Non-traversal proof legs (guarantee: rg never OPENS or
+  reads protected paths; prune is proved, not inferred): argv-
+  capture test asserting the fixed argv contains BOTH bare-prune
+  (`!.git/`) and contents (`!**/.git/**`) globs for every search
+  invocation; 000-DIRECTORY sentinel AT the protected directory
+  itself (`.git` dir chmod 000 — `opendir` on it fails loudly
+  if rg ever descends; a file INSIDE `.git/` would be pruned and
+  proves nothing — corrected from the previous inside-file
+  sentinel, which was invalid because its parent `.git` is
+  pruned); complementary open-audit leg where available
+  (LD_PRELOAD/`rg --trace` or `strace` capture showing no
+  `openat` on a protected path); prune-regression probe
+  (removing the bare `!.git/` glob must cause the `.git`-hit
+  exclusion test to fail — proves the prune glob is load-
+  bearing).
 - Counterfactuals: ambient-config inheritance (must fail TOOL-03);
   model-flag passthrough (must fail); PATH-shim execution (must
   fail); unfiltered `.git` hit (must fail); artifact-ID-as-
@@ -543,56 +590,120 @@ per batch, calls executed sequentially in order):
   `publishArtifact` (32 MiB cap). Zero-byte originals: hash-only
   receipt (sha256-empty is constant), no empty publish. Order
   under the lock: re-read/hash → pre-publish quota PREFLIGHT
-  estimate (fail fast, nothing written — advisory only) →
-  publish preimage (file bytes land on disk at rename inside
-  publish, BEFORE the reference-commit transaction:
-  GRDBSessionStore.swift:693–728 vs :733–759) → reference
-  commit with AUTHORITATIVE quota check + increment inside the
-  SAME `queue.write` transaction as the reference insert →
-  on reference-commit failure (quota or otherwise) delete the
-  just-written bytes ONLY when NO `artifactPublished` reference
-  for this digest exists — checked under the same gate/
-  transaction, not merely `createdNewFile` (a second session may
-  have dedup-referenced the digest after this call created the
-  file but before its commit failed; `createdNewFile` alone
-  would delete bytes backing that live reference) — best-effort →
-  rename → receipt. Crash between rename and reference commit
-  orphans bytes that NEVER incremented `byte_usage`
-  (under-counted, not over-counted — corrected below);
-  crash-orphans are explicitly allowed (SPEC §9), documented,
-  not tested as impossible. Pre-publish free-space check: refuse
+  estimate (fail fast, nothing written — advisory only, using
+  per-session logical + global physical estimates) → publish
+  preimage ATOMICALLY: file bytes are written to a tmp name,
+  then the tmp is verified + renamed + reference + physical
+  upsert ALL inside the SAME `queue.write` transaction under
+  the store's cross-process file lock (re-verify inside the
+  transaction: re-open the tmp `O_NOFOLLOW`, `fstat` regular-
+  file, `fsync` it, then check `artifact_physical`/existing
+  reference BEFORE rename; if another publisher committed the
+  digest between this call's tmp creation and its transaction,
+  the transaction sees the existing physical row + reference
+  and treats this as dedup — no second file, no deletion of
+  the winner's bytes). BEFORE this, GRDBSessionStore.swift
+  split verification (:661–692) and commit (:733–759) into
+  two unsynchronized steps — a second publisher could verify
+  the existing file (:661–692) before this cleanup deletes it
+  after a failed transaction, leaving a dangling reference
+  (Finding 7). Closure: dedup verification, `artifactPublished`
+  reference insert, `artifact_physical` upsert, byte-quota
+  increments, and the conditional cleanup check/unlink are all
+  inside ONE `queue.write` under the same file lock (the gate
+  already serializes the file-write + rename — :693–728 — and
+  the reference commit — :733–759 — now joined). On reference-
+  commit failure (quota or otherwise) the just-written tmp is
+  deleted ONLY when NO `artifactPublished` reference for this
+  digest exists AND no `artifact_physical` row for it is live
+  — checked UNDER THE SAME lock/transaction after the failure,
+  not merely `createdNewFile` (a second session may have dedup-
+  referenced the digest after this call created the file but
+  before its commit failed; `createdNewFile` alone would delete
+  bytes backing that live reference; `artifact_physical` is the
+  physical ground truth, `artifactPublished` the logical);
+  a barrier-coordinated test proves the race is closed (A holds
+  the transaction open on a gate, B verifies the existing file at
+  :661–692, A cleans up but finds B's committed reference/
+  physical row and keeps the bytes — no dangling reference;
+  the complementary order where A cleans before B commits is
+  covered by the atomic re-verify: B's verification is re-run
+  inside its transaction and sees the deletion, so B writes
+  the file anew rather than referencing a deleted inode) —
+  best-effort → rename → receipt. Crash between rename and
+  reference commit orphans bytes that NEVER incremented
+  `byte_usage` or `artifact_physical` (under-counted); crash-
+  orphans are explicitly allowed (SPEC §9), documented, not
+  tested as impossible. Pre-publish free-space check: refuse
   (denied result, not a crash) when the artifact filesystem has
   less than the SPEC §9.2 256 MiB reserve. Dedup/reference
   tests: two sessions publish identical bytes → second session's
   reference-commit failure must leave the first session's bytes
-  and reference intact (no cross-session deletion);
-  first-publisher-fails-after-second-dedup leg (A creates the
-  file, B dedup-references it, A's commit fails → A's cleanup
-  finds B's reference and keeps the bytes).
-- Byte quotas (new store accounting — two-stage, coherent):
-  1 GiB session / 5 GiB global over records + artifacts +
-  preimages. Schema (new, explicit): `byte_usage(session TEXT
-  PRIMARY KEY, bytes INTEGER NOT NULL)` added to the store's
-  declared shape; `schemaVersion` 2→3 with a migration creating
-  the table; FORWARD-ONLY incompatibility stated honestly
-  (old binaries fail closed on a newer `user_version` —
+  and reference intact; first-publisher-fails-after-second-dedup
+  leg (A creates the file, B dedup-references it, A's commit
+  fails → A's cleanup finds B's reference/`artifact_physical`
+  and keeps the bytes); barrier TOCTOU leg (A verifies, B
+  commits, A cleanup sees B — kept; A deletes, B re-verifies
+  inside txn and re-creates).
+ - Byte quotas (new store accounting — two-stage, coherent —
+  fixes prior under-specification + double-count): 1 GiB per-
+  session logical / 5 GiB global physical over records +
+  artifacts + preimages. Schema (new, explicit):
+  `byte_usage(session TEXT PRIMARY KEY, bytes INTEGER NOT NULL)`
+  added to the store's declared shape (per-session LOGICAL
+  bytes: sum of record payload sizes already committed for that
+  session + artifact sizes for digests that session's
+  `artifactPublished` rows reference — same `records` session
+  column used for record counts) + `artifact_physical(digest
+  TEXT PRIMARY KEY, size INTEGER NOT NULL)` for GLOBAL
+  physical distinct bytes (one row per distinct digest ever
+  published, regardless of how many sessions reference it);
+  `schemaVersion` 2→3 with a migration creating both tables;
+  FORWARD-ONLY incompatibility stated honestly (old binaries
+  fail closed on a newer `user_version` —
   GRDBSessionStore.swift:50, :109–113 — and on shape mismatch
-  — :121–124, :204–233 — so a v3 store is unreadable to v2
-  binaries; the v0 foreign-table check and `assertSchemaShape`
-  follow `declaredShape`, covering the new table; an
-  old-binary/new-store test pins the fail-closed integrity
-  error). Preflight (advisory, pre-publish): computes this
-  call's new bytes (dedup-aware: bytes whose digest the
-  publishing session already references count zero) and fails
-  fast with nothing written. Authoritative check + increment
-  run inside the reference-commit `queue.write` transaction
-  (same fail-closed shape as count quotas). Orphan accounting:
-  crash-orphaned bytes are UNDER-counted (never incremented);
-  the orphan scan (`detectArtifactOrphans`, which today only
-  reports — :787–789) gains an additive-only
-  `reconcileByteUsage` step run at startup with the B5 gate —
-  idempotent, raises `byte_usage` toward physical reality, never
-  lowers; a seeded-orphan test pins upward reconciliation.
+  — :121–124 declaration is the v0 foreign-table branch while
+  :204–245 is `assertSchemaShape` — so a v3 store is unreadable
+  to v2 binaries; the v0 foreign-table check and
+  `assertSchemaShape` follow `declaredShape`, covering the new
+  tables; an old-binary/new-store test pins the fail-closed
+  integrity error). Record bytes: EVERY durable mutation path
+  (`append`/`appendBatch` for records, and the artifact
+  reference-commit) updates `byte_usage` inside its SAME
+  `queue.write` transaction (record path: increment by payload
+  size; artifact path: increment by size iff this session did
+  not already reference the digest — dedup-aware per-session).
+  Global physical: `artifact_physical` is inserted (or ignored
+  if digest already present) inside the SAME transaction as the
+  `artifactPublished` reference — global check reads
+  `SUM(size) FROM artifact_physical` + physical orphan scan
+  (see orphan attribution), NOT `SUM(byte_usage)` (which would
+  double-count cross-session dedup — the prior `SUM(byte_usage)`
+  implied global was corrected here to `SUM(artifact_physical)`
+  + records). Preflight (advisory, pre-publish): computes this
+  call's logical new bytes (dedup-aware per-session) and
+  session logical + global physical estimates, fails fast with
+  nothing written. Authoritative session + global checks +
+  increments run inside the reference-commit `queue.write`
+  transaction (same fail-closed shape as count quotas), with
+  cross-session dedup already accounted via
+  `artifact_physical` distinctness (a second session referencing
+  an already-physical digest increments `byte_usage` but NOT
+  `artifact_physical` — no global double-count). Orphan
+  attribution: orphan files have no `byte_usage` row (no owning
+  session) and no `artifact_physical` row (never committed);
+  they contribute to global physical only after reconciliation
+  (next item). Orphan accounting: crash-orphaned bytes are
+  UNDER-counted in both tables (never incremented); the orphan
+  scan (`detectArtifactOrphans`, which today only reports —
+  :787–789 with point-in-time/offline warning — :787–796) gains
+  a SEPARATE `reconcileByteUsage` step run BEFORE the read-only
+  B5 gate under the store's cross-process lock + `queue.write`
+  (see B5 for ordering/serialization/failure mode) — idempotent,
+  raises toward physical reality, never lowers; a seeded-orphan
+  test pins upward reconciliation. Record-byte + dedup tests:
+  append path increments `byte_usage`; second session dedup does
+  not grow `artifact_physical`; orphan has no `byte_usage` row.
 - Tests: `TOOL_04_…` zero/one/multiple/empty legs;
   `TOOL_05_…` injected change between read and commit → conflict
   receipt, file untouched, no preimage; `TOOL_06_…` CRLF/no-final-
@@ -752,7 +863,9 @@ per batch, calls executed sequentially in order):
   552–560 while `ToolExecutor.execute`/`EffectReservation` carry
   no session/store/writer — SessionTransition.swift:62–79,
   125–129 — yet `publishArtifact` requires a session and
-  `WriterIdentity` — GRDBSessionStore.swift:596–599): new
+   `WriterIdentity` — GRDBSessionStore.swift:596–599, which is
+  why the previous "read-only under sealed resolves ephemeral
+  artifacts" was vacuous): new
   `FileToolRuntime` enum (`scripted(ScriptedToolBackend)` |
   `native(NativeToolExecutor)`) + `NativeToolExecutor` struct
   capturing the claimed session, store writer identity, artifact
@@ -761,38 +874,75 @@ per batch, calls executed sequentially in order):
   `claimWriterOwnership`, before actor init; sealed runs use
   `EphemeralStore` with `grdb == nil` and NO claim block —
   RunCommand.swift:391–398, :484–519 — so there is no writer
-  identity and no durable artifact publisher to capture).
-  Full selection matrix: `--workspace` without `--trusted`
-  without `--sealed` → native full; `--workspace` + `--sealed`
-  → reject (exit 2: durable file tools require the durable
-  ledger — the invocation is malformed for a sealed run);
-  `--workspace` + `--trusted` → reject (exit 2, existing rule);
-  `--trusted` without `--workspace` → scripted; `--read-root`
-  without `--workspace` (and without `--trusted`) → native
-  READ-ONLY (read/search only, composed against whichever store
-  is active; preimages and artifact publication never occur in
-  read-only mode, so no writer identity is needed); neither flag
-  → scripted with file caps denied (existing behavior
-  preserved); `--sealed` alone → scripted (existing). Ephemeral
-  path has no durable artifact publisher: native read-only
-  under `--sealed` resolves artifact IDs against the ephemeral
-  store only (same-session rule unchanged). Composition tests
-  (binary legs): flag-selection matrix (`--workspace` composes
-  native, `--read-root`-only composes native read-only with
-  mutating denied, `--workspace`+`--sealed` → exit 2,
-  `--trusted` composes scripted with zero real mutations,
-  both → exit 2, neither → mutating denied);
+  identity and no durable artifact publisher to capture; sealed
+  mode forces `ToolCapabilities.allDenied` —
+  Capabilities.swift:109–110, `SealedRestrictions` doc :71–76).
+  Full selection matrix (NEW B1/B5 options — see Roots below;
+  `--workspace` + `--read-root` do not exist today —
+  RunCommand.swift:20–50 defines only config/prompt/trace/
+  format/tools/alias/max-turns/sealed/trusted): `--workspace`
+  without `--trusted` without `--sealed` → native full;
+  `--workspace` + `--sealed` → reject (exit 2: sealed runs are
+  tool-free by `SealedRestrictions` — the invocation is malformed
+  for a file-tool run, NEW validation); `--workspace` +
+  `--trusted` → reject (exit 2, NEW validation — not an
+  "existing rule"); `--trusted` without `--workspace` → scripted;
+  `--read-root` without `--workspace` (and without `--trusted`
+  and without `--sealed`) → native READ-ONLY (read/search only,
+  composed against whichever store is active; preimages and
+  artifact publication never occur in read-only mode, so no
+  writer identity is needed); `--read-root` + `--sealed` →
+  reject (exit 2: sealed runs are tool-free — file capabilities
+  are denied regardless of read roots; NEW validation); neither
+  flag → scripted with file caps denied (existing behavior
+  preserved); `--sealed` alone → scripted/tool-free (always —
+  sealed never composes native, even read-only). No native under
+  sealed: sealed path has no durable artifact publisher and
+  resolves no artifacts (the previous "ephemeral native
+  read-only under --sealed" is withdrawn as vacuous and
+  contradictory — a sealed run is never native). Composition
+  tests (binary legs): flag-selection matrix (`--workspace`
+  composes native, `--read-root`-only (without sealed) composes
+  native read-only with mutating denied, `--workspace`+`--sealed`
+  → exit 2, `--read-root`+`--sealed` → exit 2, `--trusted`
+  composes scripted with zero real mutations, `--sealed` alone →
+  scripted/tool-free, neither → mutating denied);
   construction-order test (native executor holds the claimed
   writer identity — artifact publish under a foreign session
   fails); ephemeral test (sealed run never touches the durable
-  store or the artifact root).
+  store or the artifact root, and any file-tool proposal is
+  denied at validation).
   Grant derivation: file caps ON as build.allAllowed ∩ userConfig
   (must opt in — defaults false) ∩ workspace-designated;
   exec/consult denied even with `--workspace` (denial test).
   Approve/deny/unavailable legs at the binary level.
-- Cross-run unknown guard (SPEC §9.1: mutating continuation after
+ - Cross-run unknown guard (SPEC §9.1: mutating continuation after
   unresolved outcomes requires an explicit decision — answered
-  across runs, not in-session): on startup with mutating grants,
+  across runs, not in-session): SEPARATED into (i) a WRITE
+  reconciliation step and (ii) a READ-ONLY gate (correcting the
+  prior conflation — Finding 6). (i) BEFORE the gate, a
+  distinct `reconcileByteUsage` write runs under the store's
+  cross-process file lock + `queue.write` transaction: it scans
+  `detectArtifactOrphans` (today report-only — :787–796, with
+  the doc warning it is point-in-time and should run offline) +
+  `SELECT DISTINCT digest FROM records WHERE ...` to enumerate
+  committed `artifactPublished` digests, re-verifies each orphan
+  file's existence/size under the same lock, and inserts missing
+  `artifact_physical` rows / bumps `byte_usage` additively
+  (never decrements — a file whose bytes were never counted is
+  added; a file whose digest already has a physical row is left
+  alone). This step SERIALIZES with live `publishArtifact`
+  callers via the same `GRDBSessionStore` gate + artifact-root
+  lock (the lock that today serializes the file-write + rename
+  — the same lock is held for the scan+insert), so a live
+  publication racing the scan cannot be double-counted or lost:
+  either the publication's transaction commits first (then the
+  scan sees the new reference/physical row and does nothing) or
+  the scan inserts first (then the publication's physical insert
+  is a no-op dedup). Failure of this step fails the run closed
+  (exit 6: store integrity — the quota tables are unwritable) and
+  the gate does not run. Ordering: claim → sessionOpened →
+  reconcileByteUsage → gate. (ii) THEN the gate runs READ-ONLY:
   the CLI runs the existing `reconcileOperations` classifier over
   every session's durable stream in the state store (read-only,
   same mechanism as `session export`). Sessions are enumerated
@@ -802,8 +952,11 @@ per batch, calls executed sequentially in order):
   protocol requirement, so every conformance is updated in the
   same slice; unit-tested incl. empty store), then each session
   is paged through the existing per-session
-  `records(session:since:limit:)` + in-memory reconcile — no
-  other new store API. If `reconcileOperations` throws
+  `records(session:since:limit:)` + in-memory reconcile — the
+  gate itself performs NO writes and introduces NO new store API
+  beyond `sessions()` (the prior "no other new store API" now
+  applies strictly to the gate; `reconcileByteUsage`'s writes are
+  accounted separately in B3). If `reconcileOperations` throws
   (corrupt/undecodable session) the gate trips for that session
   (fail closed: an unreadable ledger is never treated as clean).
   Sessions have no workspace binding, so
@@ -1220,7 +1373,7 @@ NOT non-goals.)
   rg argv gains harness-owned deny globs (non-traversal) +
   argv-capture + 000-sentinel non-open proofs; root traversal
   RE-OPENS and revalidates dev/ino per use, traverses from the
-  fresh fd; preimage cleanup only when `createdNewFile` is true
+  fresh fd; preimage cleanup only after atomic re-verify (see §3)
   + cross-session dedup tests; `byte_usage(session PK, bytes)`
   schema + migration + same-transaction preflight + dedup-aware
   counting + orphan over-count documented; stale-failed summary
@@ -1258,6 +1411,49 @@ NOT non-goals.)
   under same gate/txn + first-fails-after-dedup leg;
   `schemaVersion` 2→3 + forward-only incompatibility +
   old-binary/new-store leg.
-- REV18 → deepseek-reviewer: _pending_.
+- REV18 → deepseek-reviewer: NEEDS-EVIDENCE (7 findings:
+  transition has no cancelled-pending source of truth (only
+  actor retains; `state.liveReservations` cleared; `checkStale`
+  sees no live reservation → `drop(state)`; `.cancelling` rows
+  unreachable; accepted entries never pruned; routing ignores
+  generation/consumed); sealed read-only contradicts
+  `SealedRestrictions` + matrix omits `--read-root`+`--sealed`
+  + ephemeral publisher vacuous; `--workspace`/`--read-root`
+  + conflict rule do not exist; rg contents globs do not prune
+  + 000-file sentinel inside pruned dir invalid; byte quota
+  double-counts cross-session dedup + no record-byte path +
+  orphan no-session; `reconcileByteUsage` write contradicts
+  read-only gate + point-in-time race; dedup cleanup TOCTOU
+  (verify+commit not atomic; first-fails-after-dedup leg
+  insufficient)).
+- REV19 (this revision): state-side `SessionState.
+  cancelledPendingReservations` (+ `replacing` default) with
+  `cancelActive` moving live → cancelledPending, idempotent
+  repeat-cancel filter, actor mirroring + `consumedEffects`
+  pruning; `checkStale`-first cancelled-pending routing
+  regardless of generation + `.cancelling` effect rows +
+  `completeCancelledPending` selective handler (no fan-out/
+  transcript) + termination-defer cleanup + direct transition +
+  actor retention tests; sealed always scripted/tool-free
+  (`SealedRestrictions` allDenied — Capabilities.swift:109–110),
+  `--read-root`+`--sealed` → exit 2, no native under sealed
+  (withdrawn vacuous claim), matrix + construction-order +
+  ephemeral tests; `--workspace`/`--read-root` declared NEW
+  B1/B5 options (RunCommand.swift:20–50) with NEW exit-2
+  validations; rg bare-prune + contents globs (`!.git/` +
+  `!**/.git/**` etc.), sentinel AT the `.git` dir itself (not
+  inside) + open-audit + prune-regression probe; byte quotas
+  split into per-session logical `byte_usage` + global physical
+  `artifact_physical` (distinct dedup), record-byte paths in
+  SAME txn, orphan no-session/UNDER-count attributed to
+  physical; `reconcileByteUsage` separated as pre-gate WRITE
+  under cross-process lock + serialized with publish (scan sees
+  commit or publish re-verifies) + exit-6 vs exit-3 failure
+  modes + point-in-time fix; dedup TOCTOU closed by joining
+  verify+rename+insert+quota+cleanup into ONE `queue.write`
+  under the file lock with re-verify inside txn + barrier
+  gate-test proving both orders (A cleans/B verifies re-creates
+  and B commits/A keeps).
+- REV19 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
