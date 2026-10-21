@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV10, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV12, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -38,7 +38,8 @@ by a B5 denial test covering even `--workspace` runs).
   SessionTransition.swift:1427–1430). `CancellationError` is
   silently dropped (SessionActor.swift:482–483).
 - Dispatch intents carry ONE batch-level `mutating` flag for every
-  proposal (SessionTransition.swift:1291–1304;
+  proposal (computed SessionTransition.swift:1289, applied to all
+  intents at 1301–1306;
   `batch.proposals.contains { $0.tool != "read" && ... }`).
   `cancelActive` already splits per reservation by mutating
   (1443: `where reservation.mutating`) but a mixed batch's single
@@ -129,10 +130,15 @@ per batch, calls executed sequentially in order):
   pre-commit (the executor must never report post-commit
   uncertainty as `failed`; uncertain post-commit outcomes are
   `timeout`/`cancelled` with `started == true`). The actor
-  never silently drops `CancellationError`: it synthesizes
-  per-call cancelled outcomes with `started == true` for every
-  proposal in the batch (fail-closed: unknown+hold for mutating),
-  since a cancelled task may have dispatched. `observed_at_seq` is the durable stream position
+  never silently drops `CancellationError`: `invokeExecutor`'s
+  catch synthesizes per-call cancelled outcomes with
+  `started == true` for every proposal in the batch
+  (fail-closed: unknown+hold for mutating), since a cancelled
+  task may have dispatched. This is distinct from the
+  no-post-dispatch-throw rule (which covers `Error` returns);
+  cancellation is an async runtime event, not an executor
+  verdict, and synthesis happens at the actor seam, not in the
+  reducer. `observed_at_seq` is the durable stream position
   (implicit in stream order), NOT a separate field: the executor
   stamps status/summary/data/artifact/truncation/warnings/error;
   sequencing is the reducer's stream order. FLAGGED DEVIATION
@@ -161,10 +167,10 @@ per batch, calls executed sequentially in order):
   implementer).
 - Reducer iterates reservation proposals IN ORDER, matches by
   callID; per-call `mutating` is classified at dispatch (same
-  `tool != read/search/consult` predicate now used for the batch
-  flag) and written onto EACH intent (replacing the batch-wide
-  flag at SessionTransition.swift:1302–1306, computed from the
-  batch predicate at 1289), so intent/result
+  `tool != read/search/consult` predicate as today) and written
+  onto EACH intent — replacing today's batch-wide stamp
+  (SessionTransition.swift:1289 computes one flag; 1301–1306
+  stamps it on every intent) — so intent/result
   agreement holds per call. Durable encoding per call:
   success/no-match → `.done` + toolResponse; denied/conflict/
   invalid-arguments/failed-pre-commit → `.done` with
@@ -183,15 +189,11 @@ per batch, calls executed sequentially in order):
   `timeout`/`cancelled` with `started == true`.) Cancel path and
   stale-retention (`dropRetaining`) split per proposal the same
   way (extending the existing mutating-only `cancelActive`
-  precedent). `dropRetaining` signatures stay outcome-free as
-  certifying input: `checkStale` DISCARDS the carried
-  `EffectOutcome` (SessionTransition.swift:414–425) because
-  stale content must never certify the current run — a
-  superseded generation's results cannot pair with live intents —
-  so its unknown stands honestly. The stale summary is NOT
-  dropped silently, however: `dropRetaining` takes the outcome's
-  human-readable summary (string only — never per-call results
-  as certifying records) and embeds it in each unknown marker's
+  precedent).   `dropRetaining` takes NO structured outcome (stale content
+  must never certify the current run — a superseded generation's
+  results cannot pair with live intents — so its unknown stands
+  honestly), but it DOES take the outcome's human-readable
+  summary string and embeds it in each unknown marker's
   message (`unknown: stale completion reported '<summary>'`),
   so the evidence §9.1 requires survives for manual
   reconciliation while the hold is preserved. Cancel paths
@@ -505,8 +507,7 @@ per batch, calls executed sequentially in order):
   as the dispatched intents, non-mutating absent — no transcript
   from cancel/stale paths); stale-completion leg (superseded
   generation: stale per-call outcomes are never trusted as
-  current-run done → mutating markers carrying the stale summary,
-  non-mutating absent); post-commit-failure leg (write
+  current-run done → mutating markers carrying the stale summary (existing tests asserting bare `"unknown"` markers are updated to the `unknown: stale completion reported '<summary>'` form — deliberate RED/GREEN migration), non-mutating absent); post-commit-failure leg (write
   applied then timeout reported → unknown+hold despite the
   successful write: conservative and tested); mixed-batch lock
   contention leg ([read A ok, write B lock-fails] → A done stands,
@@ -559,26 +560,35 @@ per batch, calls executed sequentially in order):
   the gate is per-state-store, documented as such); any session
   with held operations or unmatched mutating intents trips the
   gate. Without `--acknowledge-unresolved-outcomes` → fail closed
-  (exit 2: the invocation as given is refused — a conditional
-  required argument is missing, like a missing path or an
-  unreadable state dir such as missing HOME. NOT exit 4, since
-  no run/ambiguous delivery occurred; NOT exit 3, which in-repo
-  means "ask the human NOW via TTY" — no TTY path can satisfy
-  this gate, only the explicit flag, so 3 would misdirect;
-  NOT exit 6, since nothing is corrupt), naming the
-  sessions and pointing at `needletail session export` for audit.
+  (exit 3: an explicit operator decision is required before any
+  mutating work — the same code as approval-required, since this
+  gate IS an approval check (non-interactive form), not a usage
+  error: the invocation is well-formed and no TTY interaction
+  can satisfy it, only the explicit flag. NOT exit 4, since no
+  run/ambiguous delivery occurred; NOT exit 6, since nothing is
+  corrupt; NOT exit 2, since the invocation is not malformed),
+  naming the sessions and pointing at `needletail session export`
+  for audit.
   With the flag → append a new
   `DurableRecord.acknowledgedUnresolved(Acknowledgment)` record
   to the NEW session (fields: subject sessions, operation IDs,
   determination [`operator-accepted-risk` |
   `manually-reconciled:<note>`], atMillis; RecordCodec case +
   schema-note; old binaries fail closed on the unknown case per
-  the M2-A foreign-row contract) and proceed. The RECORD is the
-  reconciliation decision — the flag alone would be a bypass.
-  The flag is per-invocation, never persisted. Tests: seeded
-  store with unresolved markers → blocked without the flag
-  (exit 2, names sessions); proceeds with the flag AND the
-  acknowledgment record is present in the new session log;
+  the M2-A foreign-row contract) and proceed. Append happens
+  AFTER claiming the session and writing its `sessionOpened`
+  record (ordering: claim → sessionOpened → acknowledgment →
+  dispatch); append failure fails the run closed (exit 6:
+  integrity — the session ledger itself is unwritable). The
+  RECORD is the reconciliation decision — the flag alone would
+  be a bypass. The flag is per-invocation, never persisted, and
+  does NOT exempt future runs: every mutating run with
+  unresolved history requires its own acknowledgment (no
+  consumption — a stale exemption would re-open silent
+  continuation). Tests: seeded store with unresolved markers →
+  blocked without the flag (exit 3, names sessions); proceeds
+  with the flag AND the acknowledgment record is present in the
+  new session log;
   no-marker store → unaffected (incl. fresh/empty store
   bootstrap); non-mutating-only unmatched intents → no trip
   (re-runnable by design).
@@ -848,6 +858,77 @@ NOT non-goals.)
   openat §7 fixed; WIRE-05→SPEC-§7.2 reword; B1 lock mixed-case
   wording; B4 cancel/stale/transcript-only scoping;
   B5 acknowledgment case + exit-code justification.
-- REV10 → deepseek-reviewer: _pending_.
+- REV10 → deepseek-reviewer: NEEDS-EVIDENCE (10 findings:
+  cancel/stale never-dispatched marking + no dispatch-truth
+  mechanism + queued-batch test; N2 gate seam/decision/record/
+  cross-workspace/exit-code; CancellationError contradiction +
+  started precedence/default/validation; per-call result
+  mutating; lock granularity mixed case; missing legs incl.
+  post-commit-timeout; citations incl. performedEffects body
+  mentions, §7 failed-ambiguous, openat, §8 accuracy).
+- REV11 (this revision): no `performedEffects` anywhere in the
+  body (mechanism explicitly rejected with the single-threaded
+  executor + async-boundary rationale); §3 cancel/stale path
+  pins the attested/unattested line (executor-reported unstarted
+  → done-cancelled; everything else unknown+hold for mutating);
+  mixed-cancel + stale tests with same-IDs/summary assertions;
+  `started: Bool? = nil` with omission-is-nil semantics +
+  precedence order incl. success-wins + CancellationError
+  synthesis at `invokeExecutor` catch; per-call result
+  `mutating` replacing batch `completedMutating` + mixed-batch
+  reopen test + existing test updates; startup gate with
+  `reconcileOperations`-per-session seam, new
+  `DurableRecord.acknowledgedUnresolved(Acknowledgment)` case
+  (sessions, operation IDs, determination, atMillis; codec +
+  fail-closed note), recorded per invocation with no consumption
+  (every mutating run re-acknowledges), exit 3 as
+  operator-decision gate (explicit 2/4/6 rejections with
+  reasons), cross-workspace documented, bootstrapping +
+  non-mutating legs; unified batch-level lock + mixed-batch rule
+  + test; ApprovalRequest.protectedPaths + describe +
+  enterAuthorising; --trusted carve-out (scripted only, real
+  executor requires --workspace AND NOT --trusted); §7
+  failed-ambiguous removed; openat overclaim fixed;
+  WIRE-05→SPEC-§7.2 reword; B1 lock mixed-case wording;
+  B4 cancel/stale/transcript-only scoping; B5 acknowledgment
+  case + exit-code justification.
+- REV11 → deepseek-reviewer: NEEDS-EVIDENCE (7 findings:
+  cancel/stale never-dispatched marking + no dispatch-truth
+  mechanism + queued-batch test; N2 gate seam/decision/record/
+  cross-workspace/exit-code; CancellationError contradiction +
+  started precedence/default/validation; per-call result
+  mutating; lock granularity mixed case; missing legs incl.
+  post-commit-timeout; citations incl. performedEffects body
+  mentions, §7 failed-ambiguous, openat, §8 accuracy).
+- REV12 (this revision): dropRetaining keeps unknown+hold
+  HONESTLY (kill at arbitrary point; no executor consult
+  possible; stale content must not certify — with the stale
+  summary threaded into the marker message and a
+  test-migration note for bare-`unknown` assertions); mixed
+  cancel test asserts same operationIDs, non-mutating absent;
+  `started: Bool? = nil` (omissible under synthesized Codable,
+  reducer treats nil as true) + full precedence incl.
+  success-wins + CancellationError synthesis at
+  `invokeExecutor` catch; per-call result `mutating` replacing
+  batch `completedMutating` + mixed-batch reopen test + existing
+  test updates; startup gate with `reconcileOperations`-
+  per-session seam, new `DurableRecord.acknowledgedUnresolved`
+  (sessions, operation IDs, determination, atMillis; codec +
+  fail-closed note), recorded per invocation with no consumption
+  (every mutating run re-acknowledges), exit 3 as
+  operator-decision gate (explicit 2/4/6 rejections with
+  reasons), cross-workspace documented, bootstrapping +
+  non-mutating legs; unified batch-level lock (fails
+  not-yet-dispatched only) + mixed-batch rule + test;
+  ApprovalRequest.protectedPaths + describe + enterAuthorising;
+  --trusted carve-out (scripted only, real executor requires
+  --workspace AND NOT --trusted); §7 failed-ambiguous removed;
+  openat §7 fixed; WIRE-05→SPEC-§7.2 reword; B1 lock mixed-case
+  wording; B4 cancel/stale/transcript-only scoping;
+  B5 acknowledgment case + exit-code justification; line refs
+  corrected to 1289/1301–1306/1443; `performedEffects` appears
+  only as an explicit rejection with rationale, never as a
+  mechanism.
+- REV12 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
