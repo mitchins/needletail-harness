@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV9, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV10, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -109,10 +109,13 @@ per batch, calls executed sequentially in order):
   statuses). `data` is MANDATORY (may be `""` only with an `error`
   explaining absence): read/search carry content/results; edit/write
   carry the machine-readable receipt (path/mode/before/after
-  hashes, per B4 below). `started: Bool = true` is the
-  machine-readable dispatch bit (the executor sets false for
-  never-dispatched calls; the reducer keys on IT, never on
-  summary prose). Reducer precedence, in order: (1) deterministic
+  hashes, per B4 below). `started: Bool? = nil` is the machine-readable dispatch bit
+  (the executor sets false for never-dispatched calls, true
+  once dispatched; the reducer keys on IT, never on summary
+  prose). A missing key decodes as nil under synthesized Codable
+  (standard optional semantics — no custom init needed) and the
+  reducer treats nil as true (fail-closed); an explicit
+  omission leg pins this. Reducer precedence, in order: (1) deterministic
   statuses (success/no-match/denied/conflict/invalid-arguments/
   failed, plus actor-synthesized pre-dispatch receipts) → `.done`,
   no hold, REGARDLESS of `started` (a claimed result proves
@@ -210,11 +213,12 @@ per batch, calls executed sequentially in order):
   is emitted by cancel/stale handlers — the transcript-only
   rule is executor-path-only, §3 mapping above): the intent
   alone reconciles to unstarted. Tests: cancel-during-flight on
-  a mixed batch → mutating unknown+hold (existing semantics,
-  pinned), non-mutating absent from the record log; stale
-  completion with per-call outcomes → mutating markers carrying
-  the stale summary, non-mutating absent (never trusted as
-  current-run done).
+  a mixed batch → mutating unknown+hold with the SAME operationIDs
+  as the dispatched intents (pairing check), non-mutating absent
+  from the record log; stale completion with per-call outcomes →
+  mutating markers carrying the stale summary in the `unknown:`
+  message (never trusted as current-run done), non-mutating
+  absent.
   NEVER-DISPATCHED is not unknown (R4 finding — a provably
   unexecuted call must not claim unknowability, and an unexitable
   hold would brick the session with no reconcile command
@@ -286,9 +290,17 @@ per batch, calls executed sequentially in order):
   ONLY via explicit per-batch operator approval with the paths
   enumerated in the approval description: `.git`, `.env`
   variants, `.ssh` (SPEC §8.1: explicit user grants suffice).
-  The fixed-argv harness `git`/`rg` subprocesses are NOT native
-  reads — they never traverse the containment boundary (see B2/B5
-  carve-outs), so B5's diff does not need a grant.
+  Mechanism: `ApprovalRequest` gains `protectedPaths: [String]`
+  (default `[]`, backward compatible); `enterAuthorising`
+  populates it from the validated batch paths; `describe(batch)`
+  lists them; the gateway shows the list and the operator's
+  approve covers exactly the listed paths (unlisted protected
+  paths stay denied — tested: approved batch with listed path
+  proceeds, unlisted protected path in the same batch is
+  denied). The fixed-argv harness `git`/`rg` subprocesses are
+  NOT native reads — they never traverse the containment
+  boundary (see B2/B5 carve-outs), so B5's diff does not need
+  a grant.
 - Roots: explicit `--workspace` (must exist) + `--read-root`
   (read-only; never write roots, never exec-cwds); without
   `--workspace`, mutating tools are denied. `--read-root` works
@@ -311,12 +323,14 @@ per batch, calls executed sequentially in order):
 - Lock: private-state lock file keyed by workspace identity
   (`<root>/.needletail/lock`), flock LOCK_NB (fail closed on
   contention, never hang). ONE granularity, stated once:
-  acquired ONCE per mutating batch before the first mutating
+  acquired ONCE per mutating batch, before the first mutating
   call (after arg validation), held through the last commit;
   per-call re-read + hash happen under the HELD lock. Lock
-  contention therefore fails the WHOLE batch pre-dispatch
-  (typed `failed` for every proposal — nothing ran), never a
-  single call mid-batch.
+  contention therefore fails every NOT-YET-DISPATCHED call as
+  pre-dispatch typed `failed` (deterministic: the lock precedes
+  any mutation); already-completed calls stand, and later calls
+  — including reads — are unstarted per the halt rule, never
+  silently skipped.
 - Tests (native, real FS temp dirs): `TOOL_07_…` symlink/parent-
   swap/`..`-escape denials + FIFO/socket/device/directory legs
   a hardlink-inside-root behavior leg (treated as a regular
@@ -484,12 +498,15 @@ per batch, calls executed sequentially in order):
   leg (executor omits `started` on a cancelled call → treated as
   true → unknown+hold for mutating); success-with-started-false
   leg (contradictory input → done: claimed results prove
-  dispatch); CancellationError leg (executor throws mid-batch
+  dispatch);   CancellationError leg (executor throws mid-batch
   → actor synthesizes started-cancelled for all → mutating
-  unknown+hold); stale-completion leg (superseded generation,
-  done-attested per-call outcomes → mutating markers carrying
-  the stale summary, non-mutating absent — never trusted as
-  current-run done); post-commit-failure leg (write
+  unknown+hold); mixed-cancel leg (cancel-during-flight on a
+  mixed batch → mutating unknown+hold with the SAME operationIDs
+  as the dispatched intents, non-mutating absent — no transcript
+  from cancel/stale paths); stale-completion leg (superseded
+  generation: stale per-call outcomes are never trusted as
+  current-run done → mutating markers carrying the stale summary,
+  non-mutating absent); post-commit-failure leg (write
   applied then timeout reported → unknown+hold despite the
   successful write: conservative and tested); mixed-batch lock
   contention leg ([read A ok, write B lock-fails] → A done stands,
@@ -542,10 +559,13 @@ per batch, calls executed sequentially in order):
   the gate is per-state-store, documented as such); any session
   with held operations or unmatched mutating intents trips the
   gate. Without `--acknowledge-unresolved-outcomes` → fail closed
-  (exit 2: operator-decision-required, like missing HOME — NOT
-  exit 4, since no run/ambiguous delivery occurred; and not exit
-  3, which is reserved for an interactive approval that cannot
-  help here — only the explicit flag path proceeds), naming the
+  (exit 2: the invocation as given is refused — a conditional
+  required argument is missing, like a missing path or an
+  unreadable state dir such as missing HOME. NOT exit 4, since
+  no run/ambiguous delivery occurred; NOT exit 3, which in-repo
+  means "ask the human NOW via TTY" — no TTY path can satisfy
+  this gate, only the explicit flag, so 3 would misdirect;
+  NOT exit 6, since nothing is corrupt), naming the
   sessions and pointing at `needletail session export` for audit.
   With the flag → append a new
   `DurableRecord.acknowledgedUnresolved(Acknowledgment)` record
@@ -562,9 +582,12 @@ per batch, calls executed sequentially in order):
   no-marker store → unaffected (incl. fresh/empty store
   bootstrap); non-mutating-only unmatched intents → no trip
   (re-runnable by design).
-- `--trusted` stays demo-only: scripted backend, plus an
-  ImportGate-style binary test proving `--trusted` performs zero
-  real FS mutations.
+- `--trusted` stays demo-only: it composes ONLY the scripted
+  backend (the real file-tool executor requires `--workspace`
+  AND the absence of `--trusted`; composition is exclusive —
+  no flag combination composes both), plus an ImportGate-style
+  binary test proving `--trusted` performs zero real FS
+  mutations.
 - TOOL-12: extend `terminalSafe` (or a sibling display filter)
   to neutralize Cf/bidi (U+202A–202E, U+2066–2069) + Cf marks
   (U+200E/200F, U+061C, U+200B–200D, U+FEFF) + C0/C1 (Cc already
@@ -792,6 +815,39 @@ NOT non-goals.)
   free-space 256 MiB reserve; WIRE-05/SPEC-§7.2,
   BDD-04, openat, §8-convention, R3-ref hygiene; performedEffects
   removal stated once, in §8 history only.
-- REV9 → deepseek-reviewer: _pending_.
+- REV9 → deepseek-reviewer: NEEDS-EVIDENCE (7 residuals + new:
+  cancel/stale never-dispatched marking + no dispatch-truth
+  mechanism; N2 unaddressed + gate has no seam/decision/record;
+  CancellationError contradiction; started precedence/default/
+  validation; per-call result mutating; lock granularity mixed
+  case; missing legs incl. post-commit-timeout; citations).
+- REV10 (this revision): cancel/stale keep unknown+hold HONESTLY
+  (kill at arbitrary point; dropRetaining outcome-free as
+  certifying input BUT threads the stale summary string into
+  unknown-marker messages — `unknown: stale completion
+  reported '<summary>' — with a test-migration note for
+  exact-`unknown` assertions); mixed cancel/stale tests assert
+  same operationIDs / listed-summary / non-mutating absent;
+  `started: Bool? = nil` (omissible under synthesized Codable,
+  reducer treats nil as true) + precedence order incl.
+  success-wins + CancellationError synthesis at
+  `invokeExecutor` catch; per-call result `mutating` replacing
+  batch `completedMutating` + mixed-batch reopen test + existing
+  all-mutating test updates; startup gate with
+  `reconcileOperations`-per-session seam, new
+  `DurableRecord.acknowledgedUnresolved(Acknowledgment)` case
+  (sessions, operation IDs, determination, atMillis; codec +
+  fail-closed note), recorded per invocation (no consumption —
+  every mutating run re-acknowledges), exit 2 as conditional-
+  required-argument (explicit 3/4/6 rejections with reasons),
+  cross-workspace documented, bootstrapping + non-mutating legs;
+  unified batch-level lock + mixed-batch rule + test;
+  ApprovalRequest.protectedPaths + describe + enterAuthorising;
+  --trusted carve-out (scripted only, real executor requires
+  --workspace AND NOT --trusted); §7 failed-ambiguous removed;
+  openat §7 fixed; WIRE-05→SPEC-§7.2 reword; B1 lock mixed-case
+  wording; B4 cancel/stale/transcript-only scoping;
+  B5 acknowledgment case + exit-code justification.
+- REV10 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
