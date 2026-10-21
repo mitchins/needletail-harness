@@ -69,8 +69,9 @@ struct BackendTests {
                 Self.batch(("c1", "read", "{\"path\":\"f\"}")),
                 reservation: Self.reservation(batch: Self.batch(("c1", "read", "{\"path\":\"f\"}"))))
             Issue.record("denied tool must refuse")
-        } catch let error as ScriptedBackendError {
-            #expect(error == .capabilityDenied(tool: "read"), "typed: \(error)")
+        } catch let error as ToolFailure {
+            #expect(error == .preDispatch(status: "denied", summary: "capabilityDenied: read"), "typed: \(error)")
+            #expect(backend.remaining == 1, "denied tool must not consume script")
         } catch {
             Issue.record("wrong error class: \(error)")
         }
