@@ -66,10 +66,11 @@ struct CancellationTests {
         #expect(cancelled.state.unresolvedOperations.first?.state == .unknown)
         #expect(cancelled.state.unresolvedOperations.first?.mutating == true)
         #expect(cancelled.records.contains(where: {
-            if case .operationResult(_, let outcome) = $0 { return outcome == "unknown" }
+            if case .cancelledPendingMarker = $0 { return true }
             return false
-        }), "unknown record precedes invalidation")
-        #expect(cancelled.state.liveReservations.isEmpty, "tables clear after retention")
+        }), "pending marker precedes invalidation")
+        #expect(cancelled.state.liveReservations.isEmpty, "live tables clear after retention")
+        #expect(cancelled.state.cancelledPendingReservations.count == 1, "pending retained")
     }
 
     @Test("CORE-02 cancel grace forces interrupted without confirmation")

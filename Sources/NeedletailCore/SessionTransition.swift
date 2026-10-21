@@ -342,12 +342,18 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.executing, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
+    case (.cancelling, .effectCompleted(let effectID, _, _, _, _, let outcome, _)):
+        return completeCancelledPending(state, effectID: effectID, outcome: outcome, ids: &ids)
+    case (.cancelling, .effectFailed(let effectID, _, _, _, _, let error, _)):
+        return completeCancelledPendingFailed(state, effectID: effectID, error: error, ids: &ids)
     case (.cancelling, .tick(let now)):
         return tickCancelling(state, nowMillis: now, ids: &ids)
     case (.cancelling, .transportFailed(_, _, _, _, let at)):
         return interruptRun(state, note: "transport confirmed cancel", atMillis: at, ids: &ids)
     case (.cancelling, .cancelRequested):
         return Transition(state: state, effects: [], records: [])
+    case (_, .cancelledPendingRemoved(let effectID, let at)):
+        return handleCancelledPendingRemoved(state, effectID: effectID, atMillis: at, ids: &ids)
     case (.failed, .dismissRun(let at)), (.completed, .dismissRun(let at)), (.interrupted, .dismissRun(let at)):
         return dismissTerminal(state, atMillis: at, ids: &ids)
     case (.failed, .queueResume(let at)), (.completed, .queueResume(let at)), (.interrupted, .queueResume(let at)):
@@ -457,8 +463,10 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
             return drop(state)
         }
         return nil
-    case .effectCompleted(let effectID, let runID, let generation, let revision, _, _, _),
-         .effectFailed(let effectID, let runID, let generation, let revision, _, _, _):
+    case .effectCompleted(let effectID, let runID, let generation, let revision, _, _, _):
+        if state.cancelledPendingReservations.contains(where: { $0.effectID == effectID }) {
+            return nil
+        }
         if state.consumedEffects.contains(effectID) {
             return drop(state)
         }
@@ -473,6 +481,29 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
             return drop(state)
         }
         return nil
+    case .effectFailed(let effectID, let runID, let generation, let revision, _, _, _):
+        if state.cancelledPendingReservations.contains(where: { $0.effectID == effectID }) {
+            return nil
+        }
+        if state.consumedEffects.contains(effectID) {
+            return drop(state)
+        }
+        guard let run = state.activeRun,
+              run.runID == runID, run.revision == generation,
+              state.liveReservations.first(where: { $0.effectID == effectID })?.revision == revision
+        else {
+            let mutating = state.liveReservations.first(where: { $0.effectID == effectID })?.mutating ?? false
+            if mutating {
+                return dropRetaining(state, effectID: effectID, ids: &ids)
+            }
+            return drop(state)
+        }
+        return nil
+    case .cancelledPendingRemoved(let effectID, _):
+        if state.cancelledPendingReservations.contains(where: { $0.effectID == effectID }) {
+            return nil
+        }
+        return drop(state)
     case .requestDispatched(let requestID, _):
         guard state.phase == .admitting,
               let run = state.activeRun, run.requestID == requestID
@@ -1468,9 +1499,201 @@ private func completeEffect<I: IDSource>(
     case .failureReceipt(let summary):
         return continueAfterEffect(state, effectID: effectID, receipt: "tool-failure: \(summary)", atMillis: 0, ids: &ids)
     case .perCall(let result):
-        // TODO: per-call handling per REV25 B4 (for now map aggregate receipt for compatibility)
-        return continueAfterEffect(state, effectID: effectID, receipt: result.receipt.summary, atMillis: 0, ids: &ids)
+        return continueAfterEffectPerCall(state, effectID: effectID, result: result, ids: &ids)
     }
+}
+
+private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effectID: EffectID, result: ExecutorResult, ids: inout I) -> Transition {
+    guard let reservation = state.liveReservations.first(where: { $0.effectID == effectID }) else {
+        return Transition(state: state, effects: [], records: [])
+    }
+    let proposals = reservation.batch.proposals
+    var records: [DurableRecord] = []
+    var transcript: [DurableRecord] = []
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    var live = state.liveReservations.filter { $0.effectID != effectID }
+    var unresolved = state.unresolvedOperations
+
+    // Build map from callID to outcome
+    var outcomeMap: [String: ToolCallOutcome] = [:]
+    for call in result.calls {
+        outcomeMap[call.callID] = call
+    }
+
+    for proposal in proposals {
+        guard let outcome = outcomeMap[proposal.callID] else {
+            // No-entry: contract violation, treat as unknown for mutating, transcript-only for non-mutating
+            let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+            if isMutating {
+                let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .unknown, mutating: true)
+                let (markers, overflow) = appendUnresolved(unresolved, ref)
+                unresolved = markers
+                if overflow { return integrityStop(state, ids: &ids) }
+                records.append(.operationResult(ref, outcome: "unknown"))
+            }
+            transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "no-entry: \(proposal.callID)")))
+            continue
+        }
+        let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+        let status = outcome.status
+        let started = outcome.started
+        // Precedence per REV25 §3
+        // (1) deterministic statuses with started != false → done, no hold
+        let deterministic: Set<String> = ["success", "no-match", "denied", "conflict", "invalid-arguments", "failed"]
+        var stateForResult: OperationState = .done
+        var hold = false
+        var outcomeText = outcome.summary
+        if deterministic.contains(status) {
+            if started == false {
+                // Contradictory input: claims result for never-run call → fail closed: unknown for mutating
+                if isMutating {
+                    stateForResult = .unknown
+                    hold = true
+                    outcomeText = "unknown: contradictory \(status) with started==false"
+                } else {
+                    // Non-mutating: transcript-only, no record
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+                    continue
+                }
+            } else {
+                // started != false (true or nil) → done, no hold
+                stateForResult = .done
+                if status != "success" && status != "no-match" {
+                    outcomeText = "tool-failure: \(outcome.summary)"
+                }
+            }
+        } else if status == "cancelled" || status == "timeout" {
+            if started == false {
+                stateForResult = .done
+                outcomeText = "cancelled: unstarted"
+            } else {
+                // started true or nil → unknown for mutating, transcript-only for non-mutating
+                if isMutating {
+                    stateForResult = .unknown
+                    hold = true
+                    outcomeText = "unknown: \(status) after started"
+                } else {
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+                    continue
+                }
+            }
+        } else {
+            // Unknown status: treat as unknown for mutating
+            if isMutating {
+                stateForResult = .unknown
+                hold = true
+            } else {
+                transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+                continue
+            }
+        }
+
+        let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: stateForResult, mutating: isMutating)
+        if hold {
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.operationResult(ref, outcome: "unknown: \(outcomeText)"))
+        } else {
+            records.append(.operationResult(ref, outcome: outcomeText))
+        }
+        transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+        // Artifact handling: if outcome has artifactID, publish reference already done by executor; here we just record
+    }
+
+    var nextState = state.replacing(consumedEffects: consumed, liveReservations: live, unresolvedOperations: unresolved)
+    // Concatenate records: operation results + transcript
+    let allRecords = records + transcript
+    // Also need to handle the case where reservation had no proposals (empty batch fallback)
+    if proposals.isEmpty {
+        let ref = OperationRef(operationID: OperationID(effectID.raw), callID: effectID.raw, state: .done, mutating: reservation.mutating)
+        // This case is rare; just add a result
+        let newRecords: [DurableRecord] = [.operationResult(ref, outcome: result.receipt.summary)] + transcript
+        return Transition(state: nextState, effects: [], records: newRecords)
+    }
+    return Transition(state: nextState, effects: [], records: allRecords)
+}
+
+private func completeCancelledPending<I: IDSource>(_ state: SessionState, effectID: EffectID, outcome: EffectOutcome, ids: inout I) -> Transition {
+    guard let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) else {
+        return Transition(state: state, effects: [], records: [])
+    }
+    var pending = state.cancelledPendingReservations.filter { $0.effectID != effectID }
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    var unresolved = state.unresolvedOperations
+    var records: [DurableRecord] = []
+
+    switch outcome {
+    case .perCall(let result):
+        for call in result.calls {
+            let isMutating = call.callID == reservation.effectID.raw ? reservation.mutating : false
+            // For per-call in cancelled pending, we need to find the proposal to know mutating; use reservation batch
+            let proposal = reservation.batch.proposals.first(where: { $0.callID == call.callID })
+            let mutating: Bool
+            if let prop = proposal {
+                mutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            } else {
+                mutating = call.callID == reservation.effectID.raw ? reservation.mutating : true
+            }
+            if !mutating { continue } // non-mutating never gets a record on cancel path
+            if call.status == "cancelled" && call.started == false {
+                // Unstarted: supersede pending marker with done
+                let ref = OperationRef(operationID: operationID(effectID: effectID, callID: call.callID), callID: call.callID, state: .done, mutating: true)
+                records.append(.operationResult(ref, outcome: "cancelled: unstarted"))
+                // Remove the pending marker from unresolved if present (supersession)
+                unresolved.removeAll(where: { $0.operationID == ref.operationID })
+            } else {
+                // Started or unknown: keep marker, no new record (hold remains)
+                // For effectFailed path, we keep marker and add error via separate record below
+                continue
+            }
+        }
+    case .success, .failureReceipt:
+        // Should not happen for cancelled pending perCall, but handle
+        break
+    }
+
+    let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending, unresolvedOperations: unresolved)
+    return Transition(state: next, effects: [], records: records)
+}
+
+private func completeCancelledPendingFailed<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, ids: inout I) -> Transition {
+    guard let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) else {
+        return Transition(state: state, effects: [], records: [])
+    }
+    var pending = state.cancelledPendingReservations.filter { $0.effectID != effectID }
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    let errRecord = CancelledPendingError(effectID: effectID, operationIDs: reservation.batch.proposals.map { operationID(effectID: effectID, callID: $0.callID) }, error: error, atMillis: 0)
+    let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending)
+    return Transition(state: next, effects: [], records: [.cancelledPendingError(errRecord)])
+}
+
+private func handleCancelledPendingRemoved<I: IDSource>(_ state: SessionState, effectID: EffectID, atMillis: UInt64, ids: inout I) -> Transition {
+    var pending = state.cancelledPendingReservations.filter { $0.effectID != effectID }
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    var unresolved = state.unresolvedOperations
+    var records: [DurableRecord] = []
+    // Promote pending markers to unknown for still-pending operationIDs
+    if let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) {
+        for prop in reservation.batch.proposals {
+            let isMutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            if !isMutating { continue }
+            let ref = OperationRef(operationID: operationID(effectID: effectID, callID: prop.callID), callID: prop.callID, state: .unknown, mutating: true)
+            // Only promote if not already superseded
+            if !unresolved.contains(where: { $0.operationID == ref.operationID }) {
+                let (markers, overflow) = appendUnresolved(unresolved, ref)
+                unresolved = markers
+                if overflow { return integrityStop(state, ids: &ids) }
+                records.append(.operationResult(ref, outcome: "unknown: cancelled pending terminated"))
+            }
+        }
+    }
+    let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending, unresolvedOperations: unresolved)
+    return Transition(state: next, effects: [], records: records)
 }
 
 private func failEffect<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, ids: inout I) -> Transition {
@@ -1482,50 +1705,76 @@ private func failEffect<I: IDSource>(_ state: SessionState, effectID: EffectID, 
 // MARK: Cancellation (C3: retention BEFORE invalidation)
 
 private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, ids: inout I) -> Transition {
-    // C3: every live MUTATING reservation keeps its unknown markers +
-    // records FIRST; only then are the tables cleared and the generation
-    // bumped. A3-1: markers derive the SAME per-proposal operation IDs as
-    // the dispatch-time intents, so each unmatched intent later reconciles
-    // to unknown instead of an unpairable effect-level guess.
+    // REV25 C3: per-proposal mutating, Kind-filtered, cancelledPendingReservations with supersession.
     var unresolved = state.unresolvedOperations
     var records: [DurableRecord] = []
-    for reservation in state.liveReservations where reservation.mutating {
+    var pending: [EffectReservation] = state.cancelledPendingReservations
+    var live: [EffectReservation] = []
+    var consumed = state.consumedEffects
+    var hasPending = false
+
+    for reservation in state.liveReservations {
+        // Provider reservations: not retained, just consumed.
+        if reservation.kind == .provider {
+            consumed.insert(reservation.effectID)
+            continue
+        }
+        // Executor reservations: per-proposal mutating classification.
         let proposals = reservation.batch.proposals
-        let refs: [OperationRef]
         if proposals.isEmpty {
-            refs = [OperationRef(
-                operationID: OperationID(reservation.effectID.raw), callID: reservation.effectID.raw,
-                state: .unknown, mutating: true)]
-        } else {
-            refs = proposals.map {
-                OperationRef(
-                    operationID: operationID(effectID: reservation.effectID, callID: $0.callID),
-                    callID: $0.callID, state: .unknown, mutating: true)
+            // Empty fallback uses reservation-level mutating.
+            if reservation.mutating {
+                let ref = OperationRef(operationID: OperationID(reservation.effectID.raw), callID: reservation.effectID.raw, state: .unknown, mutating: true)
+                let (markers, overflow) = appendUnresolved(unresolved, ref)
+                unresolved = markers
+                if overflow { return integrityStop(state, ids: &ids) }
+                records.append(.cancelledPendingMarker(ref, outcome: "cancelled: pending executor \(reservation.effectID.raw)"))
+                pending.append(reservation)
+                hasPending = true
+            } else {
+                consumed.insert(reservation.effectID)
+            }
+            continue
+        }
+        var mutatingRefs: [OperationRef] = []
+        for prop in proposals {
+            let isMutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            if isMutating {
+                let ref = OperationRef(operationID: operationID(effectID: reservation.effectID, callID: prop.callID), callID: prop.callID, state: .unknown, mutating: true)
+                mutatingRefs.append(ref)
             }
         }
-        for ref in refs {
+        if mutatingRefs.isEmpty {
+            // Pure read-only batch: not retained, consumed.
+            consumed.insert(reservation.effectID)
+            continue
+        }
+        // Retain reservation for mutating proposals only.
+        for ref in mutatingRefs {
             let (markers, overflow) = appendUnresolved(unresolved, ref)
             unresolved = markers
-            if overflow {
-                return integrityStop(state, ids: &ids)
-            }
-            records.append(.operationResult(ref, outcome: "unknown"))
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.cancelledPendingMarker(ref, outcome: "cancelled: pending \(ref.callID ?? "")"))
         }
+        pending.append(reservation)
+        hasPending = true
+        // Non-mutating proposals in mixed batch are ignored (no record, but effectID is pending so late report routes to completeCancelledPending which will ignore them).
     }
+
+    // Idempotent: if no new pending and no live executor left, no duplicate markers (already handled by filtering).
     let (s1, prefix) = sequenced(state, kind: "cancelling", digest: "cancel", ids: &ids)
     var active: ActiveRequest? = nil
     if let request = state.activeRequest {
-        active = ActiveRequest(
-            requestID: request.requestID, runID: request.runID,
-            generation: request.generation, delivery: .deliveryUnknown, bytesOut: request.bytesOut)
+        active = ActiveRequest(requestID: request.requestID, runID: request.runID, generation: request.generation, delivery: .deliveryUnknown, bytesOut: request.bytesOut)
     }
-    // liveReservations cleared HERE (after the retention loop above):
-    // invalidation follows preservation, never precedes it (C3).
+    let nextPhase: SessionPhase = hasPending ? .cancelling : .cancelling
     let next = s1.replacing(
-        phase: .cancelling, activeRequest: active,
+        phase: nextPhase, activeRequest: active,
         queueHeld: true, heldReason: .cancelled(sinceMillis: atMillis),
+        consumedEffects: consumed,
         pendingApproval: .some(nil), pendingBatch: .some(nil),
-        retryDeadlineMillis: .some(nil), liveReservations: [],
+        retryDeadlineMillis: .some(nil), liveReservations: live,
+        cancelledPendingReservations: pending,
         generation: state.generation + 1,
         unresolvedOperations: unresolved)
     var effects: [Effect] = [.emitUI(.runUpdate(phase: "cancelling", detail: "cancelled; queue held"))]

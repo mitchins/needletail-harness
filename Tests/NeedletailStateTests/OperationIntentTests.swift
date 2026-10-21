@@ -181,8 +181,9 @@ struct OperationIntentTests {
         let markerIDs = Set(cancelled.state.unresolvedOperations.map(\.operationID))
         #expect(markerIDs == intentIDs, "cancel unknowns reuse the intent IDs, got \(markerIDs)")
         #expect(cancelled.state.unresolvedOperations.allSatisfy { $0.state == .unknown && $0.mutating })
-        let recorded = Self.results(in: cancelled.records).filter { $0.1 == "unknown" }
-        #expect(Set(recorded.map { $0.0.operationID }) == intentIDs, "unknown outcomes pair with the intents")
+        // REV25: cancel now writes cancelledPendingMarker (HOLD-equivalent, supersedable) not operationResult unknown
+        let pendingMarkers = cancelled.records.compactMap { if case .cancelledPendingMarker(let ref, _) = $0 { return ref } else { return nil } }
+        #expect(Set(pendingMarkers.map(\.operationID)) == intentIDs, "pending markers pair with the intents")
     }
 
     @Test("A3-1 consumed check drops even when the reservation is still live")
