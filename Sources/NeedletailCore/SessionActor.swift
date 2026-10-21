@@ -501,14 +501,8 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             let result = try await executor.execute(batch: reservation.batch, reservation: reservation)
             await self.completeEffect(reservation.effectID, outcome: .perCall(result))
         } catch let err as ToolFailure {
-            switch err {
-            case .preDispatch(let status, let summary):
-                // Pre-dispatch typed failure: synthesize per-call done receipts preserving status
-                let calls = reservation.batch.proposals.map { ToolCallOutcome(callID: $0.callID, status: status, summary: summary, data: "", error: summary, started: false) }
-                let receipt = ExecutorReceipt(callID: reservation.effectID.raw, status: status, summary: summary)
-                let synth = ExecutorResult(receipt: receipt, calls: calls)
-                await self.completeEffect(reservation.effectID, outcome: .perCall(synth))
-            }
+            // Actor-verified pre-dispatch failure: typed, not arbitrary ToolCallOutcome data
+            await self.completeEffect(reservation.effectID, outcome: .preDispatchFailure(err))
         } catch is CancellationError {
             // Synthesize per-call cancelled with started==true for every proposal (fail-closed fallback)
             let calls = reservation.batch.proposals.map { ToolCallOutcome(callID: $0.callID, status: "cancelled", summary: "cancelled: fallback", data: "", started: true) }

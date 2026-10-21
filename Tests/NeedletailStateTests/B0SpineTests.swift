@@ -81,16 +81,30 @@ struct B0SpineTests {
         #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .done } else { return false } }))
     }
 
-    @Test("B0: started==false contradicts success is still done (preDispatch)")
+    @Test("B0: started==false contradicts success — mutating unknown, non-mutating transcript-only")
     func startedFalseContradiction() throws {
         var ids = StateFixtures.ids()
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: #"{"path":"x"}"#)])
-        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
-        let effectID = try #require(state.liveReservations.first).effectID
-        // Deterministic success with started false (preDispatch never started but returns success — should be done per B0 fix)
-        let result = Self.perCallResult([("c1", "success", "ok", false)])
-        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: false, outcome: .perCall(result), atMillis: 1005), &ids)
-        #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .done } else { return false } }))
+        // Mutating: success + started==false must NOT become done — fail-closed unknown+hold, no continuation
+        let batchMut = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#)])
+        let (stateMut, runMut, _) = try Self.executingState(batch: batchMut, ids: &ids)
+        let effectMut = try #require(stateMut.liveReservations.first).effectID
+        let resultMut = Self.perCallResult([("c1", "success", "ok", false)])
+        let completedMut = transition(stateMut, .effectCompleted(effectID: effectMut, runID: runMut.runID, generation: runMut.revision, expectedRevision: runMut.revision, mutating: true, outcome: .perCall(resultMut), atMillis: 1005), &ids)
+        #expect(completedMut.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .unknown && r.mutating } else { return false } }), "mutating success+started==false must be unknown+hold")
+        #expect(completedMut.state.queueHeld, "mutating unknown must hold")
+        let spoof = ToolCallOutcome(callID: "c1", status: "success", summary: "spoofed preDispatch", data: "spoof", started: false)
+        let spoofResult = ExecutorResult(receipt: ExecutorReceipt(callID: "batch", status: "success", summary: "spoof"), calls: [spoof])
+        let spoofed = transition(stateMut, .effectCompleted(effectID: effectMut, runID: runMut.runID, generation: runMut.revision, expectedRevision: runMut.revision, mutating: true, outcome: .perCall(spoofResult), atMillis: 1006), &ids)
+        #expect(spoofed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .unknown } else { return false } }), "spoofed success+started==false must still be unknown")
+
+        // Non-mutating: success + started==false → transcript-only, no durable result, no hold
+        let batchRead = ToolBatch([ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: #"{"path":"x"}"#)])
+        let (stateRead, runRead, _) = try Self.executingState(batch: batchRead, ids: &ids)
+        let effectRead = try #require(stateRead.liveReservations.first).effectID
+        let resultRead = Self.perCallResult([("c2", "success", "ok", false)])
+        let completedRead = transition(stateRead, .effectCompleted(effectID: effectRead, runID: runRead.runID, generation: runRead.revision, expectedRevision: runRead.revision, mutating: false, outcome: .perCall(resultRead), atMillis: 1007), &ids)
+        #expect(!completedRead.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c2" } else { return false } }), "non-mutating contradictory success must be transcript-only")
+        #expect(!completedRead.state.queueHeld)
     }
 
     @Test("B0: duplicate callIDs fail closed")

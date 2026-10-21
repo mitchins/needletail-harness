@@ -1509,7 +1509,52 @@ private func completeEffect<I: IDSource>(
         return continueAfterEffect(state, effectID: effectID, receipt: "tool-failure: \(summary)", atMillis: 0, ids: &ids)
     case .perCall(let result):
         return continueAfterEffectPerCall(state, effectID: effectID, result: result, ids: &ids)
+    case .preDispatchFailure(let failure):
+        return continueAfterPreDispatchFailure(state, effectID: effectID, failure: failure, ids: &ids)
     }
+}
+
+private func continueAfterPreDispatchFailure<I: IDSource>(_ state: SessionState, effectID: EffectID, failure: ToolFailure, ids: inout I) -> Transition {
+    guard let reservation = state.liveReservations.first(where: { $0.effectID == effectID }) else {
+        return Transition(state: state, effects: [], records: [])
+    }
+    let proposals = reservation.batch.proposals
+    var records: [DurableRecord] = []
+    var transcript: [DurableRecord] = []
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    var live = state.liveReservations.filter { $0.effectID != effectID }
+    let status: String
+    let summary: String
+    switch failure {
+    case .preDispatch(let s, let m): status = s; summary = m
+    }
+    for proposal in proposals {
+        let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .done, mutating: false)
+        // Pre-dispatch failures are always done, never hold, even for mutating (they never executed)
+        // But for B0, we treat them as done with tool-failure outcome, not unknown
+        let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+        let outcomeText = "tool-failure: \(summary) (\(status))"
+        // For mutating, still done (never started, so no side effect)
+        records.append(.operationResult(ref, outcome: outcomeText))
+        transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "preDispatch \(status): \(summary)")))
+        _ = isMutating
+    }
+    var interimState = state.replacing(consumedEffects: consumed, liveReservations: live)
+    // Pre-dispatch never holds, so continue
+    guard interimState.turnsUsed < interimState.turnLimit else {
+        return failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+    }
+    guard let run = interimState.activeRun else {
+        return failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+    }
+    let nextEffectID = ids.nextEffectID()
+    let seq = ids.nextSequence()
+    let nextReservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+    let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: interimState.epoch.profile.alias, epochID: interimState.epoch.epochID, sealed: run.sealed, turnsLeft: interimState.turnLimit - interimState.turnsUsed, deadlineMillis: interimState.runDeadlineMillis, historyDigest: fnv1aHex("\(interimState.sessionID.raw):\(seq.value):continue"))
+    let (s1, prefix) = sequenced(interimState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
+    let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live + [nextReservation], lastSequence: seq.value)
+    return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + records + transcript)
 }
 
 private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effectID: EffectID, result: ExecutorResult, ids: inout I) -> Transition {
@@ -1714,6 +1759,8 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
     var records: [DurableRecord] = []
 
     switch outcome {
+    case .preDispatchFailure, .success, .failureReceipt:
+        break
     case .perCall(let result):
         // F5: duplicate and unexpected handling for cancelled-pending path
         var seen: Set<String> = []
@@ -1727,6 +1774,7 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
             continue
         }
         for call in result.calls {
+            if tainted.contains(call.callID) { continue }
             if tainted.contains(call.callID) { continue }
             let proposal = reservation.batch.proposals.first(where: { $0.callID == call.callID })
             guard let prop = proposal else {
