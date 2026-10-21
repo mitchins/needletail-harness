@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV12, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV13, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -128,17 +128,22 @@ per batch, calls executed sequentially in order):
   fail-closed) → mutating: `.unknown` + marker + hold;
   non-mutating: transcript-only. `failed` is ALWAYS deterministic
   pre-commit (the executor must never report post-commit
-  uncertainty as `failed`; uncertain post-commit outcomes are
-  `timeout`/`cancelled` with `started == true`). The actor
-  never silently drops `CancellationError`: `invokeExecutor`'s
-  catch synthesizes per-call cancelled outcomes with
-  `started == true` for every proposal in the batch
-  (fail-closed: unknown+hold for mutating), since a cancelled
-  task may have dispatched. This is distinct from the
-  no-post-dispatch-throw rule (which covers `Error` returns);
-  cancellation is an async runtime event, not an executor
-  verdict, and synthesis happens at the actor seam, not in the
-  reducer. `observed_at_seq` is the durable stream position
+  uncertainty as `failed`;   uncertain post-commit outcomes are
+  `timeout`/`cancelled` with `started == true`). Cancellation is
+  an async runtime event, not an executor verdict. The contract
+  is: the executor CATCHES cancellation itself and reports
+  per-call truth — calls it had started are reported
+  cancelled with `started == true`; calls it never reached are
+  reported cancelled with `started == false`. (A scripted test
+  double does this by catching around a gated suspension point;
+  production executors structure awaits the same way.) The
+  actor's `invokeExecutor` catch is the FAIL-CLOSED fallback for
+  executors that propagate instead of reporting: it synthesizes
+  per-call cancelled outcomes with `started == true` for every
+  proposal in the batch (unknown+hold for mutating), since a
+  propagated cancellation proves nothing about dispatch. Both
+  paths are tested (executor-handled mixed batch AND
+  propagating-executor fallback). `observed_at_seq` is the durable stream position
   (implicit in stream order), NOT a separate field: the executor
   stamps status/summary/data/artifact/truncation/warnings/error;
   sequencing is the reducer's stream order. FLAGGED DEVIATION
@@ -170,7 +175,9 @@ per batch, calls executed sequentially in order):
   `tool != read/search/consult` predicate as today) and written
   onto EACH intent — replacing today's batch-wide stamp
   (SessionTransition.swift:1289 computes one flag; 1301–1306
-  stamps it on every intent) — so intent/result
+  applies it to every intent) — and EACH result carries the same
+  per-call `mutating` (replacing `completedMutating`'s batch-wide
+  read in `continueAfterEffect`), so intent/result
   agreement holds per call. Durable encoding per call:
   success/no-match → `.done` + toolResponse; denied/conflict/
   invalid-arguments/failed-pre-commit → `.done` with
@@ -189,14 +196,14 @@ per batch, calls executed sequentially in order):
   `timeout`/`cancelled` with `started == true`.) Cancel path and
   stale-retention (`dropRetaining`) split per proposal the same
   way (extending the existing mutating-only `cancelActive`
-  precedent).   `dropRetaining` takes NO structured outcome (stale content
+  precedent). `dropRetaining` takes NO structured outcome (stale content
   must never certify the current run — a superseded generation's
   results cannot pair with live intents — so its unknown stands
   honestly), but it DOES take the outcome's human-readable
   summary string and embeds it in each unknown marker's
   message (`unknown: stale completion reported '<summary>'`),
   so the evidence §9.1 requires survives for manual
-  reconciliation while the hold is preserved. Cancel paths
+  reconciliation while the hold is preserved. `dropRetaining` gains one parameter — `summary: String?`, threaded from `checkStale`'s discarded `EffectOutcome` — used ONLY for the marker message, never for certification. Cancel paths
   cannot consult the executor either: the actor runs one
   in-flight effect at a time and a new `reserveEffect` cancels
   the previous task, so every live reservation at cancel time is
@@ -245,12 +252,16 @@ per batch, calls executed sequentially in order):
   conflict, C unstarted-cancelled-done] with C never dispatched —
   pinned by TOOL-09 tests.
 - Transcript rule (SPEC §7.2: a tool call is never cut away from
-  its result — COMPLETE-SPEC.md:336): EVERY proposal in an
-  executed batch gets a transcript `toolResponse` in order,
-  including calls with no `operationResult` (evidence ≠ state
-  claim; the stale-retention path emits records only, unchanged
-  and out of scope). Order-preservation is observed via
-  transcript order + log scan (present done/failure receipts,
+  its result — COMPLETE-SPEC.md:336): EVERY proposal in a batch
+  that completes through the executor gets a transcript
+  `toolResponse` in order, including calls with no
+  `operationResult` (evidence ≠ state claim). Cancel-requested
+  and stale batches are out of scope for this rule: they go
+  through `cancelActive`/`dropRetaining`, which emit records
+  only (markers for mutating, nothing for non-mutating) —
+  there is no executor output to transcribe. Order-preservation
+  is observed via transcript order + log scan (present
+  done/failure receipts,
   explicit unstarted entries,
   absent operationResult exactly for non-mutating unknown).
 - Rerun claim, scoped honestly: receipts stand durably and no
@@ -500,18 +511,24 @@ per batch, calls executed sequentially in order):
   leg (executor omits `started` on a cancelled call → treated as
   true → unknown+hold for mutating); success-with-started-false
   leg (contradictory input → done: claimed results prove
-  dispatch);   CancellationError leg (executor throws mid-batch
+  dispatch); executor-handled-cancellation leg (scripted
+  executor blocks on A via gate, cancel arrives, executor
+  catches and reports A started/cancelled + B unstarted-cancelled
+  → A unknown+hold, B done-cancelled with NO hold — the queued
+  never-dispatched case, deterministic via the gate);
+  propagated-CancellationError leg (executor rethrows mid-batch
   → actor synthesizes started-cancelled for all → mutating
   unknown+hold); mixed-cancel leg (cancel-during-flight on a
   mixed batch → mutating unknown+hold with the SAME operationIDs
   as the dispatched intents, non-mutating absent — no transcript
   from cancel/stale paths); stale-completion leg (superseded
   generation: stale per-call outcomes are never trusted as
-  current-run done → mutating markers carrying the stale summary (existing tests asserting bare `"unknown"` markers are updated to the `unknown: stale completion reported '<summary>'` form — deliberate RED/GREEN migration), non-mutating absent); post-commit-failure leg (write
+  current-run done → mutating markers carrying the stale summary (existing tests asserting bare `"unknown"` markers are updated to the `unknown: stale completion reported '<summary>'` form — deliberate RED/GREEN migration),   non-mutating absent); post-commit-failure leg (write
   applied then timeout reported → unknown+hold despite the
   successful write: conservative and tested); mixed-batch lock
-  contention leg ([read A ok, write B lock-fails] → A done stands,
-  B+ done-failed, no hold).
+  contention leg ([read A ok, write B lock-fails, read C] → A
+  done stands, B done-failed, C unstarted-cancelled with NO hold
+  — halt rule applies after the failed lock acquisition).
 - Counterfactuals: aggregate-receipt shim (must fail TOOL-09);
   unstarted-marked-unknown (must fail — no false unknowability);
   unknown auto-retry (must fail — second dispatch without
@@ -555,11 +572,22 @@ per batch, calls executed sequentially in order):
   across runs, not in-session): on startup with mutating grants,
   the CLI runs the existing `reconcileOperations` classifier over
   every session's durable stream in the state store (read-only,
-  same mechanism as `session export`; no new store API beyond a
-  session-listing query — sessions have no workspace binding, so
-  the gate is per-state-store, documented as such); any session
-  with held operations or unmatched mutating intents trips the
-  gate. Without `--acknowledge-unresolved-outcomes` → fail closed
+  same mechanism as `session export`). Sessions are enumerated
+  via a new read-only store seam, `sessions() -> [SessionID]`
+  (`SELECT DISTINCT session`, no row data; implemented for GRDB
+  + InMemory + EphemeralStore + CLIStore + test doubles — a new
+  protocol requirement, so every conformance is updated in the
+  same slice; unit-tested incl. empty store), then each session
+  is paged through the existing per-session
+  `records(session:since:limit:)` + in-memory reconcile — no
+  other new store API. If `reconcileOperations` throws
+  (corrupt/undecodable session) the gate trips for that session
+  (fail closed: an unreadable ledger is never treated as clean).
+  Sessions have no workspace binding, so
+  the gate is per-state-store (documented as such, with a
+  cross-workspace test: dirty store blocks, clean store
+  proceeds). Any session with held operations or unmatched
+  mutating intents trips the gate. Without `--acknowledge-unresolved-outcomes` → fail closed
   (exit 3: an explicit operator decision is required before any
   mutating work — the same code as approval-required, since this
   gate IS an approval check (non-interactive form), not a usage
@@ -575,7 +603,13 @@ per batch, calls executed sequentially in order):
   determination [`operator-accepted-risk` |
   `manually-reconciled:<note>`], atMillis; RecordCodec case +
   schema-note; old binaries fail closed on the unknown case per
-  the M2-A foreign-row contract) and proceed. Append happens
+  the M2-A foreign-row contract) and proceed. The new case
+  requires an explicit `SessionExport.project` arm (the switch
+  is exhaustive): subject session/operation IDs export as
+  structural metadata; the `determination` free-text field is
+  treated like other free text — redacted by default, included
+  only with `--include-content` — and the export schema test
+  gains the new keys. Append happens
   AFTER claiming the session and writing its `sessionOpened`
   record (ordering: claim → sessionOpened → acknowledgment →
   dispatch); append failure fails the run closed (exit 6:
@@ -929,6 +963,8 @@ NOT non-goals.)
   corrected to 1289/1301–1306/1443; `performedEffects` appears
   only as an explicit rejection with rationale, never as a
   mechanism.
-- REV12 → deepseek-reviewer: _pending_.
+- REV12 → deepseek-reviewer: NEEDS-EVIDENCE (7 findings: cancel/stale never-dispatched marking + no dispatch-truth mechanism + queued-batch test; N2 gate seam/decision/record/cross-workspace/exit-code; CancellationError contradiction + started precedence/default/validation; per-call result mutating; lock granularity mixed case; missing legs incl. post-commit-timeout; citations).
+- REV13 (this revision): executor-handled cancellation as primary path (per-call truth incl. unstarted, deterministic via gate), actor synthesis demoted to fail-closed fallback for propagating executors; `dropRetaining` takes an explicit `summary: String?` param threaded from `checkStale`; per-call result `mutating` replacing batch `completedMutating`; session-listing seam named (`sessions() -> [SessionID]`); exit 2→3 with approval-gate justification; mixed-cancel test with same-IDs; stale-completion summary threading + test migration; started-omission + success-wins + CancellationError legs; no-consumption rule stated; cross-workspace + bootstrapping tests.
+- REV13 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
