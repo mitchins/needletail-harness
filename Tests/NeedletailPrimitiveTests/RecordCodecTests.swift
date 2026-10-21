@@ -75,6 +75,9 @@ struct RecordCodecTests {
                 atMillis: 7000,
                 unresolvedOperations: [OperationRef(
                     operationID: opID, callID: "call-1", state: .unknown, mutating: true)])),
+            .cancelledPendingMarker(OperationRef(operationID: opID, callID: "call-1", state: .unknown, mutating: true), outcome: "cancelled: pending"),
+            .cancelledPendingError(CancelledPendingError(effectID: EffectID("eff-1"), operationIDs: [opID], error: "cancelled", atMillis: 8000)),
+            .acknowledgedUnresolved(Acknowledgment(subjectSessions: [SessionID("s-1")], operationIDs: [opID], determination: "operator-accepted-risk", atMillis: 9000)),
         ]
     }
 
@@ -93,6 +96,9 @@ struct RecordCodecTests {
         case .transcriptAppended: return "transcriptAppended"
         case .writerRecovered: return "writerRecovered"
         case .artifactPublished: return "artifactPublished"
+        case .cancelledPendingMarker: return "cancelledPendingMarker"
+        case .cancelledPendingError: return "cancelledPendingError"
+        case .acknowledgedUnresolved: return "acknowledgedUnresolved"
         }
     }
 
@@ -100,7 +106,8 @@ struct RecordCodecTests {
         "sessionOpened", "epochOpened", "eventAppended", "operationIntent",
         "operationResult", "queueAdmitted", "queueUpdated",
         "checkpointCommitted", "transcriptAppended", "writerRecovered",
-        "artifactPublished",
+        "artifactPublished", "cancelledPendingMarker", "cancelledPendingError",
+        "acknowledgedUnresolved",
     ]
 
     /// The transcript shapes ride DurableRecord.transcriptAppended; every
@@ -130,7 +137,7 @@ struct RecordCodecTests {
         // The table must have exercised every case exactly by name; a new
         // case without a fixture fails here even before the build break.
         #expect(covered == Self.expectedCaseNames,
-                "fixture table must cover all eleven cases, covered=\(covered.sorted())")
+                "fixture table must cover all fourteen cases, covered=\(covered.sorted())")
     }
 
     @Test("record codec round-trips every TranscriptEntry case losslessly")

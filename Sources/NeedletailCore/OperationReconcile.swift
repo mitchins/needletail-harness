@@ -67,12 +67,14 @@ public struct OperationReconciliation: Sendable, Equatable {
     /// CallID-less non-mutating done results (denial receipts),
     /// informational, never held.
     public let nonToolResults: Int
+    public let cancelledPendingErrors: [CancelledPendingError]
 
     public init(
         completed: [OperationID] = [], explicitUnknown: [OperationRef] = [],
         unmatchedMutating: [OperationRef] = [], unmatchedNonMutating: [OperationID] = [],
         orphanResults: [OperationRef] = [], heldOperations: [OperationRef] = [],
-        admissionIntents: Int = 0, nonToolResults: Int = 0
+        admissionIntents: Int = 0, nonToolResults: Int = 0,
+        cancelledPendingErrors: [CancelledPendingError] = []
     ) {
         self.completed = completed
         self.explicitUnknown = explicitUnknown
@@ -82,6 +84,7 @@ public struct OperationReconciliation: Sendable, Equatable {
         self.heldOperations = heldOperations
         self.admissionIntents = admissionIntents
         self.nonToolResults = nonToolResults
+        self.cancelledPendingErrors = cancelledPendingErrors
     }
 }
 
@@ -96,6 +99,8 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
     var admissionIDs: Set<OperationID> = []
     var denialIDs: Set<OperationID> = []
 
+    var pendingMarkers: [OperationID: OperationRef] = [:]
+    var cancelledErrors: [CancelledPendingError] = []
     for record in records {
         switch record {
         case .operationIntent(let ref):
@@ -120,11 +125,18 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             guard ref.state != .intent else {
                 throw StoreError.integrity("operation result \(ref.operationID.raw) carries intent state")
             }
-            guard results[ref.operationID] == nil else {
-                throw StoreError.integrity("duplicate result for operation \(ref.operationID.raw)")
+            // Last-record-wins for cancelledPendingMarker supersession: if a marker exists for this ID, the result supersedes it.
+            if pendingMarkers[ref.operationID] != nil {
+                pendingMarkers.removeValue(forKey: ref.operationID)
+            } else {
+                guard results[ref.operationID] == nil else {
+                    throw StoreError.integrity("duplicate result for operation \(ref.operationID.raw)")
+                }
             }
             results[ref.operationID] = (ref, outcome)
-            resultOrder.append(ref.operationID)
+            if !resultOrder.contains(ref.operationID) {
+                resultOrder.append(ref.operationID)
+            }
             if ref.callID == nil, ref.state == .done, !ref.mutating {
                 // Denial receipt shape: informational only, never held,
                 // never an orphaned tool operation.
@@ -136,7 +148,19 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
                 // orphan path: visible, and held when unknown or mutating.
                 toolIDs.insert(ref.operationID)
             }
-        default:
+        case .cancelledPendingMarker(let ref, _):
+            guard ref.state != .intent else {
+                throw StoreError.integrity("cancelledPendingMarker \(ref.operationID.raw) carries intent state")
+            }
+            // Marker is HOLD-equivalent but supersedable; store separately and do not treat as duplicate result yet.
+            // If a result already exists for this ID, marker is ignored (result wins).
+            if results[ref.operationID] == nil && pendingMarkers[ref.operationID] == nil {
+                pendingMarkers[ref.operationID] = ref
+                toolIDs.insert(ref.operationID)
+            }
+        case .cancelledPendingError(let err):
+            cancelledErrors.append(err)
+        case .acknowledgedUnresolved, .artifactPublished, .transcriptAppended, .eventAppended, .queueAdmitted, .queueUpdated, .checkpointCommitted, .writerRecovered, .sessionOpened, .epochOpened:
             continue
         }
     }
@@ -162,6 +186,12 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
         let intent = intents[id]!
         // Admission markers were counted above; they never pair.
         guard intent.callID != nil else { continue }
+        if let marker = pendingMarkers[id], results[id] == nil {
+            // Cancelled-pending marker without superseding result: HOLD-equivalent.
+            explicitUnknown.append(marker)
+            held.append(marker)
+            continue
+        }
         guard let result = results[id] else {
             if intent.mutating {
                 let unknown = OperationRef(
@@ -208,12 +238,19 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
                 state: .unknown, mutating: true))
         }
     }
+    for (id, marker) in pendingMarkers where intents[id] == nil {
+        orphanResults.append(marker)
+        held.append(marker)
+    }
+    // Include cancelledPendingErrors in held reason via count already in held; actual strings aggregated by caller via new field.
+    // Hold reason at call sites should append cancelledErrors strings if present.
 
     return OperationReconciliation(
         completed: completed, explicitUnknown: explicitUnknown,
         unmatchedMutating: unmatchedMutating, unmatchedNonMutating: unmatchedNonMutating,
         orphanResults: orphanResults, heldOperations: held,
-        admissionIntents: admissionIntents, nonToolResults: nonToolResults)
+        admissionIntents: admissionIntents, nonToolResults: nonToolResults,
+        cancelledPendingErrors: cancelledErrors)
 }
 
 extension SessionState {

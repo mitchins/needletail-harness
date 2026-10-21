@@ -28,6 +28,12 @@ public enum DurableRecord: Sendable, Equatable, Codable {
     /// (write → fsync → atomic rename → dirsync → txn). Reads re-verify
     /// size and digest and fail typed `.integrity` on any mismatch.
     case artifactPublished(ArtifactRef)
+    /// REV25 B4: cancelled-pending marker (durable HOLD, supersedable by operationResult).
+    case cancelledPendingMarker(OperationRef, outcome: String)
+    /// REV25 B4: cancelled-pending error attachment for effectFailed path.
+    case cancelledPendingError(CancelledPendingError)
+    /// REV25 B5: explicit operator acknowledgment of unresolved outcomes (SPEC §9.1).
+    case acknowledgedUnresolved(Acknowledgment)
 }
 
 public struct SequencedRecord: Sendable, Equatable {
@@ -185,6 +191,32 @@ public struct ArtifactRef: Sendable, Equatable, Codable {
 
     /// Content-addressed relative path inside the managed root.
     public var relativePath: String { digest }
+}
+
+public struct CancelledPendingError: Sendable, Equatable, Codable {
+    public let effectID: EffectID
+    public let operationIDs: [OperationID]
+    public let error: String
+    public let atMillis: UInt64
+    public init(effectID: EffectID, operationIDs: [OperationID], error: String, atMillis: UInt64) {
+        self.effectID = effectID
+        self.operationIDs = operationIDs
+        self.error = error
+        self.atMillis = atMillis
+    }
+}
+
+public struct Acknowledgment: Sendable, Equatable, Codable {
+    public let subjectSessions: [SessionID]
+    public let operationIDs: [OperationID]
+    public let determination: String
+    public let atMillis: UInt64
+    public init(subjectSessions: [SessionID], operationIDs: [OperationID], determination: String, atMillis: UInt64) {
+        self.subjectSessions = subjectSessions
+        self.operationIDs = operationIDs
+        self.determination = determination
+        self.atMillis = atMillis
+    }
 }
 
 public protocol SessionStore: Sendable {

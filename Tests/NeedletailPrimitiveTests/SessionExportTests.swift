@@ -160,6 +160,7 @@ struct SessionExportTests {
             "previousWriterHash", "newWriterHash", "reason", "operatorID",
             "reference", "unresolved",
             "artifactKind", "size", "relativePath", "digest",
+            "effectID", "operationIDs", "error", "determination", "subjectSessions",
             "complete", "recordCount",
             "operations", "completed", "held", "unstarted", "orphaned",
         ]

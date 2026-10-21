@@ -60,6 +60,10 @@ public struct ProviderInvocation: Sendable, Equatable {
 }
 
 public struct EffectReservation: Sendable, Equatable {
+    public enum Kind: String, Sendable, Equatable, Codable {
+        case executor
+        case provider
+    }
     public let effectID: EffectID
     public let runID: RunID
     public let requestID: RequestID?
@@ -67,8 +71,9 @@ public struct EffectReservation: Sendable, Equatable {
     public let revision: Revision
     public let mutating: Bool
     public let batch: ToolBatch
+    public let kind: Kind
 
-    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch()) {
+    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch(), kind: Kind = .executor) {
         self.effectID = effectID
         self.runID = runID
         self.requestID = requestID
@@ -76,6 +81,7 @@ public struct EffectReservation: Sendable, Equatable {
         self.revision = revision
         self.mutating = mutating
         self.batch = batch
+        self.kind = kind
     }
 }
 
@@ -104,9 +110,49 @@ public struct ExecutorReceipt: Sendable, Equatable {
     }
 }
 
+public struct ToolCallOutcome: Sendable, Equatable, Codable {
+    public let callID: String
+    public let status: String
+    public let summary: String
+    public let data: String
+    public let artifactID: String?
+    public let truncated: Bool
+    public let warnings: [String]
+    public let error: String?
+    public let path: String?
+    public let mode: String?
+    public let beforeHash: String?
+    public let afterHash: String?
+    public let started: Bool?
+
+    public init(callID: String, status: String, summary: String, data: String, artifactID: String? = nil, truncated: Bool = false, warnings: [String] = [], error: String? = nil, path: String? = nil, mode: String? = nil, beforeHash: String? = nil, afterHash: String? = nil, started: Bool? = nil) {
+        self.callID = callID
+        self.status = status
+        self.summary = summary
+        self.data = data
+        self.artifactID = artifactID
+        self.truncated = truncated
+        self.warnings = warnings
+        self.error = error
+        self.path = path
+        self.mode = mode
+        self.beforeHash = beforeHash
+        self.afterHash = afterHash
+        self.started = started
+    }
+}
+
+public enum ToolFailure: Error, Sendable, Equatable {
+    case preDispatch(status: String, summary: String)
+}
+
 public struct ExecutorResult: Sendable, Equatable {
     public let receipt: ExecutorReceipt
-    public init(receipt: ExecutorReceipt) { self.receipt = receipt }
+    public let calls: [ToolCallOutcome]
+    public init(receipt: ExecutorReceipt, calls: [ToolCallOutcome] = []) {
+        self.receipt = receipt
+        self.calls = calls
+    }
 }
 
 public protocol ModelTransport: Sendable {
@@ -1421,6 +1467,9 @@ private func completeEffect<I: IDSource>(
         return continueAfterEffect(state, effectID: effectID, receipt: summary, atMillis: 0, ids: &ids)
     case .failureReceipt(let summary):
         return continueAfterEffect(state, effectID: effectID, receipt: "tool-failure: \(summary)", atMillis: 0, ids: &ids)
+    case .perCall(let result):
+        // TODO: per-call handling per REV25 B4 (for now map aggregate receipt for compatibility)
+        return continueAfterEffect(state, effectID: effectID, receipt: result.receipt.summary, atMillis: 0, ids: &ids)
     }
 }
 

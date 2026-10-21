@@ -189,6 +189,42 @@ public enum SessionExport {
                 row["operationID"] = operation.raw
             }
             return row
+        case .cancelledPendingMarker(let ref, let outcome):
+            let state: String
+            switch ref.state {
+            case .intent: state = "intent"
+            case .unknown: state = "unknown"
+            case .done: state = "done"
+            }
+            return ["seq": seq, "kind": "cancelledPendingMarker",
+                    "operationID": ref.operationID.raw,
+                    "callID": ref.callID as Any,
+                    "state": state, "mutating": ref.mutating,
+                    "outcome": includeContent ? outcome : redacted]
+        case .cancelledPendingError(let err):
+            var row: [String: Any] = ["seq": seq, "kind": "cancelledPendingError",
+                                      "effectID": err.effectID.raw,
+                                      "operationIDs": err.operationIDs.map(\.raw),
+                                      "atMillis": err.atMillis]
+            if includeContent {
+                row["error"] = err.error
+                row["redacted"] = false
+            } else {
+                row["redacted"] = true
+            }
+            return row
+        case .acknowledgedUnresolved(let ack):
+            var row: [String: Any] = ["seq": seq, "kind": "acknowledgedUnresolved",
+                                      "subjectSessions": ack.subjectSessions.map(\.raw),
+                                      "operationIDs": ack.operationIDs.map(\.raw),
+                                      "atMillis": ack.atMillis]
+            if includeContent {
+                row["determination"] = ack.determination
+                row["redacted"] = false
+            } else {
+                row["redacted"] = true
+            }
+            return row
         }
     }
 
