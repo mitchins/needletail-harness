@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV5, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV6, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -41,7 +41,7 @@ by a B5 denial test covering even `--workspace` runs).
   proposal (SessionTransition.swift:1291–1304;
   `batch.proposals.contains { $0.tool != "read" && ... }`).
   `cancelActive` already splits per reservation by mutating
-  (1439: `where reservation.mutating`) but a mixed batch's single
+  (1443: `where reservation.mutating`) but a mixed batch's single
   reservation is mutating if ANY call mutates — read-only calls in
   it are still marked unknown. `OperationReconcile` requires
   intent/result agreement (OperationReconcile.swift:183–186) and
@@ -140,7 +140,8 @@ per batch, calls executed sequentially in order):
   callID; per-call `mutating` is classified at dispatch (same
   `tool != read/search/consult` predicate now used for the batch
   flag) and written onto EACH intent (replacing the batch-wide
-  flag at SessionTransition.swift:1302), so intent/result
+  flag at SessionTransition.swift:1302–1306, computed from the
+  batch predicate at 1289), so intent/result
   agreement holds per call. Durable encoding per call:
   success/no-match → `.done` + toolResponse; denied/conflict/
   invalid-arguments/failed-pre-commit → `.done` with
@@ -156,9 +157,18 @@ per batch, calls executed sequentially in order):
   contract violation, testable by omission) counts as outcome-
   uncertain: same row. Cancel path and stale-retention
   (`dropRetaining`) split per proposal the same way (extending
-  the existing mutating-only `cancelActive` precedent); the
-  empty-proposals fallback keeps reservation-level classification
-  (no proposals to classify — documented).
+  the existing mutating-only `cancelActive` precedent), keyed on
+  DISPATCH TRUTH, not reservation membership: a new in-memory-only
+  `performedEffects: Set<EffectID>` on SessionState (NOT a durable
+  record) is marked by the actor when it starts performing an
+  effect and cleared alongside `liveReservations` on completion;
+  cancel/retention consult it — performed: existing unknown path;
+  never-performed: `.done` with `cancelled: never dispatched`
+  (deterministic, no hold). The empty-proposals fallback keeps
+  reservation-level classification (no proposals to classify —
+  documented). Test: cancel with a queued batch behind the
+  in-flight one → in-flight mutating unknown+hold, queued calls
+  done-cancelled, no markers for the queued.
   NEVER-DISPATCHED is not unknown (R4 finding — a provably
   unexecuted call must not claim unknowability, and an unexitable
   hold would brick the session with no reconcile command
@@ -192,10 +202,16 @@ per batch, calls executed sequentially in order):
   absent operationResult exactly for non-mutating unknown).
 - Rerun claim, scoped honestly: receipts stand durably and no
   fake atomicity is claimed; re-proposal is operator/model-driven
-  with full evidence visible. No automated cross-run replay (a
-  fresh CLI run uses a fresh session UUID; no reconcile command
-  exists). The guarantee is evidence preservation +
-  never-auto-retry.
+  with full evidence visible. No automated cross-run replay.
+  Holds need no in-session clearing because sessions are single
+  CLI runs (fresh session UUID per invocation, `RunCommand`
+  composition root): a held queue is a terminal diagnostic for
+  THAT run (exit 4 with the ambiguous-delivery message, claim
+  retained), and the next run starts clean with exported evidence
+  (A5-2) available. There is deliberately no in-session
+  abandon/reconcile command (explicit non-goal; multi-run
+  reconciliation is M2-D territory if ever). The guarantee is
+  evidence preservation + never-auto-retry.
 - Migration: ScriptedToolBackend emits per-call entries; existing
   `ExecutorResult(receipt:)` test callers updated deliberately
   with RED/GREEN (empty-calls + multi-proposal must reconcile to
@@ -228,12 +244,14 @@ per batch, calls executed sequentially in order):
   (read-only; never write roots, never exec-cwds); without
   `--workspace`, mutating tools are denied. `--read-root` works
   standalone (reads/searches need no workspace); mutation
-  (edit/write, preimages, lock) requires `--workspace`. Grant derivation
-  (stated once, used everywhere): effective file caps =
-  build.allAllowed ∩ userConfig (must opt in: defaults are false)
-  ∩ workspace-designated (present `--workspace` ⇒ file caps ON
-  for read/search/edit/write; absent ⇒ allDenied) ∩ invocation
-  ∩ sealed. exec/consult stay denied regardless.
+  (edit/write, preimages, lock) requires `--workspace`. Grant
+  derivation, per class (this resolves the blanket allDenied):
+  read/search REQUIRE userConfig opt-in AND (workspace-designated
+  `--workspace` OR at least one `--read-root`) AND invocation AND
+  seal rules; edit/write REQUIRE userConfig opt-in AND
+  `--workspace` present AND invocation AND per-batch approval;
+  exec/consult are denied regardless of flags. The CLI rejects
+  `--workspace` + `--trusted` together (exit 2).
 - Args: strict Codable + hand validators (unknown fields, duplicate
   keys, overlong strings, int ranges, enum values fail
   PRE-side-effect). Required capabilities computed from the
@@ -577,4 +595,23 @@ any merge in this planning track.
   1304/1443, shape-table home section).
 - REV4 → deepseek-reviewer: NEEDS-EVIDENCE (R1 unstarted-as-unknown false claim + unexitable hold, R2 pre-dispatch status legs, R3 line refs, R4 preflight wording [fixed], R5 hardlink wording [fixed], R6 shape/citation/title fixes; new N1-N3 on C-status wording, explicit abandon, §3/B4 wording).
 - REV5 (this revision): holds ONLY for genuine uncertainty — never-dispatched calls complete as done-cancelled (no hold, provably no side effect); timeout-mid-execution/cancelled-mid-execution stay unknown+hold; pre-dispatch typed throws preserve status with invalid-arguments/failed/workspace-unusable legs; preflight quota + delete-on-ref-failure; hardlink behavior leg; `data` mandatory; observed_at_seq deviation flagged; §3 mapping/throw/halt/throw-policy wording aligned with B4 legs; title/refs/citations fixed.
-- REV5 → deepseek-reviewer: _pending_.
+- REV5 → deepseek-reviewer: NEEDS-EVIDENCE (false-unknowability
+  partially fixed but cancel/stale paths still mark
+  never-dispatched unknown; N2 unaddressed — no abandon/reconcile
+  path; pre-dispatch `failed`/workspace-unusable legs, R3 line
+  refs, `data`/observed_at_seq/WIRE-05/BDD-04 citation fixes,
+  §3-vs-B4 status wording).
+- REV6 (this revision): per-call DISPATCH TRUTH via new
+  in-memory `performedEffects` (cancel/retention consult it;
+  never-performed → done-cancelled, no markers); holds are
+  terminal-for-the-session BY DESIGN (single-CLI-run sessions,
+  exit-4 diagnostic, next run starts clean — no in-session
+  abandon/reconcile command, explicit non-goal); pre-dispatch
+  `failed` leg incl. lock-contention as deterministic failure;
+  stale `mixed-batch` risk entry rewritten; per-class grant
+  derivation (`--read-root` standalone for reads); R3 refs fixed
+  (computed 1289, applied 1302; `cancelActive` `where` at 1443);
+  `observed_at_seq` deviation flagged with SPEC reference +
+  amendment proposal; WIRE-05 cite replaced by SPEC §7.2:336;
+  hardlink behavior leg (treated as regular file).
+- REV6 → deepseek-reviewer: _pending_.
