@@ -1609,10 +1609,18 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         }
     }
 
-    // Ordered halt: find first non-success/no-match in proposal order
+    // Ordered halt: find first missing/tainted/non-success in proposal order — conservative boundary
     var firstHaltIndex: Int? = nil
     for (idx, prop) in proposals.enumerated() {
-        if let out = outcomeMap[prop.callID], out.status != "success" && out.status != "no-match" {
+        if taintedCallIDs.contains(prop.callID) {
+            firstHaltIndex = idx
+            break
+        }
+        guard let out = outcomeMap[prop.callID] else {
+            firstHaltIndex = idx
+            break
+        }
+        if out.status != "success" && out.status != "no-match" {
             firstHaltIndex = idx
             break
         }
