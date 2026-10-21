@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV15, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV16, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -206,12 +206,27 @@ per batch, calls executed sequentially in order):
   `timeout`/`cancelled` with `started == true`.) Cancel path and
   stale-retention (`dropRetaining`) split per proposal the same
   way (extending the existing mutating-only `cancelActive`
-  precedent). `dropRetaining` takes NO structured outcome (stale content
-  must never certify the current run — a superseded generation's
-  results cannot pair with live intents — so its unknown stands
-  honestly), but it DOES take the outcome's human-readable
-  summary string and embeds it in each unknown marker's
-  message (`unknown: stale completion reported '<summary>'`),
+  precedent). Two cancellation sub-paths, distinguished by who
+  reports first: (a) the executor ITSELF catches cancellation
+  (primary path) — it reports per-call outcomes through the
+  normal `completeEffect` path with truthful `started` flags,
+  and the reducer maps them exactly like any completed batch
+  (started unstarted calls → done-cancelled, no hold);
+  deterministic in tests by blocking a scripted executor
+  mid-batch on a gate, then cancelling; (b) an external
+  `cancelRequested` arrives while the executor is unresponsive
+  (kill-switch path) — `cancelActive` marks all live mutating
+  calls unknown+hold, and any late executor report is dropped
+  against the already-written markers (safe direction: the
+  markers subsume whatever truth arrives late). EITHER order
+  is fail-closed: per-call truth where available, unknown+hold
+  otherwise — never silent continuation and never a false
+  done. `dropRetaining` takes NO structured outcome (stale
+  content must never certify the current run — a superseded
+  generation's results cannot pair with live intents — so its
+  unknown stands honestly), but it DOES take the outcome's
+  human-readable summary string and embeds it in each unknown
+  marker's message (`unknown: stale completion reported '<summary>'`),
   so the evidence §9.1 requires survives for manual
   reconciliation while the hold is preserved. `dropRetaining` gains one parameter — `summary: String?`, threaded from `checkStale`'s discarded `EffectOutcome` — used ONLY for the marker message, never for certification. Cancel paths
   cannot consult the executor either: the actor runs one
@@ -981,6 +996,8 @@ NOT non-goals.)
 - REV14 (this revision): executor-handled cancellation as PRIMARY path with gate determinism + actor synthesis demoted to explicit fallback (both tested); `dropRetaining` summary param with honest framing (no structured outcome, summary string only for the marker) + mixed-cancel same-IDs test + stale-completion test migration note; `started: Bool?` with full precedence incl. success-wins + CancellationError/omission legs; per-call intent+result `mutating` with derivation stated + mixed-batch reopen test; batch-level lock with mixed-batch rule (failing call done-failed, rest unstarted-cancelled) + mixed lock leg; session-listing seam with all conformances + reconcile-throw trips gate + recorded acknowledgment + no-consumption + cross-workspace + exit-3 justification + bootstrapping legs; ApprovalRequest.protectedPaths + describe/enterAuthorising; --trusted carve-out; explicit abandon/reconcile rejection with rationale (single in-flight slot, async boundary, fail-closed); B1 mixed-case wording; §7 cleanup; citations corrected to 1289/1301–1306/1443.
 - REV14 → deepseek-reviewer: NEEDS-EVIDENCE (7 findings: cancel/stale path never-dispatched marking + queued-batch test + dropRetaining outcome threading + transcript rule; N2 gate seam/record/cross-workspace/exit-code; CancellationError primary-vs-fallback + started precedence/default/validation; per-call result mutating derivation; lock granularity mixed case; missing legs incl. post-commit-timeout; §7/§8/citation accuracy).
 - REV15 (this revision): cancel/stale paths keep unknown markers for mutating calls only (honest: no executor consult possible; single in-flight slot verified in actor source) with the summary string threaded through an explicit `summary: String?` param; executor-handled cancellation as the primary path (deterministic via gated test double) with actor synthesis as documented fail-closed fallback; dropRetaining outcome-free-as-certifier (summary string only); mixed-cancel + no-transcript tests with same-IDs; started precedence incl. success-wins + omission fail-closed; per-call result mutating with mixed-batch reopen test; batch-level lock with mixed-batch rule + test; session-listing seam with all conformances + reconcile-throw trips gate + recorded acknowledgment + no-consumption + cross-workspace + bootstrapping legs (exit 3 with approval-code justification); ApprovalRequest.protectedPaths + describe + enterAuthorising; --trusted carve-out; explicit abandon/reconcile rejection; citations corrected to 1289/1301–1306/1443; `performedEffects` appears only as an explicit rejection.
-- REV15 → deepseek-reviewer: _pending_.
+- REV15 → deepseek-reviewer: NEEDS-EVIDENCE (7 findings: cancel/stale never-dispatched marking + queued-batch test + dropRetaining outcome threading + transcript rule scope; N2 gate seam/record/cross-workspace/exit-code; CancellationError primary-vs-fallback + started precedence/default/validation; per-call result mutating derivation; lock granularity mixed case; missing legs incl. post-commit-timeout; §7/§8/citation accuracy).
+- REV16 (this revision): two-path cancellation made explicit (executor-handled primary via gated scripted test + kill-switch fallback with race analysis showing either order is fail-closed); `dropRetaining` takes ONLY a human-readable summary (no structured outcome) with same-operationIDs pairing test + non-mutating absent; transcript rule scoped to executor paths (cancel/stale emit records only); session-listing seam with full conformance list (GRDB/InMemory/EphemeralStore/CLIStore/test doubles) + reconcile-throw trips gate (fail-closed); recorded acknowledgment with determination + no-consumption rule + cross-workspace tests; exit 3 with approval-code justification; per-call result `mutating` replacing batch `completedMutating` + mixed-batch reopen test; batch-level lock with mixed-batch rule (failing call done-failed, rest unstarted-cancelled); ApprovalRequest.protectedPaths + describe + enterAuthorising; --trusted carve-out; explicit abandon/reconcile rejection; citations corrected; B4/B5 test lists completed (mixed-cancel same-IDs, started-omission, success-wins, CancellationError both paths, stale-completion, post-commit, mixed lock, no-entry, pre-dispatch typed/untyped, bootstrapping, non-mutating).
+- REV16 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
