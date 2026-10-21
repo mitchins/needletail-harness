@@ -1918,6 +1918,15 @@ NOT non-goals.)
   redaction alongside `operationID`/`operationIDs`/`error`/
   `outcome`; plus prior durable supersession last-record-wins
   + report field + codec arms.
-- REV25 → deepseek-reviewer: _pending_.
+- REV25 → deepseek-reviewer: APPROVED (verified HEAD b47ac26:
+  Kind on all 13 sites correct — only :1290 executor, others
+  provider; per-proposal mutating with mixed-batch →
+  completeCancelledPending ignoring non-mutating vs pure
+  read-only → consumedEffects; artifact_physical as committed-
+  reference ground truth with orphan scan + staged removal;
+  SessionExport allowlist includes effectID; Operation-
+  Reconciliation field correct; non-blocking note: §3 line 254
+  "only liveReservations" omits consumedEffects at :416 — lines
+  326–330 correctly rely on it).
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
