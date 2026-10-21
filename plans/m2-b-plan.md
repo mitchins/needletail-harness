@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV16, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV17, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -123,10 +123,14 @@ per batch, calls executed sequentially in order):
   reducer treats nil as true (fail-closed); an explicit
   omission leg pins this. Reducer precedence, in order: (1) deterministic
   statuses (success/no-match/denied/conflict/invalid-arguments/
-  failed, plus actor-synthesized pre-dispatch receipts) → `.done`,
-  no hold, REGARDLESS of `started` (a claimed result proves
-  dispatch; `success` + `started == false` is contradictory input
-  and is recorded done — tested explicitly); (2) cancelled/
+  failed, plus actor-synthesized pre-dispatch receipts) with
+  `started != false` → `.done`, no hold, REGARDLESS of omission
+  (a claimed result with no contrary bit proves dispatch); a
+  deterministic status WITH `started == false` is contradictory
+  input (claims a result for a call it also claims never ran) →
+  fail closed: mutating `.unknown` + marker + hold,
+  non-mutating transcript-only — tested explicitly as a
+  wrong-input leg; (2) cancelled/
   timeout + `started == false` → done-cancelled receipt, no hold,
   for mutating AND non-mutating alike; (3) cancelled/timeout +
   `started == true` OR started-field omitted (default true,
@@ -209,16 +213,22 @@ per batch, calls executed sequentially in order):
   precedent). Two cancellation sub-paths, distinguished by who
   reports first: (a) the executor ITSELF catches cancellation
   (primary path) — it reports per-call outcomes through the
-  normal `completeEffect` path with truthful `started` flags,
-  and the reducer maps them exactly like any completed batch
-  (started unstarted calls → done-cancelled, no hold);
-  deterministic in tests by blocking a scripted executor
-  mid-batch on a gate, then cancelling; (b) an external
-  `cancelRequested` arrives while the executor is unresponsive
-  (kill-switch path) — `cancelActive` marks all live mutating
-  calls unknown+hold, and any late executor report is dropped
-  against the already-written markers (safe direction: the
-  markers subsume whatever truth arrives late). EITHER order
+  normal `completeEffect` path with truthful `started` flags
+  while the reservation is still live (no external
+  `cancelRequested` consumed: the executor's own
+  deadline/timeout catch, or the gated scripted test calling
+  `completeEffect` directly), and the reducer maps them exactly
+  like any completed batch (started unstarted calls →
+  done-cancelled, no hold); deterministic in tests by blocking a
+  scripted executor mid-batch on a gate, then cancelling; (b) an
+  external `cancelRequested` arrives while the executor is
+  unresponsive (kill-switch path) — `cancelActive` marks all
+  live mutating calls unknown+hold AND retains the reservations
+  as cancelled-pending (REQUIRED change above), so a late
+  executor report replaces markers ONLY for `started == false`
+  entries; late started/uncertain entries stay dropped against
+  the already-written markers (safe direction: the markers
+  subsume whatever uncertain truth arrives late). EITHER order
   is fail-closed: per-call truth where available, unknown+hold
   otherwise — never silent continuation and never a false
   done. `dropRetaining` takes NO structured outcome (stale
@@ -228,16 +238,35 @@ per batch, calls executed sequentially in order):
   human-readable summary string and embeds it in each unknown
   marker's message (`unknown: stale completion reported '<summary>'`),
   so the evidence §9.1 requires survives for manual
-  reconciliation while the hold is preserved. `dropRetaining` gains one parameter — `summary: String?`, threaded from `checkStale`'s discarded `EffectOutcome` — used ONLY for the marker message, never for certification. Cancel paths
+  reconciliation while the hold is preserved. `dropRetaining` gains one parameter — `summary: String?`, threaded from `checkStale`'s discarded outcome — used ONLY for the marker message, never for certification. For `effectCompleted` the summary is the `EffectOutcome` payload string; for `effectFailed` it is the carried `error: String` (SessionEvent.swift:32) — a stale-failed leg pins the error-threaded marker. Cancel paths
   cannot consult the executor either: the actor runs one
   in-flight effect at a time and a new `reserveEffect` cancels
   the previous task, so every live reservation at cancel time is
   in-flight or was killed mid-flight — genuinely uncertain →
   existing unknown path (consistent with pre-existing crash
-  semantics: intent without result reconciles unknown). A late
-  per-call result arriving after cancel is dropped at
-  `completeEffect` against already-written unknown markers for
-  the same operationIDs — no evidence lost. No
+  semantics: intent without result reconciles unknown). REQUIRED
+  actor change (current code cannot deliver the primary path:
+  `cancel()` applies `.cancelRequested` before cancelling the
+  task — SessionActor.swift:122–125; `apply` runs `cancelActive`
+  which writes unknown markers, clears ALL reservations and
+  cancels the task — SessionActor.swift:240–250,
+  SessionTransition.swift:1435–1459; `completeEffect` drops any
+  outcome whose effectID is no longer reserved —
+  SessionActor.swift:494–500): `cancelActive` writes the
+  unknown markers but RETAINS the cancelled reservations
+  (flagged cancelled-pending; the generation bump already
+  prevents any new dispatch on them) until the executor reports
+  or the in-flight task actually terminates. `completeEffect`
+  for a cancelled-pending reservation accepts late per-call
+  outcomes and REPLACES markers only for entries the executor
+  attests never-dispatched (`started == false` → done-cancelled,
+  marker removed — provably no side effect); late entries with
+  `started == true` or omitted keep their markers (an executor
+  killed mid-flight cannot certify post-cancel knowledge).
+  A late per-call result arriving after cancel for a
+  started/uncertain call is still dropped at `completeEffect`
+  against already-written unknown markers for the same
+  operationIDs — no evidence lost, no false done. No
   `performedEffects` mechanism is specified — the actor has no
   per-call start visibility inside one `execute(batch)` call,
   and effect-granular marking would lie in both directions.
@@ -311,8 +340,15 @@ per batch, calls executed sequentially in order):
 ### B1 — containment, strict args, grants, lock (TOOL-07, PORT-03)
 - Seams: `WorkspaceRoot` + new Runtime resolver: open workspace +
   read roots as directory fds at startup (O_DIRECTORY|O_NOFOLLOW),
-  pin device/inode, verify identity (fstat) on each use; symlink
-  root → reject with message (use the real path).
+  pin device/inode. Every traversal RE-OPENS the configured root
+  path (O_DIRECTORY|O_NOFOLLOW), fstats the fresh fd, and
+  compares dev/ino to the pinned identity — mismatch (root
+  replaced, symlink-swapped) → fail closed before any descent —
+  then traverses from the freshly validated fd (never the stale
+  pinned fd, never string-prefix checks, never
+  realpath-then-unguarded-open). Symlink root → the re-open
+  with O_NOFOLLOW fails / identity mismatches → reject with
+  message (use the real path).
   Descriptor-relative no-follow traversal (FileDescriptor/openat
   chain on keyed dir fds; Glibc-direct fallback — the openat
   layer itself is NEW B1 code, reviewed in the B1 slice, not
@@ -328,14 +364,27 @@ per batch, calls executed sequentially in order):
   ONLY via explicit per-batch operator approval with the paths
   enumerated in the approval description: `.git`, `.env`
   variants, `.ssh` (SPEC §8.1: explicit user grants suffice).
-  Mechanism: `ApprovalRequest` gains `protectedPaths: [String]`
-  (default `[]`, backward compatible); `enterAuthorising`
-  populates it from the validated batch paths; `describe(batch)`
-  lists them; the gateway shows the list and the operator's
+  Mechanism: new pure Core validator
+  `validateBatchArguments(batch:) -> [ValidatedToolCall]` (tool
+  name + extracted paths + op class per call; throws
+  `ToolFailure.preDispatch` on malformed args — PRE-side-effect,
+  so no FS touch precedes it). `enterAuthorising` runs it BEFORE
+  building the request: validation failure → deterministic
+  per-call done receipts preserving the SPEC status (B4 throw
+  policy), never a generic authorising crash. `ApprovalRequest`
+  gains `protectedPaths: [String]` (default `[]`, backward
+  compatible); `enterAuthorising` populates it from the
+  VALIDATED paths ∩ the protected set (validation, not a model
+  flag, decides what is listed); `describe(batch:)` is
+  re-specified as pure formatting over the same validated calls
+  (a formatting failure falls back to tool names only — never a
+  denial bypass); the gateway shows the list and the operator's
   approve covers exactly the listed paths (unlisted protected
   paths stay denied — tested: approved batch with listed path
   proceeds, unlisted protected path in the same batch is
-  denied). The fixed-argv harness `git`/`rg` subprocesses are
+  denied). Transition-level approval test: a batch naming a
+  grantable protected path yields a request whose
+  `protectedPaths` names it. The fixed-argv harness `git`/`rg` subprocesses are
   NOT native reads — they never traverse the containment
   boundary (see B2/B5 carve-outs), so B5's diff does not need
   a grant.
@@ -411,10 +460,14 @@ per batch, calls executed sequentially in order):
   `--hidden`, bounded globs, result limit, `--` separator; ignore
   files honored as user exclusions); env scrubbed
   (`RIPGREP_CONFIG_PATH` et al. removed); no `--pre`, no model
-  flags, no symlink-follow outside root; `rg --files` for
-  discovery (empties listed, never read). Hits are post-filtered
-  through the B1 protected-path predicate (deny globs — rg output
-  never bypasses the boundary). Continuations are single-session:
+  flags, no symlink-follow outside root; harness-owned deny
+  globs are part of the FIXED argv (`--glob '!**/.git/**'`,
+  `--glob '!**/.env*'`, `--glob '!**/.ssh/**'` — rg itself
+  never descends into them, so filtering is by non-traversal,
+  not post-filtering); `rg --files` for
+  discovery (empties listed, never read). Hits are additionally
+  post-filtered through the B1 protected-path predicate (deny
+  globs — rg output never bypasses the boundary). Continuations are single-session:
   opaque token (query hash + offset + result-hash prefix); resume
   re-executes and prefix-verifies, else restarted-label (no
   stable-offset fiction, no stale reads).
@@ -424,6 +477,12 @@ per batch, calls executed sequentially in order):
   PATH — must be ignored), shim-`rg` shadowing leg, symlink-out
   leg, `.git`-hit exclusion leg, missing/too-old-rg fail-closed
   legs; `TOOL_11_…` cross-session denial + same-session allow.
+  Non-traversal proof legs (rg never OPENS protected paths, not
+  merely hides hits): argv-capture test asserting the fixed argv
+  contains the deny globs for every search invocation; sentinel
+  test with a `chmod 000` file inside `.git/` — the search
+  completes with no permission error mentioning the sentinel
+  (opening it would fail loudly), proving rg never descended.
 - Counterfactuals: ambient-config inheritance (must fail TOOL-03);
   model-flag passthrough (must fail); PATH-shim execution (must
   fail); unfiltered `.git` hit (must fail); artifact-ID-as-
@@ -452,17 +511,33 @@ per batch, calls executed sequentially in order):
   `publishArtifact` (32 MiB cap). Zero-byte originals: hash-only
   receipt (sha256-empty is constant), no empty publish. Order
   under the lock: re-read/hash → preflight byte-quota check
-  (fail fast, nothing written) → publish preimage → on reference-
-  commit failure delete the just-written bytes (best-effort) →
+  (fail fast, nothing written) → publish preimage (which reports
+  whether this call created a NEW file or reused deduped bytes)
+  → on reference-commit failure delete the just-written bytes
+  ONLY when this call created them (dedup-reused bytes are never
+  deleted — another session's reference may own them; tracked by
+  an explicit `createdNewFile` bool from publish, best-effort) →
   rename → receipt. Crash between publish and cleanup can orphan
   bytes — explicitly allowed (SPEC §9), documented, not tested
   as impossible. Pre-publish free-space check: refuse (denied
   result, not a crash) when the artifact filesystem has less
-  than the SPEC §9.2 256 MiB reserve.
+  than the SPEC §9.2 256 MiB reserve. Dedup/reference tests: two
+  sessions publish identical bytes → second session's
+  reference-commit failure must leave the first session's bytes
+  and reference intact (no cross-session deletion).
 - Byte quotas (new store accounting, in the existing mutation
   transaction — same fail-closed shape as count quotas):
   1 GiB session / 5 GiB global over records + artifacts +
-  preimages.
+  preimages. Schema (new, explicit): `byte_usage(session TEXT
+  PRIMARY KEY, bytes INTEGER NOT NULL)` added to the store's
+  declared shape + migration (additive — old binaries ignore the
+  table; new binaries create it); preflight computes this call's
+  new bytes (dedup-aware: bytes whose digest the publishing
+  session already references count zero) and the check +
+  increment run inside the SAME write transaction as the
+  reference insert (publishArtifact's existing `queue.write`
+  block); orphan bytes count until the orphan scan GCs them
+  (documented over-count direction: fail-closed).
 - Tests: `TOOL_04_…` zero/one/multiple/empty legs;
   `TOOL_05_…` injected change between read and commit → conflict
   receipt, file untouched, no preimage; `TOOL_06_…` CRLF/no-final-
@@ -537,20 +612,31 @@ per batch, calls executed sequentially in order):
   untyped-throw leg (mutating unknown+hold); started-omission
   leg (executor omits `started` on a cancelled call → treated as
   true → unknown+hold for mutating); success-with-started-false
-  leg (contradictory input → done: claimed results prove
-  dispatch); executor-handled-cancellation leg (scripted
-  executor blocks on A via gate, cancel arrives, executor
+  leg (contradictory input → fail closed: mutating unknown+hold,
+  non-mutating transcript-only — a result for a call claimed
+  never-run proves nothing); executor-handled-cancellation leg (scripted
+  executor blocks on A via gate, its own deadline fires, executor
   catches and reports A started/cancelled + B unstarted-cancelled
-  → A unknown+hold, B done-cancelled with NO hold — the queued
-  never-dispatched case, deterministic via the gate);
+  through `completeEffect` with the reservation still live (no
+  external `cancelRequested` consumed) → A unknown+hold, B
+  done-cancelled with NO hold — the queued never-dispatched
+  case, deterministic via the gate);
   propagated-CancellationError leg (executor rethrows mid-batch
   → actor synthesizes started-cancelled for all → mutating
   unknown+hold); mixed-cancel leg (cancel-during-flight on a
   mixed batch → mutating unknown+hold with the SAME operationIDs
   as the dispatched intents, non-mutating absent — no transcript
-  from cancel/stale paths); stale-completion leg (superseded
-  generation: stale per-call outcomes are never trusted as
-  current-run done → mutating markers carrying the stale summary (existing tests asserting bare `"unknown"` markers are updated to the `unknown: stale completion reported '<summary>'` form — deliberate RED/GREEN migration),   non-mutating absent); post-commit-failure leg (write
+  from cancel/stale paths); late-unstarted-replacement leg
+  (cancel writes markers, then the executor's late report
+  attests one call `started == false` + one `started == true` →
+  the unstarted marker is REPLACED by done-cancelled, the
+  started marker stands — proves retention, not clearing);
+  stale-completion leg (superseded generation: stale per-call
+  outcomes are never trusted as current-run done → mutating
+  markers carrying the stale summary (existing tests asserting bare `"unknown"` markers are updated to the `unknown: stale completion reported '<summary>'` form — deliberate RED/GREEN migration), non-mutating absent); stale-failed leg
+  (superseded generation `effectFailed`: the carried error string
+  threads into the marker message the same way, non-mutating
+  absent); post-commit-failure leg (write
   applied then timeout reported → unknown+hold despite the
   successful write: conservative and tested); mixed-batch lock
   contention leg ([read A ok, write B lock-fails, read C] → A
@@ -576,7 +662,12 @@ per batch, calls executed sequentially in order):
   covered by a test) + absolute pinned `git` (same provisioning
   model as rg). Dirty worktree supported natively; output bounded
   into artifacts. TOOL_10_ native + binary legs incl.
-  `diff.external` and textconv-driver cases.
+  `diff.external` and textconv-driver cases. Missing git
+  (DEPENDENCIES.md:44 — git-specific features disable with a clear
+  explanation): when the absolute pin is absent/unexecutable, diff
+  → denied result explaining git is unavailable (not a crash,
+  not silent); all non-git tools unaffected — a dedicated leg
+  with git removed from PATH pins this.
 - Advertisement: harness-owned strict JSON Schema tool
   definitions for read/search/edit/write (exact-schema tests);
   config reservation stands (harness injects, config never
@@ -590,6 +681,30 @@ per batch, calls executed sequentially in order):
   + mutating batch → prompt). A read-only composition (read/search
   only, no mutating tools) is allowed with `--read-root` alone. `--workspace` + `--trusted` conflict → reject
   (exit 2). Headless → unavailable → exit 3 (existing path).
+  Composition seam (named, current code has none: `RunCommand`
+  hard-codes `ScriptedToolBackend` + `HeadlessApprovals` at
+  552–560 while `ToolExecutor.execute`/`EffectReservation` carry
+  no session/store/writer — SessionTransition.swift:62–79,
+  125–129 — yet `publishArtifact` requires a session and
+  `WriterIdentity` — GRDBSessionStore.swift:596–599): new
+  `FileToolRuntime` enum (`scripted(ScriptedToolBackend)` |
+  `native(NativeToolExecutor)`) + `NativeToolExecutor` struct
+  capturing the claimed session, store writer identity, artifact
+  publisher closure, and workspace resolver at construction.
+  Construction order (after `claimWriterOwnership`, before actor
+  init): select runtime by flags (`--workspace` without
+  `--trusted` → native; `--trusted` without `--workspace` →
+  scripted; neither → scripted with file caps denied; both →
+  exit 2) → construct the chosen executor with the claimed
+  identity → inject into the generic `SessionActor`
+  (already generic over Executor/Approvals —
+  SessionActor.swift:28). Preimage reads obtain the fenced writer
+  from the same claimed identity. Composition tests (binary
+  legs): flag-selection matrix (`--workspace` composes native,
+  `--trusted` composes scripted with zero real mutations,
+  both → exit 2, neither → mutating denied); construction-order
+  test (native executor holds the claimed writer identity —
+  artifact publish under a foreign session fails).
   Grant derivation: file caps ON as build.allAllowed ∩ userConfig
   (must opt in — defaults false) ∩ workspace-designated;
   exec/consult denied even with `--workspace` (denial test).
@@ -821,7 +936,9 @@ NOT non-goals.)
   `observed_at_seq` deviation flagged with SPEC reference +
   amendment proposal; WIRE-05 cite replaced by SPEC §7.2:336;
   hardlink behavior leg (treated as regular file).
-  SUPERSEDED before review: `performedEffects` is unimplementable
+  SUPERSEDED before the REV6 review (sub-proposal withdrawn, not
+  the whole revision — the revision itself WAS reviewed, next
+  line): `performedEffects` is unimplementable
   as specified (actor has no per-call start visibility in one
   `execute(batch)`; no dispatch-truth mechanism exists for
   cancel/stale paths).
@@ -998,6 +1115,39 @@ NOT non-goals.)
 - REV15 (this revision): cancel/stale paths keep unknown markers for mutating calls only (honest: no executor consult possible; single in-flight slot verified in actor source) with the summary string threaded through an explicit `summary: String?` param; executor-handled cancellation as the primary path (deterministic via gated test double) with actor synthesis as documented fail-closed fallback; dropRetaining outcome-free-as-certifier (summary string only); mixed-cancel + no-transcript tests with same-IDs; started precedence incl. success-wins + omission fail-closed; per-call result mutating with mixed-batch reopen test; batch-level lock with mixed-batch rule + test; session-listing seam with all conformances + reconcile-throw trips gate + recorded acknowledgment + no-consumption + cross-workspace + bootstrapping legs (exit 3 with approval-code justification); ApprovalRequest.protectedPaths + describe + enterAuthorising; --trusted carve-out; explicit abandon/reconcile rejection; citations corrected to 1289/1301–1306/1443; `performedEffects` appears only as an explicit rejection.
 - REV15 → deepseek-reviewer: NEEDS-EVIDENCE (7 findings: cancel/stale never-dispatched marking + queued-batch test + dropRetaining outcome threading + transcript rule scope; N2 gate seam/record/cross-workspace/exit-code; CancellationError primary-vs-fallback + started precedence/default/validation; per-call result mutating derivation; lock granularity mixed case; missing legs incl. post-commit-timeout; §7/§8/citation accuracy).
 - REV16 (this revision): two-path cancellation made explicit (executor-handled primary via gated scripted test + kill-switch fallback with race analysis showing either order is fail-closed); `dropRetaining` takes ONLY a human-readable summary (no structured outcome) with same-operationIDs pairing test + non-mutating absent; transcript rule scoped to executor paths (cancel/stale emit records only); session-listing seam with full conformance list (GRDB/InMemory/EphemeralStore/CLIStore/test doubles) + reconcile-throw trips gate (fail-closed); recorded acknowledgment with determination + no-consumption rule + cross-workspace tests; exit 3 with approval-code justification; per-call result `mutating` replacing batch `completedMutating` + mixed-batch reopen test; batch-level lock with mixed-batch rule (failing call done-failed, rest unstarted-cancelled); ApprovalRequest.protectedPaths + describe + enterAuthorising; --trusted carve-out; explicit abandon/reconcile rejection; citations corrected; B4/B5 test lists completed (mixed-cancel same-IDs, started-omission, success-wins, CancellationError both paths, stale-completion, post-commit, mixed lock, no-entry, pre-dispatch typed/untyped, bootstrapping, non-mutating).
-- REV16 → deepseek-reviewer: _pending_.
+- REV16 → deepseek-reviewer: NEEDS-EVIDENCE (11 findings:
+  actor ordering blocks primary path; no runtime composition
+  seam/executor injection; protectedPaths uncomputable at
+  authorising; success+started-false recorded executed; rg
+  post-filter does not prevent opens; root-swap test impossible
+  on pinned fd; cleanup can delete shared dedup bytes; byte
+  quota has no schema; stale effectFailed has no summary source;
+  missing-git behavior uncovered; REV6 history contradiction).
+- REV17 (this revision): REQUIRED actor change — `cancelActive`
+  writes markers but RETAINS cancelled-pending reservations
+  (generation bump still blocks dispatch); `completeEffect`
+  replaces markers ONLY for late `started == false` entries
+  (started/omitted late reports stay dropped); primary path
+  re-scoped to still-reserved effects (executor's own
+  deadline/timeout catch, gated scripted test) + kill-switch
+  retention semantics + late-unstarted-replacement leg; §3
+  precedence (1) keys on `started != false`, contradictory
+  success+started-false fails closed (wrong-input leg); pure
+  Core `validateBatchArguments` consumed by `enterAuthorising`
+  before request construction + `describe` re-specified as
+  validated formatting + transition-level approval test; fixed
+  rg argv gains harness-owned deny globs (non-traversal) +
+  argv-capture + 000-sentinel non-open proofs; root traversal
+  RE-OPENS and revalidates dev/ino per use, traverses from the
+  fresh fd; preimage cleanup only when `createdNewFile` is true
+  + cross-session dedup tests; `byte_usage(session PK, bytes)`
+  schema + migration + same-transaction preflight + dedup-aware
+  counting + orphan over-count documented; stale-failed summary
+  = carried error string + stale-failed leg; missing-git denial
+  leg (TOOL-10); named `FileToolRuntime` enum +
+  `NativeToolExecutor` (session/store/writer/artifact/resolver
+  captured post-claim) + flag-selection matrix + construction-
+  order tests; REV6 note clarified to sub-proposal withdrawal.
+- REV17 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
