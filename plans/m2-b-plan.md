@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV7, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV8, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -112,12 +112,24 @@ per batch, calls executed sequentially in order):
   hashes, per B4 below). `started: Bool = true` is the
   machine-readable dispatch bit (the executor sets false for
   never-dispatched calls; the reducer keys on IT, never on
-  summary prose): `started == false` → done-cancelled receipt,
-  no hold, for mutating AND non-mutating alike. `failed` is
-  ALWAYS deterministic pre-commit (the executor must never
-  report post-commit uncertainty as `failed`; uncertain
-  post-commit outcomes are `timeout`/`cancelled` with
-  `started == true`). `observed_at_seq` is the durable stream position
+  summary prose). Reducer precedence, in order: (1) deterministic
+  statuses (success/no-match/denied/conflict/invalid-arguments/
+  failed, plus actor-synthesized pre-dispatch receipts) → `.done`,
+  no hold, REGARDLESS of `started` (a claimed result proves
+  dispatch; `success` + `started == false` is contradictory input
+  and is recorded done — tested explicitly); (2) cancelled/
+  timeout + `started == false` → done-cancelled receipt, no hold,
+  for mutating AND non-mutating alike; (3) cancelled/timeout +
+  `started == true` OR started-field omitted (default true,
+  fail-closed) → mutating: `.unknown` + marker + hold;
+  non-mutating: transcript-only. `failed` is ALWAYS deterministic
+  pre-commit (the executor must never report post-commit
+  uncertainty as `failed`; uncertain post-commit outcomes are
+  `timeout`/`cancelled` with `started == true`). The actor
+  never silently drops `CancellationError`: it synthesizes
+  per-call cancelled outcomes with `started == true` for every
+  proposal in the batch (fail-closed: unknown+hold for mutating),
+  since a cancelled task may have dispatched. `observed_at_seq` is the durable stream position
   (implicit in stream order), NOT a separate field: the executor
   stamps status/summary/data/artifact/truncation/warnings/error;
   sequencing is the reducer's stream order. FLAGGED DEVIATION
@@ -165,23 +177,32 @@ per batch, calls executed sequentially in order):
   uncertain: same row. (`failed` is ALWAYS deterministic
   pre-commit — the executor must never report post-commit
   uncertainty as `failed`; uncertain post-commit outcomes are
-  `timeout`/`cancelled` with `started == true`.) Cancel path and stale-retention
-  (`dropRetaining`) split per proposal the same way (extending
-  the existing mutating-only `cancelActive` precedent).
-  `dropRetaining` receives only an effectID — no outcome exists
-  to classify (the completion was never recorded) — so its
-  unknown stands honestly. Cancel paths cannot consult the
-  executor either: a kill lands at an arbitrary point, so a
-  cancelled-or-stale mutating call is genuinely uncertain →
-  existing unknown path (consistent with pre-existing crash
-  semantics: intent without result reconciles unknown). No
-  `performedEffects` mechanism is specified — the actor has no
-  per-call start visibility inside one `execute(batch)` call,
-  and effect-granular marking would lie in both directions.
-  The empty-proposals fallback keeps reservation-level
-  classification (no proposals to classify — documented).
-  Test: cancel-during-flight → mutating unknown+hold (existing
-  semantics, pinned).
+  `timeout`/`cancelled` with `started == true`.) Cancel path and
+  stale-retention (`dropRetaining`) split per proposal the same
+  way (extending the existing mutating-only `cancelActive`
+  precedent). `dropRetaining` signatures stay outcome-free on
+  purpose: `checkStale` DISCARDS the carried `EffectOutcome`
+  (SessionTransition.swift:414–425) because stale content must
+  never certify the current run — a superseded generation's
+  results cannot pair with live intents — so its unknown stands
+  honestly, and per-proposal mutating (not the carried outcome)
+  decides marker vs transcript-only. Cancel paths cannot consult
+  the executor either: the actor runs one in-flight effect at a
+  time and a new `reserveEffect` cancels the previous task, so
+  every live reservation at cancel time is in-flight or was
+  killed mid-flight — genuinely uncertain → existing unknown
+  path (consistent with pre-existing crash semantics: intent
+  without result reconciles unknown). A late per-call result
+  arriving after cancel is dropped at `completeEffect` against
+  already-written unknown markers for the same operationIDs —
+  no evidence lost. No `performedEffects` mechanism is specified
+  — the actor has no per-call start visibility inside one
+  `execute(batch)` call, and effect-granular marking would lie
+  in both directions. The empty-proposals fallback keeps
+  reservation-level classification (no proposals to classify —
+  documented). Tests: cancel-during-flight → mutating
+  unknown+hold AND non-mutating transcript-only (existing
+  semantics + per-call split, pinned).
   NEVER-DISPATCHED is not unknown (R4 finding — a provably
   unexecuted call must not claim unknowability, and an unexitable
   hold would brick the session with no reconcile command
@@ -205,13 +226,14 @@ per batch, calls executed sequentially in order):
   normative example stands as specified behavior: [A ok, B
   conflict, C unstarted-cancelled-done] with C never dispatched —
   pinned by TOOL-09 tests.
-- Transcript rule (SPEC §7.2:336 — every executed batch's
-  proposals are evidenced): EVERY proposal in an executed batch
-  gets a transcript `toolResponse` in order, including calls with
-  no `operationResult` (evidence ≠ state claim; the stale-
-  retention path emits records only, unchanged and out of scope).
-  Order-preservation is observed via transcript order + log scan
-  (present done/failure receipts, explicit unstarted entries,
+- Transcript rule (SPEC §7.2: a tool call is never cut away from
+  its result — COMPLETE-SPEC.md:336): EVERY proposal in an
+  executed batch gets a transcript `toolResponse` in order,
+  including calls with no `operationResult` (evidence ≠ state
+  claim; the stale-retention path emits records only, unchanged
+  and out of scope). Order-preservation is observed via
+  transcript order + log scan (present done/failure receipts,
+  explicit unstarted entries,
   absent operationResult exactly for non-mutating unknown).
 - Rerun claim, scoped honestly: receipts stand durably and no
   fake atomicity is claimed; re-proposal is operator/model-driven
@@ -369,7 +391,9 @@ per batch, calls executed sequentially in order):
   commit failure delete the just-written bytes (best-effort) →
   rename → receipt. Crash between publish and cleanup can orphan
   bytes — explicitly allowed (SPEC §9), documented, not tested
-  as impossible.
+  as impossible. Pre-publish free-space check: refuse (denied
+  result, not a crash) when the artifact filesystem has less
+  than the SPEC §9.2 256 MiB reserve.
 - Byte quotas (new store accounting, in the existing mutation
   transaction — same fail-closed shape as count quotas):
   1 GiB session / 5 GiB global over records + artifacts +
@@ -381,7 +405,8 @@ per batch, calls executed sequentially in order):
   preservation leg; `TOOL_08_…` exists-refusal + stale-hash legs;
   quota legs (preflight over-quota → fail closed, nothing
   written; ref-commit failure → bytes cleaned up, nothing
-  renamed).
+  renamed; sub-reserve free space → denied receipt, never a
+  crash).
 - Counterfactuals: fuzzy matcher (must fail TOOL-04);
   normalization shim (must fail TOOL-06); deterministically gated
   lock-removal interleave (must lose-update without the lock,
@@ -415,15 +440,18 @@ per batch, calls executed sequentially in order):
   synthesizes per-call done receipts preserving status; any other
   throw → mutating unknown+hold / non-mutating transcript-only.
   Post-dispatch never throws. Lock contention (B1 lock) is a
-  deterministic pre-commit failure of the whole batch → every
-  proposal `failed` (acquisition is batch-level, before any
-  mutation), never unknown. Migration (delib-
-  erate, RED/GREEN): per-proposal intent `mutating` (replacing the
-  batch-wide flag), per-call cancel split (extending the mutating-
-  only precedent; empty-proposals fallback unchanged),
-  `dropRetaining` per-proposal split; existing actor tests that
-  assert all-mutating intents are updated to per-tool
-  expectations.
+  deterministic pre-commit failure → every not-yet-dispatched
+  proposal `failed` (already-completed calls stand; acquisition
+  is batch-level, before the first mutating call), never unknown.
+  Migration (delib-
+  erate, RED/GREEN): per-proposal intent `mutating` AND per-call
+  result `mutating` (both replace their batch-wide flags, so
+  intent/result agreement holds per call — verified by a mixed
+  edit+read batch reopened natively: reconcile passes), per-call
+  cancel split (extending the mutating-only precedent;
+  empty-proposals fallback unchanged), `dropRetaining` per-proposal
+  split; existing actor tests that assert all-mutating intents
+  (e.g. edit+read batches) are updated to per-tool expectations.
 - Tests: `TOOL_09_…` second-file-fails matrix (edit + write mixes);
   prior-success-survives leg; unstarted leg (mutating C AND
   non-mutating C variants: done-cancelled with `started == false`,
@@ -440,7 +468,19 @@ per batch, calls executed sequentially in order):
   pre-dispatch invalid-arguments leg (all done-invalid, status
   preserved); pre-dispatch failed leg (workspace-unusable/
   lock-broken fixture → all done-failed); pre-dispatch
-  untyped-throw leg (mutating unknown+hold).
+  untyped-throw leg (mutating unknown+hold); started-omission
+  leg (executor omits `started` on a cancelled call → treated as
+  true → unknown+hold for mutating); success-with-started-false
+  leg (contradictory input → done: claimed results prove
+  dispatch); CancellationError leg (executors throws mid-batch
+  → actor synthesizes started-cancelled for all → mutating
+  unknown+hold); stale-completion leg (superseded generation with
+  per-call outcomes → classified per call, never trusted as
+  current-run done receipts); post-commit-failure leg (write
+  applied then timeout reported → unknown+hold despite the
+  successful write: conservative and tested); mixed-batch lock
+  contention leg ([read A ok, write B lock-fails] → A done stands,
+  B+ done-failed, no hold).
 - Counterfactuals: aggregate-receipt shim (must fail TOOL-09);
   unstarted-marked-unknown (must fail — no false unknowability);
   unknown auto-retry (must fail — second dispatch without
@@ -482,15 +522,26 @@ per batch, calls executed sequentially in order):
 - Cross-run unknown guard (SPEC §9.1: mutating continuation after
   unresolved outcomes requires an explicit decision — answered
   across runs, not in-session): on startup with mutating grants,
-  the CLI queries the state store for ANY session with unresolved
-  MUTATING markers; if found and `--acknowledge-unresolved-
-  outcomes` is absent → fail closed (exit 2) naming the
-  sessions and pointing at `needletail session export` for
-  audit. The flag is per-invocation, never persisted; it records
-  the operator's explicit decision, not an auto-retry. Tests:
-  seeded store with unresolved markers → blocked without the
-  flag (exit 2, names sessions); proceeds with the flag;
-  no-marker store → unaffected.
+  the CLI runs the existing `reconcileOperations` classifier over
+  every session's durable stream in the state store (read-only,
+  same mechanism as `session export`; no new store API beyond a
+  session-listing query — sessions have no workspace binding, so
+  the gate is per-state-store, documented as such); any session
+  with held operations or unmatched mutating intents trips the
+  gate. Without `--acknowledge-unresolved-outcomes` → fail closed
+  (exit 2: operator-decision-required, like missing HOME — NOT
+  exit 4, since no run/ambiguous delivery occurred), naming the
+  sessions and pointing at `needletail session export` for audit.
+  With the flag → append an `eventAppended` acknowledgment record
+  to the NEW session citing the prior session IDs (durable,
+  auditable determination — the flag alone is a bypass, the
+  RECORD is the reconciliation decision), then proceed. The flag
+  is per-invocation, never persisted. Tests: seeded store with
+  unresolved markers → blocked without the flag (exit 2, names
+  sessions); proceeds with the flag AND the acknowledgment record
+  is present in the new session log; no-marker store → unaffected
+  (incl. fresh/empty store bootstrap); non-mutating-only
+  unmatched intents → no trip (re-runnable by design).
 - `--trusted` stays demo-only: scripted backend, plus an
   ImportGate-style binary test proving `--trusted` performs zero
   real FS mutations.
@@ -564,9 +615,11 @@ any merge in this planning track.
 
 ## 7. Risks
 
-- swift-system 1.8.1 descriptor API surface on Linux: verified at
-  B1 start (openat/O_NOFOLLOW known good via BoundedFileRead);
-  Glibc-direct fallback, not a new dep.
+- swift-system 1.8.1 descriptor API surface on Linux: openat
+  with O_NOFOLLOW on keyed dir fds is NEW B1 code (reviewed in
+  the B1 slice); path-based `open(O_NOFOLLOW)` per
+  `BoundedFileRead` is the existing precedent, not a proof of
+  the new traversal. Glibc-direct fallback, not a new dep.
 - Operator rg/git missing/too old/shadowed on CI: fail-closed
   legs skip loudly per BDD-04 (skip ⇒ unsatisfied), absolute
   pinning + ownership checks neuter shadowing.
@@ -576,10 +629,11 @@ any merge in this planning track.
   mutation transaction (same fail-closed shape as count quotas);
   DeepSeek reviews the store delta.
 - Mixed-batch UX: only genuine outcome uncertainty holds the queue
-  (mutating timeout/cancelled-mid-execution/failed-ambiguous/
-  no-entry/contract-violation); deterministic incompleteness
-  (conflict, denial, unstarted) completes with full per-call
-  evidence and no hold. Documented, not tuned.
+  (mutating timeout/cancelled-mid-execution/no-entry/contract-
+  violation/untyped-throw); deterministic incompleteness
+  (conflict, denial, unstarted, failed-pre-commit) completes with
+  full per-call evidence and no hold. `failed` is never an
+  uncertainty category. Documented, not tuned.
 - Review load: 19-finding rounds are expensive; slices stay small
   so each delta review covers one contract area.
 
@@ -673,6 +727,32 @@ any merge in this planning track.
   (batch-level acquisition); cancelled-mid-execution +
   non-mutating-unstarted legs added; failed-ambiguous category
   removed; openat overclaim + R3 refs fixed.
-- REV7 → deepseek-reviewer: _pending_.
+- REV7 → deepseek-reviewer: NEEDS-EVIDENCE (7 residuals:
+  cancel/stale never-dispatched marking; N2 unaddressed; no
+  machine-readable discriminator; read-root contradiction; lock
+  granularity; missing legs incl. post-commit-failure mapping;
+  citations).
+- REV8 (this revision): cancel/stale keep unknown+hold HONESTLY
+  (kill at arbitrary point, no executor consult, stale content
+  must never certify; completeEffect drops late results against
+  already-written markers — no evidence lost); N2 answered by
+  terminal-for-session + B5 startup unresolved-marker gate
+  (reconcile-per-session via existing classifier; recorded
+  acknowledgment appended to the NEW session; exit 2 with
+  justification; per-state-store scope; empty/non-mutating
+  bootstrapping legs); `started: Bool` discriminator + reducer
+  precedence (deterministic statuses win; cancelled/timeout key
+  on started; omission defaults true fail-closed) + success-with-
+  started-false + CancellationError-synthesis + started-omission
+  legs; per-class grant derivation (--read-root standalone for
+  reads); unified batch-level lock + mixed-batch contention leg;
+  cancelled-mid-execution + non-mutating-unstarted +
+  post-commit-failure (applied-then-timed-out) + stale-completion
+  legs; dropRetaining keeps outcome-free signature honestly;
+  §7 failed-ambiguous removed; openat overclaim fixed;
+  per-call result `mutating` + mixed-batch reopen + existing
+  test updates specified; free-space reserve check + leg;
+  R3 refs (1302–1306/1443/1289) verified.
+- REV8 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
