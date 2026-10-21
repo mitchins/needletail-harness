@@ -1530,30 +1530,28 @@ private func continueAfterPreDispatchFailure<I: IDSource>(_ state: SessionState,
     case .preDispatch(let s, let m): status = s; summary = m
     }
     for proposal in proposals {
-        let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .done, mutating: false)
-        // Pre-dispatch failures are always done, never hold, even for mutating (they never executed)
-        // But for B0, we treat them as done with tool-failure outcome, not unknown
         let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+        let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .done, mutating: isMutating)
         let outcomeText = "tool-failure: \(summary) (\(status))"
-        // For mutating, still done (never started, so no side effect)
         records.append(.operationResult(ref, outcome: outcomeText))
         transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "preDispatch \(status): \(summary)")))
-        _ = isMutating
     }
     var interimState = state.replacing(consumedEffects: consumed, liveReservations: live)
-    // Pre-dispatch never holds, so continue
+    // Pre-dispatch never holds, but preserve already-generated records if turn-budget or missing-run fails
     guard interimState.turnsUsed < interimState.turnLimit else {
-        return failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+        let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+        return Transition(state: failed.state, effects: failed.effects, records: records + transcript + failed.records)
     }
     guard let run = interimState.activeRun else {
-        return failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+        let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+        return Transition(state: failed.state, effects: failed.effects, records: records + transcript + failed.records)
     }
     let nextEffectID = ids.nextEffectID()
     let seq = ids.nextSequence()
     let nextReservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: interimState.epoch.profile.alias, epochID: interimState.epoch.epochID, sealed: run.sealed, turnsLeft: interimState.turnLimit - interimState.turnsUsed, deadlineMillis: interimState.runDeadlineMillis, historyDigest: fnv1aHex("\(interimState.sessionID.raw):\(seq.value):continue"))
     let (s1, prefix) = sequenced(interimState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
-    let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live + [nextReservation], lastSequence: seq.value)
+    let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live, lastSequence: seq.value)
     return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + records + transcript)
 }
 
@@ -1579,17 +1577,23 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             seenCallIDs.insert(call.callID)
         }
     }
-    // For tainted IDs, the operation is contract violation → unknown for mutating, and we will not use the outcomeMap's first entry
-    for dupID in taintedCallIDs {
-        let isMutating = proposals.first(where: { $0.callID == dupID }).map { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" } ?? true
+    // For tainted IDs, emit deterministically in proposal order (not Set iteration)
+    for proposal in proposals where taintedCallIDs.contains(proposal.callID) {
+        let dupID = proposal.callID
+        let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
         if isMutating {
             let ref = OperationRef(operationID: operationID(effectID: effectID, callID: dupID), callID: dupID, state: .unknown, mutating: true)
             let (markers, overflow) = appendUnresolved(unresolved, ref)
             unresolved = markers
             if overflow { return integrityStop(state, ids: &ids) }
-            records.append(.operationResult(ref, outcome: "unknown: duplicate callID \(dupID)"))
+            // Only append one result per tainted ID, even if duplicated multiple times
+            if !records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == dupID } else { return false } }) {
+                records.append(.operationResult(ref, outcome: "unknown: duplicate callID \(dupID)"))
+            }
         }
-        transcript.append(.transcriptAppended(.toolResponse(callID: dupID, text: "duplicate callID: \(dupID)")))
+        if !transcript.contains(where: { if case .transcriptAppended(.toolResponse(let id, _)) = $0 { return id == dupID } else { return false } }) {
+            transcript.append(.transcriptAppended(.toolResponse(callID: dupID, text: "duplicate callID: \(dupID)")))
+        }
     }
     // Build map from callID to outcome (first wins, but tainted IDs will be handled as unknown above and skipped below)
     var outcomeMap: [String: ToolCallOutcome] = [:]
@@ -1605,6 +1609,14 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         }
     }
 
+    // Ordered halt: find first non-success/no-match in proposal order
+    var firstHaltIndex: Int? = nil
+    for (idx, prop) in proposals.enumerated() {
+        if let out = outcomeMap[prop.callID], out.status != "success" && out.status != "no-match" {
+            firstHaltIndex = idx
+            break
+        }
+    }
     for proposal in proposals {
         // Tainted IDs already carry their unknown marker + result above.
         if taintedCallIDs.contains(proposal.callID) {
@@ -1626,11 +1638,25 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
         let status = outcome.status
         let started = outcome.started
-        // Precedence per REV25 §3
-        // (1) deterministic statuses with started != false → done, no hold
         // Check if this proposal was tainted as duplicate — already handled as unknown
         if taintedCallIDs.contains(proposal.callID) {
             continue
+        }
+        // Ordered halt defensive: after first non-success, later calls must be cancelled unstarted
+        if let firstHalt = firstHaltIndex, let currentIndex = proposals.firstIndex(where: { $0.callID == proposal.callID }), currentIndex > firstHalt {
+            if !(status == "cancelled" && started == false) {
+                if isMutating {
+                    let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .unknown, mutating: true)
+                    let (markers, overflow) = appendUnresolved(unresolved, ref)
+                    unresolved = markers
+                    if overflow { return integrityStop(state, ids: &ids) }
+                    records.append(.operationResult(ref, outcome: "unknown: halt violation \(proposal.callID)"))
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "halt violation: \(proposal.callID)")))
+                } else {
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "halt violation: \(proposal.callID)")))
+                }
+                continue
+            }
         }
         let deterministic: Set<String> = ["success", "no-match", "denied", "conflict", "invalid-arguments", "failed"]
         var stateForResult: OperationState = .done
@@ -1638,13 +1664,9 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         var outcomeText = outcome.summary
         if deterministic.contains(status) {
             if started == false {
-                // REV25 fail-closed: deterministic + started==false is contradictory → unknown for mutating, transcript-only for non-mutating,
-                // EXCEPT for legitimate preDispatch where the call never started due to validation (denied/invalid-arguments with started false are done).
-                let isPreDispatchLegitimate = (status == "denied" || status == "invalid-arguments") && outcome.summary.contains("capabilityDenied") || outcome.summary.contains("argumentsNotObject") || status == "denied"
-                if isPreDispatchLegitimate {
-                    stateForResult = .done
-                    outcomeText = "tool-failure: \(outcome.summary)"
-                } else if isMutating {
+                // RED/GREEN: deterministic + started==false is contradictory → unknown for mutating, transcript-only for non-mutating.
+                // Only the typed preDispatchFailure path may certify no dispatch; arbitrary ToolCallOutcome data never does.
+                if isMutating {
                     stateForResult = .unknown
                     hold = true
                     outcomeText = "unknown: contradictory \(status) with started==false"
@@ -1734,17 +1756,19 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         return Transition(state: next, effects: [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + allRecords)
     }
     guard interimState.turnsUsed < interimState.turnLimit else {
-        return failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+        let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+        return Transition(state: failed.state, effects: failed.effects, records: allRecords + failed.records)
     }
     guard let run = interimState.activeRun else {
-        return failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+        let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+        return Transition(state: failed.state, effects: failed.effects, records: allRecords + failed.records)
     }
     let nextEffectID = ids.nextEffectID()
     let seq = ids.nextSequence()
     let nextReservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: interimState.epoch.profile.alias, epochID: interimState.epoch.epochID, sealed: run.sealed, turnsLeft: interimState.turnLimit - interimState.turnsUsed, deadlineMillis: interimState.runDeadlineMillis, historyDigest: fnv1aHex("\(interimState.sessionID.raw):\(seq.value):continue"))
     let (s1, prefix) = sequenced(interimState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
-    let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live + [nextReservation], lastSequence: seq.value)
+    let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live, lastSequence: seq.value)
     return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + allRecords)
 }
 

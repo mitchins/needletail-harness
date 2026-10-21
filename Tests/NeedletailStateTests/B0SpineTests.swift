@@ -244,4 +244,108 @@ struct B0SpineTests {
         let report = try reconcileOperations([intent])
         #expect(report.unmatchedMutating.count == 1, "intent without result is unknown+held")
     }
+
+    @Test("B0-1: mutating typed pre-dispatch failure and fresh-handle reconciliation")
+    func typedPreDispatchMutating() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#)])
+        let (state, run, intents) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        let failure = ToolFailure.preDispatch(status: "denied", summary: "capability")
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .preDispatchFailure(failure), atMillis: 1010), &ids)
+        #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .done } else { return false } }))
+        // Reconcile the full intent + result stream (intents from initial state + results from completion)
+        let all = intents + completed.records.filter { if case .operationIntent = $0 { return true } else if case .operationResult = $0 { return true } else { return false } }
+        let report = try reconcileOperations(all)
+        #expect(report.completed.count == 1, "preDispatch done should reconcile as completed")
+        #expect(report.heldOperations.isEmpty)
+    }
+
+    @Test("B0-1: spoofed pre-dispatch summary does not certify")
+    func spoofedSummary() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#)])
+        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        // Spoofed summary with same text as legitimate preDispatch, but via perCall with started==false and success (contradictory)
+        let spoof = ToolCallOutcome(callID: "c1", status: "success", summary: "capabilityDenied: read", data: "capabilityDenied: read", started: false)
+        let result = ExecutorResult(receipt: ExecutorReceipt(callID: "c1", status: "success", summary: "capabilityDenied: read"), calls: [spoof])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 1011), &ids)
+        #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .unknown } else { return false } }), "spoofed success+started==false must be unknown")
+    }
+
+    @Test("B0-1: budget exhaustion preserves already-generated records")
+    func budgetExhaustionPreserves() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#)])
+        var (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        state = state.replacing(turnsUsed: 80, turnLimit: 80)
+        let effectID = try #require(state.liveReservations.first).effectID
+        let result = Self.perCallResult([("c1", "success", "ok", true)])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 1012), &ids)
+        #expect(completed.state.phase == .failed(.budgetExhausted("turn budget exhausted after tool batch")))
+        #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" } else { return false } }), "budget fail must preserve operation result")
+    }
+
+    @Test("B0-4: partial scripted execution retains earlier success")
+    func partialRetainsSuccess() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: #"{"path":"a"}"#),
+            ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"b"}"#),
+        ])
+        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        // Simulate ScriptedToolBackend partial: c1 success, c2 failed due to script exhausted
+        let result = Self.perCallResult([
+            ("c1", "success", "file", true),
+            ("c2", "failed", "scriptExhausted", true),
+        ])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 1013), &ids)
+        #expect(completed.records.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c1" && r.state == .done && !o.contains("unknown") } else { return false } }))
+        #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c2" && r.state == .done } else { return false } }))
+    }
+
+    @Test("B0-4: false later success after earlier failure is violation")
+    func falseLaterSuccessIsViolation() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#),
+            ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"b"}"#),
+            ToolProposal(callID: "c3", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"c"}"#),
+        ])
+        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        // c1 success, c2 failed, c3 reports success (should have been unstarted) → violation → unknown
+        let result = Self.perCallResult([
+            ("c1", "success", "ok", true),
+            ("c2", "failed", "bad", true),
+            ("c3", "success", "ok", true),
+        ])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 1014), &ids)
+        #expect(completed.records.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c3" && r.state == .unknown && o.contains("halt violation") } else { return false } }), "false later success must be unknown halt violation")
+    }
+
+    @Test("B0-4: two duplicated callIDs with deterministic ordering")
+    func twoDuplicatesDeterministic() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#),
+            ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"b"}"#),
+        ])
+        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        let dupResult = ExecutorResult(receipt: ExecutorReceipt(callID: "batch", status: "ok", summary: "dup"), calls: [
+            ToolCallOutcome(callID: "c1", status: "success", summary: "ok", data: "ok", started: true),
+            ToolCallOutcome(callID: "c1", status: "success", summary: "ok2", data: "ok2", started: true),
+            ToolCallOutcome(callID: "c2", status: "success", summary: "ok", data: "ok", started: true),
+            ToolCallOutcome(callID: "c2", status: "success", summary: "ok2", data: "ok2", started: true),
+        ])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(dupResult), atMillis: 1015), &ids)
+        let recs = completed.records.compactMap { if case .operationResult(let r, _) = $0 { return r } else { return nil } }.filter { $0.state == .unknown }
+        #expect(recs.map { $0.callID ?? "" }.sorted() == ["c1", "c2"], "both duplicates should be unknown")
+        // Check byte-deterministic: records for c1 and c2 should be in proposal order (c1 before c2)
+        let ordered = completed.records.compactMap { if case .operationResult(let r, _) = $0, r.state == .unknown { return r.callID } else { return nil } }
+        #expect(ordered == ["c1", "c2"], "duplicate records must be in proposal order")
+    }
 }

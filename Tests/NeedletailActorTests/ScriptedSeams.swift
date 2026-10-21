@@ -132,7 +132,9 @@ final class ScriptedExecutor: ToolExecutor, @unchecked Sendable {
             for await _ in gate { break }
             // A closed gate releases execution exactly once; the loop exits.
         }
-        return ExecutorResult(receipt: ExecutorReceipt(callID: "scripted", status: "ok", summary: "scripted"))
+        let firstCallID = batch.proposals.first?.callID ?? "scripted"
+        let calls = batch.proposals.map { ToolCallOutcome(callID: $0.callID, status: "success", summary: "scripted", data: "scripted", started: true) }
+        return ExecutorResult(receipt: ExecutorReceipt(callID: firstCallID, status: "ok", summary: "scripted"), calls: calls)
     }
 }
 
