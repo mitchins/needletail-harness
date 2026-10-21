@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV17, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV18, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -224,7 +224,9 @@ per batch, calls executed sequentially in order):
   external `cancelRequested` arrives while the executor is
   unresponsive (kill-switch path) — `cancelActive` marks all
   live mutating calls unknown+hold AND retains the reservations
-  as cancelled-pending (REQUIRED change above), so a late
+  as cancelled-pending (REQUIRED change above: actor-table
+  retention + `cancelledPending` flag + `completeCancelledPending`
+  handler + routing + termination cleanup), so a late
   executor report replaces markers ONLY for `started == false`
   entries; late started/uncertain entries stay dropped against
   the already-written markers (safe direction: the markers
@@ -238,31 +240,56 @@ per batch, calls executed sequentially in order):
   human-readable summary string and embeds it in each unknown
   marker's message (`unknown: stale completion reported '<summary>'`),
   so the evidence §9.1 requires survives for manual
-  reconciliation while the hold is preserved. `dropRetaining` gains one parameter — `summary: String?`, threaded from `checkStale`'s discarded outcome — used ONLY for the marker message, never for certification. For `effectCompleted` the summary is the `EffectOutcome` payload string; for `effectFailed` it is the carried `error: String` (SessionEvent.swift:32) — a stale-failed leg pins the error-threaded marker. Cancel paths
+  reconciliation while the hold is preserved.   `dropRetaining` gains one parameter — `summary: String?`, threaded from `checkStale`'s discarded outcome — used ONLY for the marker message, never for certification. For `effectCompleted` the summary is the aggregate `result.receipt.summary` (the per-call `EffectOutcome` case carries the whole `ExecutorResult`, which has no single payload string — the aggregate receipt summary is the defined derivation, pinned by the stale-completed test); for `effectFailed` it is the carried `error: String` (SessionEvent.swift:32) — a stale-failed leg pins the error-threaded marker. Cancel paths
   cannot consult the executor either: the actor runs one
   in-flight effect at a time and a new `reserveEffect` cancels
   the previous task, so every live reservation at cancel time is
   in-flight or was killed mid-flight — genuinely uncertain →
   existing unknown path (consistent with pre-existing crash
   semantics: intent without result reconciles unknown). REQUIRED
-  actor change (current code cannot deliver the primary path:
-  `cancel()` applies `.cancelRequested` before cancelling the
-  task — SessionActor.swift:122–125; `apply` runs `cancelActive`
-  which writes unknown markers, clears ALL reservations and
-  cancels the task — SessionActor.swift:240–250,
-  SessionTransition.swift:1435–1459; `completeEffect` drops any
+  actor change (current code cannot deliver the kill-switch
+  late-report path: `cancel()` applies `.cancelRequested` before
+  cancelling the task — SessionActor.swift:122–125; `apply` runs
+  `cancelActive` which writes unknown markers — then the actor
+  clears its OWN `reservations` dict — SessionActor.swift:240–250
+  — and transition `cancelActive` clears `state.liveReservations`
+  — SessionTransition.swift:1435–1459; `completeEffect` drops any
   outcome whose effectID is no longer reserved —
-  SessionActor.swift:494–500): `cancelActive` writes the
-  unknown markers but RETAINS the cancelled reservations
-  (flagged cancelled-pending; the generation bump already
-  prevents any new dispatch on them) until the executor reports
-  or the in-flight task actually terminates. `completeEffect`
-  for a cancelled-pending reservation accepts late per-call
-  outcomes and REPLACES markers only for entries the executor
-  attests never-dispatched (`started == false` → done-cancelled,
-  marker removed — provably no side effect); late entries with
-  `started == true` or omitted keep their markers (an executor
-  killed mid-flight cannot certify post-cancel knowledge).
+  SessionActor.swift:494–500; the phase switch has
+  `effectCompleted`/`effectFailed` rows only for `.executing`
+  (:291–294) with `.cancelling`/`.cancelled` falling to the
+  default no-op (:345–350)). SCOPE NOTE: the executor-handled
+  primary path (executor reports while the reservation is still
+  live — its own deadline/timeout catch) already works through
+  today's `completeEffect`; this change serves ONLY the
+  kill-switch path (external `cancelRequested` consumed, late
+  executor report arrives after). The change, all in B4:
+  (a) new `EffectReservation.cancelledPending: Bool = false`
+  field; (b) the actor's `cancelRequested` handling, instead of
+  `reservations = [:]`, marks every live entry
+  `cancelledPending = true` and retains it (the generation bump
+  still blocks any new dispatch on those IDs); (c) new pure
+  transition handler `completeCancelledPending` performing
+  SELECTIVE marker replacement only — `started == false`
+  entries: marker removed, done-cancelled recorded; `started ==
+  true`/omitted: marker kept — with NO `continueAfterEffect`
+  fan-out and no transcript emission; (d) routing: `checkStale`
+  tests the cancelled-pending set FIRST and routes those
+  effectIDs to the new handler regardless of generation
+  (before the `dropRetaining` branch); new phase-switch rows
+  `(.cancelling, .effectCompleted)` and `(.cancelling,
+  .effectFailed)` route to it (kill-switch lands the run in
+  `.cancelling`, whose rows today are tick/transport-failed/
+  cancel-requested only); (e) termination cleanup: the
+  `invokeExecutor` task removes its reservation entry in a
+  `defer` on task end (observed via the existing `inFlight`
+  handle — return, throw, and fallback-synthesizer paths all
+  terminate the task), so cancelled-pending entries cannot
+  leak; (f) tests: direct transition tests (cancelled-pending +
+  late started-false → replaced; + late started-true → kept; +
+  stale generation still routes to the new handler, never
+  `dropRetaining`) and an actor kill-switch-then-late-report
+  test.
   A late per-call result arriving after cancel for a
   started/uncertain call is still dropped at `completeEffect`
   against already-written unknown markers for the same
@@ -462,12 +489,14 @@ per batch, calls executed sequentially in order):
   (`RIPGREP_CONFIG_PATH` et al. removed); no `--pre`, no model
   flags, no symlink-follow outside root; harness-owned deny
   globs are part of the FIXED argv (`--glob '!**/.git/**'`,
-  `--glob '!**/.env*'`, `--glob '!**/.ssh/**'` — rg itself
+  `--glob '!**/.env*'`,   `--glob '!**/.ssh/**'` — rg itself
   never descends into them, so filtering is by non-traversal,
   not post-filtering); `rg --files` for
   discovery (empties listed, never read). Hits are additionally
-  post-filtered through the B1 protected-path predicate (deny
-  globs — rg output never bypasses the boundary). Continuations are single-session:
+  post-filtered through the B1 protected-path predicate as
+  defense-in-depth (explicitly layered: non-traversal is the
+  guarantee, post-filter catches harness bugs — never the sole
+  mechanism). Continuations are single-session:
   opaque token (query hash + offset + result-hash prefix); resume
   re-executes and prefix-verifies, else restarted-label (no
   stable-offset fiction, no stale reads).
@@ -477,12 +506,15 @@ per batch, calls executed sequentially in order):
   PATH — must be ignored), shim-`rg` shadowing leg, symlink-out
   leg, `.git`-hit exclusion leg, missing/too-old-rg fail-closed
   legs; `TOOL_11_…` cross-session denial + same-session allow.
-  Non-traversal proof legs (rg never OPENS protected paths, not
-  merely hides hits): argv-capture test asserting the fixed argv
-  contains the deny globs for every search invocation; sentinel
-  test with a `chmod 000` file inside `.git/` — the search
-  completes with no permission error mentioning the sentinel
-  (opening it would fail loudly), proving rg never descended.
+  Non-traversal proof legs (guarantee: rg never OPENS or reads
+  protected paths — open/read is the security property; descent
+  without open still cannot exfiltrate bytes): argv-capture test
+  asserting the fixed argv contains the deny globs for every
+  search invocation; 000-DIRECTORY sentinel inside `.git/`
+  (descent itself fails loudly — a 000 file would prove only
+  no-open, since readdir/lstat still succeed); prune-pattern
+  test proving the deny globs match the protected paths
+  (wrong-glob probe must fail).
 - Counterfactuals: ambient-config inheritance (must fail TOOL-03);
   model-flag passthrough (must fail); PATH-shim execution (must
   fail); unfiltered `.git` hit (must fail); artifact-ID-as-
@@ -510,42 +542,69 @@ per batch, calls executed sequentially in order):
   (§3 outcome mapping above); the preimage BYTES go through
   `publishArtifact` (32 MiB cap). Zero-byte originals: hash-only
   receipt (sha256-empty is constant), no empty publish. Order
-  under the lock: re-read/hash → preflight byte-quota check
-  (fail fast, nothing written) → publish preimage (which reports
-  whether this call created a NEW file or reused deduped bytes)
-  → on reference-commit failure delete the just-written bytes
-  ONLY when this call created them (dedup-reused bytes are never
-  deleted — another session's reference may own them; tracked by
-  an explicit `createdNewFile` bool from publish, best-effort) →
-  rename → receipt. Crash between publish and cleanup can orphan
-  bytes — explicitly allowed (SPEC §9), documented, not tested
-  as impossible. Pre-publish free-space check: refuse (denied
-  result, not a crash) when the artifact filesystem has less
-  than the SPEC §9.2 256 MiB reserve. Dedup/reference tests: two
-  sessions publish identical bytes → second session's
+  under the lock: re-read/hash → pre-publish quota PREFLIGHT
+  estimate (fail fast, nothing written — advisory only) →
+  publish preimage (file bytes land on disk at rename inside
+  publish, BEFORE the reference-commit transaction:
+  GRDBSessionStore.swift:693–728 vs :733–759) → reference
+  commit with AUTHORITATIVE quota check + increment inside the
+  SAME `queue.write` transaction as the reference insert →
+  on reference-commit failure (quota or otherwise) delete the
+  just-written bytes ONLY when NO `artifactPublished` reference
+  for this digest exists — checked under the same gate/
+  transaction, not merely `createdNewFile` (a second session may
+  have dedup-referenced the digest after this call created the
+  file but before its commit failed; `createdNewFile` alone
+  would delete bytes backing that live reference) — best-effort →
+  rename → receipt. Crash between rename and reference commit
+  orphans bytes that NEVER incremented `byte_usage`
+  (under-counted, not over-counted — corrected below);
+  crash-orphans are explicitly allowed (SPEC §9), documented,
+  not tested as impossible. Pre-publish free-space check: refuse
+  (denied result, not a crash) when the artifact filesystem has
+  less than the SPEC §9.2 256 MiB reserve. Dedup/reference
+  tests: two sessions publish identical bytes → second session's
   reference-commit failure must leave the first session's bytes
-  and reference intact (no cross-session deletion).
-- Byte quotas (new store accounting, in the existing mutation
-  transaction — same fail-closed shape as count quotas):
+  and reference intact (no cross-session deletion);
+  first-publisher-fails-after-second-dedup leg (A creates the
+  file, B dedup-references it, A's commit fails → A's cleanup
+  finds B's reference and keeps the bytes).
+- Byte quotas (new store accounting — two-stage, coherent):
   1 GiB session / 5 GiB global over records + artifacts +
   preimages. Schema (new, explicit): `byte_usage(session TEXT
   PRIMARY KEY, bytes INTEGER NOT NULL)` added to the store's
-  declared shape + migration (additive — old binaries ignore the
-  table; new binaries create it); preflight computes this call's
-  new bytes (dedup-aware: bytes whose digest the publishing
-  session already references count zero) and the check +
-  increment run inside the SAME write transaction as the
-  reference insert (publishArtifact's existing `queue.write`
-  block); orphan bytes count until the orphan scan GCs them
-  (documented over-count direction: fail-closed).
+  declared shape; `schemaVersion` 2→3 with a migration creating
+  the table; FORWARD-ONLY incompatibility stated honestly
+  (old binaries fail closed on a newer `user_version` —
+  GRDBSessionStore.swift:50, :109–113 — and on shape mismatch
+  — :121–124, :204–233 — so a v3 store is unreadable to v2
+  binaries; the v0 foreign-table check and `assertSchemaShape`
+  follow `declaredShape`, covering the new table; an
+  old-binary/new-store test pins the fail-closed integrity
+  error). Preflight (advisory, pre-publish): computes this
+  call's new bytes (dedup-aware: bytes whose digest the
+  publishing session already references count zero) and fails
+  fast with nothing written. Authoritative check + increment
+  run inside the reference-commit `queue.write` transaction
+  (same fail-closed shape as count quotas). Orphan accounting:
+  crash-orphaned bytes are UNDER-counted (never incremented);
+  the orphan scan (`detectArtifactOrphans`, which today only
+  reports — :787–789) gains an additive-only
+  `reconcileByteUsage` step run at startup with the B5 gate —
+  idempotent, raises `byte_usage` toward physical reality, never
+  lowers; a seeded-orphan test pins upward reconciliation.
 - Tests: `TOOL_04_…` zero/one/multiple/empty legs;
   `TOOL_05_…` injected change between read and commit → conflict
   receipt, file untouched, no preimage; `TOOL_06_…` CRLF/no-final-
   newline/emoji/combining fixtures byte-preserved + mode-
   preservation leg; `TOOL_08_…` exists-refusal + stale-hash legs;
   quota legs (preflight over-quota → fail closed, nothing
-  written; ref-commit failure → bytes cleaned up, nothing
-  renamed; sub-reserve free space → denied receipt, never a
+  written; authoritative over-quota at commit → fail closed +
+  just-written bytes cleaned up iff unreferenced, nothing
+  renamed; orphan-reconcile leg (seeded orphan → `byte_usage`
+  corrected upward at gate time); old-binary/new-store leg
+  (v2 binary on v3 store → fail-closed integrity error);
+  sub-reserve free space → denied receipt, never a
   crash).
 - Counterfactuals: fuzzy matcher (must fail TOOL-04);
   normalization shim (must fail TOOL-06); deterministically gated
@@ -627,10 +686,17 @@ per batch, calls executed sequentially in order):
   mixed batch → mutating unknown+hold with the SAME operationIDs
   as the dispatched intents, non-mutating absent — no transcript
   from cancel/stale paths); late-unstarted-replacement leg
-  (cancel writes markers, then the executor's late report
-  attests one call `started == false` + one `started == true` →
-  the unstarted marker is REPLACED by done-cancelled, the
-  started marker stands — proves retention, not clearing);
+  (cancel writes markers and retains cancelled-pending
+  reservations; then the executor's late report attests one call
+  `started == false` + one `started == true` → the unstarted
+  marker is REPLACED by done-cancelled, the started marker
+  stands — proves retention, not clearing);
+  cancelled-pending transition legs (direct: stale-generation
+  late completion routes to `completeCancelledPending`, never
+  `dropRetaining`; the handler performs no `continueAfterEffect`
+  fan-out and emits no transcript); actor
+  kill-switch-then-late-report test (external cancel consumed,
+  then late executor report → selective replacement per above);
   stale-completion leg (superseded generation: stale per-call
   outcomes are never trusted as current-run done → mutating
   markers carrying the stale summary (existing tests asserting bare `"unknown"` markers are updated to the `unknown: stale completion reported '<summary>'` form — deliberate RED/GREEN migration), non-mutating absent); stale-failed leg
@@ -691,20 +757,35 @@ per batch, calls executed sequentially in order):
   `native(NativeToolExecutor)`) + `NativeToolExecutor` struct
   capturing the claimed session, store writer identity, artifact
   publisher closure, and workspace resolver at construction.
-  Construction order (after `claimWriterOwnership`, before actor
-  init): select runtime by flags (`--workspace` without
-  `--trusted` → native; `--trusted` without `--workspace` →
-  scripted; neither → scripted with file caps denied; both →
-  exit 2) → construct the chosen executor with the claimed
-  identity → inject into the generic `SessionActor`
-  (already generic over Executor/Approvals —
-  SessionActor.swift:28). Preimage reads obtain the fenced writer
-  from the same claimed identity. Composition tests (binary
-  legs): flag-selection matrix (`--workspace` composes native,
+  Construction order (durable path only — after
+  `claimWriterOwnership`, before actor init; sealed runs use
+  `EphemeralStore` with `grdb == nil` and NO claim block —
+  RunCommand.swift:391–398, :484–519 — so there is no writer
+  identity and no durable artifact publisher to capture).
+  Full selection matrix: `--workspace` without `--trusted`
+  without `--sealed` → native full; `--workspace` + `--sealed`
+  → reject (exit 2: durable file tools require the durable
+  ledger — the invocation is malformed for a sealed run);
+  `--workspace` + `--trusted` → reject (exit 2, existing rule);
+  `--trusted` without `--workspace` → scripted; `--read-root`
+  without `--workspace` (and without `--trusted`) → native
+  READ-ONLY (read/search only, composed against whichever store
+  is active; preimages and artifact publication never occur in
+  read-only mode, so no writer identity is needed); neither flag
+  → scripted with file caps denied (existing behavior
+  preserved); `--sealed` alone → scripted (existing). Ephemeral
+  path has no durable artifact publisher: native read-only
+  under `--sealed` resolves artifact IDs against the ephemeral
+  store only (same-session rule unchanged). Composition tests
+  (binary legs): flag-selection matrix (`--workspace` composes
+  native, `--read-root`-only composes native read-only with
+  mutating denied, `--workspace`+`--sealed` → exit 2,
   `--trusted` composes scripted with zero real mutations,
-  both → exit 2, neither → mutating denied); construction-order
-  test (native executor holds the claimed writer identity —
-  artifact publish under a foreign session fails).
+  both → exit 2, neither → mutating denied);
+  construction-order test (native executor holds the claimed
+  writer identity — artifact publish under a foreign session
+  fails); ephemeral test (sealed run never touches the durable
+  store or the artifact root).
   Grant derivation: file caps ON as build.allAllowed ∩ userConfig
   (must opt in — defaults false) ∩ workspace-designated;
   exec/consult denied even with `--workspace` (denial test).
@@ -1147,7 +1228,36 @@ NOT non-goals.)
   leg (TOOL-10); named `FileToolRuntime` enum +
   `NativeToolExecutor` (session/store/writer/artifact/resolver
   captured post-claim) + flag-selection matrix + construction-
-  order tests; REV6 note clarified to sub-proposal withdrawal.
-- REV17 → deepseek-reviewer: _pending_.
+   order tests; REV6 note clarified to sub-proposal withdrawal.
+- REV17 → deepseek-reviewer: NEEDS-EVIDENCE (7 findings:
+  actor change missing actor-table/flag/handler/rows/cleanup +
+  primary-path scope; matrix omits --read-root/--sealed +
+  ephemeral claim order; 000-file proves no-open not no-descend
+  + post-filter contradiction; quota preflight-vs-commit
+  contradiction + orphan under-count; createdNewFile TOCTOU vs
+  second-session dedup; EffectOutcome case has no payload string;
+  old binaries reject new table (forward-only)).
+- REV18 (this revision): actor change completed —
+  `EffectReservation.cancelledPending` flag, actor-table
+  retention (not just transition state), `completeCancelledPending`
+  handler with no fan-out/transcript, `checkStale`-first routing
+  + `(.cancelling, effectCompleted/effectFailed)` rows,
+  `invokeExecutor`-defer termination cleanup, transition + actor
+  legs; scope note (primary path already works live — change
+  serves kill-switch late reports); stale-completed summary =
+  aggregate `result.receipt.summary`; selection matrix completed
+  (`--read-root`-only → native read-only, `--workspace`+`--sealed`
+  → exit 2, neither → scripted denied, `--sealed` alone →
+  scripted) + ephemeral no-publisher rule + matrix/ephemeral
+  legs; 000-DIRECTORY descend-proof + prune-pattern leg +
+  guarantee restated as never-open/read with post-filter as
+  layered defense; two-stage quota (advisory preflight +
+  authoritative in-txn check with conditional cleanup) +
+  orphan UNDER-count + `reconcileByteUsage` at gate +
+  seeded-orphan leg; cleanup conditioned on no-reference-exists
+  under same gate/txn + first-fails-after-dedup leg;
+  `schemaVersion` 2→3 + forward-only incompatibility +
+  old-binary/new-store leg.
+- REV18 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
