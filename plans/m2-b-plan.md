@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV8, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV9, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -180,29 +180,41 @@ per batch, calls executed sequentially in order):
   `timeout`/`cancelled` with `started == true`.) Cancel path and
   stale-retention (`dropRetaining`) split per proposal the same
   way (extending the existing mutating-only `cancelActive`
-  precedent). `dropRetaining` signatures stay outcome-free on
-  purpose: `checkStale` DISCARDS the carried `EffectOutcome`
-  (SessionTransition.swift:414–425) because stale content must
-  never certify the current run — a superseded generation's
-  results cannot pair with live intents — so its unknown stands
-  honestly, and per-proposal mutating (not the carried outcome)
-  decides marker vs transcript-only. Cancel paths cannot consult
-  the executor either: the actor runs one in-flight effect at a
-  time and a new `reserveEffect` cancels the previous task, so
-  every live reservation at cancel time is in-flight or was
-  killed mid-flight — genuinely uncertain → existing unknown
-  path (consistent with pre-existing crash semantics: intent
-  without result reconciles unknown). A late per-call result
-  arriving after cancel is dropped at `completeEffect` against
-  already-written unknown markers for the same operationIDs —
-  no evidence lost. No `performedEffects` mechanism is specified
-  — the actor has no per-call start visibility inside one
-  `execute(batch)` call, and effect-granular marking would lie
-  in both directions. The empty-proposals fallback keeps
-  reservation-level classification (no proposals to classify —
-  documented). Tests: cancel-during-flight → mutating
-  unknown+hold AND non-mutating transcript-only (existing
-  semantics + per-call split, pinned).
+  precedent). `dropRetaining` signatures stay outcome-free as
+  certifying input: `checkStale` DISCARDS the carried
+  `EffectOutcome` (SessionTransition.swift:414–425) because
+  stale content must never certify the current run — a
+  superseded generation's results cannot pair with live intents —
+  so its unknown stands honestly. The stale summary is NOT
+  dropped silently, however: `dropRetaining` takes the outcome's
+  human-readable summary (string only — never per-call results
+  as certifying records) and embeds it in each unknown marker's
+  message (`unknown: stale completion reported '<summary>'`),
+  so the evidence §9.1 requires survives for manual
+  reconciliation while the hold is preserved. Cancel paths
+  cannot consult the executor either: the actor runs one
+  in-flight effect at a time and a new `reserveEffect` cancels
+  the previous task, so every live reservation at cancel time is
+  in-flight or was killed mid-flight — genuinely uncertain →
+  existing unknown path (consistent with pre-existing crash
+  semantics: intent without result reconciles unknown). A late
+  per-call result arriving after cancel is dropped at
+  `completeEffect` against already-written unknown markers for
+  the same operationIDs — no evidence lost. No
+  `performedEffects` mechanism is specified — the actor has no
+  per-call start visibility inside one `execute(batch)` call,
+  and effect-granular marking would lie in both directions.
+  The empty-proposals fallback keeps reservation-level
+  classification (no proposals to classify — documented).
+  Non-mutating calls get NO record on either path (no transcript
+  is emitted by cancel/stale handlers — the transcript-only
+  rule is executor-path-only, §3 mapping above): the intent
+  alone reconciles to unstarted. Tests: cancel-during-flight on
+  a mixed batch → mutating unknown+hold (existing semantics,
+  pinned), non-mutating absent from the record log; stale
+  completion with per-call outcomes → mutating markers carrying
+  the stale summary, non-mutating absent (never trusted as
+  current-run done).
   NEVER-DISPATCHED is not unknown (R4 finding — a provably
   unexecuted call must not claim unknowability, and an unexitable
   hold would brick the session with no reconcile command
@@ -472,11 +484,12 @@ per batch, calls executed sequentially in order):
   leg (executor omits `started` on a cancelled call → treated as
   true → unknown+hold for mutating); success-with-started-false
   leg (contradictory input → done: claimed results prove
-  dispatch); CancellationError leg (executors throws mid-batch
+  dispatch); CancellationError leg (executor throws mid-batch
   → actor synthesizes started-cancelled for all → mutating
-  unknown+hold); stale-completion leg (superseded generation with
-  per-call outcomes → classified per call, never trusted as
-  current-run done receipts); post-commit-failure leg (write
+  unknown+hold); stale-completion leg (superseded generation,
+  done-attested per-call outcomes → mutating markers carrying
+  the stale summary, non-mutating absent — never trusted as
+  current-run done); post-commit-failure leg (write
   applied then timeout reported → unknown+hold despite the
   successful write: conservative and tested); mixed-batch lock
   contention leg ([read A ok, write B lock-fails] → A done stands,
@@ -530,18 +543,25 @@ per batch, calls executed sequentially in order):
   with held operations or unmatched mutating intents trips the
   gate. Without `--acknowledge-unresolved-outcomes` → fail closed
   (exit 2: operator-decision-required, like missing HOME — NOT
-  exit 4, since no run/ambiguous delivery occurred), naming the
+  exit 4, since no run/ambiguous delivery occurred; and not exit
+  3, which is reserved for an interactive approval that cannot
+  help here — only the explicit flag path proceeds), naming the
   sessions and pointing at `needletail session export` for audit.
-  With the flag → append an `eventAppended` acknowledgment record
-  to the NEW session citing the prior session IDs (durable,
-  auditable determination — the flag alone is a bypass, the
-  RECORD is the reconciliation decision), then proceed. The flag
-  is per-invocation, never persisted. Tests: seeded store with
-  unresolved markers → blocked without the flag (exit 2, names
-  sessions); proceeds with the flag AND the acknowledgment record
-  is present in the new session log; no-marker store → unaffected
-  (incl. fresh/empty store bootstrap); non-mutating-only
-  unmatched intents → no trip (re-runnable by design).
+  With the flag → append a new
+  `DurableRecord.acknowledgedUnresolved(Acknowledgment)` record
+  to the NEW session (fields: subject sessions, operation IDs,
+  determination [`operator-accepted-risk` |
+  `manually-reconciled:<note>`], atMillis; RecordCodec case +
+  schema-note; old binaries fail closed on the unknown case per
+  the M2-A foreign-row contract) and proceed. The RECORD is the
+  reconciliation decision — the flag alone would be a bypass.
+  The flag is per-invocation, never persisted. Tests: seeded
+  store with unresolved markers → blocked without the flag
+  (exit 2, names sessions); proceeds with the flag AND the
+  acknowledgment record is present in the new session log;
+  no-marker store → unaffected (incl. fresh/empty store
+  bootstrap); non-mutating-only unmatched intents → no trip
+  (re-runnable by design).
 - `--trusted` stays demo-only: scripted backend, plus an
   ImportGate-style binary test proving `--trusted` performs zero
   real FS mutations.
@@ -609,9 +629,10 @@ credentials, or artifact-dir contents (absolute denials);
 workspace `.git`/`.env`/`.ssh` without explicit per-batch
 operator approval; real mutations via demo `--trusted`; live
 provider traffic; background/detached processes; deletion tool;
-cross-run automated replay; timeout/cancellation semantics left
-unspecified (specified: B4 deadlines + wiring); M2-C/D scope;
-any merge in this planning track.
+cross-run automated replay; M2-C/D scope;
+any merge in this planning track. (Timeout/cancellation semantics
+are specified in B4 — deadlines, synthesis, started rule — and are
+NOT non-goals.)
 
 ## 7. Risks
 
@@ -753,6 +774,24 @@ any merge in this planning track.
   per-call result `mutating` + mixed-batch reopen + existing
   test updates specified; free-space reserve check + leg;
   R3 refs (1302–1306/1443/1289) verified.
-- REV8 → deepseek-reviewer: _pending_.
+- REV8 → deepseek-reviewer: NEEDS-EVIDENCE (7 residuals:
+  cancel/stale never-dispatched marking + no dispatch-truth
+  mechanism; N2 unaddressed + gate has no seam/record/exit
+  justification; CancellationError vs started contradiction;
+  started precedence/default/validation; per-call result mutating;
+  lock granularity mixed case; missing legs; stale citations).
+- REV9 (this revision): dropRetaining outcome-free BY DESIGN
+  (stale content must not certify; summaries threaded into
+  unknown-marker messages); cancel paths honest about no
+  executor consult; `started` precedence total order + omission
+  fail-closed + success-wins + CancellationError synthesis;
+  per-call RESULT mutating + mixed-batch reopen + existing test
+  updates; batch-level lock with mixed-batch rule; startup gate
+  with session-listing seam + recorded `acknowledgedUnresolved`
+  determination + exit-2 justification + bootstrapping legs;
+  free-space 256 MiB reserve; WIRE-05/SPEC-§7.2,
+  BDD-04, openat, §8-convention, R3-ref hygiene; performedEffects
+  removal stated once, in §8 history only.
+- REV9 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
