@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV22, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV23, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -285,17 +285,38 @@ per batch, calls executed sequentially in order):
   (current type at SessionTransition.swift:62–80 has only
   `effectID/runID/requestID/generation/revision/mutating/batch`
   and no kind field — Finding 1 — so every construction site
-  is updated: :570, :1019, :1208, :1290, :1365, :1542 — tool
-  batches pass `.executor`, provider paths pass `.provider`;
-  the actor `reservations` table is likewise ` [EffectID:
-  EffectReservation]` with the same kind) — provider
+  is updated: 6 PRODUCTION sites :570/:1019/:1208/:1290/:1365/
+  :1542 PLUS 7 TEST sites — `Tests/NeedletailProviderTests/
+  BackendTests.swift:21`, `Tests/NeedletailStateTests/
+  StaleCompletionTests.swift:18,69`, `CancellationTests.swift:
+  59`, `ResidualFixTests.swift:14,115`,
+  `BudgetInvalidTests.swift:55` — 13 total; tool batches pass
+  `.executor`, provider paths pass `.provider`; provider-shaped
+  fixtures like `StaleCompletionTests.liveTriple` ("provider
+  request shape") are explicitly marked `.provider` so they do
+  NOT become executor reservations under cancel — a `Kind`
+  default is NOT used (required init param, so every call site
+  must state it, compile-fails if missed); moreover the
+  retention scope is per-call MUTATING (Finding 5): `cancelActive`
+  filters `kind == .executor && mutating == true` (read-only tool
+  batches are also `.executor` but with `mutating == false`,
+  so they are NOT retained — they are consumed/dropped via
+  `consumedEffects` per the transcript-only rule at :419 and
+  never gain a `cancelledPendingMarker` or
+  `cancelledPendingError`; the mutating-scope and Kind-scope
+  are both tested: a cancelled mutating batch retains with a
+  pending marker, a cancelled read-only batch leaves no pending
+  marker and is consumed); the actor `reservations` table is
+  likewise `[EffectID: EffectReservation]` with the same kind) — provider
   reservations are NOT retained: they are removed from
   `liveReservations` and their `effectID` is inserted into
   `state.consumedEffects` (the set `checkStale` already reads
   at :414–429, which today `cancelActive` never populates at
   :1473–1479), so a cancel during provider flight leaves no
   dangling executor pending entry; `cancelActive` writes
-  unknown markers only for the retained executor entries —
+  `cancelledPendingMarker` only for the retained MUTATING
+  executor entries (non-mutating executor entries are
+  consumed/dropped, never a marker — Finding 5) —
   generation bump still blocks any new dispatch on those IDs;
   repeat `cancelRequested` is idempotent: if
   `cancelledPendingReservations` already holds the effectIDs
@@ -339,35 +360,64 @@ per batch, calls executed sequentially in order):
   OperationReconcile.swift:119–125, so "marker removed,
   done-cancelled recorded" has no durable path as written.
   Fix (all in B4, same `SessionState.cancelledPending-
-  Reservations` seam): `cancelActive` for retained executor
-  reservations does NOT write durable `operationResult(unknown)`
-  immediately — it writes a NEW durable record type
-  `DurableRecord.cancelledPendingMarker(OperationRef)` (marker
-  is DURABLE but is NOT a `operationResult`; it carries the
-  per-call `OperationRef` + a placeholder outcome for §9.1)
-  and the matching `RecordCodec` case + `SessionExport.project`
-  arm (redacted by default). `reconcileOperations` treats
-  `cancelledPendingMarker` as HOLD-equivalent (same as
-  unknown) but ALLOWS a later `operationResult(done)` for the
-  same `operationID` to SUPERSEDE it (no duplicate-result
-  error; the marker is replaced). `completeCancelledPending`
-  for `started == false` appends `operationResult(done,
-  outcome: "cancelled: unstarted")` which supersedes the
-  pending marker durably; for `started == true`/omitted it
-  leaves the marker in place (no second record), and for
-  `effectFailed` it keeps the pending marker and appends an
-  auxiliary `DurableRecord.cancelledPendingError(effectID,
-  error)` carrying the error string (since `OperationRef`
-  has no message field); `reconcileOperations` aggregates the
-  error string into the hold reason. Termination cleanup
-  (task ends without a report) promotes the pending marker
-  to `operationResult(unknown)` via the same `defer` + marker
-  event, so no dangling pending marker remains. Tests:
-  `cancelledPending + started-false supersedes to done` pins
-  the durable supersession (reconcile passes), `effectFailed
-  on cancelledPending keeps pending marker + error record`
-  pins the error embedding, and the old "marker removed,
-  done recorded" is withdrawn as durable-append would fail; (d) new pure transition handler
+  Reservations` seam): `cancelActive` for retained MUTATING
+  executor reservations does NOT write durable
+  `operationResult(unknown)` immediately — it writes a NEW
+  durable record type `DurableRecord.cancelledPendingMarker
+  (OperationRef)` (marker is DURABLE but is NOT a
+  `operationResult`; it carries the per-call `OperationRef` +
+  a placeholder outcome for §9.1) and the matching `RecordCodec`
+  case + `SessionExport.project` arm (redacted by default) for
+  the marker; a second new type
+  `DurableRecord.cancelledPendingError(CancelledPendingError)`
+  (`effectID: EffectID, operationIDs: [OperationID], error:
+  String, atMillis: UInt64`) is added for the `effectFailed`
+  error path — `OperationRef` has no message field
+  (SessionState.swift:242–253) so the error cannot live there,
+  and `OperationReconciliation` at
+  OperationReconcile.swift:49–85 exposes only
+  `heldOperations: [OperationRef]` with the hold reason built
+  only from a count at :232–234 — therefore a NEW field
+  `ReconciliationReport.cancelledPendingErrors: [Cancelled-
+  PendingError]` is added to the report, `reconcileOperations`
+  populates it from `cancelledPendingError` records, and the
+  hold-reason construction at :232–234 is updated to append
+  the error strings (e.g. `held reason: <count> pending +
+  <error>`); `SessionExport.project` gains exhaustive arms for
+  BOTH new records (marker and error) plus `RecordCodec` cases
+  and schema notes, with redaction for the error free text.
+  `reconcileOperations` treats `cancelledPendingMarker` as
+  HOLD-equivalent (same as unknown) but ALLOWS a later
+  `operationResult` for the same `operationID` to SUPERSEDE it:
+  last-record-wins per `operationID` — the marker holds until
+  a superseding `operationResult(done)` or
+  `operationResult(unknown)` for that ID appears, then the
+  marker is ignored (no duplicate-result error; the superseding
+  record replaces). `completeCancelledPending` for
+  `started == false` appends `operationResult(done, outcome:
+  "cancelled: unstarted")` which supersedes the pending marker
+  durably; for `started == true`/omitted it leaves the marker
+  in place (no second record); for `effectFailed` it keeps the
+  pending marker and appends the auxiliary
+  `cancelledPendingError` carrying the error string — reconcile
+  aggregates it via the new report field. Termination cleanup
+  (task ends without a report) appends
+  `operationResult(unknown, outcome: "cancelled: pending
+  terminated")` for each still-pending operationID — this
+  supersedes the marker per the last-record-wins rule (so the
+  marker+unknown pair is defined: marker is HOLD, the later
+  unknown supersedes it — no double-hold, no conflict), and a
+  dedicated termination-promotion test pins marker → unknown
+  supersession via reconcile. Tests:
+  `cancelledPending + started-false supersedes marker to done`
+  pins the durable supersession (reconcile passes with done),
+  `cancelledPending + terminated supersedes marker to unknown`
+  pins the marker+unknown last-wins rule (reconcile passes with
+  unknown, not double-hold), `effectFailed
+   on cancelledPending keeps pending marker + error record
+  via the new report field` pins the error embedding (and its
+  `SessionExport` arm), and the old "marker removed, done
+  recorded" is withdrawn as durable-append would fail; (d) new pure transition handler
   `completeCancelledPending` performing SELECTIVE marker
   replacement only for `effectCompleted` — `started == false`
   entries: marker removed (durably via supersession above),
@@ -769,32 +819,32 @@ per batch, calls executed sequentially in order):
   `byte_usage(session TEXT PRIMARY KEY, bytes INTEGER NOT NULL)`
   added to the store's declared shape (per-session LOGICAL
   bytes: sum of record payload sizes already committed for that
-  session + artifact sizes for digests that session's
-  `artifactPublished` rows reference — same `records` session
-  column used for record counts) + `artifact_physical(digest
-  TEXT PRIMARY KEY, size INTEGER NOT NULL)` for GLOBAL
-  physical distinct bytes (one row per distinct digest ever
-  published, regardless of how many sessions reference it);
-  `schemaVersion` 2→3 with a migration creating both tables
-  AND backfilling BOTH via recompute-to-expected (Finding 4):
-  scan all committed `records` rows — `SELECT session, payload
-  FROM records` — decode each `artifactPublished` `ArtifactRef`
-  (digest/size/kind per SessionStore.swift:173–187; session is
-  in `records.session` per 204–214, :755–758 — NOT in the ref),
-  build per-session distinct digest sets, join to
-  `artifact_physical.size` to compute per-session distinct
-  artifact sums + `SUM(length(CAST(payload AS BLOB)))` for
-  record bytes (bytes, not characters — Finding 4), and insert
-  into `byte_usage`; insert distinct digests into
-  `artifact_physical` (distinct, not raw payload sum — the prior
-  "scan records payloads → sum per-session bytes" omitted
-  artifacts and proved non-idempotent additive bumps; now
-  recompute-to-expected is demonstrably idempotent, second run
-  sets same values). Empty tables for a fresh store. A v2-
-  store-with-artifact migration test seeds a v2 DB with a
-  `records` row containing an `artifactPublished` digest and
-  verifies the v3 open backfills `artifact_physical` and
-  per-session `byte_usage` correctly. FORWARD-ONLY
+  session + sum of distinct referenced artifact sizes for THAT
+  session) + `artifact_physical(digest TEXT PRIMARY KEY, size
+  INTEGER NOT NULL)` for GLOBAL physical distinct bytes (one row
+  per distinct digest CURRENTLY present — physical ground truth,
+  rows removed when no reference/orphan remains; the prior "ever
+  published" is withdrawn as it contradicts authoritative removal
+  — Finding 4); `schemaVersion` 2→3 with a migration creating
+  both tables AND backfilling BOTH via recompute-to-expected
+  (Finding 3+4): FIRST insert distinct `(digest, size)` into
+  `artifact_physical` directly from decoded
+  `artifactPublished` `ArtifactRef.digest/size` per
+  SessionStore.swift:173–187 (so the table has rows before any
+  join), THEN scan all committed `records` rows —
+  `SELECT session, payload FROM records` — decode each
+  `artifactPublished` digest, build per-session distinct digest
+  sets, JOIN to the just-populated `artifact_physical.size` to
+  compute per-session distinct artifact sums + `SUM(length(CAST
+  (payload AS BLOB)))` for record bytes (bytes, not characters —
+  Finding 4), and insert into `byte_usage` (so a v2 store with
+  artifacts yields non-zero artifact bytes — the prior body
+  joined before the insert and would yield zero). Empty tables
+  for a fresh store — migration is idempotent, recompute-to-
+  expected. A v2-store-with-artifact migration test seeds a v2
+  DB with a `records` row containing an `artifactPublished`
+  digest and verifies the v3 open backfills `artifact_physical`
+  and per-session `byte_usage` correctly. FORWARD-ONLY
   incompatibility stated honestly (old binaries fail closed on
   a newer `user_version` — GRDBSessionStore.swift:50, :109–113
   — and on shape mismatch — :121–124 declaration is the v0
@@ -898,13 +948,17 @@ per batch, calls executed sequentially in order):
   written; authoritative over-quota at commit → fail closed +
   just-written bytes cleaned up iff unreferenced, nothing
   renamed; orphan-reconcile leg (seeded orphan file →
-  `artifact_physical` created, no `byte_usage` row); two-session
-  missing-logical leg (committed reference without `byte_usage`
-  → that session's row recomputed); migration leg (v2 store with
-  artifact → v3 backfills `artifact_physical` + per-session
-  `byte_usage` via `records.session` join); old-binary/new-store
-  leg (v2 binary on v3 store → fail-closed integrity error);
-  sub-reserve free space → denied receipt, never a crash).
+  `artifact_physical` created, no `byte_usage` row);
+  two-session missing-logical leg (committed reference without
+  `byte_usage` → that session's row recomputed);
+  stale-row-removal leg (orphan file deleted → `artifact_physical`
+  row removed; overcounted `byte_usage` → lowered);
+  migration leg (v2 store with artifact → v3 backfills
+  `artifact_physical` first then per-session `byte_usage` via
+  `records.session` join with `length(CAST(payload AS BLOB))`);
+  old-binary/new-store leg (v2 binary on v3 store → fail-closed
+  integrity error); sub-reserve free space → denied receipt,
+  never a crash; non-ASCII byte fixture).
 - Counterfactuals: fuzzy matcher (must fail TOOL-04);
   normalization shim (must fail TOOL-06); deterministically gated
   lock-removal interleave (must lose-update without the lock,
@@ -1736,6 +1790,29 @@ NOT non-goals.)
   length(CAST(payload AS BLOB))` + per-session distinct join +
   authoritative set-to-expected including stale-row removal +
   overcounted-row + non-ASCII tests.
-- REV22 → deepseek-reviewer: _pending_.
+- REV22 → deepseek-reviewer: NEEDS-EVIDENCE (5 findings:
+  `EffectReservation.Kind` not populated at 7 test sites;
+  marker supersession has no last-wins rule + `cancelledPending
+  Error` has no report field + missing export arm + termination
+  marker+unknown double-hold; migration joins physical before it
+  has rows (frozen §8 only); `LENGTH(payload)` counts chars not
+  bytes; recompute contradicts never-lowers).
+- REV23 (this revision): Kind on all 13 sites (6 prod + 7 test,
+  provider fixtures explicitly `.provider`, required param) +
+  per-call mutating scope (`executor && mutating`) with read-only
+  executor consumed/dropped + both tests; durable supersession
+  last-record-wins per operationID (marker HOLD but supersedable
+  by done/unknown) + NEW `ReconciliationReport.
+  cancelledPendingErrors` field + `SessionExport`/`RecordCodec`
+  arms for both new records + termination promotion to unknown
+  via supersession + supersession/termination/error tests;
+  migration normative body now inserts `artifact_physical`
+  first from `ArtifactRef.size` then per-session `byte_usage`
+  via `records.session` join + `length(CAST(payload AS BLOB))`
+  + v2-with-artifact test; authoritative recompute including
+  stale-row removal/lowering + stale-row + overcounted + non-
+  ASCII legs; `artifact_physical` redefined as current ground
+  truth (not "ever").
+- REV23 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
