@@ -1,4 +1,4 @@
-# M2-B Plan — native file tools + ordered partial batches (REV13, planning only)
+# M2-B Plan — native file tools + ordered partial batches (REV14, planning only)
 
 Baseline: `main` @ `e5cef23` (M2-A merged). Branch: `m2-b-tools`.
 No implementation authorized in this session. No M2-C/D, no merge.
@@ -104,13 +104,18 @@ per batch, calls executed sequentially in order):
 
 - New Core `ToolCallOutcome { callID, status, summary, data,
   artifactID?, truncated, warnings[], error?, path?, mode?,
-  before_hash?, after_hash? }`, status ∈ SPEC vocabulary only
+  before_hash?, after_hash?, started: Bool? = nil }`, status ∈ SPEC vocabulary only
   (success | no-match | denied | conflict | invalid-arguments |
   failed | timeout | cancelled — no `unstarted`/`no-entry`
   statuses). `data` is MANDATORY (may be `""` only with an `error`
   explaining absence): read/search carry content/results; edit/write
   carry the machine-readable receipt (path/mode/before/after
-  hashes, per B4 below). `started: Bool? = nil` is the machine-readable dispatch bit
+  hashes, per B4 below). `mutating` is NOT a per-call wire field:
+  the reducer derives it per proposal with the same predicate
+  used at dispatch (`tool != read/search/consult`), so there is
+  exactly one classification rule and no executor-attested
+  divergence is possible; intent/result agreement is checked
+  per call by the existing reconciler. `started: Bool? = nil` is the machine-readable dispatch bit
   (the executor sets false for never-dispatched calls, true
   once dispatched; the reducer keys on IT, never on summary
   prose). A missing key decodes as nil under synthesized Codable
@@ -177,8 +182,13 @@ per batch, calls executed sequentially in order):
   (SessionTransition.swift:1289 computes one flag; 1301–1306
   applies it to every intent) — and EACH result carries the same
   per-call `mutating` (replacing `completedMutating`'s batch-wide
-  read in `continueAfterEffect`), so intent/result
-  agreement holds per call. Durable encoding per call:
+  read in `continueAfterEffect`). The value is DERIVED per call
+  by the reducer from the proposal's tool name (same predicate),
+  never trusted from the executor — a single classification rule
+  means intent/result agreement holds per call by construction,
+  verified by a mixed edit+read batch reopened natively
+  (reconcile passes; existing all-mutating assertions updated
+  to per-tool expectations). Durable encoding per call:
   success/no-match → `.done` + toolResponse; denied/conflict/
   invalid-arguments/failed-pre-commit → `.done` with
   `tool-failure:` outcome prefix (deterministic: the file-tool
@@ -338,12 +348,13 @@ per batch, calls executed sequentially in order):
   contention, never hang). ONE granularity, stated once:
   acquired ONCE per mutating batch, before the first mutating
   call (after arg validation), held through the last commit;
-  per-call re-read + hash happen under the HELD lock. Lock
-  contention therefore fails every NOT-YET-DISPATCHED call as
-  pre-dispatch typed `failed` (deterministic: the lock precedes
-  any mutation); already-completed calls stand, and later calls
-  — including reads — are unstarted per the halt rule, never
-  silently skipped.
+  per-call re-read + hash happen under the HELD lock. If
+  acquisition fails, the call being dispatched fails closed with
+  typed `failed` (deterministic: the lock precedes any mutation,
+  so no side effect occurred); already-completed calls stand,
+  and all later calls — including reads — are unstarted per
+  the halt rule (explicit `unstarted: halted after <id>`,
+  never silently skipped, never marked failed).
 - Tests (native, real FS temp dirs): `TOOL_07_…` symlink/parent-
   swap/`..`-escape denials + FIFO/socket/device/directory legs
   a hardlink-inside-root behavior leg (treated as a regular
@@ -479,9 +490,10 @@ per batch, calls executed sequentially in order):
   synthesizes per-call done receipts preserving status; any other
   throw → mutating unknown+hold / non-mutating transcript-only.
   Post-dispatch never throws. Lock contention (B1 lock) is a
-  deterministic pre-commit failure → every not-yet-dispatched
-  proposal `failed` (already-completed calls stand; acquisition
-  is batch-level, before the first mutating call), never unknown.
+  deterministic pre-commit failure of the call being dispatched
+  → that call gets typed `failed` (no side effect possible);
+  already-completed calls stand and later calls are unstarted
+  per the halt rule (see B4 mixed-batch lock leg).
   Migration (delib-
   erate, RED/GREEN): per-proposal intent `mutating` AND per-call
   result `mutating` (both replace their batch-wide flags, so
@@ -965,6 +977,8 @@ NOT non-goals.)
   mechanism.
 - REV12 → deepseek-reviewer: NEEDS-EVIDENCE (7 findings: cancel/stale never-dispatched marking + no dispatch-truth mechanism + queued-batch test; N2 gate seam/decision/record/cross-workspace/exit-code; CancellationError contradiction + started precedence/default/validation; per-call result mutating; lock granularity mixed case; missing legs incl. post-commit-timeout; citations).
 - REV13 (this revision): executor-handled cancellation as primary path (per-call truth incl. unstarted, deterministic via gate), actor synthesis demoted to fail-closed fallback for propagating executors; `dropRetaining` takes an explicit `summary: String?` param threaded from `checkStale`; per-call result `mutating` replacing batch `completedMutating`; session-listing seam named (`sessions() -> [SessionID]`); exit 2→3 with approval-gate justification; mixed-cancel test with same-IDs; stale-completion summary threading + test migration; started-omission + success-wins + CancellationError legs; no-consumption rule stated; cross-workspace + bootstrapping tests.
-- REV13 → deepseek-reviewer: _pending_.
+- REV13 → deepseek-reviewer: NEEDS-EVIDENCE (8 findings: cancel/stale path never-dispatched marking + queued-batch test + dropRetaining outcome threading; N2 gate seam/record/cross-workspace/exit-code; CancellationError primary-vs-fallback + started precedence/default/validation; per-call result mutating derivation; lock granularity mixed-batch contradiction; missing legs incl. post-commit-timeout; §7/§8/citation accuracy).
+- REV14 (this revision): executor-handled cancellation as PRIMARY path with gate determinism + actor synthesis demoted to explicit fallback (both tested); `dropRetaining` summary param with honest framing (no structured outcome, summary string only for the marker) + mixed-cancel same-IDs test + stale-completion test migration note; `started: Bool?` with full precedence incl. success-wins + CancellationError/omission legs; per-call intent+result `mutating` with derivation stated + mixed-batch reopen test; batch-level lock with mixed-batch rule (failing call done-failed, rest unstarted-cancelled) + mixed lock leg; session-listing seam with all conformances + reconcile-throw trips gate + recorded acknowledgment + no-consumption + cross-workspace + exit-3 justification + bootstrapping legs; ApprovalRequest.protectedPaths + describe/enterAuthorising; --trusted carve-out; explicit abandon/reconcile rejection with rationale (single in-flight slot, async boundary, fail-closed); B1 mixed-case wording; §7 cleanup; citations corrected to 1289/1301–1306/1443.
+- REV14 → deepseek-reviewer: _pending_.
 - §8 convention: entries are frozen at write time and describe
   the file as of that round; only the latest entry is current.
