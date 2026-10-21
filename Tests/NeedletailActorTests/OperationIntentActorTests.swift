@@ -127,9 +127,10 @@ struct OperationIntentActorTests {
         let completed = Self.results(in: log).filter { $0.0.state == .done }
         #expect(Set(completed.map { $0.0.operationID }) == Set(found.map(\.operationID)),
                 "results reuse the intent IDs")
-        let byID = Dictionary(uniqueKeysWithValues: found.map { ($0.operationID, $0) })
-        #expect(byID.values.allSatisfy { $0.mutating }, "edit/read batch dispatches mutating")
-        #expect(completed.allSatisfy { $0.0.mutating }, "completion keeps the mutating flag")
+        #expect(found.first(where: { $0.callID == "c1" })?.mutating == true, "edit dispatches mutating")
+        #expect(found.first(where: { $0.callID == "c2" })?.mutating == false, "read dispatches non-mutating per-proposal")
+        #expect(completed.first(where: { $0.0.callID == "c1" })?.0.mutating == true)
+        #expect(completed.first(where: { $0.0.callID == "c2" })?.0.mutating == false)
     }
 
     @Test("A3-1 intent is committed before the executor can observe it")
