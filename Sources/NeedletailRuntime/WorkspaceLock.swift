@@ -17,24 +17,44 @@ public struct WorkspaceLock: Sendable {
     /// must be closed to release. Throws StoreError.integrity on failure
     /// or contention (typed `failed` in executor).
     public static func acquire(workspace: WorkspaceResolver.PinnedRoot) throws -> Int32 {
-        // Revalidate workspace root before each lock acquisition
-        let wsFD = try WorkspaceResolver(workspace: workspace.path, readRoots: []).validatedWorkspaceFD()
+        // Revalidate workspace root against caller's pinned identity (not a fresh pin)
+        if workspace.path.string.utf8.contains(0) {
+            throw StoreError.integrity("workspace path contains NUL")
+        }
+        let wsFD = workspace.path.string.withCString { cstr in
+            open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard wsFD >= 0 else {
+            throw StoreError.integrity("workspace re-open failed (symlink or replaced): \(workspace.path.string): \(String(cString: strerror(errno)))")
+        }
         defer { close(wsFD) }
+        var st = stat()
+        guard fstat(wsFD, &st) == 0 else {
+            throw StoreError.integrity("workspace fstat failed")
+        }
+        guard UInt64(st.st_dev) == workspace.device && UInt64(st.st_ino) == workspace.inode else {
+            throw StoreError.integrity("workspace identity mismatch (replaced): \(workspace.path.string)")
+        }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else {
+            throw StoreError.integrity("workspace not a directory after revalidation")
+        }
 
         // Ensure .needletail directory exists safely, not via unguarded path
         let dirFD = try ensureLockDirectory(workspaceFD: wsFD)
 
-        // Open lock file (create if needed, 0600) and try nonblocking flock
-        let lockFD = lockDirName.withCString { _ in
-            // Actually we need to open "lock" inside dirFD
-            "lock".withCString { name in
-                openat(dirFD, name, O_RDWR | O_CREAT | O_CLOEXEC, mode_t(0o600))
-            }
+        // Open lock file with O_NOFOLLOW and verify regular file (not symlink/FIFO/dir)
+        let lockFD = "lock".withCString { name in
+            openat(dirFD, name, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
         }
         // Close dirFD after opening lock file
         close(dirFD)
         guard lockFD >= 0 else {
             throw StoreError.integrity("cannot open lock file: \(String(cString: strerror(errno)))")
+        }
+        var lst = stat()
+        guard fstat(lockFD, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFREG else {
+            close(lockFD)
+            throw StoreError.integrity("lock file is not a regular file")
         }
         // Ensure 0600
         _ = fchmod(lockFD, mode_t(0o600))

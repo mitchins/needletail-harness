@@ -120,6 +120,13 @@ public struct WorkspaceResolver: Sendable {
         var toClose: [Int32] = []
         defer {
             for fd in toClose { close(fd) }
+            if currentFD != dirFD {
+                // If we exit via throw, currentFD is an intermediate that was not yet moved to toClose
+                // Check if it's already in toClose to avoid double close
+                if !toClose.contains(currentFD) {
+                    close(currentFD)
+                }
+            }
         }
         for (index, compSub) in components.enumerated() {
             let name = String(compSub)
@@ -137,12 +144,9 @@ public struct WorkspaceResolver: Sendable {
             }
             // Byte-exact: no NFC/NFD normalization; Swift String preserves UTF-8, we pass raw via withCString without transform
             let isLast = index == components.count - 1
-            let openFlags: Int32
-            if isLast {
-                openFlags = flags
-            } else {
-                openFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-            }
+            let baseFlags: Int32 = isLast ? flags : (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            // Always add NONBLOCK to avoid FIFO hang, and ensure NOFOLLOW on final as well
+            let openFlags = baseFlags | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
             let fd = name.withCString { cstr in
                 openat(currentFD, cstr, openFlags, mode)
             }
@@ -187,6 +191,8 @@ public struct WorkspaceResolver: Sendable {
                     }
                 }
                 // Hardlinks are treated as regular files (indistinguishable)
+                // Remove currentFD from toClose tracking if it was there (we are returning final fd, not closing current)
+                // But we need to ensure toClose will not close the returned fd
                 return fd
             } else {
                 guard fileType == S_IFDIR else {

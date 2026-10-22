@@ -75,26 +75,28 @@ struct RunCommand: ParsableCommand {
             throw ExitCode(2)
         }
         if let ws = workspace {
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: ws, isDirectory: &isDir), isDir.boolValue else {
-                eprint("error: --workspace must exist and be a directory: \(terminalSafe(ws))")
-                throw ExitCode(2)
-            }
             if ws.utf8.contains(0) {
                 eprint("error: --workspace contains NUL")
                 throw ExitCode(2)
             }
-        }
-        for rr in readRoot {
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: rr, isDirectory: &isDir), isDir.boolValue else {
-                eprint("error: --read-root must exist and be a directory: \(terminalSafe(rr))")
+            let fd = ws.withCString { cstr in open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard fd >= 0 else {
+                eprint("error: --workspace must exist and be a directory (not symlink): \(terminalSafe(ws)): \(String(cString: strerror(errno)))")
                 throw ExitCode(2)
             }
+            close(fd)
+        }
+        for rr in readRoot {
             if rr.utf8.contains(0) {
                 eprint("error: --read-root contains NUL")
                 throw ExitCode(2)
             }
+            let fd = rr.withCString { cstr in open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard fd >= 0 else {
+                eprint("error: --read-root must exist and be a directory (not symlink): \(terminalSafe(rr)): \(String(cString: strerror(errno)))")
+                throw ExitCode(2)
+            }
+            close(fd)
         }
         // Capture values for Sendable closure (mutating self cannot be captured)
         let promptCopy = prompt

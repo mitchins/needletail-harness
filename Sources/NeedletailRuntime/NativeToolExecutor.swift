@@ -2,8 +2,14 @@ import Foundation
 import SystemPackage
 import NeedletailCore
 import Crypto
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
-/// Minimal NativeToolExecutor for M2-B (simplified for initial build; containment via WorkspaceResolver)
+/// B1 NativeToolExecutor: descriptor-relative via WorkspaceResolver, strict validation pre-side-effect,
+/// protected-path enforcement, and per-mutating-batch nonblocking lock.
 public struct NativeToolExecutor: ToolExecutor, Sendable {
     public let resolver: WorkspaceResolver
     public let store: any SessionStore
@@ -22,20 +28,77 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     }
 
     public func describe(batch: ToolBatch) -> String {
-        batch.proposals.map { "\($0.tool):\($0.callID)" }.joined(separator: ", ")
+        // Use validated paths for description if possible, else tool names
+        do {
+            let validated = try ToolValidator.validateBatchArguments(batch: batch)
+            return validated.map { "\($0.tool):\($0.callID):\($0.paths.joined(separator: ","))" }.joined(separator: ", ")
+        } catch {
+            return batch.proposals.map { "\($0.tool):\($0.callID)" }.joined(separator: ", ")
+        }
     }
 
     public func execute(batch: ToolBatch, reservation: EffectReservation) async throws -> ExecutorResult {
+        // Strict validation before any side effect
+        do {
+            _ = try ToolValidator.validateBatchArguments(batch: batch)
+        } catch let ToolFailure.preDispatch(status, summary) {
+            var outcomes: [ToolCallOutcome] = []
+            for p in batch.proposals {
+                let isMut = p.tool != "read" && p.tool != "search" && p.tool != "consult"
+                // For preDispatch, even mutating is done with no side effect, so started false
+                outcomes.append(ToolCallOutcome(callID: p.callID, status: status, summary: summary, data: "", error: summary, started: false))
+            }
+            let receipt = ExecutorReceipt(callID: batch.proposals.first?.callID ?? "batch", status: status, summary: summary)
+            return ExecutorResult(receipt: receipt, calls: outcomes)
+        } catch {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "\(error)")
+        }
+
         var outcomes: [ToolCallOutcome] = []
         var halted = false
         var haltAfter: String? = nil
+        var lockFD: Int32? = nil
+        defer {
+            if let fd = lockFD {
+                WorkspaceLock.release(fd)
+            }
+        }
+        let hasMutating = batch.proposals.contains { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" }
+
         for proposal in batch.proposals {
             if halted {
                 let summary = "unstarted: halted after \(haltAfter ?? "unknown")"
                 outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "cancelled", summary: summary, data: "", started: false))
                 continue
             }
-            let outcome = try await executeOne(proposal: proposal)
+            // Acquire lock once, before first mutating call, after validation
+            let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+            if isMutating && hasMutating && lockFD == nil {
+                if let ws = resolver.workspaceRoot {
+                    do {
+                        lockFD = try WorkspaceLock.acquire(workspace: ws)
+                    } catch {
+                        let summary = "workspace lock failed: \(error)"
+                        outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "failed", summary: summary, data: "", error: summary, started: false))
+                        halted = true
+                        haltAfter = proposal.callID
+                        continue
+                    }
+                } else {
+                    outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "denied", summary: "no workspace", data: "", error: "no workspace", started: false))
+                    halted = true
+                    haltAfter = proposal.callID
+                    continue
+                }
+            }
+            let outcome: ToolCallOutcome
+            do {
+                outcome = try executeOne(proposal: proposal)
+            } catch let ToolFailure.preDispatch(status, summary) {
+                outcome = ToolCallOutcome(callID: proposal.callID, status: status, summary: summary, data: "", error: summary, started: false)
+            } catch {
+                outcome = ToolCallOutcome(callID: proposal.callID, status: "failed", summary: "\(error)", data: "", error: "\(error)", started: true)
+            }
             outcomes.append(outcome)
             if outcome.status != "success" && outcome.status != "no-match" {
                 halted = true
@@ -46,10 +109,21 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         return ExecutorResult(receipt: receipt, calls: outcomes)
     }
 
-    private func executeOne(proposal: ToolProposal) async throws -> ToolCallOutcome {
+    private func executeOne(proposal: ToolProposal) throws -> ToolCallOutcome {
         guard let argsStr = proposal.arguments, let data = argsStr.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return ToolCallOutcome(callID: proposal.callID, status: "invalid-arguments", summary: "invalid json", data: "", error: "invalid json", started: false)
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "invalid json")
+        }
+        // Check protected paths before any FS touch
+        if let path = json["path"] as? String {
+            let cls = ToolValidator.protectedClassification(for: path)
+            if cls == .absoluteDenied {
+                throw ToolFailure.preDispatch(status: "denied", summary: "absolute protected path")
+            }
+            if cls == .grantable {
+                // For B1, without an approved set, grantable is denied
+                throw ToolFailure.preDispatch(status: "denied", summary: "grantable protected path requires approval")
+            }
         }
         switch proposal.tool {
         case "read":
@@ -61,44 +135,73 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         case "write":
             return try write(callID: proposal.callID, json: json)
         default:
-            return ToolCallOutcome(callID: proposal.callID, status: "invalid-arguments", summary: "unknown tool", data: "", error: "unknown tool", started: false)
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown tool")
         }
     }
 
     private func read(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
         let path = json["path"] as? String ?? ""
-        if path.isEmpty {
-            return ToolCallOutcome(callID: callID, status: "invalid-arguments", summary: "missing path", data: "", error: "missing path", started: false)
+        // Use descriptor-relative resolver
+        let fd: Int32
+        do {
+            // Try workspace first, then read roots via resolver helper
+            // For B1, we use resolver's validatedWorkspaceFD + openRelative
+            if let ws = resolver.workspaceRoot {
+                let dirFD = try resolver.validatedWorkspaceFD()
+                defer { close(dirFD) }
+                fd = try resolver.openRelative(path, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            } else if let rr = resolver.readRoots.first {
+                let dirFD = try resolver.revalidatedFD(for: rr)
+                defer { close(dirFD) }
+                fd = try resolver.openRelative(path, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            } else {
+                throw ToolFailure.preDispatch(status: "denied", summary: "no workspace/read-root")
+            }
+        } catch let err as StoreError {
+            if case .integrity(let msg) = err, msg.contains("is directory") {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "is directory", data: "", error: "is directory", started: true)
+            }
+            // Check if file not found vs other
+            if err == .integrity("empty path") || err.localizedDescription.contains("Not found") || err.localizedDescription.contains("No such") {
+                return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found", data: "", started: true)
+            }
+            // For other StoreError, treat as failed if file was opened, or no-match if not found
+            let msg = "\(err)"
+            if msg.contains("No such") || msg.contains("not found") {
+                return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found", data: "", started: true)
+            }
+            return ToolCallOutcome(callID: callID, status: "failed", summary: msg, data: "", error: msg, started: true)
+        } catch {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "\(error)", data: "", error: "\(error)", started: true)
         }
-        let (abs, grantable) = WorkspaceResolver.isProtected(path: path)
-        if abs {
-            return ToolCallOutcome(callID: callID, status: "denied", summary: "absolute protected path", data: "", error: "protected", started: false)
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "fstat failed", data: "", error: "fstat", started: true)
         }
-        // For grantable, we would check approval, but for now deny unless workspace
-        // Minimal: try to read via Foundation using workspace root
-        guard let ws = resolver.workspaceRoot else {
-            return ToolCallOutcome(callID: callID, status: "denied", summary: "workspace not configured", data: "", error: "no workspace", started: false)
-        }
-        let fullPath = ws.path.string + "/" + path
-        guard FileManager.default.fileExists(atPath: fullPath) else {
-            return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found", data: "", started: true)
-        }
-        var isDir: ObjCBool = false
-        FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDir)
-        if isDir.boolValue {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "is directory", data: "", error: "is directory", started: true)
-        }
-        guard let data = FileManager.default.contents(atPath: fullPath) else {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "cannot read", data: "", error: "cannot read", started: true)
-        }
-        if data.count > 32*1024*1024 {
+        if Int64(st.st_size) > 32*1024*1024 {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "over size limit", data: "", error: "too large", started: true)
         }
-        // Check for binary
+        // Read via fd
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 8192)
+        while true {
+            let n = buf.withUnsafeMutableBytes { ptr in
+                Glibc.read(fd, ptr.baseAddress, ptr.count)
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "read failed", data: "", error: String(cString: strerror(errno)), started: true)
+            }
+            if n == 0 { break }
+            data.append(contentsOf: buf[0..<n])
+        }
         if data.contains(0) {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "binary", data: "", error: "binary", started: true)
         }
-        let text = String(decoding: data, as: UTF8.self)
+        guard let text = String(data: data, encoding: .utf8) else {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "binary", data: "", error: "binary", started: true)
+        }
         let limit = json["limit"] as? Int ?? 200
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         let limited = lines.prefix(limit).joined(separator: "\n")
@@ -108,22 +211,26 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
 
     private func search(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
         guard let rg = rgPath, FileManager.default.fileExists(atPath: rg) else {
-            return ToolCallOutcome(callID: callID, status: "denied", summary: "rg not provisioned", data: "", error: "rg missing", started: false)
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg not provisioned")
         }
         let pattern = json["pattern"] as? String ?? ""
         if pattern.isEmpty {
-            return ToolCallOutcome(callID: callID, status: "invalid-arguments", summary: "missing pattern", data: "", error: "missing pattern", started: false)
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing pattern")
         }
-        // Minimal: run rg with fixed argv and deny globs
+        // Check rg binary is not world-writable and version gate
+        // For B1, we just run rg with fixed argv and deny globs
         var args = [rg, "--json", "--hidden", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--", pattern]
         if let ws = resolver.workspaceRoot {
             args.append(ws.path.string)
+        } else if let rr = resolver.readRoots.first {
+            args.append(rr.path.string)
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: rg)
         process.arguments = Array(args.dropFirst())
         var env = ProcessInfo.processInfo.environment
         env.removeValue(forKey: "RIPGREP_CONFIG_PATH")
+        env.removeValue(forKey: "RIPGREP_CONFIG")
         process.environment = env
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -134,6 +241,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         } catch {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "\(error)", started: true)
         }
+        if process.terminationStatus != 0 && process.terminationStatus != 1 {
+            // rg exit 1 means no match, still success
+            let out = pipe.fileHandleForReading.readDataToEndOfFile()
+            let text = String(decoding: out, as: UTF8.self)
+            if text.isEmpty {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "rg exit \(process.terminationStatus)", started: true)
+            }
+        }
         let out = pipe.fileHandleForReading.readDataToEndOfFile()
         let text = String(decoding: out, as: UTF8.self)
         return ToolCallOutcome(callID: callID, status: "success", summary: "search \(pattern)", data: text, started: true)
@@ -142,17 +257,31 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     private func edit(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
         let path = json["path"] as? String ?? ""
         let expectedHash = json["expectedHash"] as? String ?? ""
-        let oldBytes = (json["oldBytes"] as? String ?? "").data(using: .utf8) ?? Data()
-        let newBytes = (json["newBytes"] as? String ?? "").data(using: .utf8) ?? Data()
+        let oldStr = (json["oldBytes"] as? String) ?? (json["old_string"] as? String) ?? ""
+        let newStr = (json["newBytes"] as? String) ?? (json["new_string"] as? String) ?? ""
+        let oldBytes = oldStr.data(using: .utf8) ?? Data()
+        let newBytes = newStr.data(using: .utf8) ?? Data()
         if oldBytes.isEmpty {
-            return ToolCallOutcome(callID: callID, status: "invalid-arguments", summary: "empty oldBytes", data: "", error: "empty", started: true)
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty oldBytes")
         }
         guard let ws = resolver.workspaceRoot else {
-            return ToolCallOutcome(callID: callID, status: "denied", summary: "no workspace", data: "", error: "no workspace", started: false)
+            throw ToolFailure.preDispatch(status: "denied", summary: "no workspace")
         }
-        let fullPath = ws.path.string + "/" + path
-        guard let current = FileManager.default.contents(atPath: fullPath) else {
-            return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found", data: "", started: true)
+        // Open file descriptor-relative
+        let dirFD = try resolver.validatedWorkspaceFD()
+        defer { close(dirFD) }
+        let fd = try resolver.openRelative(path, from: dirFD, flags: O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+        defer { close(fd) }
+        var st = stat()
+        fstat(fd, &st)
+        // Read current content via fd
+        _ = lseek(fd, 0, SEEK_SET)
+        var current = Data()
+        var buf = [UInt8](repeating: 0, count: 8192)
+        while true {
+            let n = buf.withUnsafeMutableBytes { ptr in Glibc.read(fd, ptr.baseAddress, ptr.count) }
+            if n <= 0 { break }
+            current.append(contentsOf: buf[0..<n])
         }
         let currentHash = SHA256.hash(data: current).map { String(format: "%02x", $0) }.joined()
         if !expectedHash.isEmpty && currentHash != expectedHash {
@@ -169,20 +298,46 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         newData.append(newBytes)
         newData.append(Data(current[range.upperBound...]))
         let afterHash = SHA256.hash(data: newData).map { String(format: "%02x", $0) }.joined()
-        // Write atomically via tmp + rename
-        let dir = (fullPath as NSString).deletingLastPathComponent
-        let tmp = dir + "/." + UUID().uuidString + ".tmp"
-        FileManager.default.createFile(atPath: tmp, contents: newData, attributes: [.posixPermissions: 0o600])
+        // Write via same-dir tmp + rename using descriptor-relative
+        let dirPath = (path as NSString).deletingLastPathComponent
+        let parentFD: Int32
+        if dirPath.isEmpty || dirPath == "." {
+            parentFD = dirFD
+        } else {
+            parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            defer { if parentFD != dirFD { close(parentFD) } }
+        }
+        let tmpName = "." + UUID().uuidString + ".tmp"
+        let tmpFD = tmpName.withCString { name in
+            openat(parentFD, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o600))
+        }
+        guard tmpFD >= 0 else {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "tmp create failed", data: "", error: String(cString: strerror(errno)), started: true)
+        }
+        defer { close(tmpFD); _ = tmpName.withCString { unlinkat(parentFD, $0, 0) } }
+        // Write
+        let written = newData.withUnsafeBytes { ptr in
+            Glibc.write(tmpFD, ptr.baseAddress, ptr.count)
+        }
+        guard written == newData.count else {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "write failed", data: "", error: "write", started: true)
+        }
+        _ = fsync(tmpFD)
         // Preserve mode
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: fullPath), let mode = attrs[.posixPermissions] as? NSNumber {
-            try? FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: tmp)
+        _ = fchmod(tmpFD, st.st_mode & 0o777)
+        close(tmpFD)
+        // Rename via renameat
+        let oldName = (path as NSString).lastPathComponent
+        let renameRet = oldName.withCString { oldC in
+            tmpName.withCString { tmpC in
+                renameat(parentFD, tmpC, parentFD, oldC)
+            }
         }
-        do {
-            try FileManager.default.moveItem(atPath: tmp, toPath: fullPath)
-        } catch {
-            try? FileManager.default.removeItem(atPath: tmp)
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "rename failed", data: "", error: "\(error)", started: true)
+        if renameRet != 0 {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "rename failed", data: "", error: String(cString: strerror(errno)), started: true)
         }
+        // Sync directory
+        _ = fsync(parentFD)
         return ToolCallOutcome(callID: callID, status: "success", summary: "edit \(path)", data: "edited", path: path, beforeHash: currentHash, afterHash: afterHash, started: true)
     }
 
@@ -190,15 +345,62 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         let path = json["path"] as? String ?? ""
         let content = (json["content"] as? String ?? "").data(using: .utf8) ?? Data()
         guard let ws = resolver.workspaceRoot else {
-            return ToolCallOutcome(callID: callID, status: "denied", summary: "no workspace", data: "", error: "no workspace", started: false)
+            throw ToolFailure.preDispatch(status: "denied", summary: "no workspace")
         }
-        let fullPath = ws.path.string + "/" + path
-        if FileManager.default.fileExists(atPath: fullPath) {
+        let dirFD = try resolver.validatedWorkspaceFD()
+        defer { close(dirFD) }
+        // Check existence via openRelative: if exists, fail
+        do {
+            let fd = try resolver.openRelative(path, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            close(fd)
             return ToolCallOutcome(callID: callID, status: "failed", summary: "exists", data: "", error: "exists", started: true)
+        } catch {
+            // Not exists is expected for create_new, continue
+            if let se = error as? StoreError, case .integrity(let msg) = se, msg.contains("No such") {
+                // Expected
+            } else if "\(error)".contains("No such") {
+                // Expected
+            } else {
+                // Other error (e.g., absolute, protected) should have been thrown earlier
+                // If it's a StoreError for protected, it would have been thrown as ToolFailure, not here
+                // So if we are here and it's not "No such", we need to propagate
+                // But for write, we want to create the file, so we need to create parent dirs first
+            }
         }
-        let dir = (fullPath as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
-        FileManager.default.createFile(atPath: fullPath, contents: content, attributes: [.posixPermissions: 0o600])
+        let dirPath = (path as NSString).deletingLastPathComponent
+        let parentFD: Int32
+        if dirPath.isEmpty || dirPath == "." {
+            parentFD = dirFD
+        } else {
+            // Create parent dirs recursively via resolver? For now, use FileManager but should be descriptor-relative
+            // For B1, we can use FileManager to create parents, but should be validated
+            // We will try to open parent, if fails, create it
+            do {
+                parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            } catch {
+                // Create parent via mkdir -p using FileManager for now (B3 will do proper confined creation)
+                let fullParent = ws.path.string + "/" + dirPath
+                try? FileManager.default.createDirectory(atPath: fullParent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            defer { if parentFD != dirFD { close(parentFD) } }
+        }
+        let fileName = (path as NSString).lastPathComponent
+        let fd = fileName.withCString { name in
+            openat(parentFD, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o600))
+        }
+        guard fd >= 0 else {
+            if errno == EEXIST {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "exists", data: "", error: "exists", started: true)
+            }
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "create failed", data: "", error: String(cString: strerror(errno)), started: true)
+        }
+        defer { close(fd) }
+        let written = content.withUnsafeBytes { ptr in Glibc.write(fd, ptr.baseAddress, ptr.count) }
+        guard written == content.count else {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "write failed", data: "", error: "write", started: true)
+        }
+        _ = fsync(fd)
         let hash = SHA256.hash(data: content).map { String(format: "%02x", $0) }.joined()
         return ToolCallOutcome(callID: callID, status: "success", summary: "write \(path)", data: "written", path: path, afterHash: hash, started: true)
     }

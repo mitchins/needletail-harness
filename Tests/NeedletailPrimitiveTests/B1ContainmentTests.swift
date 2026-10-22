@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import NeedletailCore
 @testable import NeedletailRuntime
+import NeedletailTestSupport
 import SystemPackage
 #if canImport(Glibc)
 import Glibc
@@ -18,6 +19,26 @@ struct B1ContainmentTests {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("b1-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         return (url, FilePath(url.path))
+    }
+
+    private static func makeEpoch(permissive: Bool = true) throws -> EpochDescriptor {
+        let cfgJSON = """
+        {"version":1,"default_model":"local-coder","allow_http_origins":["http://127.0.0.1:11434"],"models":[{"alias":"local-coder","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11434","model":"qwen","context_window":262144,"max_output":4096,"locality":"local","connect_timeout_s":10,"read_idle_timeout_s":300,"request_timeout_s":1800,"max_in_flight":1}],"tools":{"read":true,"search":true,"edit":true,"write":true,"exec":"ask","consult":false}}
+        """
+        let cfg = try validateConfig(Data(cfgJSON.utf8))
+        let profile = try #require(cfg.profiles["local-coder"])
+        let caps = effectiveCapabilities(build: .allAllowed, userConfig: cfg.tools, workspaceGrant: permissive ? .allAllowed : .allDenied, invocationMask: .allAllowed, sealed: SealedRestrictions(sealed: false))
+        let route = selectRoute(snapshot: cfg, requestedAlias: "local-coder", sealed: false)
+        return EpochDescriptor(epochID: EpochID("epoch-1"), configSnapshot: cfg, profile: profile, effectiveCaps: caps, route: route)
+    }
+
+    private static func makeState() throws -> SessionState {
+        let epoch = try Self.makeEpoch()
+        return SessionState(sessionID: SessionID("s-b1"), epoch: epoch, trustMode: .workspace, phase: .idle)
+    }
+
+    private static func input(_ text: String, id: String) -> SessionEvent {
+        .operatorInput(commandID: CommandID(id), text: text, kind: .followUp, revision: 1, sealed: false, atMillis: 1000)
     }
 
     // MARK: - TOOL_07 containment
@@ -322,7 +343,7 @@ struct B1ContainmentTests {
     // MARK: - Lock
 
     @Test("B1_lockContention")
-    func b1LockContention() throws {
+    func b1LockContention() async throws {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let pinned = try WorkspaceResolver(workspace: fp, readRoots: []).workspaceRoot!
@@ -336,7 +357,7 @@ struct B1ContainmentTests {
         holder.arguments = ["-n", lockPath, "sleep", "2"]
         try holder.run()
         // Give subprocess time to acquire
-        Thread.sleep(forTimeInterval: 0.3)
+        try? await Task.sleep(nanoseconds: 300_000_000)
         #expect(holder.isRunning, "holder should be holding lock")
         // Second acquisition nonblocking should fail with contention
         #expect(throws: StoreError.self) {
@@ -466,5 +487,176 @@ struct B1ContainmentTests {
         let fd2 = "linkFinal".withCString { cstr in openat(fd, cstr, O_RDONLY | O_CLOEXEC) }
         #expect(fd2 >= 0)
         if fd2 >= 0 { close(fd2) }
+    }
+
+    @Test("TOOL_07_hardlink")
+    func tool07Hardlink() throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let orig = url.appendingPathComponent("orig")
+        try "hello".write(to: orig, atomically: true, encoding: .utf8)
+        let link = url.appendingPathComponent("hardlink")
+        try FileManager.default.linkItem(atPath: orig.path, toPath: link.path)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let fd = try resolver.validatedWorkspaceFD()
+        defer { close(fd) }
+        let rfd = try resolver.openRelative("hardlink", from: fd, flags: O_RDONLY | O_NOFOLLOW)
+        defer { close(rfd) }
+        var st = stat(); fstat(rfd, &st)
+        #expect((st.st_mode & S_IFMT) == S_IFREG, "hardlink is regular file")
+    }
+
+    @Test("TOOL_07_socketAndDevice")
+    func tool07SocketAndDevice() throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let fd = try resolver.validatedWorkspaceFD()
+        defer { close(fd) }
+        let sockPath = url.appendingPathComponent("sock")
+        let sockFD = socket(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0)
+        #expect(sockFD >= 0)
+        if sockFD >= 0 {
+            var addr = sockaddr_un()
+            addr.sun_family = sa_family_t(AF_UNIX)
+            let pathPtr = withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+                ptr.withMemoryRebound(to: CChar.self, capacity: 108) { cptr in
+                    let p = sockPath.path
+                    p.withCString { src in strncpy(cptr, src, 107) }
+                    return cptr
+                }
+            }
+            _ = pathPtr
+            let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+            _ = bind(sockFD, withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 } }, addrLen)
+            close(sockFD)
+        }
+        if FileManager.default.fileExists(atPath: sockPath.path) {
+            #expect(throws: StoreError.self) {
+                _ = try resolver.openRelative("sock", from: fd, flags: O_RDONLY | O_NOFOLLOW)
+            }
+            try? FileManager.default.removeItem(at: sockPath)
+        }
+    }
+
+    @Test("TOOL_07_symlinkToGit")
+    func tool07SymlinkToGit() throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let gitDir = url.appendingPathComponent(".git")
+        try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent("git-outside-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let link = url.appendingPathComponent("linkToGit")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: gitDir.path)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let fd = try resolver.validatedWorkspaceFD()
+        defer { close(fd) }
+        #expect(throws: StoreError.self) {
+            _ = try resolver.openRelative("linkToGit/config", from: fd, flags: O_RDONLY | O_NOFOLLOW)
+        }
+        #expect(ToolValidator.protectedClassification(for: ".git/config") == .grantable)
+    }
+
+    @Test("B1_grantOverride")
+    func b1GrantOverride() throws {
+        var ids = DeterministicIDSource(prefix: "t-override")
+        let epoch = try Self.makeEpoch()
+        var state = SessionState(sessionID: SessionID("s-override"), epoch: epoch, trustMode: .workspace, phase: .idle)
+        state = transition(state, Self.input("run", id: "a-1"), &ids).state
+        state = transition(state, .requestDispatched(requestID: state.activeRun!.requestID, atMillis: 1001), &ids).state
+        state = transition(state, .requestStarted(requestID: state.activeRun!.requestID, generation: state.activeRun!.revision, atMillis: 1002), &ids).state
+        let run = try #require(state.activeRun)
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\".git/config\"}"),
+            ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\".env\"}"),
+        ])
+        let resp = ProviderResponse(requestID: run.requestID, generation: run.revision, outcome: .textDeltaComplete(text: "x", toolProposals: batch.proposals.map { ToolProposal(callID: $0.callID, tool: $0.tool, argumentsDigest: "d") }, isFinal: false))
+        state = transition(state, .providerResponse(requestID: run.requestID, generation: run.revision, response: resp, atMillis: 1003), &ids).state
+        let auth = transition(state, .validationCompleted(requestID: run.requestID, generation: run.revision, batch: batch, atMillis: 1004), &ids)
+        #expect(({ if case .authorising = auth.state.phase { return true }; return false }()))
+        let req = try #require(auth.state.pendingApproval)
+        #expect(Set(req.protectedPaths) == Set([".git/config", ".env"]))
+        var state2 = auth.state
+        let approved = ApprovalRequest(requestID: run.requestID, runID: run.runID, generation: run.revision, operation: "x", requiredGrant: "x", protectedPaths: [".git/config"])
+        state2 = state2.replacing(pendingApproval: .some(approved), pendingBatch: .some(batch))
+        var ids2 = DeterministicIDSource(prefix: "t2")
+        let granted = transition(state2, .approvalGrant(requestID: run.requestID, generation: run.revision, atMillis: 2000), &ids2)
+        guard case .failed(let _) = granted.state.phase else {
+            Issue.record("grant with missing .env should fail, got \(granted.state.phase)"); return
+        }
+    }
+
+    @Test("B1_lockRootReplacement")
+    func b1LockRootReplacement() throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let pinned = try #require(resolver.workspaceRoot)
+        let fd1 = try WorkspaceLock.acquire(workspace: pinned)
+        WorkspaceLock.release(fd1)
+        let parent = url.deletingLastPathComponent()
+        let tmp = parent.appendingPathComponent("tmp-lock-replace-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.moveItem(at: tmp, to: url)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        #expect(throws: StoreError.self) {
+            _ = try WorkspaceLock.acquire(workspace: pinned)
+        }
+    }
+
+    @Test("B1_lockSymlink")
+    func b1LockSymlink() throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let pinned = try #require(resolver.workspaceRoot)
+        let needletail = url.appendingPathComponent(".needletail")
+        try FileManager.default.createDirectory(at: needletail, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent("lock-target-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.removeItem(at: needletail)
+        try FileManager.default.createSymbolicLink(atPath: needletail.path, withDestinationPath: target.path)
+        #expect(throws: StoreError.self) {
+            _ = try WorkspaceLock.acquire(workspace: pinned)
+        }
+        try? FileManager.default.removeItem(at: needletail)
+        try? FileManager.default.removeItem(at: target)
+    }
+
+    @Test("B1_mixedBatchLock")
+    func b1MixedBatchLock() async throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let file = url.appendingPathComponent("f")
+        try "hello".write(to: file, atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let writer = WriterIdentity(session: SessionID("s-mix"), writer: "w")
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-mix"), writer: writer)
+        let lockPath = url.appendingPathComponent(".needletail/lock").path
+        let pinned = try #require(resolver.workspaceRoot)
+        let tmpFD = try WorkspaceLock.acquire(workspace: pinned)
+        WorkspaceLock.release(tmpFD)
+        let holder = Process()
+        holder.executableURL = URL(fileURLWithPath: "/usr/bin/flock")
+        holder.arguments = ["-n", lockPath, "sleep", "2"]
+        try holder.run()
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        #expect(holder.isRunning, "holder should hold lock")
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
+            ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"f\"}"),
+        ])
+        let reservation = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: true, batch: batch, kind: .executor)
+        let result = try await exec.execute(batch: batch, reservation: reservation)
+        holder.terminate()
+        holder.waitUntilExit()
+        #expect(result.calls.count == 2)
+        #expect(result.calls[0].status == "failed", "first mutating should fail due to lock contention")
+        #expect(result.calls[0].started == false, "lock contention must be pre-dispatch")
+        #expect(result.calls[1].status == "cancelled" && result.calls[1].started == false, "later read must be unstarted halt, got \(result.calls[1])")
     }
 }

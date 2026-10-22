@@ -85,29 +85,113 @@ public enum ToolValidator {
     }
 
     private static func checkDuplicateKeys(in json: String, tool: String, callID: String) throws {
-        // Simple duplicate key detection: scan for quoted keys
-        // This is approximate but catches obvious duplicates like {"path":"a","path":"b"}
-        // We parse by finding all keys via regex for "...": and checking duplicates
-        // Use a simple state machine: extract keys between quotes before colon
+        // JSON-aware duplicate key detection: handles escaped quotes and unicode escapes
+        // Scan for string literals that are followed by optional whitespace and colon (keys)
         var seen: Set<String> = []
-        var idx = json.startIndex
-        while idx < json.endIndex {
-            guard let qStart = json[idx...].firstIndex(of: "\"") else { break }
-            let afterQ = json.index(after: qStart)
-            guard let qEnd = json[afterQ...].firstIndex(of: "\"") else { break }
-            let key = String(json[afterQ..<qEnd])
-            // Look ahead for colon after optional whitespace
-            var look = json.index(after: qEnd)
-            while look < json.endIndex && json[look].isWhitespace { look = json.index(after: look) }
-            if look < json.endIndex && json[look] == ":" {
-                // This is a key
-                if seen.contains(key) {
-                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "duplicate field \(key) for \(tool) \(callID)")
+        var i = json.startIndex
+        var inString = false
+        var escape = false
+        var stringStart: String.Index? = nil
+        while i < json.endIndex {
+            let c = json[i]
+            if !inString {
+                if c == "\"" {
+                    inString = true
+                    escape = false
+                    stringStart = json.index(after: i)
                 }
-                seen.insert(key)
+                i = json.index(after: i)
+                continue
+            } else {
+                // Inside string
+                if escape {
+                    escape = false
+                    // Handle \u escape: skip next 4 hex digits if present
+                    if c == "u" {
+                        // Skip 4 hex digits
+                        var j = json.index(after: i)
+                        var count = 0
+                        while j < json.endIndex && count < 4 {
+                            j = json.index(after: j)
+                            count += 1
+                        }
+                        i = j
+                        continue
+                    }
+                    i = json.index(after: i)
+                    continue
+                }
+                if c == "\\" {
+                    escape = true
+                    i = json.index(after: i)
+                    continue
+                }
+                if c == "\"" {
+                    // End of string
+                    if let start = stringStart {
+                        let rawKey = String(json[start..<i])
+                        // Unescape the key for comparison (handle \" and \\ and \u)
+                        let key = unescapeJSONString(rawKey)
+                        // Look ahead for colon after optional whitespace
+                        var look = json.index(after: i)
+                        while look < json.endIndex && json[look].isWhitespace { look = json.index(after: look) }
+                        if look < json.endIndex && json[look] == ":" {
+                            if seen.contains(key) {
+                                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "duplicate field \(key) for \(tool) \(callID)")
+                            }
+                            seen.insert(key)
+                        }
+                    }
+                    inString = false
+                    stringStart = nil
+                }
+                i = json.index(after: i)
             }
-            idx = json.index(after: qEnd)
         }
+    }
+
+    private static func unescapeJSONString(_ s: String) -> String {
+        // Minimal unescaping for duplicate key comparison: handle \" \\ \/ \b \f \n \r \t and \u
+        var result = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            if c == "\\" {
+                let next = s.index(after: i)
+                guard next < s.endIndex else { result.append(c); break }
+                let esc = s[next]
+                switch esc {
+                case "\"", "\\", "/": result.append(esc)
+                case "b": result.append("\u{08}")
+                case "f": result.append("\u{0C}")
+                case "n": result.append("\n")
+                case "r": result.append("\r")
+                case "t": result.append("\t")
+                case "u":
+                    // 4 hex digits
+                    let hexStart = s.index(after: next)
+                    var hexEnd = hexStart
+                    var count = 0
+                    while hexEnd < s.endIndex && count < 4 {
+                        hexEnd = s.index(after: hexEnd)
+                        count += 1
+                    }
+                    if count == 4, let code = UInt32(String(s[hexStart..<hexEnd]), radix: 16), let scalar = Unicode.Scalar(code) {
+                        result.append(Character(scalar))
+                        i = hexEnd
+                        continue
+                    } else {
+                        result.append("\\u")
+                    }
+                default: result.append(esc)
+                }
+                i = s.index(after: next)
+            } else {
+                result.append(c)
+                i = s.index(after: i)
+            }
+        }
+        return result
     }
 
     private static func validateRead(callID: String, json: [String: Any], raw: String) throws -> ValidatedToolCall {
@@ -248,8 +332,8 @@ public enum ToolValidator {
         if components.contains(where: { $0 == ".git" }) { return .grantable }
         if first == ".ssh" || first.hasPrefix(".ssh/") { return .grantable }
         if components.contains(where: { $0 == ".ssh" }) { return .grantable }
-        if first.hasPrefix(".env") { return .grantable }
-        if components.contains(where: { $0.hasPrefix(".env") }) { return .grantable }
+        if first == ".env" || first.hasPrefix(".env.") { return .grantable }
+        if components.contains(where: { $0 == ".env" || $0.hasPrefix(".env.") }) { return .grantable }
         return .unprotected
     }
 }

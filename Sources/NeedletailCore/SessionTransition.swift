@@ -1388,9 +1388,13 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         return Transition(state: s1.replacing(phase: .requesting, pendingBatch: .some(nil)), effects: [], records: prefix)
     }
     let names = batch.proposals.map(\.tool)
-    let needsApproval = batchNeedsApproval(
+    var needsApproval = batchNeedsApproval(
         toolNames: names, execPolicy: state.epoch.effectiveCaps.tools.exec,
         mode: state.trustMode, sealed: state.activeRun?.sealed ?? false)
+    // B1: grantable protected paths always require explicit approval, even for read
+    if !grantablePaths.isEmpty {
+        needsApproval = true
+    }
     if !needsApproval {
         return dispatchTrustedBatch(state, batch: batch, ids: &ids)
     }
@@ -1466,6 +1470,23 @@ private func grantApproval<I: IDSource>(_ state: SessionState, requestID: Reques
     guard let batch = state.pendingBatch else {
         let (s1, prefix) = sequenced(state, kind: "authorising", digest: "grant-no-batch", ids: &ids)
         return Transition(state: s1, effects: [], records: prefix)
+    }
+    // Enforce that grantable paths were actually enumerated in the approval
+    if let approval = state.pendingApproval {
+        do {
+            let validated = try ToolValidator.validateBatchArguments(batch: batch)
+            for v in validated {
+                for p in v.paths {
+                    if ToolValidator.protectedClassification(for: p) == .grantable && !approval.protectedPaths.contains(p) {
+                        return failRun(state, failure: .approvalDenied("protected path not approved: \(p)"), hold: true, atMillis: 0, ids: &ids)
+                    }
+                }
+            }
+        } catch let ToolFailure.preDispatch(status, summary) {
+            return failRun(state, failure: .providerError("grant validation failed: \(status) \(summary)"), hold: true, atMillis: 0, ids: &ids)
+        } catch {
+            return failRun(state, failure: .providerError("grant validation error"), hold: true, atMillis: 0, ids: &ids)
+        }
     }
     return dispatchTrustedBatch(state, batch: batch, ids: &ids)
 }

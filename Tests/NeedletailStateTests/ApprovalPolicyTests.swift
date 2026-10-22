@@ -46,7 +46,7 @@ struct ApprovalPolicyTests {
     func POLICY_04_approvalMatrix() throws {
         // Workspace mode: mutating batches need approval.
         var ids = StateFixtures.ids()
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
         let (authorising, _) = try Self.authorisingState(mode: .workspace, batch: batch, ids: &ids)
         #expect(authorising.phase == .authorising, "workspace edit batch must hold for approval")
         #expect(authorising.pendingApproval != nil)
@@ -60,11 +60,11 @@ struct ApprovalPolicyTests {
     @Test("POLICY-04 reads proceed, ask always asks, observe denies upfront")
     func POLICY_04_readsAskObserve() throws {
         var ids = StateFixtures.ids()
-        let reads = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d")])
+        let reads = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
         let (workspaceReads, _) = try Self.authorisingState(mode: .workspace, batch: reads, ids: &ids)
         #expect(workspaceReads.phase == .executing, "workspace reads need no approval")
         var ids2 = StateFixtures.ids(prefix: "u")
-        let askBatch = ToolBatch([ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d")])
+        let askBatch = ToolBatch([ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d", arguments: "{}")])
         let (trustedAsk, _) = try Self.authorisingState(mode: .trustedExec, batch: askBatch, ids: &ids2)
         #expect(trustedAsk.phase == .authorising, "exec=ask always asks, even trusted")
         // Observe + exec-allowed caps is a contradictory session: refused at creation.
@@ -87,7 +87,7 @@ struct ApprovalPolicyTests {
         let run = try #require(state.activeRun)
         state = transition(state, .requestDispatched(requestID: run.requestID, atMillis: 1001), &ids).state
         state = transition(state, .requestStarted(requestID: run.requestID, generation: run.revision, atMillis: 1002), &ids).state
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
         state = transition(state, .providerResponse(
             requestID: run.requestID, generation: run.revision,
             response: ProviderResponse(requestID: run.requestID, generation: run.revision,
@@ -105,7 +105,7 @@ struct ApprovalPolicyTests {
     @Test("POLICY-04 silent gateway leaves approval pending forever")
     func POLICY_04_silentGatewayPends() throws {
         var ids = StateFixtures.ids()
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
         let (authorising, run) = try Self.authorisingState(mode: .workspace, batch: batch, ids: &ids)
         // Ticks (the only time source) never decide: still pending, no hang.
         var state = authorising
