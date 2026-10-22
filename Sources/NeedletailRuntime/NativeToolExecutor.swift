@@ -258,12 +258,9 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if (st.st_mode & 0o002) != 0 {
             throw ToolFailure.preDispatch(status: "denied", summary: "rg is world-writable")
         }
-        // Ownership check: rg should be owned by root or current user, not world-writable already checked, but also check not owned by other
-        // For B2, we check that rg is not world-writable and is owned by root (0) or current uid
         let uid = getuid()
         if st.st_uid != 0 && st.st_uid != uid {
-            // Not root and not current user, but not world-writable, still fail closed for ownership
-            // For now, allow if not world-writable, but log
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg not owned by root or current user")
         }
         // Version gate: rg --version must be >= 13.0.0, fail closed if regex doesn't match or version <13
         do {
@@ -294,7 +291,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if pattern.isEmpty {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing pattern")
         }
-        var args = [rg, "--json", "--hidden", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
+        var args = [rg, "--json", "--hidden", "--max-count", "1000", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
         // If search path is provided, validate and use it (relative to workspace/read-root)
         if let searchPath = json["path"] as? String, !searchPath.isEmpty {
             let cls = ToolValidator.protectedClassification(for: searchPath)

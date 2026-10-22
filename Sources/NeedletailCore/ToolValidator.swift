@@ -227,9 +227,21 @@ public enum ToolValidator {
             }
             if artifactId.utf8.count > 128 { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "artifactId too long") }
             if artifactId.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "artifactId contains NUL") }
-            // Artifact IDs are hex digests (64 hex)
             if artifactId.count != 64 || !artifactId.allSatisfy({ $0.isHexDigit }) {
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "artifactId must be 64 hex")
+            }
+            if let limit = json["limit"] {
+                guard let v = limit as? Int else {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "limit must be int for read \(callID)")
+                }
+                if v < 1 || v > 10000 {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "limit out of range for read \(callID)")
+                }
+            }
+            if let offset = json["offset"] {
+                guard let v = offset as? Int, v >= 0 else {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "offset must be non-negative int for read \(callID)")
+                }
             }
             return ValidatedToolCall(callID: callID, tool: "read", paths: [], isMutating: false, rawArguments: raw)
         }
