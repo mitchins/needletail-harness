@@ -140,42 +140,43 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
 
     private func read(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
         let path = json["path"] as? String ?? ""
-        // Use descriptor-relative resolver
-        let fd: Int32
-        do {
-            // Try workspace first, then read roots via resolver helper
-            // For B1, we use resolver's validatedWorkspaceFD + openRelative
-            if let ws = resolver.workspaceRoot {
+        var fd: Int32? = nil
+        var lastError: Error? = nil
+        if let ws = resolver.workspaceRoot {
+            do {
                 let dirFD = try resolver.validatedWorkspaceFD()
                 defer { close(dirFD) }
                 fd = try resolver.openRelative(path, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-            } else if let rr = resolver.readRoots.first {
-                let dirFD = try resolver.revalidatedFD(for: rr)
-                defer { close(dirFD) }
-                fd = try resolver.openRelative(path, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-            } else {
-                throw ToolFailure.preDispatch(status: "denied", summary: "no workspace/read-root")
+            } catch {
+                lastError = error
             }
-        } catch let err as StoreError {
-            if case .integrity(let msg) = err, msg.contains("is directory") {
+        }
+        if fd == nil {
+            for rr in resolver.readRoots {
+                do {
+                    let dirFD = try resolver.revalidatedFD(for: rr)
+                    defer { close(dirFD) }
+                    fd = try resolver.openRelative(path, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                    break
+                } catch {
+                    lastError = error
+                    continue
+                }
+            }
+        }
+        guard let readFD = fd else {
+            if let err = lastError as? StoreError, case .integrity(let msg) = err, msg.contains("is directory") {
                 return ToolCallOutcome(callID: callID, status: "failed", summary: "is directory", data: "", error: "is directory", started: true)
             }
-            // Check if file not found vs other
-            if err == .integrity("empty path") || err.localizedDescription.contains("Not found") || err.localizedDescription.contains("No such") {
-                return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found", data: "", started: true)
-            }
-            // For other StoreError, treat as failed if file was opened, or no-match if not found
-            let msg = "\(err)"
+            let msg = "\(lastError ?? StoreError.integrity("no workspace/read-root"))"
             if msg.contains("No such") || msg.contains("not found") {
                 return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found", data: "", started: true)
             }
-            return ToolCallOutcome(callID: callID, status: "failed", summary: msg, data: "", error: msg, started: true)
-        } catch {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "\(error)", data: "", error: "\(error)", started: true)
+            throw lastError ?? ToolFailure.preDispatch(status: "denied", summary: "no workspace/read-root")
         }
-        defer { close(fd) }
+        defer { close(readFD) }
         var st = stat()
-        guard fstat(fd, &st) == 0 else {
+        guard fstat(readFD, &st) == 0 else {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "fstat failed", data: "", error: "fstat", started: true)
         }
         if Int64(st.st_size) > 32*1024*1024 {
@@ -186,7 +187,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var buf = [UInt8](repeating: 0, count: 8192)
         while true {
             let n = buf.withUnsafeMutableBytes { ptr in
-                Glibc.read(fd, ptr.baseAddress, ptr.count)
+                Glibc.read(readFD, ptr.baseAddress, ptr.count)
             }
             if n < 0 {
                 if errno == EINTR { continue }
@@ -217,12 +218,55 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing pattern")
         }
         // Check rg binary is not world-writable and version gate
-        // For B1, we just run rg with fixed argv and deny globs
-        var args = [rg, "--json", "--hidden", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--", pattern]
-        if let ws = resolver.workspaceRoot {
-            args.append(ws.path.string)
-        } else if let rr = resolver.readRoots.first {
-            args.append(rr.path.string)
+        // For B1, run rg with fixed argv and deny globs for all protected (including .needletail, credentials, artifacts)
+        var args = [rg, "--json", "--hidden", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--", pattern]
+        // If search path is provided, validate and use it (relative to workspace/read-root)
+        if let searchPath = json["path"] as? String, !searchPath.isEmpty {
+            let cls = ToolValidator.protectedClassification(for: searchPath)
+            if cls == .absoluteDenied {
+                throw ToolFailure.preDispatch(status: "denied", summary: "absolute protected path for search")
+            }
+            if cls == .grantable {
+                throw ToolFailure.preDispatch(status: "denied", summary: "grantable search path requires approval")
+            }
+            // Resolve searchPath relative to workspace/read-root and use as root
+            var found = false
+            if let ws = resolver.workspaceRoot {
+                let dirFD = try resolver.validatedWorkspaceFD()
+                defer { close(dirFD) }
+                do {
+                    let fd = try resolver.openRelative(searchPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                    close(fd)
+                    args.append((ws.path.string as NSString).appendingPathComponent(searchPath))
+                    found = true
+                } catch {}
+            }
+            if !found {
+                for rr in resolver.readRoots {
+                    do {
+                        let dirFD = try resolver.revalidatedFD(for: rr)
+                        defer { close(dirFD) }
+                        let fd = try resolver.openRelative(searchPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                        close(fd)
+                        args.append((rr.path.string as NSString).appendingPathComponent(searchPath))
+                        found = true
+                        break
+                    } catch { continue }
+                }
+            }
+            if !found {
+                return ToolCallOutcome(callID: callID, status: "no-match", summary: "search path not found", data: "", started: true)
+            }
+        } else {
+            if let ws = resolver.workspaceRoot {
+                args.append(ws.path.string)
+            }
+            for rr in resolver.readRoots {
+                args.append(rr.path.string)
+            }
+            if args.count <= 13 { // only rg + globs + pattern, no root
+                throw ToolFailure.preDispatch(status: "denied", summary: "no workspace/read-root for search")
+            }
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: rg)
