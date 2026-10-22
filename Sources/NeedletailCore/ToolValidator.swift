@@ -222,7 +222,10 @@ public enum ToolValidator {
         if pattern.isEmpty { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty pattern for search \(callID)") }
         if pattern.utf8.count > 1024 { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "pattern too long for search \(callID)") }
         if pattern.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "pattern contains NUL") }
-        if let path = json["path"] as? String {
+        if let rawPath = json["path"] {
+            guard let path = rawPath as? String else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path must be string for search \(callID)")
+            }
             try validatePath(path, callID: callID, tool: "search")
             return ValidatedToolCall(callID: callID, tool: "search", paths: [path], isMutating: false, rawArguments: raw)
         }
@@ -239,12 +242,21 @@ public enum ToolValidator {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing path for edit \(callID)")
         }
         try validatePath(path, callID: callID, tool: "edit")
-        // B1: oldBytes/newBytes not strictly required for validation (B3 will enforce); only validate if present
-        let hasOldBytes = json["oldBytes"] != nil || json["old_string"] != nil
-        let hasNewBytes = json["newBytes"] != nil || json["new_string"] != nil
-        // For B1, we allow missing old/new for capability-denied tests (e.g., edit with only path)
-        _ = hasOldBytes; _ = hasNewBytes
-        // Validate strings if present
+        // B1 Phase1: edit now requires its mandatory payload and SHA before auth/lock
+        guard let expectedHash = json["expectedHash"] as? String else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing expectedHash for edit \(callID)")
+        }
+        if expectedHash.utf8.count != 64 || !expectedHash.allSatisfy({ $0.isHexDigit }) {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "expectedHash must be 64 hex for edit \(callID)")
+        }
+        let hasOld = (json["oldBytes"] as? String) ?? (json["old_string"] as? String)
+        guard hasOld != nil else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing oldBytes/old_string for edit \(callID)")
+        }
+        let hasNew = (json["newBytes"] as? String) ?? (json["new_string"] as? String)
+        guard hasNew != nil else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing newBytes/new_string for edit \(callID)")
+        }
         for key in ["oldBytes", "newBytes", "old_string", "new_string"] {
             if let v = json[key] {
                 guard v is String else {
@@ -254,13 +266,6 @@ public enum ToolValidator {
                 if s.utf8.count > 1024*1024 { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "\(key) too large") }
                 if s.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "\(key) contains NUL") }
             }
-        }
-        if let hash = json["expectedHash"] as? String {
-            if hash.utf8.count != 64 || !hash.allSatisfy({ $0.isHexDigit }) {
-                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "expectedHash must be 64 hex for edit \(callID)")
-            }
-        } else if json["expectedHash"] != nil {
-            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "expectedHash must be string")
         }
         return ValidatedToolCall(callID: callID, tool: "edit", paths: [path], isMutating: true, rawArguments: raw)
     }

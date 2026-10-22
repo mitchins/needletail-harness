@@ -83,7 +83,7 @@ struct TranscriptEmissionTests {
             requestID: run.requestID, generation: run.revision,
             outcome: .textDeltaComplete(
                 text: "",
-                toolProposals: [ToolProposal(callID: "c9", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\"}")],
+                toolProposals: [ToolProposal(callID: "c9", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")],
                 isFinal: false))
         let out = transition(state, .providerResponse(
             requestID: run.requestID, generation: run.revision, response: response, atMillis: 1003), &ids)
@@ -92,7 +92,7 @@ struct TranscriptEmissionTests {
         }
         let authorised = transition(out.state, .validationCompleted(
             requestID: run.requestID, generation: run.revision,
-            batch: ToolBatch([ToolProposal(callID: "c9", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\"}")]),
+            batch: ToolBatch([ToolProposal(callID: "c9", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")]),
             atMillis: 1004), &ids)
         guard case .requesting = authorised.state.phase else {
             Issue.record("denied batch must return to requesting, got \(authorised.state.phase)"); return

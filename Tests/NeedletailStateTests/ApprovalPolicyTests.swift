@@ -46,7 +46,7 @@ struct ApprovalPolicyTests {
     func POLICY_04_approvalMatrix() throws {
         // Workspace mode: mutating batches need approval.
         var ids = StateFixtures.ids()
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")])
         let (authorising, _) = try Self.authorisingState(mode: .workspace, batch: batch, ids: &ids)
         #expect(authorising.phase == .authorising, "workspace edit batch must hold for approval")
         #expect(authorising.pendingApproval != nil)
@@ -87,7 +87,7 @@ struct ApprovalPolicyTests {
         let run = try #require(state.activeRun)
         state = transition(state, .requestDispatched(requestID: run.requestID, atMillis: 1001), &ids).state
         state = transition(state, .requestStarted(requestID: run.requestID, generation: run.revision, atMillis: 1002), &ids).state
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")])
         state = transition(state, .providerResponse(
             requestID: run.requestID, generation: run.revision,
             response: ProviderResponse(requestID: run.requestID, generation: run.revision,
@@ -105,7 +105,7 @@ struct ApprovalPolicyTests {
     @Test("POLICY-04 silent gateway leaves approval pending forever")
     func POLICY_04_silentGatewayPends() throws {
         var ids = StateFixtures.ids()
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")])
         let (authorising, run) = try Self.authorisingState(mode: .workspace, batch: batch, ids: &ids)
         // Ticks (the only time source) never decide: still pending, no hang.
         var state = authorising

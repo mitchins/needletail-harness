@@ -120,7 +120,7 @@ struct B0ActorIntegrationTests {
         let exec = GatedExecutor()
         let transport = ScriptedTransport()
         transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")], isFinal: false))]
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")], isFinal: false))]
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
         let store = InMemorySessionStore()
@@ -173,7 +173,7 @@ struct B0ActorIntegrationTests {
         let exec = GatedExecutor()
         let transport = ScriptedTransport()
         transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")], isFinal: false))]
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")], isFinal: false))]
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
         let store = InMemorySessionStore()
@@ -208,7 +208,7 @@ struct B0ActorIntegrationTests {
         let exec = GatedExecutor()
         let transport = ScriptedTransport()
         transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"), ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}")], isFinal: false))]
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"), ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}")], isFinal: false))]
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
         let store = InMemorySessionStore()
@@ -228,7 +228,7 @@ struct B0ActorIntegrationTests {
         let exec2 = GatedExecutor()
         let transport2 = ScriptedTransport()
         transport2.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"), ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}")], isFinal: false))]
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"), ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}")], isFinal: false))]
         let approvals2 = ScriptedApprovals(); approvals2.script = [.approve]
         let store2 = InMemorySessionStore()
         let actor2 = try Self.gatedActor(transport: transport2, executor: exec2, approvals: approvals2, store: store2)
@@ -267,7 +267,7 @@ struct B0ActorIntegrationTests {
         let exec = GatedExecutor()
         let transport = ScriptedTransport()
         transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"), ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"b\"}")], isFinal: false))]
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"), ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"b\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")], isFinal: false))]
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
         let store = InMemorySessionStore()
@@ -310,7 +310,7 @@ struct B0ActorIntegrationTests {
         let exec = GatedExecutor()
         let transport = ScriptedTransport()
         transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")], isFinal: false))]
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")], isFinal: false))]
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
         let failingStore = FailingBatchStore()
@@ -355,7 +355,7 @@ struct B0ActorIntegrationTests {
         let exec = GatedExecutor()
         let transport = ScriptedTransport()
         transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")], isFinal: false))]
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")], isFinal: false))]
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
         let store = InMemorySessionStore()
@@ -430,7 +430,7 @@ struct B0ActorIntegrationTests {
         let exec2 = GatedExecutor()
         let transport2 = ScriptedTransport()
         transport2.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
-            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")], isFinal: false))]
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")], isFinal: false))]
         let approvals2 = ScriptedApprovals(); approvals2.script = [.approve]
         let store2 = InMemorySessionStore()
         let actor2 = try Self.gatedActor(transport: transport2, executor: exec2, approvals: approvals2, store: store2)

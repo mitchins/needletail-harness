@@ -15,7 +15,7 @@ struct ActorApprovalTests {
     static func authorisingActor(
         approvals: ScriptedApprovals,
         executorGate: AsyncStream<Void>? = nil,
-        batch: [ToolProposal] = [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")]
+        batch: [ToolProposal] = [ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")]
     ) async throws -> (
         SessionActor<ScriptedTransport, ScriptedExecutor, InMemorySessionStore, ScriptedApprovals, VirtualClock, DeterministicIDSource>,
         ScriptedTransport,
@@ -129,7 +129,7 @@ struct ActorApprovalTests {
         tTransport.script = [ProviderResponse(
             requestID: RequestID("s"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await tActor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(tActor, { $0.phase == .executing }, "trustedExec executing")

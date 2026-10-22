@@ -48,7 +48,7 @@ struct OperationIntentTests {
     func dispatchCommitsPerOperationIntents() throws {
         var ids = StateFixtures.ids()
         let batch = ToolBatch([
-            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ToolProposal(callID: "c2", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"b\",\"content\":\"x\"}"),
         ])
         let (executing, _, records) = try Self.executingState(batch: batch, ids: &ids)
@@ -70,7 +70,7 @@ struct OperationIntentTests {
     func completionCorrelatesWithIntents() throws {
         var ids = StateFixtures.ids()
         let batch = ToolBatch([
-            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ToolProposal(callID: "c2", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"b\",\"content\":\"x\"}"),
         ])
         let (executing, run, dispatchRecords) = try Self.executingState(batch: batch, ids: &ids)
@@ -127,7 +127,7 @@ struct OperationIntentTests {
     func mismatchedCompletionRetainsDerivedUnknowns() throws {
         var ids = StateFixtures.ids()
         let batch = ToolBatch([
-            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ToolProposal(callID: "c2", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"b\",\"content\":\"x\"}"),
         ])
         let (executing, run, dispatchRecords) = try Self.executingState(batch: batch, ids: &ids)
@@ -151,7 +151,7 @@ struct OperationIntentTests {
     @Test("A3-1 double completion drops bare with no new result")
     func doubleCompletionDropsBare() throws {
         var ids = StateFixtures.ids()
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")])
         let (executing, run, _) = try Self.executingState(batch: batch, ids: &ids)
         let effectID = try #require(executing.liveReservations.first).effectID
         let event = SessionEvent.effectCompleted(
@@ -170,7 +170,7 @@ struct OperationIntentTests {
     func cancellationRetainsPairedUnknowns() throws {
         var ids = StateFixtures.ids()
         let batch = ToolBatch([
-            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ToolProposal(callID: "c2", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"b\",\"content\":\"x\"}"),
         ])
         let (executing, _, dispatchRecords) = try Self.executingState(batch: batch, ids: &ids)
@@ -189,7 +189,7 @@ struct OperationIntentTests {
     @Test("A3-1 consumed check drops even when the reservation is still live")
     func consumedCheckWinsOverLiveReservation() throws {
         var ids = StateFixtures.ids()
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")])
         let (executing, run, _) = try Self.executingState(batch: batch, ids: &ids)
         let effectID = try #require(executing.liveReservations.first).effectID
         // Hypothetical torn state: consumed recorded but the reservation

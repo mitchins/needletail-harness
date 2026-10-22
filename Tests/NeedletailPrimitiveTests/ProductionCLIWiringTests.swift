@@ -392,7 +392,7 @@ struct ProductionCLIWiringTests {
         // exists for non-headless gateways; headless never approves, so
         // the shutdown paired with its throw is defense-in-depth.)
         let server = try LoopbackSSEServer()
-        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.toolCallChunk(callID: "c1", tool: "edit", arguments: "{\"path\":\"f\"}").utf8))]))
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.toolCallChunk(callID: "c1", tool: "edit", arguments: "{\"path\":\"f\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}").utf8))]))
         server.start()
         defer { server.stop() }
         let directory = try Self.freshDirectory()

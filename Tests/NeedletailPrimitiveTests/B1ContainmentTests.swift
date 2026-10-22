@@ -652,7 +652,7 @@ struct B1ContainmentTests {
         try? await Task.sleep(nanoseconds: 300_000_000)
         #expect(holder.isRunning, "holder should hold lock")
         let batch = ToolBatch([
-            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"f\"}"),
         ])
         let reservation = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: true, batch: batch, kind: .executor)

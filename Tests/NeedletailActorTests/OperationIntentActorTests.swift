@@ -111,7 +111,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
                 ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
@@ -147,7 +147,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, { $0.phase == .executing }, "dispatch reached executing")
@@ -171,7 +171,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, {
@@ -201,7 +201,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, {
@@ -241,7 +241,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, {
