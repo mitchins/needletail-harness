@@ -369,6 +369,135 @@ struct B0F2BDurabilityTests {
             #expect(ze.atMillis != atMillis, "nonzero must not collapse to zero")
         } else { Issue.record("zero decode failed") }
     }
+
+    // MARK: - 8 Reconcile rejects mismatched state/outcome supersession (Finding 1)
+
+    @Test("F2B 8: marker supersession rejects state-outcome mismatch as integrity")
+    func markerSupersessionRejectsMismatchedStateOutcome() throws {
+        // done with terminated outcome must fail
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                Self.intent("eff-1/c1", call: "c1", mutating: true),
+                Self.marker("eff-1/c1", call: "c1", mutating: true),
+                Self.result("eff-1/c1", call: "c1", mutating: true, state: .done, outcome: "unknown: cancelled pending terminated"),
+            ])
+        }
+        // unknown with unstarted outcome must fail
+        #expect(throws: StoreError.self) {
+            try reconcileOperations([
+                Self.intent("eff-1/c1", call: "c1", mutating: true),
+                Self.marker("eff-1/c1", call: "c1", mutating: true),
+                Self.result("eff-1/c1", call: "c1", mutating: true, state: .unknown, outcome: "cancelled: unstarted"),
+            ])
+        }
+        // RED/GREEN: correct pairings still succeed (done+unstarted => completed, unknown+terminated => held)
+        let okDone = try reconcileOperations([
+            Self.intent("eff-1/c1", call: "c1", mutating: true),
+            Self.marker("eff-1/c1", call: "c1", mutating: true),
+            Self.result("eff-1/c1", call: "c1", mutating: true, state: .done, outcome: "cancelled: unstarted"),
+        ])
+        #expect(okDone.completed == [OperationID("eff-1/c1")])
+        let okUnknown = try reconcileOperations([
+            Self.intent("eff-1/c1", call: "c1", mutating: true),
+            Self.marker("eff-1/c1", call: "c1", mutating: true),
+            Self.result("eff-1/c1", call: "c1", mutating: true, state: .unknown, outcome: "unknown: cancelled pending terminated"),
+        ])
+        #expect(okUnknown.heldOperations.map(\.operationID) == [OperationID("eff-1/c1")])
+    }
+
+    // MARK: - 9 Writer fencing on fresh handle (Finding 3)
+
+    @Test("F2B 9: fresh-handle writer fencing blocks stale writer and allows correct writer")
+    func freshHandleWriterFencing() throws {
+        let (dir, path) = try Self.freshPath()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let s = SessionID("s-fence")
+        // First handle claims w-1 and writes ledger, then closes
+        do {
+            let a = try GRDBSessionStore(path: path)
+            try a.claimWriterOwnership(session: s, writer: "w-1")
+            try a.appendBatch([Self.intent("eff-1/c1", call: "c1", mutating: true)], as: WriterIdentity(session: s, writer: "w-1"))
+            try a.close()
+        }
+        // Fresh handle cannot append with stale w-1's old identity without reclaim? w-1 is still holder, so w-1 can still write, but w-2 cannot
+        let fresh = try GRDBSessionStore(path: path)
+        // Stale/mismatched writer must fail
+        #expect(throws: StoreError.self) {
+            try fresh.appendBatch([Self.intent("eff-1/c2", call: "c2", mutating: true)], as: WriterIdentity(session: s, writer: "w-stale"))
+        }
+        // Competing claim with new writer must learn who holds
+        #expect(throws: StoreError.self) {
+            try fresh.claimWriterOwnership(session: s, writer: "w-2")
+        }
+        // Correct holder can still append via fresh handle
+        try fresh.appendBatch([Self.intent("eff-1/c2", call: "c2", mutating: true)], as: WriterIdentity(session: s, writer: "w-1"))
+        let report = try fresh.reconcile(session: s)
+        #expect(report.unmatchedMutating.map(\.operationID).contains(OperationID("eff-1/c1")))
+        #expect(report.unmatchedMutating.map(\.operationID).contains(OperationID("eff-1/c2")))
+        try fresh.close()
+
+        // After close, new handle reopen sees both intents durable
+        let reopened = try GRDBSessionStore(path: path)
+        let r2 = try reopened.reconcile(session: s)
+        #expect(r2.unmatchedMutating.count == 2)
+        try reopened.close()
+    }
+
+    // MARK: - 10 Transition promotion via cancelledPendingRemoved (Finding 2)
+
+    @Test("F2B 10: cancelledPendingRemoved transition promotes marker to unknown")
+    func cancelledPendingRemovedPromotes() throws {
+        var ids = DeterministicIDSource(prefix: "t")
+        let epoch = try {
+            let cfg = try validateConfig(Data("""
+            {"version":1,"default_model":"local-coder","allow_http_origins":["http://127.0.0.1:11434"],"models":[{"alias":"local-coder","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11434","model":"qwen","context_window":262144,"max_output":4096,"locality":"local","connect_timeout_s":10,"read_idle_timeout_s":300,"request_timeout_s":1800,"max_in_flight":1}],"tools":{"read":true,"search":true,"edit":true,"write":true,"exec":"ask","consult":false}}
+            """.utf8))
+            let profile = try #require(cfg.profiles["local-coder"])
+            let caps = effectiveCapabilities(build: .allAllowed, userConfig: cfg.tools, workspaceGrant: .allAllowed, invocationMask: .allAllowed, sealed: SealedRestrictions(sealed: false))
+            let route = selectRoute(snapshot: cfg, requestedAlias: "local-coder", sealed: false)
+            return EpochDescriptor(epochID: EpochID("epoch-1"), configSnapshot: cfg, profile: profile, effectiveCaps: caps, route: route)
+        }()
+        let run = RunDescriptor(runID: RunID("r1"), requestID: RequestID("req1"), revision: Revision(1), startedAtMillis: 1, sealed: false)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d")])
+        let eff = EffectID("eff-1")
+        let reservation = EffectReservation(effectID: eff, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: true, batch: batch, kind: .executor)
+        var state = SessionState(sessionID: SessionID("s-promote"), epoch: epoch, trustMode: .workspace, phase: .cancelling, activeRun: run, queueHeld: true, heldReason: .cancelled(sinceMillis: 1), cancelledPendingReservations: [reservation], generation: 1, unresolvedOperations: [OperationRef(operationID: OperationID("eff-1/c1"), callID: "c1", state: .unknown, mutating: true)])
+        let t = transition(state, .cancelledPendingRemoved(effectID: eff, atMillis: 9999), &ids)
+        #expect(t.records.contains(where: { if case .operationResult(let r, let o) = $0 { return r.operationID == OperationID("eff-1/c1") && r.state == .unknown && o == "unknown: cancelled pending terminated" } else { return false } }))
+        #expect(t.state.unresolvedOperations.contains(where: { $0.operationID == OperationID("eff-1/c1") && $0.state == .unknown }))
+        #expect(t.state.cancelledPendingReservations.isEmpty)
+
+        // RED/GREEN: without promotion, marker would stay as pendingMarker not as operationResult
+        let rawBefore = state.cancelledPendingReservations
+        #expect(rawBefore.count == 1)
+    }
+
+    // MARK: - 11 preDispatchFailure discharges after cancellation (Finding 4)
+
+    @Test("F2B 11: preDispatchFailure after cancellation discharges to done")
+    func preDispatchFailureDischarges() throws {
+        var ids = DeterministicIDSource(prefix: "t2")
+        let epoch = try {
+            let cfg = try validateConfig(Data("""
+            {"version":1,"default_model":"local-coder","allow_http_origins":["http://127.0.0.1:11434"],"models":[{"alias":"local-coder","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11434","model":"qwen","context_window":262144,"max_output":4096,"locality":"local","connect_timeout_s":10,"read_idle_timeout_s":300,"request_timeout_s":1800,"max_in_flight":1}],"tools":{"read":true,"search":true,"edit":true,"write":true,"exec":"ask","consult":false}}
+            """.utf8))
+            let profile = try #require(cfg.profiles["local-coder"])
+            let caps = effectiveCapabilities(build: .allAllowed, userConfig: cfg.tools, workspaceGrant: .allAllowed, invocationMask: .allAllowed, sealed: SealedRestrictions(sealed: false))
+            let route = selectRoute(snapshot: cfg, requestedAlias: "local-coder", sealed: false)
+            return EpochDescriptor(epochID: EpochID("epoch-1"), configSnapshot: cfg, profile: profile, effectiveCaps: caps, route: route)
+        }()
+        let run = RunDescriptor(runID: RunID("r1"), requestID: RequestID("req1"), revision: Revision(1), startedAtMillis: 1, sealed: false)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"), ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d")])
+        let eff = EffectID("eff-1")
+        let reservation = EffectReservation(effectID: eff, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: true, batch: batch, kind: .executor)
+        var state = SessionState(sessionID: SessionID("s-pre"), epoch: epoch, trustMode: .workspace, phase: .cancelling, activeRun: run, queueHeld: true, heldReason: .cancelled(sinceMillis: 1), cancelledPendingReservations: [reservation], generation: 1, unresolvedOperations: [OperationRef(operationID: OperationID("eff-1/c1"), callID: "c1", state: .unknown, mutating: true)])
+        // Only c1 is mutating, c2 is read so not in unresolved
+        let t = transition(state, .effectCompleted(effectID: eff, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .preDispatchFailure(.preDispatch(status: "denied", summary: "policy")), atMillis: 2), &ids)
+        // Should discharge c1 to done, not hold
+        #expect(t.records.contains(where: { if case .operationResult(let r, let o) = $0 { return r.operationID == OperationID("eff-1/c1") && r.state == .done && o == "cancelled: unstarted" } else { return false } }))
+        #expect(!t.state.unresolvedOperations.contains(where: { $0.operationID == OperationID("eff-1/c1") }))
+        #expect(t.state.cancelledPendingReservations.isEmpty)
+    }
 }
 
 private extension DurableRecord {

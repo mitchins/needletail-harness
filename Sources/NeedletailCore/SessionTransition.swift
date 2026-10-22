@@ -1796,7 +1796,17 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
     var records: [DurableRecord] = []
 
     switch outcome {
-    case .preDispatchFailure, .success, .failureReceipt:
+    case .preDispatchFailure:
+        // Typed proof that no dispatch occurred: discharge every mutating marker as done
+        for prop in reservation.batch.proposals {
+            let isMutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            if !isMutating { continue }
+            let ref = OperationRef(operationID: operationID(effectID: effectID, callID: prop.callID), callID: prop.callID, state: .done, mutating: true)
+            records.append(.operationResult(ref, outcome: "cancelled: unstarted"))
+            unresolved.removeAll(where: { $0.operationID == ref.operationID })
+        }
+        break
+    case .success, .failureReceipt:
         break
     case .perCall(let result):
         // F5: duplicate and unexpected handling for cancelled-pending path — tainted IDs never supersede
@@ -1825,9 +1835,6 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
                 continue
             }
         }
-    case .success, .failureReceipt:
-        // Should not happen for cancelled pending perCall, but handle
-        break
     }
 
     let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending, unresolvedOperations: unresolved)
