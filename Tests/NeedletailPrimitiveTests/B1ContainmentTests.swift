@@ -264,6 +264,18 @@ struct B1ContainmentTests {
         #expect(json["unknown"] != nil, "unknown field present")
     }
 
+    @Test("B1_searchPathType")
+    func b1SearchPathType() throws {
+        let batchNum = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"x\",\"path\":123}")])
+        #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: batchNum) }
+        let batchNull = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"x\",\"path\":null}")])
+        #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: batchNull) }
+        // Valid string path should pass
+        let batchOk = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"x\",\"path\":\"a\"}")])
+        let validated = try ToolValidator.validateBatchArguments(batch: batchOk)
+        #expect(validated[0].paths == ["a"])
+    }
+
     @Test("B1_argShapeDuplicateKeys")
     func b1ArgShapeDuplicateKeys() throws {
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"path\":\"b\"}")])
@@ -372,30 +384,84 @@ struct B1ContainmentTests {
 
     // MARK: - CLI grants (direct validation, no subprocess hang)
 
+    @Test("B1_invalidArgsNoSideEffect")
+    func b1InvalidArgsNoSideEffect() async throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let target = url.appendingPathComponent("target")
+        try "original".write(to: target, atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-inv"), writer: WriterIdentity(session: SessionID("s-inv"), writer: "w"))
+        let lockPath = url.appendingPathComponent(".needletail/lock").path
+        #expect(!FileManager.default.fileExists(atPath: lockPath), "no lock before invalid batch")
+        // Invalid edit (missing expectedHash) should be rejected pre-side-effect
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"target\",\"old_string\":\"orig\",\"new_string\":\"new\"}")])
+        let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: true, batch: batch, kind: .executor, approvedPaths: [])
+        let result = try await exec.execute(batch: batch, reservation: res)
+        #expect(result.calls[0].status == "invalid-arguments", "invalid edit should be rejected, got \(result.calls[0])")
+        #expect(result.calls[0].started == false, "invalid edit must be pre-dispatch (no side effect)")
+        #expect(!FileManager.default.fileExists(atPath: lockPath), "no lock file on invalid args")
+        // No temp file
+        let tmpFiles = (try? FileManager.default.contentsOfDirectory(atPath: url.path).filter { $0.hasSuffix(".tmp") }) ?? []
+        #expect(tmpFiles.isEmpty, "no temp file on invalid args, found \(tmpFiles)")
+        // No target mutation
+        let after = try String(contentsOf: target, encoding: .utf8)
+        #expect(after == "original", "target must not be mutated on invalid args")
+    }
+
     @Test("B1_cliWorkspaceTrusted")
     func b1CLIWorkspaceTrusted() throws {
-        // Direct validation of flag combinations (mirrors RunCommand.run checks)
-        func check(workspace: String?, readRoot: [String], sealed: Bool, trusted: Bool) -> Int {
-            if workspace != nil && trusted { return 2 }
-            if workspace != nil && sealed { return 2 }
-            if !readRoot.isEmpty && sealed { return 2 }
-            return 0
+        let bin = ".build/debug/needletail"
+        guard FileManager.default.fileExists(atPath: bin) else {
+            Issue.record("needletail binary not built"); return
         }
-        let (url, _) = try Self.tempRoot()
-        defer { try? FileManager.default.removeItem(at: url) }
-        #expect(check(workspace: url.path, readRoot: [], sealed: false, trusted: true) == 2, "workspace+trusted must exit 2")
-        #expect(check(workspace: url.path, readRoot: [], sealed: true, trusted: false) == 2)
-        #expect(check(workspace: nil, readRoot: [url.path], sealed: true, trusted: false) == 2)
-        #expect(check(workspace: nil, readRoot: [], sealed: false, trusted: false) == 0)
-        #expect(check(workspace: url.path, readRoot: [], sealed: false, trusted: false) == 0)
-        // Also verify that workspace must exist
+        let cfgJSON = """
+        {"version":1,"default_model":"local-coder","allow_http_origins":["http://127.0.0.1:11434"],"models":[{"alias":"local-coder","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11434","model":"qwen","context_window":262144,"max_output":4096,"locality":"local","connect_timeout_s":10,"read_idle_timeout_s":300,"request_timeout_s":1800,"max_in_flight":1}],"tools":{"read":true,"search":true,"edit":true,"write":true,"exec":"ask","consult":false}}
+        """
+        let cfgDir = FileManager.default.temporaryDirectory.appendingPathComponent("b1-cli-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: cfgDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cfgDir) }
+        let cfgPath = cfgDir.appendingPathComponent("config.json").path
+        try cfgJSON.write(toFile: cfgPath, atomically: true, encoding: .utf8)
+        let (wsURL, _) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: wsURL) }
+        let (rrURL, _) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: rrURL) }
+        func run(_ args: [String], env: [String: String]? = nil) throws -> Int32 {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: bin)
+            proc.arguments = args
+            proc.environment = env ?? ProcessInfo.processInfo.environment
+            proc.standardOutput = Pipe()
+            proc.standardError = Pipe()
+            try proc.run()
+            proc.waitUntilExit()
+            return proc.terminationStatus
+        }
+        // Conflicting flags must exit 2 without provider or state
+        let stateDir1 = cfgDir.appendingPathComponent("state1").path
+        #expect(try run(["run", "--config", cfgPath, "--prompt", "hi", "--workspace", wsURL.path, "--trusted"], env: ["NEEDLETAIL_STATE_DIR": stateDir1]) == 2, "workspace+trusted must exit 2")
+        #expect(!FileManager.default.fileExists(atPath: stateDir1 + "/store.sqlite"), "no state store on flag conflict")
+        let stateDir2 = cfgDir.appendingPathComponent("state2").path
+        #expect(try run(["run", "--config", cfgPath, "--prompt", "hi", "--workspace", wsURL.path, "--sealed"], env: ["NEEDLETAIL_STATE_DIR": stateDir2]) == 2)
+        #expect(!FileManager.default.fileExists(atPath: stateDir2 + "/store.sqlite"))
+        let stateDir3 = cfgDir.appendingPathComponent("state3").path
+        #expect(try run(["run", "--config", cfgPath, "--prompt", "hi", "--read-root", rrURL.path, "--sealed"], env: ["NEEDLETAIL_STATE_DIR": stateDir3]) == 2)
+        #expect(!FileManager.default.fileExists(atPath: stateDir3 + "/store.sqlite"))
+        // Missing workspace must exit 2
         let missing = "/tmp/b1-missing-\(UUID().uuidString)"
-        var isDir: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: missing, isDirectory: &isDir)
-        #expect(!exists, "missing workspace should not exist")
-        // Simulate RunCommand's existence check
-        let wouldExit2 = !FileManager.default.fileExists(atPath: missing)
-        #expect(wouldExit2, "missing workspace would exit 2")
+        let stateDir4 = cfgDir.appendingPathComponent("state4").path
+        #expect(try run(["run", "--config", cfgPath, "--prompt", "hi", "--workspace", missing], env: ["NEEDLETAIL_STATE_DIR": stateDir4]) == 2)
+        // Valid workspace should not exit 2 for flag check (will fail later due to no provider, but not flag conflict)
+        let stateDir5 = cfgDir.appendingPathComponent("state5").path
+        let code5 = try run(["run", "--config", cfgPath, "--prompt", "hi", "--workspace", wsURL.path], env: ["NEEDLETAIL_STATE_DIR": stateDir5])
+        #expect(code5 != 2, "valid workspace should not exit 2 for flag conflict, got \(code5)")
+        // Symlink workspace must exit 2
+        let link = cfgDir.appendingPathComponent("ws-link").path
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: wsURL.path)
+        let stateDir6 = cfgDir.appendingPathComponent("state6").path
+        #expect(try run(["run", "--config", cfgPath, "--prompt", "hi", "--workspace", link], env: ["NEEDLETAIL_STATE_DIR": stateDir6]) == 2, "symlink workspace must exit 2")
     }
 
     // MARK: - Counterfactuals
