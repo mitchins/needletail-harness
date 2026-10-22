@@ -78,7 +78,7 @@ struct B2ReadSearchTests {
     }
 
     @Test("TOOL_11_crossSession")
-    func tool11CrossSession() throws {
+    func tool11CrossSession() async throws {
         let (dir, path) = try Self.tempRootForStore()
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = try GRDBSessionStore(path: path)
@@ -86,13 +86,29 @@ struct B2ReadSearchTests {
         let sessionB = SessionID("s-b")
         try store.claimWriterOwnership(session: sessionA, writer: "w-a")
         try store.claimWriterOwnership(session: sessionB, writer: "w-b")
-        let digest = String(repeating: "a", count: 64)
-        let ref = ArtifactRef(digest: digest, size: 4, kind: "test", operationID: OperationID("op-1"))
+        let data = Data("artifact-data".utf8)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let ref = ArtifactRef(digest: digest, size: data.count, kind: "test", operationID: OperationID("op-1"))
+        let artifactsRoot = (path as NSString).deletingLastPathComponent + "/" + (path as NSString).lastPathComponent + "-artifacts"
+        try FileManager.default.createDirectory(atPath: artifactsRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try data.write(to: URL(fileURLWithPath: artifactsRoot + "/" + digest))
         try store.appendBatch([.artifactPublished(ref)], as: WriterIdentity(session: sessionA, writer: "w-a"))
-        let (recordsA, _) = try store.records(session: sessionA, since: 0, limit: 10)
-        let (recordsB, _) = try store.records(session: sessionB, since: 0, limit: 10)
-        #expect(recordsA.contains { if case .artifactPublished(let r) = $0.record, r.digest == digest { return true }; return false }, "session A should have artifact")
-        #expect(!recordsB.contains { if case .artifactPublished(let r) = $0.record, r.digest == digest { return true }; return false }, "session B should not have artifact")
+        // Same-session read via executor should succeed
+        let resolverA = try WorkspaceResolver(workspace: FilePath(dir.path), readRoots: [])
+        let execA = NativeToolExecutor(resolver: resolverA, store: store, sessionID: sessionA, writer: WriterIdentity(session: sessionA, writer: "w-a"))
+        let batchA = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"artifactId\":\"\(digest)\"}")])
+        let resA = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batchA, kind: .executor, approvedPaths: [])
+        let resultA = try await execA.execute(batch: batchA, reservation: resA)
+        #expect(resultA.calls[0].status == "success", "same-session artifact read should succeed, got \(resultA.calls[0])")
+        // Foreign session should be denied
+        let execB = NativeToolExecutor(resolver: resolverA, store: store, sessionID: sessionB, writer: WriterIdentity(session: sessionB, writer: "w-b"))
+        let resultB = try await execB.execute(batch: batchA, reservation: resA)
+        #expect(resultB.calls[0].status == "denied", "foreign session artifact read should be denied, got \(resultB.calls[0])")
+        // Digest alone is never a grant (no artifactPublished for random digest)
+        let badDigest = String(repeating: "b", count: 64)
+        let batchBad = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"artifactId\":\"\(badDigest)\"}")])
+        let resultBad = try await execA.execute(batch: batchBad, reservation: resA)
+        #expect(resultBad.calls[0].status == "denied", "unknown digest should be denied")
         try store.close()
     }
 
@@ -142,17 +158,26 @@ struct B2ReadSearchTests {
     }
 
     @Test("TOOL_11_sameSession")
-    func tool11SameSession() throws {
+    func tool11SameSession() async throws {
         let (dir, path) = try Self.tempRootForStore()
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = try GRDBSessionStore(path: path)
         let sessionA = SessionID("s-a")
         try store.claimWriterOwnership(session: sessionA, writer: "w-a")
-        let digest = String(repeating: "b", count: 64)
-        let ref = ArtifactRef(digest: digest, size: 4, kind: "test", operationID: OperationID("op-2"))
+        let data = Data("hello artifact".utf8)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let ref = ArtifactRef(digest: digest, size: data.count, kind: "test", operationID: OperationID("op-2"))
+        let artifactsRoot = (path as NSString).deletingLastPathComponent + "/" + (path as NSString).lastPathComponent + "-artifacts"
+        try FileManager.default.createDirectory(atPath: artifactsRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try data.write(to: URL(fileURLWithPath: artifactsRoot + "/" + digest))
         try store.appendBatch([.artifactPublished(ref)], as: WriterIdentity(session: sessionA, writer: "w-a"))
-        let (records, _) = try store.records(session: sessionA, since: 0, limit: 10)
-        #expect(records.contains { if case .artifactPublished(let r) = $0.record, r.digest == digest { return true }; return false }, "same session should have artifact")
+        let resolver = try WorkspaceResolver(workspace: FilePath(dir.path), readRoots: [])
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: sessionA, writer: WriterIdentity(session: sessionA, writer: "w-a"))
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"artifactId\":\"\(digest)\"}")])
+        let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
+        let result = try await exec.execute(batch: batch, reservation: res)
+        #expect(result.calls[0].status == "success", "same-session artifact read should succeed, got \(result.calls[0])")
+        #expect(result.calls[0].data == "hello artifact")
         try store.close()
     }
 

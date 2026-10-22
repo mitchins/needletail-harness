@@ -231,11 +231,15 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
         let limit = json["limit"] as? Int ?? 200
         let offset = json["offset"] as? Int ?? 0
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        let start = min(offset, lines.count)
-        let end = min(start + limit, lines.count)
-        let truncated = end < lines.count
-        let limited = lines[start..<end].joined(separator: "\n")
+        var effectiveLines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        if text.hasSuffix("\n") && !effectiveLines.isEmpty && effectiveLines.last == "" {
+            effectiveLines = effectiveLines.dropLast()
+        }
+        let effectiveArray = Array(effectiveLines)
+        let start = min(offset, effectiveArray.count)
+        let end = min(start + limit, effectiveArray.count)
+        let truncated = end < effectiveArray.count
+        let limited = effectiveArray[start..<end].joined(separator: "\n")
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         return ToolCallOutcome(callID: callID, status: "success", summary: "read \(path)", data: limited, truncated: truncated, path: path, beforeHash: hash, started: true)
     }
@@ -353,12 +357,21 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         process.standardError = errPipe
         final class DataBox: @unchecked Sendable { var data = Data(); let lock = NSLock() }
         let outBox = DataBox()
+        let errBox = DataBox()
         outPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
             } else {
                 outBox.lock.withLock { outBox.data.append(data) }
+            }
+        }
+        errPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+            } else {
+                errBox.lock.withLock { errBox.data.append(data) }
             }
         }
         do {
@@ -369,21 +382,56 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "\(error)", started: true)
         }
         outPipe.fileHandleForReading.readabilityHandler = nil
+        errPipe.fileHandleForReading.readabilityHandler = nil
         // Drain any remaining
         let remaining = outPipe.fileHandleForReading.readDataToEndOfFile()
         if !remaining.isEmpty {
             outBox.lock.withLock { outBox.data.append(remaining) }
         }
-        // Also drain stderr to prevent block (though we ignore it)
-        _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let errRemaining = errPipe.fileHandleForReading.readDataToEndOfFile()
+        if !errRemaining.isEmpty {
+            errBox.lock.withLock { errBox.data.append(errRemaining) }
+        }
         if process.terminationStatus != 0 && process.terminationStatus != 1 {
             let text = String(decoding: outBox.data, as: UTF8.self)
             if text.isEmpty {
                 return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "rg exit \(process.terminationStatus)", started: true)
             }
         }
-        let text = String(decoding: outBox.data, as: UTF8.self)
-        return ToolCallOutcome(callID: callID, status: "success", summary: "search \(pattern)", data: text, started: true)
+        // Global bounded output: cap at 1MB, truthful truncation
+        let maxBytes = 1 * 1024 * 1024
+        var truncated = false
+        var outputData = outBox.data
+        if outputData.count > maxBytes {
+            outputData = outputData.prefix(maxBytes)
+            truncated = true
+        }
+        var text = String(decoding: outputData, as: UTF8.self)
+        // Post-filter protected hits (defense-in-depth): remove any lines that contain protected paths
+        // This is in addition to the argv pruning, to catch harness bugs
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let filtered = lines.filter { line in
+            // Check if line contains a protected path (simple check for .git etc.)
+            let s = String(line)
+            if s.contains(".git/") || s.contains(".env") || s.contains(".ssh/") || s.contains(".needletail/") || s.contains("credentials") || s.contains("artifacts") {
+                // Only filter if the line is a JSON hit with a path that is protected
+                // For now, do a simple check: if line contains "\"path\":\"" and then protected, filter
+                // This is a best-effort post-filter
+                if s.contains(".git") || s.contains(".env") || s.contains(".ssh") {
+                    // Check if the matched file is protected
+                    // For B2, we will filter any line that has a protected path
+                    return false
+                }
+            }
+            return true
+        }
+        if filtered.count != lines.count {
+            text = filtered.joined(separator: "\n")
+            truncated = true
+        } else {
+            text = String(decoding: outputData, as: UTF8.self)
+        }
+        return ToolCallOutcome(callID: callID, status: "success", summary: "search \(pattern)", data: text, truncated: truncated, started: true)
     }
 
     private func edit(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
