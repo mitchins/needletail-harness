@@ -583,9 +583,14 @@ struct B1ContainmentTests {
         state2 = state2.replacing(pendingApproval: .some(approved), pendingBatch: .some(batch))
         var ids2 = DeterministicIDSource(prefix: "t2")
         let granted = transition(state2, .approvalGrant(requestID: run.requestID, generation: run.revision, atMillis: 2000), &ids2)
-        guard case .failed(let _) = granted.state.phase else {
-            Issue.record("grant with missing .env should fail, got \(granted.state.phase)"); return
-        }
+        // Approval with missing .env should still dispatch (executing), but the executor will deny the unapproved .env per-call
+        #expect(granted.state.phase == .executing, "grant with missing .env should still dispatch, unapproved will be per-call denied at execution")
+        let reservation = try #require(granted.state.liveReservations.first)
+        #expect(reservation.approvedPaths == [".git/config"], "reservation must carry only approved paths")
+        // Verify that the unapproved .env would be denied at execution time (grantable but not in approvedPaths)
+        let unapproved = batch.proposals[1]
+        let unapprovedPath = try #require(ToolValidator.validateBatchArguments(batch: batch)[1].paths.first)
+        #expect(!reservation.approvedPaths.contains(unapprovedPath), ".env should not be in approvedPaths")
     }
 
     @Test("B1_lockRootReplacement")

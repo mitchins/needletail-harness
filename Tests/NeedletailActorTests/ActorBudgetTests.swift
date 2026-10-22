@@ -36,7 +36,7 @@ struct ActorBudgetTests {
             ProviderResponse(
                 requestID: RequestID("s"), generation: Revision(0),
                 outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                    ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d"),
+                    ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
                 ], isFinal: false)),
             ProviderResponse(
                 requestID: RequestID("s"), generation: Revision(0),

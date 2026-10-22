@@ -151,7 +151,7 @@ struct ApprovalPolicyTests {
         let response = ProviderResponse(
             requestID: run.requestID, generation: run.revision,
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "evil", tool: "exec", argumentsDigest: "d"),
+                ToolProposal(callID: "evil", tool: "exec", argumentsDigest: "d", arguments: "{}"),
             ], isFinal: false))
         state = transition(state, .providerResponse(
             requestID: run.requestID, generation: run.revision, response: response, atMillis: 1003), &ids).state

@@ -45,11 +45,7 @@ public enum ToolValidator {
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty tool")
             }
             guard let argsStr = proposal.arguments else {
-                // State tests create proposals without arguments (just tool + callID) to test dispatch logic;
-                // treat nil as empty valid for backward compat (no paths, isMutating derived from tool)
-                let isMut = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
-                validated.append(ValidatedToolCall(callID: proposal.callID, tool: proposal.tool, paths: [], isMutating: isMut, rawArguments: "{}"))
-                continue
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing arguments for \(proposal.tool) \(proposal.callID)")
             }
             if argsStr.utf8.count > maxTotalArgumentsSize {
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "arguments too large")

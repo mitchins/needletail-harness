@@ -93,7 +93,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
             let outcome: ToolCallOutcome
             do {
-                outcome = try executeOne(proposal: proposal)
+                outcome = try executeOne(proposal: proposal, reservation: reservation)
             } catch let ToolFailure.preDispatch(status, summary) {
                 outcome = ToolCallOutcome(callID: proposal.callID, status: status, summary: summary, data: "", error: summary, started: false)
             } catch {
@@ -109,19 +109,18 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         return ExecutorResult(receipt: receipt, calls: outcomes)
     }
 
-    private func executeOne(proposal: ToolProposal) throws -> ToolCallOutcome {
+    private func executeOne(proposal: ToolProposal, reservation: EffectReservation) throws -> ToolCallOutcome {
         guard let argsStr = proposal.arguments, let data = argsStr.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "invalid json")
         }
-        // Check protected paths before any FS touch
+        // Check protected paths before any FS touch; grantable requires explicit approval in reservation
         if let path = json["path"] as? String {
             let cls = ToolValidator.protectedClassification(for: path)
             if cls == .absoluteDenied {
                 throw ToolFailure.preDispatch(status: "denied", summary: "absolute protected path")
             }
-            if cls == .grantable {
-                // For B1, without an approved set, grantable is denied
+            if cls == .grantable && !reservation.approvedPaths.contains(path) {
                 throw ToolFailure.preDispatch(status: "denied", summary: "grantable protected path requires approval")
             }
         }
@@ -372,15 +371,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if dirPath.isEmpty || dirPath == "." {
             parentFD = dirFD
         } else {
-            // Create parent dirs recursively via resolver? For now, use FileManager but should be descriptor-relative
-            // For B1, we can use FileManager to create parents, but should be validated
-            // We will try to open parent, if fails, create it
+            // Create parent dirs descriptor-relative via mkdirat chain (no FileManager path following symlinks)
             do {
                 parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             } catch {
-                // Create parent via mkdir -p using FileManager for now (B3 will do proper confined creation)
-                let fullParent = ws.path.string + "/" + dirPath
-                try? FileManager.default.createDirectory(atPath: fullParent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                // Try to create the missing parent chain via mkdirat
+                try Self.mkdirs(dirPath, from: dirFD)
                 parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             }
             defer { if parentFD != dirFD { close(parentFD) } }
@@ -403,5 +399,46 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         _ = fsync(fd)
         let hash = SHA256.hash(data: content).map { String(format: "%02x", $0) }.joined()
         return ToolCallOutcome(callID: callID, status: "success", summary: "write \(path)", data: "written", path: path, afterHash: hash, started: true)
+    }
+
+    private static func mkdirs(_ dirPath: String, from dirFD: Int32) throws {
+        let components = dirPath.split(separator: "/")
+        var currentFD = dirFD
+        var owned: [Int32] = []
+        defer {
+            for fd in owned { close(fd) }
+        }
+        for comp in components {
+            let name = String(comp)
+            if name.isEmpty || name == "." || name == ".." { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "invalid dir component") }
+            let fd = name.withCString { cstr in openat(currentFD, cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            if fd >= 0 {
+                if currentFD != dirFD {
+                    owned.append(currentFD)
+                }
+                currentFD = fd
+                continue
+            }
+            if errno != ENOENT {
+                throw StoreError.integrity("mkdirs open failed: \(String(cString: strerror(errno)))")
+            }
+            // Create via mkdirat
+            let ret = name.withCString { cstr in mkdirat(currentFD, cstr, mode_t(0o700)) }
+            guard ret == 0 else {
+                throw StoreError.integrity("mkdirat failed for \(name): \(String(cString: strerror(errno)))")
+            }
+            let newFD = name.withCString { cstr in openat(currentFD, cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard newFD >= 0 else {
+                throw StoreError.integrity("mkdirs re-open failed: \(String(cString: strerror(errno)))")
+            }
+            if currentFD != dirFD {
+                owned.append(currentFD)
+            }
+            currentFD = newFD
+        }
+        // Close the last currentFD if not dirFD (it will be closed by caller via defer, but we need to avoid leak)
+        if currentFD != dirFD {
+            close(currentFD)
+        }
     }
 }

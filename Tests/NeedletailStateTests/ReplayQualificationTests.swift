@@ -34,7 +34,7 @@ struct ReplayQualificationTests {
         state = transition(state, .requestDispatched(requestID: run.requestID, atMillis: 1001), &ids).state
         state = transition(state, .requestStarted(
             requestID: run.requestID, generation: run.revision, atMillis: 1002), &ids).state
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d")])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
         state = transition(state, .providerResponse(
             requestID: run.requestID, generation: run.revision,
             response: ProviderResponse(requestID: run.requestID, generation: run.revision,

@@ -72,8 +72,9 @@ public struct EffectReservation: Sendable, Equatable {
     public let mutating: Bool
     public let batch: ToolBatch
     public let kind: Kind
+    public let approvedPaths: [String]
 
-    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch(), kind: Kind) {
+    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch(), kind: Kind, approvedPaths: [String] = []) {
         self.effectID = effectID
         self.runID = runID
         self.requestID = requestID
@@ -82,6 +83,7 @@ public struct EffectReservation: Sendable, Equatable {
         self.mutating = mutating
         self.batch = batch
         self.kind = kind
+        self.approvedPaths = approvedPaths
     }
 }
 
@@ -1396,7 +1398,7 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         needsApproval = true
     }
     if !needsApproval {
-        return dispatchTrustedBatch(state, batch: batch, ids: &ids)
+        return dispatchTrustedBatch(state, batch: batch, approvedPaths: grantablePaths, ids: &ids)
     }
     guard let run = state.activeRun else {
         return failRun(state, failure: .providerError("authorising without a run"), hold: true, atMillis: atMillis, ids: &ids)
@@ -1425,7 +1427,7 @@ private func operationID(effectID: EffectID, callID: String) -> OperationID {
     OperationID("\(effectID.raw)/\(callID)")
 }
 
-private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: ToolBatch, ids: inout I) -> Transition {
+private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: ToolBatch, approvedPaths: [String] = [], ids: inout I) -> Transition {
     guard let run = state.activeRun else {
         let (s1, prefix) = sequenced(state, kind: "failed", digest: "no-run", ids: &ids)
         return Transition(state: s1.replacing(phase: .failed(.providerError("trusted dispatch without a run"))), effects: [], records: prefix)
@@ -1444,7 +1446,7 @@ private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: Too
     let mutating = batch.proposals.contains { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" }
     let reservation = EffectReservation(
         effectID: effectID, runID: run.runID, requestID: run.requestID,
-        generation: run.revision, revision: run.revision, mutating: mutating, batch: batch, kind: .executor)
+        generation: run.revision, revision: run.revision, mutating: mutating, batch: batch, kind: .executor, approvedPaths: approvedPaths)
     let (s1, prefix) = sequenced(state, kind: "executing", digest: eventDigest("exec", run.requestID.raw), ids: &ids)
     let next = s1.replacing(
         phase: .executing, pendingApproval: .some(nil), pendingBatch: .some(nil),
@@ -1471,24 +1473,8 @@ private func grantApproval<I: IDSource>(_ state: SessionState, requestID: Reques
         let (s1, prefix) = sequenced(state, kind: "authorising", digest: "grant-no-batch", ids: &ids)
         return Transition(state: s1, effects: [], records: prefix)
     }
-    // Enforce that grantable paths were actually enumerated in the approval
-    if let approval = state.pendingApproval {
-        do {
-            let validated = try ToolValidator.validateBatchArguments(batch: batch)
-            for v in validated {
-                for p in v.paths {
-                    if ToolValidator.protectedClassification(for: p) == .grantable && !approval.protectedPaths.contains(p) {
-                        return failRun(state, failure: .approvalDenied("protected path not approved: \(p)"), hold: true, atMillis: 0, ids: &ids)
-                    }
-                }
-            }
-        } catch let ToolFailure.preDispatch(status, summary) {
-            return failRun(state, failure: .providerError("grant validation failed: \(status) \(summary)"), hold: true, atMillis: 0, ids: &ids)
-        } catch {
-            return failRun(state, failure: .providerError("grant validation error"), hold: true, atMillis: 0, ids: &ids)
-        }
-    }
-    return dispatchTrustedBatch(state, batch: batch, ids: &ids)
+    let approved = state.pendingApproval?.protectedPaths ?? []
+    return dispatchTrustedBatch(state, batch: batch, approvedPaths: approved, ids: &ids)
 }
 
 private func denyApproval<I: IDSource>(_ state: SessionState, ids: inout I) -> Transition {
