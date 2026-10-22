@@ -704,14 +704,21 @@ struct B1ContainmentTests {
         let store = InMemorySessionStore()
         let writer = WriterIdentity(session: SessionID("s-search"), writer: "w")
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-search"), writer: writer, rgPath: "/usr/bin/rg")
-        // Search without path should still be filtered (prune) but we test that search with grantable path is denied without approval
-        // For now, just test that search with absolute path is handled
+        // Search with grantable path without approval should be denied
+        let batchGrantable = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"x\",\"path\":\".git\"}")])
+        let resNoApproval = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batchGrantable, kind: .executor, approvedPaths: [])
+        let resultNoApproval = try await exec.execute(batch: batchGrantable, reservation: resNoApproval)
+        #expect(resultNoApproval.calls[0].status == "denied", "search grantable without approval must be denied, got \(resultNoApproval.calls[0])")
+        // With approval, it should proceed (success or no-match, not denied)
+        let resApproved = EffectReservation(effectID: EffectID("eff-2"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batchGrantable, kind: .executor, approvedPaths: [".git"])
+        let resultApproved = try await exec.execute(batch: batchGrantable, reservation: resApproved)
+        #expect(resultApproved.calls[0].status != "denied", "approved search grantable should not be denied, got \(resultApproved.calls[0])")
         _ = exec
         _ = resolver
     }
 
     @Test("B1_readRootFallback")
-    func b1ReadRootFallback() throws {
+    func b1ReadRootFallback() async throws {
         let (wsURL, wsFP) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: wsURL) }
         let (rrURL, rrFP) = try Self.tempRoot()
@@ -719,26 +726,23 @@ struct B1ContainmentTests {
         let file = rrURL.appendingPathComponent("shared")
         try "from-read-root".write(to: file, atomically: true, encoding: .utf8)
         let resolver = try WorkspaceResolver(workspace: wsFP, readRoots: [rrFP])
-        // Read via read-root should succeed even when workspace doesn't have file
-        let pinnedRR = try #require(resolver.readRoots.first)
-        let dirFD = try resolver.revalidatedFD(for: pinnedRR)
-        defer { close(dirFD) }
-        let fd = try resolver.openRelative("shared", from: dirFD, flags: O_RDONLY | O_NOFOLLOW)
-        defer { close(fd) }
-        var st = stat(); fstat(fd, &st)
-        #expect((st.st_mode & S_IFMT) == S_IFREG)
-        // Multiple read roots: second root should be consulted
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-rr"), writer: WriterIdentity(session: SessionID("s-rr"), writer: "w"), rgPath: nil, gitPath: nil)
+        // Read via executor should succeed via read-root fallback
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"shared\"}")])
+        let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
+        let result = try await exec.execute(batch: batch, reservation: res)
+        #expect(result.calls[0].status == "success", "read via read-root should succeed, got \(result.calls[0])")
+        // Multiple read roots: second root should be consulted via executor
         let (rr2URL, rr2FP) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: rr2URL) }
         let file2 = rr2URL.appendingPathComponent("second")
         try "second".write(to: file2, atomically: true, encoding: .utf8)
         let resolver2 = try WorkspaceResolver(workspace: wsFP, readRoots: [rrFP, rr2FP])
-        let pinnedRR2 = try #require(resolver2.readRoots.last)
-        let fd2 = try resolver2.revalidatedFD(for: pinnedRR2)
-        defer { close(fd2) }
-        let fdSecond = try resolver2.openRelative("second", from: fd2, flags: O_RDONLY | O_NOFOLLOW)
-        defer { close(fdSecond) }
-        var st2 = stat(); fstat(fdSecond, &st2)
-        #expect((st2.st_mode & S_IFMT) == S_IFREG)
+        let exec2 = NativeToolExecutor(resolver: resolver2, store: store, sessionID: SessionID("s-rr2"), writer: WriterIdentity(session: SessionID("s-rr2"), writer: "w"), rgPath: nil, gitPath: nil)
+        let batch2 = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"second\"}")])
+        let res2 = EffectReservation(effectID: EffectID("eff-2"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch2, kind: .executor, approvedPaths: [])
+        let result2 = try await exec2.execute(batch: batch2, reservation: res2)
+        #expect(result2.calls[0].status == "success", "read via second read-root should succeed, got \(result2.calls[0])")
     }
 }

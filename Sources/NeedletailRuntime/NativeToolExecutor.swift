@@ -128,7 +128,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         case "read":
             return try read(callID: proposal.callID, json: json)
         case "search":
-            return try search(callID: proposal.callID, json: json)
+            return try search(callID: proposal.callID, json: json, reservation: reservation)
         case "edit":
             return try edit(callID: proposal.callID, json: json)
         case "write":
@@ -159,6 +159,10 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     fd = try resolver.openRelative(path, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
                     break
                 } catch {
+                    if let se = error as? StoreError, case .integrity(let msg) = se, msg.contains("is directory") {
+                        lastError = error
+                        break
+                    }
                     lastError = error
                     continue
                 }
@@ -209,7 +213,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         return ToolCallOutcome(callID: callID, status: "success", summary: "read \(path)", data: limited, path: path, beforeHash: hash, started: true)
     }
 
-    private func search(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
+    private func search(callID: String, json: [String: Any], reservation: EffectReservation) throws -> ToolCallOutcome {
         guard let rg = rgPath, FileManager.default.fileExists(atPath: rg) else {
             throw ToolFailure.preDispatch(status: "denied", summary: "rg not provisioned")
         }
@@ -219,14 +223,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
         // Check rg binary is not world-writable and version gate
         // For B1, run rg with fixed argv and deny globs for all protected (including .needletail, credentials, artifacts)
-        var args = [rg, "--json", "--hidden", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--", pattern]
+        var args = [rg, "--json", "--hidden", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
         // If search path is provided, validate and use it (relative to workspace/read-root)
         if let searchPath = json["path"] as? String, !searchPath.isEmpty {
             let cls = ToolValidator.protectedClassification(for: searchPath)
             if cls == .absoluteDenied {
                 throw ToolFailure.preDispatch(status: "denied", summary: "absolute protected path for search")
             }
-            if cls == .grantable {
+            if cls == .grantable && !reservation.approvedPaths.contains(searchPath) {
                 throw ToolFailure.preDispatch(status: "denied", summary: "grantable search path requires approval")
             }
             // Resolve searchPath relative to workspace/read-root and use as root
@@ -258,14 +262,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 return ToolCallOutcome(callID: callID, status: "no-match", summary: "search path not found", data: "", started: true)
             }
         } else {
+            guard resolver.workspaceRoot != nil || !resolver.readRoots.isEmpty else {
+                throw ToolFailure.preDispatch(status: "denied", summary: "no workspace/read-root for search")
+            }
             if let ws = resolver.workspaceRoot {
                 args.append(ws.path.string)
             }
             for rr in resolver.readRoots {
                 args.append(rr.path.string)
-            }
-            if args.count <= 13 { // only rg + globs + pattern, no root
-                throw ToolFailure.preDispatch(status: "denied", summary: "no workspace/read-root for search")
             }
         }
         let process = Process()
