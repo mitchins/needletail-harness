@@ -94,4 +94,51 @@ struct BackendTests {
             Issue.record("wrong error class: \(error)")
         }
     }
+
+    @Test("B0 ScriptedToolBackend success→failure→unstarted preserves earlier success")
+    func b0SuccessFailureUnstarted() async throws {
+        let b = Self.backend([("read","{\"path\":\"a\"}","ok"), ("edit","{\"path\":\"b\"}","tool-failure: bad")])
+        let batch = Self.batch(("c1","read","{\"path\":\"a\"}"), ("c2","edit","{\"path\":\"b\"}"), ("c3","edit","{\"path\":\"c\"}"))
+        let result = try await b.execute(batch: batch, reservation: Self.reservation(batch: batch))
+        #expect(result.calls.count == 3)
+        #expect(result.calls[0].status == "success" && result.calls[0].callID == "c1")
+        #expect(result.calls[1].status == "failed")
+        #expect(result.calls[2].status == "cancelled" && result.calls[2].started == false, "third must be unstarted after halt")
+        #expect(result.calls[0].data == "ok", "earlier success preserved")
+        #expect(b.remaining == 0)
+    }
+
+    @Test("B0 ScriptedToolBackend success→exhaustion→unstarted")
+    func b0SuccessExhaustionUnstarted() async throws {
+        let b = Self.backend([("read","{\"path\":\"a\"}","ok")])
+        let batch = Self.batch(("c1","read","{\"path\":\"a\"}"), ("c2","edit","{\"path\":\"b\"}"), ("c3","edit","{\"path\":\"c\"}"))
+        let result = try await b.execute(batch: batch, reservation: Self.reservation(batch: batch))
+        #expect(result.calls[0].status == "success")
+        #expect(result.calls[1].status == "failed" && result.calls[1].started == true)
+        #expect(result.calls[2].status == "cancelled" && result.calls[2].started == false)
+        #expect(result.calls[0].data == "ok")
+    }
+
+    @Test("B0 ScriptedToolBackend success→mismatch→unstarted")
+    func b0SuccessMismatchUnstarted() async throws {
+        let b = Self.backend([("read","{\"path\":\"a\"}","ok"), ("edit","{\"path\":\"WRONG\"}","bad")])
+        let batch = Self.batch(("c1","read","{\"path\":\"a\"}"), ("c2","edit","{\"path\":\"b\"}"), ("c3","edit","{\"path\":\"c\"}"))
+        let result = try await b.execute(batch: batch, reservation: Self.reservation(batch: batch))
+        #expect(result.calls[0].status == "success")
+        #expect(result.calls[1].status == "failed")
+        #expect(result.calls[2].status == "cancelled" && result.calls[2].started == false)
+    }
+
+    @Test("B0 ScriptedToolBackend pre-dispatch denial consumes no script")
+    func b0PreDispatchDenialNoConsumption() async throws {
+        let b = Self.backend([("read","{\"path\":\"a\"}","ok")], caps: .allDenied)
+        let before = b.remaining
+        do {
+            _ = try await b.execute(batch: Self.batch(("c1","read","{\"path\":\"a\"}")), reservation: Self.reservation(batch: Self.batch(("c1","read","{\"path\":\"a\"}"))))
+            Issue.record("should throw")
+        } catch let e as ToolFailure {
+            #expect(e == .preDispatch(status: "denied", summary: "capabilityDenied: read"))
+        }
+        #expect(b.remaining == before, "denied must not consume script")
+    }
 }

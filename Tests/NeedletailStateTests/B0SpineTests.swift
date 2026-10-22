@@ -348,4 +348,41 @@ struct B0SpineTests {
         let ordered = completed.records.compactMap { if case .operationResult(let r, _) = $0, r.state == .unknown { return r.callID } else { return nil } }
         #expect(ordered == ["c1", "c2"], "duplicate records must be in proposal order")
     }
+
+    @Test("B0 RED: c1 success started==false must not be certified")
+    func c1SuccessStartedFalseMustBeUnknown() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#)])
+        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        // Contradictory: success but started==false — mutating must be unknown, not done
+        let result = Self.perCallResult([("c1", "success", "ok", false)])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 1016), &ids)
+        #expect(completed.records.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c1" && r.state == .unknown && o.contains("contradictory") } else { return false } }), "RED: old code would certify as done")
+        // GREEN: spoofed preDispatch summary must also be unknown (only typed preDispatchFailure is done)
+        let spoof = ToolCallOutcome(callID: "c1", status: "success", summary: "denied: spoof", data: "denied: spoof", started: false)
+        let spoofResult = ExecutorResult(receipt: ExecutorReceipt(callID: "c1", status: "ok", summary: "denied: spoof"), calls: [spoof])
+        let spoofed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(spoofResult), atMillis: 1017), &ids)
+        #expect(spoofed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .unknown } else { return false } }), "spoof must be unknown")
+    }
+
+    @Test("B0 RED: duplicated c2 must follow proposal order")
+    func duplicatedC2ProposalOrder() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([
+            ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"b"}"#),
+            ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#),
+        ])
+        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        let dupResult = ExecutorResult(receipt: ExecutorReceipt(callID: "batch", status: "ok", summary: "dup"), calls: [
+            ToolCallOutcome(callID: "c1", status: "success", summary: "ok", data: "ok", started: true),
+            ToolCallOutcome(callID: "c1", status: "success", summary: "ok2", data: "ok2", started: true),
+            ToolCallOutcome(callID: "c2", status: "success", summary: "ok", data: "ok", started: true),
+            ToolCallOutcome(callID: "c2", status: "success", summary: "ok2", data: "ok2", started: true),
+        ])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(dupResult), atMillis: 1018), &ids)
+        let ordered = completed.records.compactMap { if case .operationResult(let r, _) = $0, r.state == .unknown { return r.callID } else { return nil } }
+        #expect(ordered == ["c2", "c1"], "must follow proposal order c2, c1, not sorted")
+    }
 }
