@@ -1293,14 +1293,16 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
             return failRun(state, failure: .budgetExhausted("turn budget exhausted after validation"), hold: true, atMillis: atMillis, ids: &ids)
         }
         // Per-call mutating classification derived from tool name, not model flag
+        // For preDispatch, create matching intent+result so reopen sees completed, not held orphan
         var records: [DurableRecord] = []
         var transcripts: [DurableRecord] = []
         for prop in batch.proposals {
             let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
-            let opID = OperationID("\(ids.nextOperationID().raw)") // temporary, will be replaced below? Actually we need stable per-call IDs via operationID helper
-            // Use a fresh operationID per call for this synthetic batch (no reservation yet, so we mint)
-            let ref = OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut)
-            records.append(.operationResult(ref, outcome: "tool-failure: \(summary) (\(status))"))
+            let opID = ids.nextOperationID()
+            let intentRef = OperationRef(operationID: opID, callID: prop.callID, state: .intent, mutating: isMut)
+            let resultRef = OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut)
+            records.append(.operationIntent(intentRef))
+            records.append(.operationResult(resultRef, outcome: "tool-failure: \(summary) (\(status))"))
             transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "preDispatch \(status): \(summary)")))
         }
         let nextEffectID = ids.nextEffectID()
@@ -1332,8 +1334,11 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         var transcripts: [DurableRecord] = []
         for prop in batch.proposals {
             let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
-            let ref = OperationRef(operationID: ids.nextOperationID(), callID: prop.callID, state: .done, mutating: isMut)
-            records.append(.operationResult(ref, outcome: "tool-failure: \(summary) (\(status))"))
+            let opID = ids.nextOperationID()
+            let intentRef = OperationRef(operationID: opID, callID: prop.callID, state: .intent, mutating: isMut)
+            let resultRef = OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut)
+            records.append(.operationIntent(intentRef))
+            records.append(.operationResult(resultRef, outcome: "tool-failure: \(summary) (\(status))"))
             transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "denied: \(summary)")))
         }
         let nextEffectID = ids.nextEffectID()

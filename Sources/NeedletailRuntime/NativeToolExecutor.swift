@@ -313,18 +313,19 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         guard tmpFD >= 0 else {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "tmp create failed", data: "", error: String(cString: strerror(errno)), started: true)
         }
-        defer { close(tmpFD); _ = tmpName.withCString { unlinkat(parentFD, $0, 0) } }
         // Write
         let written = newData.withUnsafeBytes { ptr in
             Glibc.write(tmpFD, ptr.baseAddress, ptr.count)
         }
         guard written == newData.count else {
+            close(tmpFD); _ = tmpName.withCString { unlinkat(parentFD, $0, 0) }
             return ToolCallOutcome(callID: callID, status: "failed", summary: "write failed", data: "", error: "write", started: true)
         }
         _ = fsync(tmpFD)
         // Preserve mode
         _ = fchmod(tmpFD, st.st_mode & 0o777)
         close(tmpFD)
+        defer { _ = tmpName.withCString { unlinkat(parentFD, $0, 0) } }
         // Rename via renameat
         let oldName = (path as NSString).lastPathComponent
         let renameRet = oldName.withCString { oldC in
@@ -407,6 +408,9 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var owned: [Int32] = []
         defer {
             for fd in owned { close(fd) }
+            if currentFD != dirFD && !owned.contains(currentFD) {
+                close(currentFD)
+            }
         }
         for comp in components {
             let name = String(comp)
@@ -435,10 +439,6 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 owned.append(currentFD)
             }
             currentFD = newFD
-        }
-        // Close the last currentFD if not dirFD (it will be closed by caller via defer, but we need to avoid leak)
-        if currentFD != dirFD {
-            close(currentFD)
         }
     }
 }
