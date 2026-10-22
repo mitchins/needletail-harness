@@ -14,7 +14,7 @@ import NeedletailCore
 public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
     public static let recordCap = 10_000
 
-    private let lock = NSLock()
+    private let lock = NSRecursiveLock()
     private var log: [SequencedRecord] = []
     /// Per-record session attribution, index-aligned with `log`.
     private var sessions: [String] = []

@@ -62,7 +62,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     private var closed = false
     /// Serializes every operation against `close` so the typed
     /// closed-store contract holds atomically (A1 stabilization).
-    private let gate = NSLock()
+    private let gate = NSRecursiveLock()
 
     public init(path: String, sessionRecordLimit: Int = 10_000, globalRecordLimit: Int = 100_000, artifactByteLimit: Int = 32 * 1024 * 1024) throws {
         self.path = path

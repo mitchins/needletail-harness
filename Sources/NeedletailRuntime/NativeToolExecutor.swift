@@ -139,45 +139,25 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     }
 
     private func read(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
-        // Handle artifact ID read (session-scoped)
+        // Handle artifact ID read (session-scoped) with bounded output, SHA, binary check
         if let artifactId = (json["artifactId"] as? String) ?? (json["artifact_id"] as? String) {
-            // Artifact IDs are already validated as 64 hex; now resolve via store
-            // The store must have an artifactPublished for this session with this digest
-            // Use the sessionID from the executor's session
-            // The artifact store is in GRDBSessionStore or InMemorySessionStore via artifactRecord
-            // For now, try to fetch via store's artifactPublished lookup
-            // If not found or foreign, deny
-            // We need to handle both GRDB and InMemory stores; we can try to use a helper that checks the store's records
-            // For now, we will attempt to use the store's records to find the artifact
-            // This is a placeholder for the real artifactRecord seam
-            // We will check if the store is a GRDBSessionStore or InMemorySessionStore and look for the artifact
-            // For B2, we will implement a proper seam: try to use the store's records to find artifactPublished with matching digest for this session
-            // If not found, deny
-            // For now, we will try to use the store's records to find it
             do {
-                // Try to use the store's records to find artifactPublished
-                // This is a bit hacky but works for the test
-                if let grdb = store as? GRDBSessionStore {
-                    // Use the new artifactRecord seam if available
-                    if let data = try? grdb.artifactRecord(session: sessionID, digest: artifactId) {
-                        let text = String(decoding: data, as: UTF8.self)
-                        let hash = artifactId // already the digest
-                        return ToolCallOutcome(callID: callID, status: "success", summary: "read artifact \(artifactId)", data: text, path: artifactId, beforeHash: hash, started: true)
+                if let data = try store.artifactRecord(session: sessionID, digest: artifactId) {
+                    if data.contains(0) {
+                        return ToolCallOutcome(callID: callID, status: "failed", summary: "binary artifact", data: "", error: "binary", started: true)
                     }
-                }
-                // Fallback: check InMemory via records
-                let (records, _) = try store.records(session: sessionID, since: 0, limit: 10000)
-                for rec in records {
-                    if case .artifactPublished(let ref) = rec.record, ref.digest == artifactId {
-                        // Found, now read the artifact file via the store's readArtifact
-                        if let grdb = store as? GRDBSessionStore {
-                            let data = try grdb.readArtifact(ref)
-                            let text = String(decoding: data, as: UTF8.self)
-                            return ToolCallOutcome(callID: callID, status: "success", summary: "read artifact \(artifactId)", data: text, path: artifactId, beforeHash: ref.digest, started: true)
-                        }
-                        // For InMemory, we don't have artifact storage, so deny
-                        break
+                    guard let text = String(data: data, encoding: .utf8) else {
+                        return ToolCallOutcome(callID: callID, status: "failed", summary: "binary artifact", data: "", error: "binary", started: true)
                     }
+                    let limit = json["limit"] as? Int ?? 200
+                    let offset = json["offset"] as? Int ?? 0
+                    let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+                    let start = min(offset, lines.count)
+                    let end = min(start + limit, lines.count)
+                    let truncated = end < lines.count
+                    let limited = lines[start..<end].joined(separator: "\n")
+                    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                    return ToolCallOutcome(callID: callID, status: "success", summary: "read artifact \(artifactId)", data: limited, truncated: truncated, path: artifactId, beforeHash: hash, started: true)
                 }
             } catch {}
             return ToolCallOutcome(callID: callID, status: "denied", summary: "artifact not found or foreign", data: "", error: "artifact denied", started: false)
