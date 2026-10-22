@@ -139,6 +139,22 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
+    public func artifactRecord(session: SessionID, digest: String) throws -> Data? {
+        // For InMemory, check log for artifactPublished for this session with digest
+        // Note: InMemory doesn't store artifact bytes, so we return nil (not found) for now
+        // B2 tests using GRDB will use the real store; InMemory artifact reads are not covered
+        return try lock.withLock {
+            for (idx, rec) in log.enumerated() where sessions[idx] == session.raw {
+                if case .artifactPublished(let ref) = rec.record, ref.digest == digest {
+                    // InMemory doesn't have file storage, so we can't return bytes
+                    // Return nil to indicate not found (will be denied)
+                    return nil
+                }
+            }
+            return nil
+        }
+    }
+
     /// Test inspection only: total appended records.
     public var count: Int {
         lock.withLock { log.count }

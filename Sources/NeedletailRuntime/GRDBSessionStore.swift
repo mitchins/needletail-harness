@@ -857,6 +857,29 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
 
     // MARK: - Diagnostics (test/receipt support)
 
+    public func artifactRecord(session: SessionID, digest: String) throws -> Data? {
+        gate.lock()
+        defer { gate.unlock() }
+        try assertOpenLocked()
+        // Check if there's an artifactPublished for this session with this digest
+        let payloads: [String]
+        do {
+            payloads = try queue.read { db in
+                try String.fetchAll(db, sql: "SELECT payload FROM records WHERE session = ? ORDER BY seq", arguments: [session.raw])
+            }
+        } catch { throw Self.translate(error) }
+        var found: ArtifactRef?
+        for payload in payloads {
+            guard let data = payload.data(using: .utf8),
+                  let rec = try? RecordCodec.decode(data),
+                  case .artifactPublished(let ref) = rec, ref.digest == digest else { continue }
+            found = ref
+            break
+        }
+        guard let ref = found else { return nil }
+        return try readArtifact(ref)
+    }
+
     /// Reads a PRAGMA on THIS store's connection (per-connection settings
     /// such as `synchronous` cannot be observed from another handle).
     /// Internal: durability assertions use it via `@testable import`.

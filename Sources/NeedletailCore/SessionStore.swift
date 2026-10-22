@@ -1,3 +1,4 @@
+import Foundation
 /// M1-B durability shapes + store seams (SPEC §9, ARCH §§1/7). The row
 /// shapes mirror the normative tables (sessions/epochs/events/operations/
 //// queue) as values; SQL lives in M2-A. M1-B appends to the seam and proves
@@ -220,6 +221,8 @@ public struct Acknowledgment: Sendable, Equatable, Codable {
 }
 
 public protocol SessionStore: Sendable {
+    /// Artifact lookup for B2: returns the artifact bytes for `digest` iff an `artifactPublished` row for `session` names that digest.
+    func artifactRecord(session: SessionID, digest: String) throws -> Data?
     /// FENCED durable append: implementations validate, INSIDE the
     /// mutation's own transaction, that `identity.writer` currently owns
     /// `identity.session`. A stale writer (never claimed, superseded, or
@@ -270,6 +273,8 @@ public protocol SessionStore: Sendable {
 }
 
 extension SessionStore {
+    public func artifactRecord(session: SessionID, digest: String) throws -> Data? { nil }
+
     /// Default sequential batch (NO atomicity claim): diagnostic-only
     /// conformances inherit this. Durable paths must override.
     public func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {

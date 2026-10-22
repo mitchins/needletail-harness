@@ -191,24 +191,48 @@ public enum ToolValidator {
     }
 
     private static func validateRead(callID: String, json: [String: Any], raw: String) throws -> ValidatedToolCall {
-        let allowed: Set<String> = ["path", "limit"]
+        let allowed: Set<String> = ["path", "artifactId", "artifact_id", "limit", "offset"]
         for key in json.keys where !allowed.contains(key) {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown field \(key) for read \(callID)")
         }
-        guard let path = json["path"] as? String else {
-            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing path for read \(callID)")
+        let hasPath = json["path"] != nil
+        let hasArtifact = json["artifactId"] != nil || json["artifact_id"] != nil
+        if hasPath == hasArtifact {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "read requires exactly one of path or artifactId for \(callID)")
         }
-        try validatePath(path, callID: callID, tool: "read")
-        if let limit = json["limit"] {
-            guard let v = limit as? Int else {
-                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "limit must be int for read \(callID)")
+        if let rawPath = json["path"] {
+            guard let path = rawPath as? String else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path must be string for read \(callID)")
             }
-            if v < 1 || v > 10000 {
-                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "limit out of range for read \(callID)")
+            try validatePath(path, callID: callID, tool: "read")
+            if let limit = json["limit"] {
+                guard let v = limit as? Int else {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "limit must be int for read \(callID)")
+                }
+                if v < 1 || v > 10000 {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "limit out of range for read \(callID)")
+                }
             }
+            if let offset = json["offset"] {
+                guard let v = offset as? Int, v >= 0 else {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "offset must be non-negative int for read \(callID)")
+                }
+            }
+            return ValidatedToolCall(callID: callID, tool: "read", paths: [path], isMutating: false, rawArguments: raw)
+        } else {
+            // Artifact ID path
+            let artifactId = (json["artifactId"] as? String) ?? (json["artifact_id"] as? String) ?? ""
+            if artifactId.isEmpty {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "artifactId must be non-empty string for read \(callID)")
+            }
+            if artifactId.utf8.count > 128 { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "artifactId too long") }
+            if artifactId.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "artifactId contains NUL") }
+            // Artifact IDs are hex digests (64 hex)
+            if artifactId.count != 64 || !artifactId.allSatisfy({ $0.isHexDigit }) {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "artifactId must be 64 hex")
+            }
+            return ValidatedToolCall(callID: callID, tool: "read", paths: [], isMutating: false, rawArguments: raw)
         }
-        // Check for NUL, overlong, etc already in validatePath
-        return ValidatedToolCall(callID: callID, tool: "read", paths: [path], isMutating: false, rawArguments: raw)
     }
 
     private static func validateSearch(callID: String, json: [String: Any], raw: String) throws -> ValidatedToolCall {

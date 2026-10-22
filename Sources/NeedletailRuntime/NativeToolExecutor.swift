@@ -139,6 +139,49 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     }
 
     private func read(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
+        // Handle artifact ID read (session-scoped)
+        if let artifactId = (json["artifactId"] as? String) ?? (json["artifact_id"] as? String) {
+            // Artifact IDs are already validated as 64 hex; now resolve via store
+            // The store must have an artifactPublished for this session with this digest
+            // Use the sessionID from the executor's session
+            // The artifact store is in GRDBSessionStore or InMemorySessionStore via artifactRecord
+            // For now, try to fetch via store's artifactPublished lookup
+            // If not found or foreign, deny
+            // We need to handle both GRDB and InMemory stores; we can try to use a helper that checks the store's records
+            // For now, we will attempt to use the store's records to find the artifact
+            // This is a placeholder for the real artifactRecord seam
+            // We will check if the store is a GRDBSessionStore or InMemorySessionStore and look for the artifact
+            // For B2, we will implement a proper seam: try to use the store's records to find artifactPublished with matching digest for this session
+            // If not found, deny
+            // For now, we will try to use the store's records to find it
+            do {
+                // Try to use the store's records to find artifactPublished
+                // This is a bit hacky but works for the test
+                if let grdb = store as? GRDBSessionStore {
+                    // Use the new artifactRecord seam if available
+                    if let data = try? grdb.artifactRecord(session: sessionID, digest: artifactId) {
+                        let text = String(decoding: data, as: UTF8.self)
+                        let hash = artifactId // already the digest
+                        return ToolCallOutcome(callID: callID, status: "success", summary: "read artifact \(artifactId)", data: text, path: artifactId, beforeHash: hash, started: true)
+                    }
+                }
+                // Fallback: check InMemory via records
+                let (records, _) = try store.records(session: sessionID, since: 0, limit: 10000)
+                for rec in records {
+                    if case .artifactPublished(let ref) = rec.record, ref.digest == artifactId {
+                        // Found, now read the artifact file via the store's readArtifact
+                        if let grdb = store as? GRDBSessionStore {
+                            let data = try grdb.readArtifact(ref)
+                            let text = String(decoding: data, as: UTF8.self)
+                            return ToolCallOutcome(callID: callID, status: "success", summary: "read artifact \(artifactId)", data: text, path: artifactId, beforeHash: ref.digest, started: true)
+                        }
+                        // For InMemory, we don't have artifact storage, so deny
+                        break
+                    }
+                }
+            } catch {}
+            return ToolCallOutcome(callID: callID, status: "denied", summary: "artifact not found or foreign", data: "", error: "artifact denied", started: false)
+        }
         let path = json["path"] as? String ?? ""
         var fd: Int32? = nil
         var lastError: Error? = nil
@@ -208,21 +251,55 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
         let limit = json["limit"] as? Int ?? 200
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let truncated = lines.count > limit
         let limited = lines.prefix(limit).joined(separator: "\n")
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        return ToolCallOutcome(callID: callID, status: "success", summary: "read \(path)", data: limited, path: path, beforeHash: hash, started: true)
+        return ToolCallOutcome(callID: callID, status: "success", summary: "read \(path)", data: limited, truncated: truncated, path: path, beforeHash: hash, started: true)
     }
 
     private func search(callID: String, json: [String: Any], reservation: EffectReservation) throws -> ToolCallOutcome {
-        guard let rg = rgPath, FileManager.default.fileExists(atPath: rg) else {
+        guard let rg = rgPath else {
             throw ToolFailure.preDispatch(status: "denied", summary: "rg not provisioned")
+        }
+        // Pinned absolute executable, ownership/mode checks and version gate
+        guard rg.hasPrefix("/") else {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg must be absolute path")
+        }
+        guard FileManager.default.fileExists(atPath: rg) else {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg not found")
+        }
+        var st = stat()
+        guard stat(rg, &st) == 0 else {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg stat failed")
+        }
+        if (st.st_mode & 0o002) != 0 {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg is world-writable")
+        }
+        // Version gate: rg --version must be >= 13.0.0 (or at least 11)
+        do {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: rg)
+            proc.arguments = ["--version"]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            try proc.run()
+            proc.waitUntilExit()
+            let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            // Expect "ripgrep 13." or "ripgrep 14." etc.
+            let versionPattern = try? NSRegularExpression(pattern: #"ripgrep (\d+)\."#)
+            if let m = versionPattern?.firstMatch(in: out, range: NSRange(out.startIndex..., in: out)), let r = Range(m.range(at: 1), in: out), let v = Int(out[r]), v < 13 {
+                throw ToolFailure.preDispatch(status: "denied", summary: "rg too old")
+            }
+        } catch let e as ToolFailure {
+            throw e
+        } catch {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg version check failed")
         }
         let pattern = json["pattern"] as? String ?? ""
         if pattern.isEmpty {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing pattern")
         }
-        // Check rg binary is not world-writable and version gate
-        // For B1, run rg with fixed argv and deny globs for all protected (including .needletail, credentials, artifacts)
         var args = [rg, "--json", "--hidden", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
         // If search path is provided, validate and use it (relative to workspace/read-root)
         if let searchPath = json["path"] as? String, !searchPath.isEmpty {
@@ -279,25 +356,42 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         env.removeValue(forKey: "RIPGREP_CONFIG_PATH")
         env.removeValue(forKey: "RIPGREP_CONFIG")
         process.environment = env
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        final class DataBox: @unchecked Sendable { var data = Data(); let lock = NSLock() }
+        let outBox = DataBox()
+        outPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+            } else {
+                outBox.lock.withLock { outBox.data.append(data) }
+            }
+        }
         do {
             try process.run()
             process.waitUntilExit()
         } catch {
+            outPipe.fileHandleForReading.readabilityHandler = nil
             return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "\(error)", started: true)
         }
+        outPipe.fileHandleForReading.readabilityHandler = nil
+        // Drain any remaining
+        let remaining = outPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remaining.isEmpty {
+            outBox.lock.withLock { outBox.data.append(remaining) }
+        }
+        // Also drain stderr to prevent block (though we ignore it)
+        _ = errPipe.fileHandleForReading.readDataToEndOfFile()
         if process.terminationStatus != 0 && process.terminationStatus != 1 {
-            // rg exit 1 means no match, still success
-            let out = pipe.fileHandleForReading.readDataToEndOfFile()
-            let text = String(decoding: out, as: UTF8.self)
+            let text = String(decoding: outBox.data, as: UTF8.self)
             if text.isEmpty {
                 return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "rg exit \(process.terminationStatus)", started: true)
             }
         }
-        let out = pipe.fileHandleForReading.readDataToEndOfFile()
-        let text = String(decoding: out, as: UTF8.self)
+        let text = String(decoding: outBox.data, as: UTF8.self)
         return ToolCallOutcome(callID: callID, status: "success", summary: "search \(pattern)", data: text, started: true)
     }
 
