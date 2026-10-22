@@ -83,7 +83,7 @@ struct ProductionExportCLIWiringTests {
 
     private static func writeTools(_ directory: URL) throws -> String {
         let entries = [
-            ["tool": "read", "arguments": "{\"path\":\"/x/GAMMA-333\"}", "result": "file EXP-DELTA-444"],
+            ["tool": "read", "arguments": "{\"path\":\"x/GAMMA-333\"}", "result": "file EXP-DELTA-444"],
         ]
         let url = directory.appendingPathComponent("tools.json")
         try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys])
@@ -100,7 +100,7 @@ struct ProductionExportCLIWiringTests {
         var out = dataJSON([
             "choices": [["index": 0, "delta": ["tool_calls": [[
                 "index": 0, "id": callID,
-                "function": ["name": "read", "arguments": "{\"path\":\"/x/GAMMA-333\"}"],
+                "function": ["name": "read", "arguments": "{\"path\":\"x/GAMMA-333\"}"],
             ]]], "finish_reason": NSNull()]],
         ])
         out += dataJSON(["choices": [["index": 0, "delta": [:], "finish_reason": "tool_calls"]]])

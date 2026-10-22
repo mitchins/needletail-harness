@@ -1276,6 +1276,71 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
             return failRun(state, failure: .providerError("malformed tool batch: empty or duplicate call identity"), hold: true, atMillis: atMillis, ids: &ids)
         }
     }
+    // B1 strict validator: validate every call before side effects
+    let validated: [ValidatedToolCall]
+    do {
+        validated = try ToolValidator.validateBatchArguments(batch: batch)
+    } catch let ToolFailure.preDispatch(status, summary) {
+        // Deterministic per-call done receipts preserving SPEC status, no FS touch
+        // Synthesize a provider continuation with per-call operationResults
+        let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("preDispatch", status), ids: &ids)
+        guard let run = s1.activeRun else {
+            return failRun(state, failure: .providerError("validation without run"), hold: true, atMillis: atMillis, ids: &ids)
+        }
+        guard s1.turnsUsed < s1.turnLimit else {
+            return failRun(state, failure: .budgetExhausted("turn budget exhausted after validation"), hold: true, atMillis: atMillis, ids: &ids)
+        }
+        // Per-call mutating classification derived from tool name, not model flag
+        var records: [DurableRecord] = []
+        var transcripts: [DurableRecord] = []
+        for prop in batch.proposals {
+            let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            let opID = OperationID("\(ids.nextOperationID().raw)") // temporary, will be replaced below? Actually we need stable per-call IDs via operationID helper
+            // Use a fresh operationID per call for this synthetic batch (no reservation yet, so we mint)
+            let ref = OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut)
+            records.append(.operationResult(ref, outcome: "tool-failure: \(summary) (\(status))"))
+            transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "preDispatch \(status): \(summary)")))
+        }
+        let nextEffectID = ids.nextEffectID()
+        let seq = ids.nextSequence()
+        let reservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+        let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed, turnsLeft: state.turnLimit - s1.turnsUsed, deadlineMillis: state.runDeadlineMillis, historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):preDispatch"))
+        let next = s1.replacing(phase: .requesting, consumedEffects: s1.consumedEffects, turnsUsed: s1.turnsUsed + 1, pendingBatch: .some(nil), liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+        return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
+    } catch {
+        return failRun(state, failure: .providerError("validation error: \(error)"), hold: true, atMillis: atMillis, ids: &ids)
+    }
+    // Absolute protected paths (never grantable) -> deterministic denied
+    var absoluteDenied: [String] = []
+    var grantablePaths: [String] = []
+    for v in validated {
+        for p in v.paths {
+            let cls = ToolValidator.protectedClassification(for: p)
+            if cls == .absoluteDenied { absoluteDenied.append(p) }
+            else if cls == .grantable { grantablePaths.append(p) }
+        }
+    }
+    if !absoluteDenied.isEmpty {
+        let status = "denied"
+        let summary = "absolute protected path denied: \(absoluteDenied.joined(separator: ","))"
+        let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("absolute-denied", summary), ids: &ids)
+        guard let run = s1.activeRun else { return failRun(state, failure: .providerError("absolute denied without run"), hold: true, atMillis: atMillis, ids: &ids) }
+        guard s1.turnsUsed < s1.turnLimit else { return failRun(state, failure: .budgetExhausted("turn budget exhausted"), hold: true, atMillis: atMillis, ids: &ids) }
+        var records: [DurableRecord] = []
+        var transcripts: [DurableRecord] = []
+        for prop in batch.proposals {
+            let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            let ref = OperationRef(operationID: ids.nextOperationID(), callID: prop.callID, state: .done, mutating: isMut)
+            records.append(.operationResult(ref, outcome: "tool-failure: \(summary) (\(status))"))
+            transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "denied: \(summary)")))
+        }
+        let nextEffectID = ids.nextEffectID()
+        let seq = ids.nextSequence()
+        let reservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+        let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed, turnsLeft: state.turnLimit - s1.turnsUsed, deadlineMillis: state.runDeadlineMillis, historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):absolute"))
+        let next = s1.replacing(phase: .requesting, turnsUsed: s1.turnsUsed + 1, pendingBatch: .some(nil), liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+        return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
+    }
     // Capability grant check (I05): proposals without an effective grant
     // are denied as typed receipts — never executed, never silently dropped.
     let denied = batch.proposals.map(\.tool).filter { !toolAllowed($0, caps: state.epoch.effectiveCaps.tools) }
@@ -1335,7 +1400,8 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
     let request = ApprovalRequest(
         requestID: run.requestID, runID: run.runID, generation: run.revision,
         operation: "tool batch: \(names.joined(separator: ", "))",
-        requiredGrant: "explicit approval")
+        requiredGrant: "explicit approval",
+        protectedPaths: Array(Set(grantablePaths)).sorted())
     let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("approval", run.requestID.raw), ids: &ids)
     let next = s1.replacing(phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch))
     return Transition(

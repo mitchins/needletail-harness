@@ -49,11 +49,52 @@ struct RunCommand: ParsableCommand {
     @Flag(name: .long, help: "Trusted execution fixture: allow all tools without approval (demo only, not the default).")
     var trusted: Bool = false
 
+    @Option(name: .long, help: "Workspace root (must exist) for mutating file tools.")
+    var workspace: String?
+
+    @Option(name: .customLong("read-root"), help: "Read-only root for read/search (may be repeated).")
+    var readRoot: [String] = []
+
     mutating func run() throws {
         let isJSONL = format?.lowercased() == "jsonl"
         if let format, !["json", "human", "jsonl"].contains(format.lowercased()) {
             eprint("error $.cli.--format: must be 'jsonl', 'human', or 'json'.")
             throw ExitCode(2)
+        }
+        // B1 workspace/read-root + sealed/trusted conflict validations (exit 2)
+        if workspace != nil && trusted {
+            eprint("error: --workspace and --trusted are mutually exclusive")
+            throw ExitCode(2)
+        }
+        if workspace != nil && sealed {
+            eprint("error: --workspace and --sealed are mutually exclusive")
+            throw ExitCode(2)
+        }
+        if !readRoot.isEmpty && sealed {
+            eprint("error: --read-root and --sealed are mutually exclusive")
+            throw ExitCode(2)
+        }
+        if let ws = workspace {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: ws, isDirectory: &isDir), isDir.boolValue else {
+                eprint("error: --workspace must exist and be a directory: \(terminalSafe(ws))")
+                throw ExitCode(2)
+            }
+            if ws.utf8.contains(0) {
+                eprint("error: --workspace contains NUL")
+                throw ExitCode(2)
+            }
+        }
+        for rr in readRoot {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: rr, isDirectory: &isDir), isDir.boolValue else {
+                eprint("error: --read-root must exist and be a directory: \(terminalSafe(rr))")
+                throw ExitCode(2)
+            }
+            if rr.utf8.contains(0) {
+                eprint("error: --read-root contains NUL")
+                throw ExitCode(2)
+            }
         }
         // Capture values for Sendable closure (mutating self cannot be captured)
         let promptCopy = prompt
@@ -63,6 +104,8 @@ struct RunCommand: ParsableCommand {
         let toolsCopy = tools
         let aliasCopy = alias
         let maxTurnsCopy = maxTurns
+        let workspaceCopy = workspace
+        let readRootCopy = readRoot
         final class Box: @unchecked Sendable {
             var exitCode: Int32 = 0
             var error: Error?
@@ -82,7 +125,7 @@ struct RunCommand: ParsableCommand {
                 try await RunCommand.executeStatic(
                     prompt: promptCopy, config: configCopy, trace: traceCopy,
                     format: formatCopy, tools: toolsCopy, alias: aliasCopy,
-                    maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy, isJSONL: isJSONL)
+                    maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy, workspace: workspaceCopy, readRoot: readRootCopy, isJSONL: isJSONL)
             } catch let error as ExitCode {
                 box.lock.withLock { box.exitCode = error.rawValue }
             } catch {
@@ -252,7 +295,7 @@ struct RunCommand: ParsableCommand {
         return store
     }
 
-    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, isJSONL: Bool) async throws {
+    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, workspace: String?, readRoot: [String], isJSONL: Bool) async throws {
         // Unused format param kept for future envelope versioning
         _ = format
         // Private-by-default file creation for EVERYTHING this process
@@ -305,8 +348,18 @@ struct RunCommand: ParsableCommand {
         // 3. Effective caps and epoch — default is fail-closed
         // (workspace deny-all, mode workspace) per §10/ARCH. The demo
         // fixture explicitly opts into trustedExec via --trusted.
+        // B1: workspace/read-root grants resolve the blanket allDenied.
         let mode: TrustMode = trusted ? .trustedExec : .workspace
-        let workspaceGrant: ToolCapabilities = trusted ? .allAllowed : .allDenied
+        let workspaceGrant: ToolCapabilities
+        if trusted {
+            workspaceGrant = .allAllowed
+        } else if workspace != nil {
+            workspaceGrant = ToolCapabilities(read: true, search: true, edit: true, write: true, exec: .denied, consult: false)
+        } else if !readRoot.isEmpty {
+            workspaceGrant = ToolCapabilities(read: true, search: true, edit: false, write: false, exec: .denied, consult: false)
+        } else {
+            workspaceGrant = .allDenied
+        }
         let effective = effectiveCapabilities(
             build: .allAllowed, userConfig: snapshot.tools,
             workspaceGrant: workspaceGrant, invocationMask: .allAllowed,

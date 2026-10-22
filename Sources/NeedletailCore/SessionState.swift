@@ -208,13 +208,15 @@ public struct ApprovalRequest: Sendable, Equatable {
     /// Rendered, redacted operation description (terminalSafe at construction).
     public let operation: String
     public let requiredGrant: String
+    public let protectedPaths: [String]
 
-    public init(requestID: RequestID, runID: RunID, generation: Revision, operation: String, requiredGrant: String) {
+    public init(requestID: RequestID, runID: RunID, generation: Revision, operation: String, requiredGrant: String, protectedPaths: [String] = []) {
         self.requestID = requestID
         self.runID = runID
         self.generation = generation
         self.operation = terminalSafe(operation)
         self.requiredGrant = requiredGrant
+        self.protectedPaths = protectedPaths
     }
 }
 
