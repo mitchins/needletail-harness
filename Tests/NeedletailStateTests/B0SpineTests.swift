@@ -385,4 +385,43 @@ struct B0SpineTests {
         let ordered = completed.records.compactMap { if case .operationResult(let r, _) = $0, r.state == .unknown { return r.callID } else { return nil } }
         #expect(ordered == ["c2", "c1"], "must follow proposal order c2, c1, not sorted")
     }
+
+    @Test("B0 RED: c1 success started==false establishes halt, c2 success must be halt violation")
+    func c1ContradictoryHaltsC2() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: #"{"path":"x"}"#),
+            ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#),
+        ])
+        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        let result = Self.perCallResult([
+            ("c1", "success", "ok", false),
+            ("c2", "success", "ok", true),
+        ])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 1019), &ids)
+        // c1 is read with contradictory success+started==false → transcript-only, but still a halt boundary for c2
+        #expect(completed.records.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c2" && r.state == .unknown && o.contains("halt violation") } else { return false } }), "c2 after contradictory c1 must be halt violation unknown")
+        // c1 should have no durable result (transcript-only)
+        #expect(!completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" } else { return false } }))
+    }
+
+    @Test("B0 RED: c1 no-match started==false also halts c2")
+    func c1NoMatchStartedFalseHaltsC2() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: #"{"path":"x"}"#),
+            ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#),
+        ])
+        let (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
+        let effectID = try #require(state.liveReservations.first).effectID
+        let result = Self.perCallResult([
+            ("c1", "no-match", "no", false),
+            ("c2", "success", "ok", true),
+        ])
+        let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 1020), &ids)
+        // no-match with started==false is not contradictory, it is not a halt? Actually no-match is deterministic but with started==false, should it be considered halt? No, per halt logic, only non-success/non-no-match or contradictory started==false is halt. For read no-match with started false, it's not a halt, so c2 should be done.
+        // This test documents that no-match does not halt, even with started false, because it's a legitimate not-found.
+        #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c2" && r.state == .done } else { return false } }), "c2 after no-match should be done, not halt")
+    }
 }

@@ -1609,7 +1609,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         }
     }
 
-    // Ordered halt: find first missing/tainted/non-success in proposal order — conservative boundary
+    // Ordered halt: find first missing/tainted/non-success/contradictory-success in proposal order — conservative boundary
     var firstHaltIndex: Int? = nil
     for (idx, prop) in proposals.enumerated() {
         if taintedCallIDs.contains(prop.callID) {
@@ -1621,6 +1621,11 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             break
         }
         if out.status != "success" && out.status != "no-match" {
+            firstHaltIndex = idx
+            break
+        }
+        if out.status == "success" && out.started == false {
+            // Contradictory success+started==false is a halt boundary, even for non-mutating (transcript-only) — subsequent success must be violation
             firstHaltIndex = idx
             break
         }
