@@ -365,6 +365,9 @@ struct B2ClosureTests {
             // rg must attempt the 000 files and fail the run.
             let trap = parent.appendingPathComponent("trap-ws")
             try FileManager.default.createDirectory(at: trap, withIntermediateDirectories: true)
+            let trapGit = trap.appendingPathComponent(".git")
+            try "TRAPGIT=1\n".write(to: trapGit, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: trapGit.path)
             let trapArt = trap.appendingPathComponent("artifacts")
             try "TRAPMARK=1\n".write(to: trapArt, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: trapArt.path)
@@ -373,6 +376,17 @@ struct B2ClosureTests {
             try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: trapSfx.path)
             let (_, trapStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "TRAPMARK|TRAP2MARK", trap.path])
             #expect(trapStatus == 2, "counterfactual: unpruned open of 000 files fails, got \(trapStatus)")
+            let (directGit, _) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "TRAPGIT", trap.path])
+            #expect(directGit.contains("TRAPGIT"), "counterfactual: unpruned rg sees the bare .git file")
+            // Executor search over the trap workspace: the bare .git file is
+            // pruned before traversal (success, empty), even though it is
+            // readable — no EACCES, no match.
+            let trapResolver = try WorkspaceResolver(workspace: FilePath(trap.path), readRoots: [])
+            let trapExec = NativeToolExecutor(resolver: trapResolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
+            let trapBatch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"TRAPGIT\"}")])
+            let trapResult = try await trapExec.execute(batch: trapBatch, reservation: Self.makeReservation(batch: trapBatch))
+            #expect(trapResult.calls[0].status == "success", "bare .git file must be pruned, not read, got \(trapResult.calls[0])")
+            #expect(trapResult.calls[0].data.isEmpty, "no output for pruned bare .git file")
         }
         // Legitimate content merely MENTIONING .env/.git is preserved.
         let batch2 = ToolBatch([ToolProposal(callID: "c2", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"mentions\"}")])

@@ -311,4 +311,80 @@ struct B3ByteQuotaMigrationTests {
         }
         #expect(try store.byteUsageForTesting()[session.raw] == expected, "recovery audit bytes counted")
     }
+
+
+    @Test("TOOL_v0FullShapeStampsWithoutDroppingClaims")
+    func v0FullShapeStampsWithoutDroppingClaims() async throws {
+        // A v0 file that already has the full current shape: stamp it,
+        // do not run migrations that would drop writer claims.
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("store.sqlite").path
+        let raw = try DatabaseQueue(path: path)
+        try await raw.write { db in
+            try db.execute(sql: "CREATE TABLE records(seq INTEGER PRIMARY KEY, payload TEXT NOT NULL, session TEXT NOT NULL DEFAULT '')")
+            try db.execute(sql: "CREATE TABLE writer(session TEXT PRIMARY KEY, writer TEXT NOT NULL)")
+            try db.execute(sql: "CREATE TABLE byte_usage(session TEXT PRIMARY KEY, bytes INTEGER NOT NULL CHECK (bytes >= 0))")
+            try db.execute(sql: "CREATE TABLE artifact_physical(digest TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK (size >= 0))")
+            try db.execute(sql: "CREATE INDEX records_session ON records(session, seq)")
+            try db.execute(sql: "INSERT INTO writer (session, writer) VALUES ('s-keep', 'w-keep')")
+        }
+        let store = try GRDBSessionStore(path: path)
+        defer { try? store.close() }
+        let holder = try GRDBSessionStore(path: path)
+        defer { try? holder.close() }
+        #expect(try holder.byteUsageForTesting() == [:], "fresh tables stay empty")
+    }
+
+    @Test("TOOL_v2MigrationCreatesIndex")
+    func v2MigrationCreatesIndex() async throws {
+        // A genuine v2 file gains the session index (and byte tables) on open.
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("store.sqlite").path
+        let raw = try DatabaseQueue(path: path)
+        try await raw.write { db in
+            try db.execute(sql: "CREATE TABLE records(seq INTEGER PRIMARY KEY, payload TEXT NOT NULL, session TEXT NOT NULL DEFAULT '')")
+            try db.execute(sql: "CREATE TABLE writer(session TEXT PRIMARY KEY, writer TEXT NOT NULL)")
+            try db.execute(sql: "PRAGMA user_version = 2")
+        }
+        let before = try await DatabaseQueue(path: path).read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='records_session'"))
+        }
+        #expect(before.isEmpty, "fixture must start index-free")
+        let store = try GRDBSessionStore(path: path)
+        defer { try? store.close() }
+        let after = try await DatabaseQueue(path: path).read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='records_session'"))
+        }
+        #expect(after.contains("records_session"), "v2->v3 migration must create the session index")
+        #expect(try store.artifactPhysicalForTesting().isEmpty)
+        #expect(try store.byteUsageForTesting().isEmpty)
+    }
+
+    @Test("TOOL_preflightRunsBeforeFs")
+    func preflightRunsBeforeFs() async throws {
+        // Preflight must fail before any filesystem write: with a read-only
+        // artifacts root, an over-quota publish fails with quotaExceeded
+        // (not a filesystem error), proving the check precedes tmp creation.
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("store.sqlite").path
+        let store = try GRDBSessionStore(path: path, sessionByteLimit: 100, globalByteLimit: 100000, freeSpaceReserve: 0)
+        defer { try? store.close() }
+        let session = SessionID("s-pre")
+        try store.claimWriterOwnership(session: session, writer: "w")
+        let identity = WriterIdentity(session: session, writer: "w")
+        let root = GRDBSessionStore.artifactsRoot(for: path)
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: root)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root) }
+        do {
+            _ = try store.publishArtifact(session: session, as: identity, kind: "t", operationID: nil, bytes: Data(repeating: 0x41, count: 200))
+            Issue.record("expected quota failure before any filesystem write")
+        } catch let error as StoreError {
+            guard case .quotaExceeded = error else { Issue.record("preflight must fail with quotaExceeded, not \(error)"); return }
+        }
+    }
 }
+

@@ -62,6 +62,34 @@ struct B3ByteQuotaTests {
 
     // MARK: - Quota accounting
 
+    private static func makeReservation(batch: ToolBatch, approved: [String] = []) -> EffectReservation {
+        EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: approved)
+    }
+
+    @Test("TOOL_approvalTwin")
+    func approvalTwin() async throws {
+        // NFC vs NFD twin: approving one must not authorize the other.
+        #expect(ToolValidator.isApprovedPath(".env.\u{00E9}", approvedPaths: [".env.\u{00E9}"]) == true)
+        #expect(ToolValidator.isApprovedPath(".env.e\u{0301}", approvedPaths: [".env.\u{00E9}"]) == false, "canonically equal but byte-distinct paths must not match")
+        #expect(ToolValidator.isApprovedPrefix("sub/x", approvedPaths: ["sub"]) == true)
+        #expect(ToolValidator.isApprovedPrefix(".env/x", approvedPaths: [".env.\u{00E9}"]) == false)
+        #expect(ToolValidator.isApprovedPrefix("d\u{00E9}/f", approvedPaths: ["d\u{00E9}"]) == true)
+        #expect(ToolValidator.isApprovedPrefix("de\u{0301}/f", approvedPaths: ["d\u{00E9}"]) == false, "NFD path must not match NFC grant")
+        #expect(ToolValidator.dedupeByteDistinct(["a", ".env.\u{00E9}", ".env.e\u{0301}", "a"]).count == 3)
+        let (dir, store, session, writer) = try Self.freshStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let nfc = ".env.\u{00E9}"
+        let nfd = ".env.e\u{0301}"
+        let exec = NativeToolExecutor(resolver: try WorkspaceResolver(workspace: FilePath(dir.path), readRoots: []), store: store, sessionID: session, writer: writer, rgPath: nil)
+        let wb = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"" + nfc + "\",\"content\":\"x\\n\"}")])
+        let resA = try await exec.execute(batch: wb, reservation: Self.makeReservation(batch: wb, approved: [nfc]))
+        #expect(resA.calls[0].status == "success", "approved NFC form writes, got \(resA.calls[0])")
+        let wb2 = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"" + nfd + "\",\"content\":\"x\\n\"}")])
+        let resB = try await exec.execute(batch: wb2, reservation: Self.makeReservation(batch: wb2, approved: [nfc]))
+        #expect(resB.calls[0].status == "denied", "unlisted NFD twin must stay denied, got \(resB.calls[0])")
+        #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent(nfd).path), "twin file must not be created")
+    }
+
     @Test("TOOL_quotaAppendCountsUtf8Bytes")
     func quotaAppendCountsUtf8Bytes() async throws {
         let (dir, store, session, writer) = try Self.freshStore()
@@ -270,5 +298,96 @@ struct B3ByteQuotaTests {
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
         #expect(!entries.contains(where: { $0.hasPrefix(".tmp-") }), "loser's tmp cleaned, found \(entries)")
         #expect(entries.filter({ !$0.hasPrefix(".tmp-") }) == [digest], "only the winner's file remains")
+    }
+}
+
+extension B3ByteQuotaTests {
+    @Test("TOOL_negativeSizeRejected")
+    func negativeSizeRejected() throws {
+        // Negative sizes must fail closed as integrity errors, never
+        // subtract from quotas. (publishArtifact derives size from bytes,
+        // so this exercises the guard directly.)
+        let (dir, store, session, _) = try Self.freshStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let view = GRDBSessionStore.ByteQuotaView(logicalCurrent: 0, physicalSum: 0, globalRecordBytes: 0, orphanBytes: 0, physicalRows: [:], sessionHasDigest: false)
+        do {
+            try store.checkByteQuotas(view, session: session.raw, payloadBytes: 10, digest: String(repeating: "a", count: 64), size: -5)
+            Issue.record("negative size must fail closed")
+        } catch let error as StoreError {
+            guard case .integrity = error else { Issue.record("expected integrity, got \(error)"); return }
+        }
+    }
+
+    @Test("TOOL_intMaxSizeQuotaExceeded")
+    func intMaxSizeQuotaExceeded() throws {
+        // Int.max size must fail closed as quota (never trap on overflow).
+        let (dir, store, session, _) = try Self.freshStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let view = GRDBSessionStore.ByteQuotaView(logicalCurrent: 0, physicalSum: 0, globalRecordBytes: 0, orphanBytes: 0, physicalRows: [:], sessionHasDigest: false)
+        do {
+            try store.checkByteQuotas(view, session: session.raw, payloadBytes: 10, digest: String(repeating: "b", count: 64), size: Int64.max)
+            Issue.record("Int.max size must fail closed")
+        } catch let error as StoreError {
+            guard case .quotaExceeded = error else { Issue.record("expected quotaExceeded, got \(error)"); return }
+        }
+    }
+
+    @Test("TOOL_appendBatchMismatch")
+    func appendBatchMismatch() throws {
+        // Same digest with different sizes in one batch fails closed.
+        let (dir, store, session, writer) = try Self.freshStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        try store.claimWriterOwnership(session: session, writer: "w")
+        let digest = String(repeating: "c", count: 64)
+        let ref1 = ArtifactRef(digest: digest, size: 10, kind: "t", operationID: nil)
+        let ref2 = ArtifactRef(digest: digest, size: 20, kind: "t", operationID: nil)
+        do {
+            try store.appendBatch([
+                .artifactPublished(ref1),
+                .artifactPublished(ref2),
+            ], as: WriterIdentity(session: session, writer: "w"))
+            Issue.record("mismatched batch must fail")
+        } catch let error as StoreError {
+            guard case .integrity = error else { Issue.record("expected integrity, got \(error)"); return }
+        }
+    }
+
+    @Test("TOOL_crashOrphanRetrySucceeds")
+    func crashOrphanRetrySucceeds() throws {
+        // A crash between rename and reference commit leaves the final file.
+        // Re-publishing adopts it instead of failing or duplicating.
+        let (dir, store, session, writer) = try Self.freshStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        try store.claimWriterOwnership(session: session, writer: "w")
+        let bytes = Data("crash-orphan-payload".utf8)
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let root = GRDBSessionStore.artifactsRoot(for: dir.appendingPathComponent("store.sqlite").path)
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        try bytes.write(to: URL(fileURLWithPath: root + "/" + digest))
+        let ref = try store.publishArtifact(session: session, as: writer, kind: "t", operationID: nil, bytes: bytes)
+        #expect(ref.digest == digest, "crash-orphan retry must succeed by adopting the verified file")
+        #expect(try store.artifactRecord(session: session, digest: digest) == bytes)
+        #expect(try store.artifactPhysicalForTesting()[digest] == Int64(bytes.count))
+    }
+
+    @Test("TOOL_preflightQuotaBeforeFs")
+    func preflightQuotaBeforeFs() throws {
+        // Quota failure must precede any filesystem mutation (no tmp file).
+        let (dir, store, session, writer) = try Self.freshStore(sessionByteLimit: 100)
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        try store.claimWriterOwnership(session: session, writer: "w")
+        // 60 bytes passes preflight (usage 0 + 60 <= 100), but the
+        // authoritative check adds the reference row and must fail.
+        // Use small enough bytes that preflight passes on bytes alone.
+        do {
+            _ = try store.publishArtifact(session: session, as: writer, kind: "t", operationID: nil, bytes: Data(repeating: 0x41, count: 60))
+            Issue.record("expected authoritative quota failure")
+        } catch let error as StoreError {
+            guard case .quotaExceeded = error else { Issue.record("expected quotaExceeded, got \(error)"); return }
+        }
+        let root = GRDBSessionStore.artifactsRoot(for: dir.appendingPathComponent("store.sqlite").path)
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
+        #expect(!entries.contains(where: { $0.hasPrefix(".tmp-") }), "no tmp leftovers, found \(entries)")
+        #expect(!entries.contains(where: { $0.count == 64 }), "no final file from failed publish")
     }
 }
