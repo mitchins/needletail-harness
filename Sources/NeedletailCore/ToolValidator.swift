@@ -354,7 +354,7 @@ public enum ToolValidator {
     /// would hide an embedded separator from every per-component check).
     /// ASCII boundaries align with scalar boundaries, so decoding each
     /// piece is lossless.
-    static func byteComponents(of path: String) -> [String] {
+    public static func byteComponents(of path: String) -> [String] {
         var parts: [String] = []
         var piece: [UInt8] = []
         piece.reserveCapacity(64)
@@ -397,6 +397,47 @@ public enum ToolValidator {
             if p == ".." { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "parent escape not allowed for \(tool) \(callID)") }
             if p.utf8.count > 255 { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "component too long") }
         }
+    }
+
+    /// Byte-exact string equality (raw UTF-8 bytes). Swift `String ==` is
+    /// Unicode canonical equivalence, so NFC and NFD spellings of the same
+    /// name compare equal — approvals must never rely on that, or one
+    /// approved spelling authorizes an unlisted twin (B1 grant enumeration).
+    public static func byteEqual(_ a: String, _ b: String) -> Bool {
+        Array(a.utf8) == Array(b.utf8)
+    }
+
+    /// Byte-exact approval membership (see byteEqual).
+    public static func isApprovedPath(_ path: String, approvedPaths: [String]) -> Bool {
+        approvedPaths.contains(where: { byteEqual($0, path) })
+    }
+
+    /// Byte-exact subtree grant: exact match or `base + "/"` prefix match on
+    /// raw bytes. A U+FFFD literal approval never matches a different raw
+    /// name (see the lossy-bytes handling at the search classifier).
+    public static func isApprovedPrefix(_ logical: String, approvedPaths: [String]) -> Bool {
+        let lb = Array(logical.utf8)
+        for a in approvedPaths {
+            let ab = Array(a.utf8)
+            if lb == ab { return true }
+            if lb.count > ab.count + 1, lb.starts(with: ab), lb[ab.count] == 0x2F {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Byte-distinct dedup preserving first-occurrence order (for grantable
+    /// approval enumeration: NFC/NFD twins must both be listed).
+    public static func dedupeByteDistinct(_ paths: [String]) -> [String] {
+        var seen = Set<[UInt8]>()
+        var unique: [String] = []
+        for p in paths {
+            if seen.insert(Array(p.utf8)).inserted {
+                unique.append(p)
+            }
+        }
+        return unique
     }
 
     public static func protectedClassification(for path: String) -> ProtectedClassification {

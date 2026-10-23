@@ -122,7 +122,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             if cls == .absoluteDenied {
                 throw ToolFailure.preDispatch(status: "denied", summary: "absolute protected path")
             }
-            if cls == .grantable && !reservation.approvedPaths.contains(path) {
+            if cls == .grantable && !ToolValidator.isApprovedPath(path, approvedPaths: reservation.approvedPaths) {
                 throw ToolFailure.preDispatch(status: "denied", summary: "grantable protected path requires approval")
             }
         }
@@ -847,7 +847,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         // artifact globs are deliberately NOT added: classification denies
         // only exact/suffixed components, and a broad *artifacts* glob would
         // wrongly prune legitimate names with no approval recourse.
-        var argv = ["--json", "--no-config", "--hidden", "--max-count", "1000", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.git", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.ssh", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!.needletail", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!.credentials", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--glob", "!credentials", "--", pattern]
+        var argv = ["--json", "--no-config", "--hidden", "--max-count", "1000", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.git", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.ssh", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!.needletail", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!artifacts", "--glob", "!*-artifacts", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!.credentials", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--glob", "!credentials", "--", pattern]
         // Resolve search roots to HELD OPEN directory FDs and pass only
         // /proc/self/fd paths to ripgrep. The FDs stay open (cloexec cleared so
         // the child inherits them) across process launch: ripgrep traverses
@@ -898,7 +898,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             if cls == .absoluteDenied {
                 throw ToolFailure.preDispatch(status: "denied", summary: "absolute protected path for search")
             }
-            if cls == .grantable && !reservation.approvedPaths.contains(searchPath) {
+            if cls == .grantable && !ToolValidator.isApprovedPath(searchPath, approvedPaths: reservation.approvedPaths) {
                 throw ToolFailure.preDispatch(status: "denied", summary: "grantable search path requires approval")
             }
             var found = false
@@ -912,7 +912,18 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     explicitDomain = -1
                 } catch let e as ToolFailure {
                     throw e
-                } catch {}
+                } catch {
+                    // A symlink in the path is a traversal refusal (denied),
+                    // not a missing path; resource exhaustion fails the call.
+                    // Anything else (not found, replaced root) falls through
+                    // to the read-root attempt and finally to no-match.
+                    if Self.isSymlinkError(error) {
+                        throw ToolFailure.preDispatch(status: "denied", summary: "symlink in search path")
+                    }
+                    if Self.isResourceError(error) {
+                        throw ToolFailure.preDispatch(status: "failed", summary: "search root unavailable: \(error)")
+                    }
+                }
             }
             if !found {
                 for (i, rr) in resolver.readRoots.enumerated() {
@@ -926,7 +937,15 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                         break
                     } catch let e as ToolFailure {
                         throw e
-                    } catch { continue }
+                    } catch {
+                        if Self.isSymlinkError(error) {
+                            throw ToolFailure.preDispatch(status: "denied", summary: "symlink in search path")
+                        }
+                        if Self.isResourceError(error) {
+                            throw ToolFailure.preDispatch(status: "failed", summary: "search root unavailable: \(error)")
+                        }
+                        continue
+                    }
                 }
             }
             if !found {
@@ -1128,14 +1147,19 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// base. Returns nil for paths outside every pinned root or containing
     /// ".." (fail closed).
     static func logicalSearchPath(reported: String, roots: [(proc: String, logicalBase: String)]) -> String? {
+        // Byte-exact prefix matching: a reported name starting with a
+        // combining mark would glue to "/" into one grapheme and defeat a
+        // Character-based hasPrefix/dropFirst (silently dropping legitimate
+        // unprotected matches or mis-mapping approved ones).
+        let rep = Array(reported.utf8)
         for r in roots {
-            if reported == r.proc {
+            let proc = Array(r.proc.utf8)
+            if rep == proc {
                 return r.logicalBase.isEmpty ? nil : r.logicalBase
             }
-            let prefix = r.proc + "/"
-            if reported.hasPrefix(prefix) {
-                let rel = String(reported.dropFirst(prefix.count))
-                if rel.isEmpty || rel.split(separator: "/").contains(where: { $0 == ".." }) {
+            if rep.count > proc.count + 1, rep.starts(with: proc), rep[proc.count] == 0x2F {
+                let rel = String(decoding: rep[(proc.count + 1)...], as: UTF8.self)
+                if rel.isEmpty || ToolValidator.byteComponents(of: rel).contains("..") {
                     return nil
                 }
                 if r.logicalBase.isEmpty {
@@ -1150,12 +1174,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// Grantable approval covers the exact path or any ancestor prefix
     /// (approving a search root authorizes its subtree view).
     static func isSearchPathApproved(_ logical: String, approvedPaths: [String]) -> Bool {
-        for a in approvedPaths {
-            if logical == a || logical.hasPrefix(a + "/") {
-                return true
-            }
-        }
-        return false
+        ToolValidator.isApprovedPrefix(logical, approvedPaths: approvedPaths)
     }
 
     /// Resolve one approved grantable path to a held-open FD for use as an
@@ -1209,9 +1228,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     }
 
     static func isResourceError(_ error: Error) -> Bool {
-        // openat/fstat surface errno via strerror in StoreError messages.
+        // openat/fstat errors surface errno via strerror in StoreError messages.
         let s = "\(error)"
         return s.contains("Too many open files")
+    }
+
+    static func isSymlinkError(_ error: Error) -> Bool {
+        // Resolver reports symlink encounters and symlink-swapped roots.
+        "\(error)".contains("symlink")
     }
 
     // B3 edit: byte-exact replacement authorized by an expected SHA-256.

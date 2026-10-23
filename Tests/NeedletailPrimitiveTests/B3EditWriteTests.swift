@@ -41,8 +41,8 @@ struct B3EditWriteTests {
         SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func makeReservation(batch: ToolBatch) -> EffectReservation {
-        EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: true, batch: batch, kind: .executor, approvedPaths: [])
+    private static func makeReservation(batch: ToolBatch, approved: [String] = []) -> EffectReservation {
+        EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: true, batch: batch, kind: .executor, approvedPaths: approved)
     }
 
     private static func preimageDigests(store: GRDBSessionStore, session: SessionID) throws -> [String] {
@@ -493,6 +493,9 @@ struct B3EditWriteTests {
         #expect(out.status == "conflict", "fifo swap must conflict without hanging, got \(out)")
         #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on conflict")
         #expect(Self.tmpFiles(under: url).isEmpty, "tmp cleaned")
+        var fstatBuf = stat()
+        #expect(file.path.withCString { Glibc.lstat($0, &fstatBuf) } == 0, "target must still exist")
+        #expect((fstatBuf.st_mode & S_IFMT) == S_IFIFO, "target must still be the fifo (no replace-on-conflict)")
     }
 
     @Test("TOOL_05_phaseHappyPath")
@@ -507,6 +510,8 @@ struct B3EditWriteTests {
         #expect(out.beforeHash == h && out.afterHash == Self.sha("MUTANT\n"), "receipts carry both hashes")
         #expect(out.mode == "640", "receipt carries preserved mode")
         #expect(out.artifactID == h, "preimage published")
+        let stMode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int
+        #expect(stMode == 0o640, "on-disk mode preserved")
         #expect(try String(contentsOf: file, encoding: .utf8) == "MUTANT\n")
         #expect(Self.tmpFiles(under: url).isEmpty, "no tmp leftovers")
     }
@@ -580,7 +585,35 @@ struct B3EditWriteTests {
         #expect(result2.calls[0].status == "denied", "grantable combining-mark path needs approval, got \(result2.calls[0])")
     }
 
+    // MARK: - B3 approval byte-exactness (NFC vs NFD twins)
+
+    @Test("TOOL_approvalTwin")
+    func approvalTwin() async throws {
+        // NFC ".env.\u{00E9}" and NFD ".env.e\u{0301}" are canonically equal
+        // as Swift Strings but distinct inodes. Approving only the NFC form
+        // must not authorize the NFD twin (byte-exact grant enumeration).
+        #expect(ToolValidator.isApprovedPath(".env.\u{00E9}", approvedPaths: [".env.e\u{0301}"]) == false, "canonically-equal twin must not approve")
+        #expect(ToolValidator.isApprovedPath(".env.\u{00E9}", approvedPaths: [".env.\u{00E9}"]) == true, "exact twin approves")
+        #expect(ToolValidator.dedupeByteDistinct(["a", ".env.\u{00E9}", ".env.e\u{0301}", "a"]).count == 3, "byte-distinct dedup keeps NFC/NFD twins")
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (dir, store, session, writer) = try Self.tempStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: session, writer: writer)
+        let nfc = ".env.\u{00E9}"
+        let nfd = ".env.e\u{0301}"
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"" + nfc + "\",\"content\":\"x\\n\"}")])
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch, approved: [nfc]))
+        #expect(result.calls[0].status == "success", "approved NFC form writes, got \(result.calls[0])")
+        let batch2 = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"" + nfd + "\",\"content\":\"x\\n\"}")])
+        let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2, approved: [nfc]))
+        #expect(result2.calls[0].status == "denied", "unlisted NFD twin must stay denied, got \(result2.calls[0])")
+        #expect(!FileManager.default.fileExists(atPath: url.appendingPathComponent(nfd).path), "twin file must not be created")
+    }
+
     // MARK: - TOOL-08 write
+
 
     @Test("TOOL_08_createNew")
     func tool08CreateNew() async throws {

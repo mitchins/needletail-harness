@@ -341,6 +341,23 @@ struct B2ClosureTests {
         #expect(!result.calls[0].data.contains("GIT_SENTINEL_111"), ".git content must be pruned")
         #expect(!result.calls[0].data.contains("ENV_SECRET_222"), ".env content must be pruned")
         #expect(result.calls[0].data.isEmpty, "protected-only search must return empty output (no summary oracle), got \(result.calls[0].data.prefix(200))")
+
+        // Bare protected FILE (not a directory): a regular file named exactly
+        // "artifacts" must be pruned before traversal too. Without the bare-name
+        // glob rg would open it (EACCES on 000 -> exit 2); with pruning the search
+        // succeeds empty.
+        let bareArt = ws.appendingPathComponent("artifacts")
+        try "BAREMARK=1\n".write(to: bareArt, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: bareArt.path)
+        let batchArt = ToolBatch([ToolProposal(callID: "ca", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"BAREMARK\"}")])
+        let resultArt = try await exec.execute(batch: batchArt, reservation: Self.makeReservation(batch: batchArt))
+        #expect(resultArt.calls[0].status == "success", "bare protected file must be pruned, got \(resultArt.calls[0])")
+        #expect(resultArt.calls[0].data.isEmpty, "no output for pruned-only match")
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bareArt.path)
+        if getuid() != 0 {
+            let (_, bareStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "BAREMARK", ws.path])
+            #expect(bareStatus == 2, "counterfactual: unpruned open of 000 file fails, got \(bareStatus)")
+        }
         // Legitimate content merely MENTIONING .env/.git is preserved.
         let batch2 = ToolBatch([ToolProposal(callID: "c2", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"mentions\"}")])
         let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2))

@@ -1324,6 +1324,10 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
             else if cls == .grantable { grantablePaths.append(p) }
         }
     }
+    // Byte-distinct grantable enumeration: NFC/NFD twins are distinct
+    // inodes and must both be listed for approval (Swift Set would
+    // collapse them via canonical equality).
+    grantablePaths = ToolValidator.dedupeByteDistinct(grantablePaths)
     if !absoluteDenied.isEmpty {
         let status = "denied"
         let summary = "absolute protected path denied: \(absoluteDenied.joined(separator: ","))"
@@ -1412,7 +1416,7 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         requestID: run.requestID, runID: run.runID, generation: run.revision,
         operation: "tool batch: \(names.joined(separator: ", "))",
         requiredGrant: "explicit approval",
-        protectedPaths: Array(Set(grantablePaths)).sorted())
+        protectedPaths: grantablePaths.sorted())
     let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("approval", run.requestID.raw), ids: &ids)
     let next = s1.replacing(phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch))
     return Transition(
