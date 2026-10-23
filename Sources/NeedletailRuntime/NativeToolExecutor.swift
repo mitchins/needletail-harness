@@ -151,11 +151,15 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     }
                     let limit = json["limit"] as? Int ?? 200
                     let offset = json["offset"] as? Int ?? 0
-                    let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-                    let start = min(offset, lines.count)
-                    let end = min(start + limit, lines.count)
-                    let truncated = end < lines.count
-                    let limited = lines[start..<end].joined(separator: "\n")
+                    var effectiveLines = text.split(separator: "\n", omittingEmptySubsequences: false)
+                    if text.hasSuffix("\n") && !effectiveLines.isEmpty && effectiveLines.last == "" {
+                        effectiveLines.removeLast()
+                    }
+                    let effectiveArray = Array(effectiveLines)
+                    let start = min(offset, effectiveArray.count)
+                    let end = min(start + limit, effectiveArray.count)
+                    let truncated = end < effectiveArray.count
+                    let limited = effectiveArray[start..<end].joined(separator: "\n")
                     let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
                     return ToolCallOutcome(callID: callID, status: "success", summary: "read artifact \(artifactId)", data: limited, truncated: truncated, path: artifactId, beforeHash: hash, started: true)
                 }
@@ -233,7 +237,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         let offset = json["offset"] as? Int ?? 0
         var effectiveLines = text.split(separator: "\n", omittingEmptySubsequences: false)
         if text.hasSuffix("\n") && !effectiveLines.isEmpty && effectiveLines.last == "" {
-            effectiveLines = effectiveLines.dropLast()
+            effectiveLines.removeLast()
         }
         let effectiveArray = Array(effectiveLines)
         let start = min(offset, effectiveArray.count)
