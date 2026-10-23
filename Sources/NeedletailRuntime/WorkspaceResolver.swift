@@ -112,8 +112,26 @@ public struct WorkspaceResolver: Sendable {
         if relativePath.hasPrefix("/") {
             throw StoreError.integrity("absolute path not allowed: \(relativePath)")
         }
-        // Split preserving empty components to detect //, trailing /
-        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        // Split on UTF-8 BYTES at 0x2F, preserving empty components to detect
+        // // and trailing /. Character-based splitting is WRONG here: "/" +
+        // a combining mark is a single grapheme, so a Character split would
+        // keep an embedded "/" in one component and openat would traverse an
+        // intermediate symlink that O_NOFOLLOW was meant to stop. ASCII
+        // boundaries always align with scalar boundaries, so the decode is
+        // lossless.
+        let pathBytes = Array(relativePath.utf8)
+        var components: [String] = []
+        var piece: [UInt8] = []
+        piece.reserveCapacity(64)
+        for b in pathBytes {
+            if b == 0x2F {
+                components.append(String(decoding: piece, as: UTF8.self))
+                piece.removeAll(keepingCapacity: true)
+            } else {
+                piece.append(b)
+            }
+        }
+        components.append(String(decoding: piece, as: UTF8.self))
         // Reject empty due to // or trailing slash
         // Note: leading slash already rejected, but // inside yields empty
         var currentFD = dirFD
@@ -128,8 +146,7 @@ public struct WorkspaceResolver: Sendable {
                 }
             }
         }
-        for (index, compSub) in components.enumerated() {
-            let name = String(compSub)
+        for (index, name) in components.enumerated() {
             if name.isEmpty {
                 throw StoreError.integrity("empty path component in: \(relativePath)")
             }

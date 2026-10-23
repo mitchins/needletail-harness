@@ -292,6 +292,9 @@ public enum ToolValidator {
         guard hasOld != nil else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing oldBytes/old_string for edit \(callID)")
         }
+        if let o = hasOld, o.isEmpty {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty oldBytes/old_string for edit \(callID)")
+        }
         let hasNew = (json["newBytes"] as? String) ?? (json["new_string"] as? String)
         guard hasNew != nil else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing newBytes/new_string for edit \(callID)")
@@ -354,10 +357,23 @@ public enum ToolValidator {
         // Check for // or trailing / gives empty component
         if path.contains("//") { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty component in path for \(tool) \(callID)") }
         if path.hasSuffix("/") { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "trailing slash in path for \(tool) \(callID)") }
-        // Check each component for "." and ".." and length
-        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
-        for part in parts {
-            let p = String(part)
+        // Check each component for "." and ".." and length. Split on UTF-8
+        // BYTES at 0x2F: "/" + combining mark is one grapheme, so a
+        // Character split would hide an embedded separator from these
+        // checks (and from openRelative's per-component no-follow).
+        // ASCII boundaries align with scalar boundaries: lossless.
+        var parts: [String] = []
+        var piece: [UInt8] = []
+        for b in path.utf8 {
+            if b == 0x2F {
+                parts.append(String(decoding: piece, as: UTF8.self))
+                piece.removeAll(keepingCapacity: true)
+            } else {
+                piece.append(b)
+            }
+        }
+        parts.append(String(decoding: piece, as: UTF8.self))
+        for p in parts {
             if p.isEmpty { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty component in path for \(tool) \(callID)") }
             if p == "." { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "dot component not allowed for \(tool) \(callID)") }
             if p == ".." { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "parent escape not allowed for \(tool) \(callID)") }

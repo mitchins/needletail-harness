@@ -164,6 +164,9 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             guard bytes.count <= Self.artifactByteLimit else {
                 throw StoreError.quotaExceeded(limit: Self.artifactByteLimit)
             }
+            guard log.count + 1 <= Self.recordCap else {
+                throw StoreError.quotaExceeded(limit: Self.recordCap)
+            }
             let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
             if artifactBytes[digest] == nil {
                 artifactBytes[digest] = bytes

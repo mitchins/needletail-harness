@@ -269,10 +269,10 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "over size limit", data: "", error: "too large", started: true)
         }
         // Read via fd, bounded: st_size gate above is racy (file may grow after
-        // fstat), so the loop itself caps at maxReadFileBytes+1 and reports
-        // oversize instead of buffering unboundedly.
+        // fstat), so the loop itself fails closed past exactly maxReadFileBytes
+        // instead of buffering unboundedly.
         var data = Data()
-        let readCap = Int(Self.maxReadFileBytes) + 1
+        let readCap = Int(Self.maxReadFileBytes)
         if st.st_size >= 0 && st.st_size < 8 * 1024 * 1024 {
             data.reserveCapacity(Int(st.st_size) + 1)
         }
@@ -1217,12 +1217,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     // B3 edit: byte-exact replacement authorized by an expected SHA-256.
     // Order under the B1 workspace lock (held by execute() for the batch):
     // validate → bounded read → hash/match checks → tmp write+fsync →
-    // re-read+hash immediately before commit → preimage publish → atomic
-    // rename. The re-read gate runs AFTER the tmp is complete so an injected
-    // change between read and commit conflicts with no preimage and no
-    // mutation; the preimage is published only for content that WILL be
-    // replaced. Optimistic check only: a same-user writer bypassing the
-    // lock is a documented residual (the gate still detects it here).
+    // path re-open + dev/ino + hash gate immediately before commit →
+    // preimage publish → atomic rename. The gate re-opens the PATH (never
+    // the held fd), so replacement, deletion and symlink swap after the
+    // initial read all conflict with no preimage and no mutation; the
+    // preimage is published only for content that WILL be replaced.
+    // Optimistic check only: a same-user writer bypassing the lock is a
+    // documented residual (the gate still detects it here); the residual
+    // check-to-rename window is nanoseconds wide and documented.
     private func edit(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
         let path = json["path"] as? String ?? ""
         let expectedHash = json["expectedHash"] as? String ?? ""
@@ -1251,6 +1253,9 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         do {
             fd = try resolver.openRelative(path, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         } catch {
+            if Self.isNotFound(error) {
+                return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found", data: "", path: path, started: true)
+            }
             throw error
         }
         defer { close(fd) }
@@ -1260,22 +1265,32 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
         let fileMode = st.st_mode & 0o7777
         // Bounded read: post-fstat growth cannot blow memory (same bound as
-        // the read path).
+        // the read path). Quota errors are size errors; anything else is a
+        // read failure (never conflated).
         let current: Data
         do {
             current = try Self.readBoundedEdit(fd: fd)
+        } catch let e as StoreError {
+            if case .quotaExceeded = e {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "over size limit", data: "", error: "too large", path: path, started: true)
+            }
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "read failed: \(e)", data: "", error: "\(e)", path: path, started: true)
         } catch {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "over size limit", data: "", error: "too large", started: true)
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "read failed: \(error)", data: "", error: "\(error)", path: path, started: true)
         }
         let currentHash = Self.sha256Hex(current)
         if currentHash != expectedHash {
             return ToolCallOutcome(callID: callID, status: "conflict", summary: "hash mismatch", data: "", error: "conflict", path: path, beforeHash: currentHash, started: true)
         }
-        guard let range = current.range(of: oldBytes) else {
+        let occurrences = Self.occurrenceCount(haystack: current, needle: oldBytes)
+        if occurrences == 0 {
             return ToolCallOutcome(callID: callID, status: "no-match", summary: "oldBytes not found", data: "", path: path, beforeHash: currentHash, started: true)
         }
-        if current[range.upperBound...].range(of: oldBytes) != nil {
+        if occurrences > 1 {
             return ToolCallOutcome(callID: callID, status: "invalid-arguments", summary: "multiple matches", data: "", error: "multiple", path: path, beforeHash: currentHash, started: true)
+        }
+        guard let range = current.range(of: oldBytes) else {
+            return ToolCallOutcome(callID: callID, status: "no-match", summary: "oldBytes not found", data: "", path: path, beforeHash: currentHash, started: true)
         }
         var newData = Data(current[..<range.lowerBound])
         newData.append(newBytes)
@@ -1305,7 +1320,10 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var data = Data()
         var buf = [UInt8](repeating: 0, count: 8192)
         var total = 0
-        let cap = Int(Self.maxReadFileBytes) + 1
+        // Fail when growth EXCEEDS the budget (a file of exactly the budget
+        // reads whole; anything more fails closed rather than succeeding
+        // with silently truncated bytes that would then hash-mismatch).
+        let cap = Int(Self.maxReadFileBytes)
         while true {
             let n = buf.withUnsafeMutableBytes { ptr in Glibc.read(fd, ptr.baseAddress, ptr.count) }
             if n < 0 {
@@ -1328,13 +1346,35 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         String(format: "%o", mode & 0o7777)
     }
 
-    /// Byte-exact parent/leaf split ("/" is ASCII so lastIndex is byte-safe;
-    /// no NFC/NFD normalization, unlike NSString path APIs — which also hit
-    /// a UD2 trap in this toolchain's Foundation on Linux).
+    /// Occurrence count with OVERLAP ("aaa" contains "aa" twice, at 0 and 1).
+    /// Stops at 2: callers only distinguish zero / exactly-one / multiple.
+    /// REV25 requires "exactly once" — overlapping occurrences are distinct
+    /// positions and count toward multiple.
+    static func occurrenceCount(haystack: Data, needle: Data) -> Int {
+        guard !needle.isEmpty, needle.count <= haystack.count else { return 0 }
+        var count = 0
+        var from = haystack.startIndex
+        while from < haystack.endIndex,
+              let r = haystack.range(of: needle, options: [], in: from..<haystack.endIndex) {
+            count += 1
+            if count > 1 { return count }
+            from = haystack.index(after: r.lowerBound)
+        }
+        return count
+    }
+
+    /// Byte-exact parent/leaf split on the LAST 0x2F byte. Character-based
+    /// splitting is WRONG here ("/" + combining mark is one grapheme, so
+    /// lastIndex(of:) can miss a real separator and hand openat/renameat a
+    /// leaf with an embedded "/", traversing an unchecked intermediate).
+    /// No NFC/NFD normalization, unlike NSString path APIs — which also hit
+    /// a UD2 trap in this toolchain's Foundation on Linux.
     /// "f" → ("", "f"); "sub/dir/n.txt" → ("sub/dir", "n.txt").
     static func splitParentLeaf(_ path: String) -> (dir: String, file: String) {
-        if let idx = path.lastIndex(of: "/") {
-            return (String(path[..<idx]), String(path[path.index(after: idx)...]))
+        let bytes = Array(path.utf8)
+        if let i = bytes.lastIndex(of: 0x2F) {
+            return (String(decoding: bytes[..<i], as: UTF8.self),
+                    String(decoding: bytes[(i + 1)...], as: UTF8.self))
         }
         return ("", path)
     }
@@ -1345,19 +1385,41 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
 
     /// Shared commit tail for edit and authorized write-replacement.
     /// Caller owns all FDs except the tmp (created and cleaned up here).
-    /// Order: exclusive tmp → checked write loop → checked fsync → checked
-    /// fchmod → re-read+hash under the workspace lock → preimage publish
-    /// (nonempty only) → atomic rename → dirsync. Any failure before rename
-    /// leaves the target untouched and removes the tmp; a conflict after a
-    /// complete tmp publishes NO preimage (nothing will be modified).
+    /// Order: exclusive tmp (prepare) → re-open gate + preimage + rename
+    /// (finalize). Any failure before rename leaves the target untouched and
+    /// removes the tmp; a conflict after a complete tmp publishes NO preimage
+    /// (nothing will be modified). If rename fails AFTER the preimage commit,
+    /// the preimage reference remains (recoverable by design — it describes
+    /// verifiable pre-commit bytes; B3-B byte accounting reconciles it).
+    /// Unlink failures on cleanup paths are ignored: the parent is writable
+    /// in every path that creates a tmp (creation itself would have failed
+    /// otherwise), so a leftover would require an intervening failure
+    /// outside this function's control; documented residual, no silent
+    /// user-data effect either way. Split into two internal phases so
+    /// phase-level tests can inject filesystem changes deterministically
+    /// between them; production always runs both back-to-back with the
+    /// workspace lock held.
     private func commitReplacement(callID: String, path: String, fileFD: Int32, current: Data, expectedHash: String, newData: Data, fileMode: mode_t, parentFD: Int32, fileName: String, verb: String) -> ToolCallOutcome {
-        let afterHash = Self.sha256Hex(newData)
+        let tmpName: String
+        do {
+            tmpName = try prepareCommitTmp(newData: newData, fileMode: fileMode, parentFD: parentFD)
+        } catch {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "commit prepare failed: \(error)", data: "", error: "\(error)", path: path, beforeHash: expectedHash, started: true)
+        }
+        return finalizeCommit(callID: callID, path: path, fileFD: fileFD, current: current, expectedHash: expectedHash, newData: newData, fileMode: fileMode, parentFD: parentFD, fileName: fileName, tmpName: tmpName, verb: verb)
+    }
+
+    /// Commit phase 1 (internal for phase-level tests): exclusive same-dir
+    /// tmp, checked write loop (partial writes retried, never silent),
+    /// checked fsync, checked mode preserve. Throws on any failure with
+    /// nothing committed and the tmp removed.
+    func prepareCommitTmp(newData: Data, fileMode: mode_t, parentFD: Int32) throws -> String {
         let tmpName = "." + UUID().uuidString + ".tmp"
         let tmpFD = tmpName.withCString { name in
             openat(parentFD, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o600))
         }
         guard tmpFD >= 0 else {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "tmp create failed", data: "", error: String(cString: strerror(errno)), path: path, beforeHash: expectedHash, started: true)
+            throw StoreError.integrity("tmp create failed: \(String(cString: strerror(errno)))")
         }
         var committed = false
         defer {
@@ -1366,7 +1428,6 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 _ = tmpName.withCString { unlinkat(parentFD, $0, 0) }
             }
         }
-        // Checked write loop: partial writes are retried, never silent.
         var offset = 0
         let total = newData.count
         while offset < total {
@@ -1375,47 +1436,97 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
             if n < 0 {
                 if errno == EINTR { continue }
-                return ToolCallOutcome(callID: callID, status: "failed", summary: "tmp write failed", data: "", error: String(cString: strerror(errno)), path: path, beforeHash: expectedHash, started: true)
+                throw StoreError.integrity("tmp write failed: \(String(cString: strerror(errno)))")
             }
             if n == 0 {
-                return ToolCallOutcome(callID: callID, status: "failed", summary: "tmp write failed", data: "", error: "short write", path: path, beforeHash: expectedHash, started: true)
+                throw StoreError.integrity("tmp short write")
             }
             offset += n
         }
         guard fsync(tmpFD) == 0 else {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "tmp fsync failed", data: "", error: String(cString: strerror(errno)), path: path, beforeHash: expectedHash, started: true)
+            throw StoreError.integrity("tmp fsync failed: \(String(cString: strerror(errno)))")
         }
         guard fchmod(tmpFD, fileMode) == 0 else {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "tmp mode preserve failed", data: "", error: String(cString: strerror(errno)), path: path, beforeHash: expectedHash, started: true)
+            throw StoreError.integrity("tmp mode preserve failed: \(String(cString: strerror(errno)))")
         }
-        // Re-read + hash under the workspace lock immediately before commit:
-        // an injected change between read and commit conflicts here with the
-        // file untouched, no preimage, tmp cleaned.
-        _ = lseek(fileFD, 0, SEEK_SET)
+        committed = true
+        return tmpName
+    }
+
+    /// Commit phase 2 (internal for phase-level tests): consumes a prepared
+    /// tmp. Re-OPENS the path (never the held fd): atomic replacement,
+    /// deletion, and symlink swap between initial read and commit are all
+    /// visible here, because the held fd still points at the replaced-away
+    /// inode. Dev/ino identity is compared first (replacement/deletion and
+    /// symlink swap conflict even when content would hash equal), then the
+    /// fresh bytes are hashed. Any gate failure removes the tmp and leaves
+    /// the target untouched with no preimage. Rename failure removes the tmp
+    /// with the target untouched; a published preimage remains committed
+    /// (recoverable by design — it describes bytes that verifiably existed).
+    func finalizeCommit(callID: String, path: String, fileFD: Int32, current: Data, expectedHash: String, newData: Data, fileMode: mode_t, parentFD: Int32, fileName: String, tmpName: String, verb: String) -> ToolCallOutcome {
+        func fail(_ summary: String, _ error: String, beforeHash: String) -> ToolCallOutcome {
+            _ = tmpName.withCString { unlinkat(parentFD, $0, 0) }
+            return ToolCallOutcome(callID: callID, status: "failed", summary: summary, data: "", error: error, path: path, beforeHash: beforeHash, started: true)
+        }
+        func conflict(_ summary: String, beforeHash: String) -> ToolCallOutcome {
+            _ = tmpName.withCString { unlinkat(parentFD, $0, 0) }
+            return ToolCallOutcome(callID: callID, status: "conflict", summary: summary, data: "", error: "conflict", path: path, beforeHash: beforeHash, started: true)
+        }
+        // Fresh open of the PATH (O_NOFOLLOW): the held fileFD cannot see a
+        // swap, so only this open can.
+        let checkFD: Int32 = fileName.withCString { name in
+            openat(parentFD, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard checkFD >= 0 else {
+            let e = errno
+            if e == ENOENT {
+                return conflict("target deleted before commit", beforeHash: expectedHash)
+            }
+            if e == ELOOP {
+                return conflict("target replaced by symlink before commit", beforeHash: expectedHash)
+            }
+            return fail("re-open failed: \(String(cString: strerror(e)))", String(cString: strerror(e)), beforeHash: expectedHash)
+        }
+        defer { close(checkFD) }
+        var origST = stat()
+        var freshST = stat()
+        guard fstat(fileFD, &origST) == 0, fstat(checkFD, &freshST) == 0,
+              (freshST.st_mode & S_IFMT) == S_IFREG else {
+            return fail("re-open fstat failed", "integrity", beforeHash: expectedHash)
+        }
+        guard origST.st_dev == freshST.st_dev, origST.st_ino == freshST.st_ino else {
+            return conflict("target replaced before commit", beforeHash: expectedHash)
+        }
         let reread: Data
         do {
-            reread = try Self.readBoundedEdit(fd: fileFD)
+            reread = try Self.readBoundedEdit(fd: checkFD)
+        } catch let e as StoreError {
+            if case .quotaExceeded = e {
+                return fail("over size limit", "too large", beforeHash: expectedHash)
+            }
+            return fail("re-read failed: \(e)", "\(e)", beforeHash: expectedHash)
         } catch {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "re-read failed", data: "", error: "\(error)", path: path, beforeHash: expectedHash, started: true)
+            return fail("re-read failed: \(error)", "\(error)", beforeHash: expectedHash)
         }
         let rereadHash = Self.sha256Hex(reread)
         guard rereadHash == expectedHash else {
-            return ToolCallOutcome(callID: callID, status: "conflict", summary: "hash changed before commit", data: "", error: "conflict", path: path, beforeHash: rereadHash, started: true)
+            return conflict("hash changed before commit", beforeHash: rereadHash)
         }
         // Verified preimage before modifying a nonempty file. Zero-byte
         // originals publish nothing (hash-only receipt; sha256-empty is
         // constant). Publication failure fails the commit with the target
         // untouched and the tmp cleaned.
+        let afterHash = Self.sha256Hex(newData)
         var preimageDigest: String? = nil
         if !current.isEmpty {
             do {
                 let ref = try store.publishArtifact(session: sessionID, as: writer, kind: "preimage", operationID: nil, bytes: current)
                 guard ref.digest == expectedHash else {
-                    return ToolCallOutcome(callID: callID, status: "failed", summary: "preimage digest mismatch", data: "", error: "integrity", path: path, beforeHash: expectedHash, started: true)
+                    return fail("preimage digest mismatch", "integrity", beforeHash: expectedHash)
                 }
                 preimageDigest = ref.digest
             } catch {
-                return ToolCallOutcome(callID: callID, status: "failed", summary: "preimage publish failed: \(error)", data: "", error: "\(error)", path: path, beforeHash: expectedHash, started: true)
+                return fail("preimage publish failed: \(error)", "\(error)", beforeHash: expectedHash)
             }
         }
         let renameRet = fileName.withCString { oldC in
@@ -1424,9 +1535,8 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
         }
         guard renameRet == 0 else {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "rename failed", data: "", error: String(cString: strerror(errno)), path: path, beforeHash: expectedHash, started: true)
+            return fail("rename failed: \(String(cString: strerror(errno)))", String(cString: strerror(errno)), beforeHash: expectedHash)
         }
-        committed = true
         // Post-commit directory sync: best-effort durability signal. A
         // failure here does not undo the atomic rename; it is reported, not
         // hidden, since durability is weakened.
@@ -1518,13 +1628,29 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
             offset += n
         }
+        // fchmod before fsync so the synced image carries the final mode;
+        // both checked. Mode is read back (not assumed) for the receipt.
+        guard fchmod(fd, mode_t(0o600)) == 0 else {
+            _ = fileName.withCString { unlinkat(parentFD, $0, 0) }
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "fchmod failed", data: "", error: String(cString: strerror(errno)), path: path, started: true)
+        }
         guard fsync(fd) == 0 else {
             _ = fileName.withCString { unlinkat(parentFD, $0, 0) }
             return ToolCallOutcome(callID: callID, status: "failed", summary: "fsync failed", data: "", error: String(cString: strerror(errno)), path: path, started: true)
         }
-        _ = fsync(parentFD)
+        var createdST = stat()
+        let createdMode: String
+        if fstat(fd, &createdST) == 0, (createdST.st_mode & S_IFMT) == S_IFREG {
+            createdMode = Self.modeOctal(createdST.st_mode)
+        } else {
+            createdMode = "600"
+        }
+        var warnings: [String] = []
+        if fsync(parentFD) != 0 {
+            warnings = ["directory sync failed: \(String(cString: strerror(errno)))"]
+        }
         let hash = Self.sha256Hex(content)
-        return ToolCallOutcome(callID: callID, status: "success", summary: "write \(path)", data: "written", path: path, mode: "600", afterHash: hash, started: true)
+        return ToolCallOutcome(callID: callID, status: "success", summary: "write \(path)", data: "written", warnings: warnings, path: path, mode: createdMode, afterHash: hash, started: true)
     }
 
     /// Authorized write-replacement: the file must exist and hash exactly to
@@ -1551,8 +1677,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         let current: Data
         do {
             current = try Self.readBoundedEdit(fd: fd)
+        } catch let e as StoreError {
+            if case .quotaExceeded = e {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "over size limit", data: "", error: "too large", path: path, started: true)
+            }
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "read failed: \(e)", data: "", error: "\(e)", path: path, started: true)
         } catch {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "over size limit", data: "", error: "too large", path: path, started: true)
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "read failed: \(error)", data: "", error: "\(error)", path: path, started: true)
         }
         let currentHash = Self.sha256Hex(current)
         if currentHash != expectedHash {
@@ -1575,7 +1706,20 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     }
 
     private static func mkdirs(_ dirPath: String, from dirFD: Int32) throws {
-        let components = dirPath.split(separator: "/")
+        // Byte-split (see openRelative): a Character split would keep an
+        // embedded "/" inside one component and mkdirat/openat would then
+        // traverse it, bypassing per-component checks.
+        var components: [String] = []
+        var piece: [UInt8] = []
+        for b in dirPath.utf8 {
+            if b == 0x2F {
+                components.append(String(decoding: piece, as: UTF8.self))
+                piece.removeAll(keepingCapacity: true)
+            } else {
+                piece.append(b)
+            }
+        }
+        components.append(String(decoding: piece, as: UTF8.self))
         var currentFD = dirFD
         var owned: [Int32] = []
         defer {

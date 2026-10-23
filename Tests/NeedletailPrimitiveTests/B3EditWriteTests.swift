@@ -134,6 +134,24 @@ struct B3EditWriteTests {
         #expect(Self.tmpFiles(under: url).isEmpty, "no tmp leftovers")
     }
 
+    @Test("TOOL_04_overlapMatch")
+    func tool04OverlapMatch() async throws {
+        // Overlapping occurrences count: "aaa" contains "aa" twice.
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (dir, store, session, writer) = try Self.tempStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        try "aaa\n".write(to: url.appendingPathComponent("f"), atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: session, writer: writer)
+        let h = Self.sha("aaa\n")
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"expectedHash\":\"" + h + "\",\"old_string\":\"aa\",\"new_string\":\"b\"}")])
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
+        #expect(result.calls[0].status == "invalid-arguments", "overlapping occurrences count as multiple, got \(result.calls[0])")
+        #expect(try String(contentsOf: url.appendingPathComponent("f"), encoding: .utf8) == "aaa\n", "file untouched")
+        #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on multiple-match")
+    }
+
     @Test("TOOL_04_emptyOld")
     func tool04EmptyOld() async throws {
         let (url, fp) = try Self.tempRoot()
@@ -150,6 +168,12 @@ struct B3EditWriteTests {
         #expect(result.calls[0].started == false, "empty old must be pre-dispatch")
         #expect(!FileManager.default.fileExists(atPath: url.appendingPathComponent(".needletail/lock").path), "no lock on invalid args")
         #expect(Self.tmpFiles(under: url).isEmpty, "no tmp on invalid args")
+        // Explicit empty old_string is also invalid pre-dispatch (not merely missing).
+        let batch2 = ToolBatch([ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"expectedHash\":\"" + String(repeating: "0", count: 64) + "\",\"old_string\":\"\",\"new_string\":\"x\"}")])
+        let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2))
+        #expect(result2.calls[0].status == "invalid-arguments", "empty old must be invalid-arguments, got \(result2.calls[0])")
+        #expect(result2.calls[0].started == false, "empty old must be pre-dispatch")
+        #expect(!FileManager.default.fileExists(atPath: url.appendingPathComponent(".needletail/lock").path), "no lock on empty old")
     }
 
     @Test("TOOL_04_fuzzyCounterfactual")
@@ -359,6 +383,153 @@ struct B3EditWriteTests {
         #expect(after == Data("a\r\nb\r\n".utf8), "file untouched")
     }
 
+    // MARK: - Phase tests: deterministic gate proof via prepare/finalize
+
+    /// Phase-test harness: tmp prepared through the real phase 1, filesystem
+    /// mutated deterministically, then phase 2 decides. Deleting phase 2's
+    /// gate (or the re-open) turns every conflict leg below green-to-red.
+    private static func openDir(_ path: String) throws -> Int32 {
+        var fd: Int32 = -1
+        path.withCString { cstr in fd = Glibc.open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        guard fd >= 0 else { throw StoreError.integrity("test setup: cannot open dir") }
+        return fd
+    }
+
+    private static func openFile(_ path: String) throws -> Int32 {
+        var fd: Int32 = -1
+        path.withCString { cstr in fd = Glibc.open(cstr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard fd >= 0 else { throw StoreError.integrity("test setup: cannot open file") }
+        return fd
+    }
+
+    private static func phaseSetup(body: String) throws -> (URL, FilePath, GRDBSessionStore, SessionID, WriterIdentity, NativeToolExecutor, URL, Int32, Int32, String) {
+        let (url, fp) = try Self.tempRoot()
+        let (dir, store, session, writer) = try Self.tempStore()
+        let file = url.appendingPathComponent("f")
+        try Data(body.utf8).write(to: file)
+        let h = Self.sha(body)
+        let dirFD = try openDir(url.path)
+        let fileFD = try openFile(file.path)
+        let exec = try NativeToolExecutor(resolver: WorkspaceResolver(workspace: fp, readRoots: []), store: store, sessionID: session, writer: writer)
+        return (url, fp, store, session, writer, exec, file, dirFD, fileFD, h)
+    }
+
+    @Test("TOOL_05_phaseContentChange")
+    func tool05PhaseContentChange() async throws {
+        // T1: in-place content change between prepare and finalize.
+        let (url, _, store, session, _, exec, file, dirFD, fileFD, h) = try Self.phaseSetup(body: "original\n")
+        defer { close(dirFD); close(fileFD); try? FileManager.default.removeItem(at: url) }
+        let tmp = try exec.prepareCommitTmp(newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD)
+        try Data("INJECTED\n".utf8).write(to: file)
+        let res = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{}")])
+        let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
+        _ = res
+        #expect(out.status == "conflict", "in-place change must conflict at the gate, got \(out)")
+        #expect(try String(contentsOf: file, encoding: .utf8) == "INJECTED\n", "injected content untouched")
+        #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on conflict")
+        #expect(Self.tmpFiles(under: url).isEmpty, "tmp cleaned")
+    }
+
+    @Test("TOOL_05_phaseAtomicReplace")
+    func tool05PhaseAtomicReplace() async throws {
+        // T2: atomic rename-over between prepare and finalize (editor save).
+        let (url, _, store, session, _, exec, file, dirFD, fileFD, h) = try Self.phaseSetup(body: "original\n")
+        defer { close(dirFD); close(fileFD); try? FileManager.default.removeItem(at: url) }
+        let tmp = try exec.prepareCommitTmp(newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD)
+        let swap = url.appendingPathComponent("swap")
+        try Data("SWAPPED\n".utf8).write(to: swap)
+        #expect(swap.path.withCString({ a in file.path.withCString({ b in Glibc.rename(a, b) }) }) == 0, "test setup: atomic swap must work")
+        let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
+        #expect(out.status == "conflict", "atomic replace must conflict, got \(out)")
+        #expect(out.summary.contains("replaced"), "replacement distinguished from content change, got \(out.summary)")
+        #expect(try String(contentsOf: file, encoding: .utf8) == "SWAPPED\n", "swapped content untouched")
+        #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on conflict")
+        #expect(Self.tmpFiles(under: url).isEmpty, "tmp cleaned")
+    }
+
+    @Test("TOOL_05_phaseDelete")
+    func tool05PhaseDelete() async throws {
+        // T3: deletion between prepare and finalize.
+        let (url, _, store, session, _, exec, file, dirFD, fileFD, h) = try Self.phaseSetup(body: "original\n")
+        defer { close(dirFD); close(fileFD); try? FileManager.default.removeItem(at: url) }
+        let tmp = try exec.prepareCommitTmp(newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD)
+        try FileManager.default.removeItem(at: file)
+        let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
+        #expect(out.status == "conflict", "deletion must conflict, got \(out)")
+        #expect(!FileManager.default.fileExists(atPath: file.path), "deleted stays deleted (no resurrection)")
+        #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on conflict")
+        #expect(Self.tmpFiles(under: url).isEmpty, "tmp cleaned")
+    }
+
+    @Test("TOOL_05_phaseSymlinkSwap")
+    func tool05PhaseSymlinkSwap() async throws {
+        // T4: symlink swap between prepare and finalize — refused, outside untouched.
+        let (url, _, store, session, _, exec, file, dirFD, fileFD, h) = try Self.phaseSetup(body: "original\n")
+        defer { close(dirFD); close(fileFD); try? FileManager.default.removeItem(at: url) }
+        let outside = url.appendingPathComponent("outside.txt")
+        try Data("OUTSIDE\n".utf8).write(to: outside)
+        let tmp = try exec.prepareCommitTmp(newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createSymbolicLink(at: file, withDestinationURL: outside)
+        let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
+        #expect(out.status == "conflict", "symlink swap must conflict, got \(out)")
+        #expect(try String(contentsOf: outside, encoding: .utf8) == "OUTSIDE\n", "outside untouched")
+        #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on conflict")
+        #expect(Self.tmpFiles(under: url).isEmpty, "tmp cleaned")
+    }
+
+    @Test("TOOL_05_phaseHappyPath")
+    func tool05PhaseHappyPath() async throws {
+        // T5: phases composed with no interference commit with full receipts.
+        let (url, _, store, session, _, exec, file, dirFD, fileFD, h) = try Self.phaseSetup(body: "original\n")
+        defer { close(dirFD); close(fileFD); try? FileManager.default.removeItem(at: url) }
+        let newData = Data("MUTANT\n".utf8)
+        let tmp = try exec.prepareCommitTmp(newData: newData, fileMode: 0o640, parentFD: dirFD)
+        let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: newData, fileMode: 0o640, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
+        #expect(out.status == "success", "undisturbed phases must commit, got \(out)")
+        #expect(out.beforeHash == h && out.afterHash == Self.sha("MUTANT\n"), "receipts carry both hashes")
+        #expect(out.artifactID == h, "preimage published")
+        #expect(try String(contentsOf: file, encoding: .utf8) == "MUTANT\n")
+        #expect(Self.tmpFiles(under: url).isEmpty, "no tmp leftovers")
+    }
+
+    // MARK: - TOOL-06 unicode path handling
+
+    @Test("TOOL_06_unicodeEscape")
+    func tool06UnicodeEscape() async throws {
+        // "/" + combining mark is ONE grapheme: a Character-based split hides
+        // the separator and would let openat traverse an intermediate symlink
+        // that O_NOFOLLOW was meant to stop. Byte-split paths must ELOOP.
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (dir, store, session, writer) = try Self.tempStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let outside = url.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try "SNEAKY\n".write(to: outside.appendingPathComponent("secret.txt"), atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: url.appendingPathComponent("linkdir"), withDestinationURL: outside)
+        // Legitimate combining-mark filename still works byte-exactly.
+        try "hi\n".write(to: url.appendingPathComponent("e\u{0301}.txt"), atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: session, writer: writer)
+        // Sensitivity: Character.split hides the embedded separator.
+        let evil = "linkdir/" + "\u{0301}b"
+        #expect(evil.split(separator: "/").count == 1, "sensitivity: Character split hides the separator")
+        #expect(evil.utf8.filter({ $0 == 0x2F }).count == 1, "one real 0x2F byte present")
+        let h = Self.sha("whatever")
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"" + evil + "\",\"expectedHash\":\"" + h + "\",\"old_string\":\"x\",\"new_string\":\"y\"}")])
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
+        #expect(result.calls[0].status == "failed", "symlink traversal via combining-mark path must fail, got \(result.calls[0])")
+        #expect(try String(contentsOf: outside.appendingPathComponent("secret.txt"), encoding: .utf8) == "SNEAKY\n", "outside untouched")
+        #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on refusal")
+        // Combining-mark filename without separators edits normally.
+        let h2 = Self.sha("hi\n")
+        let batch2 = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"e\u{0301}.txt\",\"expectedHash\":\"" + h2 + "\",\"old_string\":\"hi\",\"new_string\":\"bye\"}")])
+        let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2))
+        #expect(result2.calls[0].status == "success", "combining-mark filename must edit, got \(result2.calls[0])")
+        #expect(try Data(contentsOf: url.appendingPathComponent("e\u{0301}.txt")) == Data("bye\n".utf8))
+    }
+
     // MARK: - TOOL-08 write
 
     @Test("TOOL_08_createNew")
@@ -512,6 +683,8 @@ struct B3EditWriteTests {
     func tool08InjectedCommitFailure() async throws {
         // Read-only parent: tmp creation fails, so nothing is committed, no
         // tmp remains, and no preimage is published for unmodified content.
+        // Root bypasses permission bits: there the same fixture must SUCCEED
+        // with full receipts instead (still meaningful, never vacuous).
         let (url, fp) = try Self.tempRoot()
         defer {
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.appendingPathComponent("sub").path)
@@ -528,10 +701,16 @@ struct B3EditWriteTests {
         let h = Self.sha("precious\n")
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"sub/f\",\"expectedHash\":\"\(h)\",\"old_string\":\"precious\",\"new_string\":\"ruin\"}")])
         let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
-        #expect(result.calls[0].status == "failed", "read-only parent must fail the commit, got \(result.calls[0])")
-        #expect(try String(contentsOf: sub.appendingPathComponent("f"), encoding: .utf8) == "precious\n", "file untouched")
-        #expect(Self.tmpFiles(under: sub).isEmpty, "no tmp leftovers")
-        #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "nothing modified, nothing preserved")
+        if getuid() == 0 {
+            #expect(result.calls[0].status == "success", "root bypasses perms: commit proceeds, got \(result.calls[0])")
+            #expect(try String(contentsOf: sub.appendingPathComponent("f"), encoding: .utf8) == "ruin\n")
+            #expect(result.calls[0].artifactID == h, "preimage still published on the root path")
+        } else {
+            #expect(result.calls[0].status == "failed", "read-only parent must fail the commit, got \(result.calls[0])")
+            #expect(try String(contentsOf: sub.appendingPathComponent("f"), encoding: .utf8) == "precious\n", "file untouched")
+            #expect(Self.tmpFiles(under: sub).isEmpty, "no tmp leftovers")
+            #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "nothing modified, nothing preserved")
+        }
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: sub.path)
     }
 }
