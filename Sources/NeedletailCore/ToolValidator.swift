@@ -220,7 +220,10 @@ public enum ToolValidator {
             }
             return ValidatedToolCall(callID: callID, tool: "read", paths: [path], isMutating: false, rawArguments: raw)
         } else {
-            // Artifact ID path
+            // Artifact ID path: exactly one alias form allowed
+            if json["artifactId"] != nil && json["artifact_id"] != nil {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "both artifactId and artifact_id for read \(callID)")
+            }
             let artifactId = (json["artifactId"] as? String) ?? (json["artifact_id"] as? String) ?? ""
             if artifactId.isEmpty {
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "artifactId must be non-empty string for read \(callID)")

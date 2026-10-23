@@ -94,6 +94,8 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             let outcome: ToolCallOutcome
             do {
                 outcome = try executeOne(proposal: proposal, reservation: reservation)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch let ToolFailure.preDispatch(status, summary) {
                 outcome = ToolCallOutcome(callID: proposal.callID, status: status, summary: summary, data: "", error: summary, started: false)
             } catch {
@@ -138,6 +140,64 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
     }
 
+    // B2 closure: read fidelity budgets. File bytes capped at 32 MiB+1 (growth
+    // after fstat cannot cause unbounded reads); returned text capped at a
+    // 1 MiB result-byte budget independent of line counts, cut at line
+    // boundaries so returned bytes are always an exact prefix/slice of the
+    // file (terminal newlines preserved). SHA-256 is over the full bytes
+    // read; truncated is true iff limit/offset or the byte budget omitted
+    // trailing content.
+    static let maxReadFileBytes: Int64 = 32 * 1024 * 1024
+    static let maxResultBytes = 1 * 1024 * 1024
+    static let maxSearchStdoutBytes = 1 * 1024 * 1024
+    static let maxSearchStderrBytes = 64 * 1024
+    static let searchTimeoutSeconds: TimeInterval = 30
+    static let versionTimeoutSeconds: TimeInterval = 10
+
+    /// Slice text into exact bytes: lines [offset, offset+limit), preserving a
+    /// terminal newline iff the slice reaches the original EOF newline or is
+    /// cut mid-file at a line boundary. Enforces maxResultBytes at line
+    /// boundaries. Returns (slice, truncated).
+    static func sliceTextExact(_ text: String, limit: Int, offset: Int) -> (String, Bool) {
+        var effective = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let hadTrailing = text.hasSuffix("\n")
+        if hadTrailing && !effective.isEmpty && effective.last == "" {
+            effective.removeLast()
+        }
+        let count = effective.count
+        let start = min(offset, count)
+        let end = min(start + limit, count)
+        var truncated = end < count
+        let slice = Array(effective[start..<end])
+        var limited: String
+        if slice.isEmpty {
+            limited = ""
+        } else {
+            limited = slice.joined(separator: "\n")
+            if end < count || hadTrailing {
+                limited += "\n"
+            }
+        }
+        if limited.utf8.count > maxResultBytes {
+            var acc = 0
+            var keep = 0
+            for line in slice {
+                // Each kept line is followed by "\n" in the output (mid-file cut
+                // always ends at a line boundary; EOF-newline case keeps it).
+                let lb = line.utf8.count + 1
+                if acc + lb > maxResultBytes { break }
+                acc += lb
+                keep += 1
+            }
+            if keep < slice.count {
+                let kept = slice[0..<keep].joined(separator: "\n") + (keep > 0 ? "\n" : "")
+                limited = kept
+                truncated = true
+            }
+        }
+        return (limited, truncated)
+    }
+
     private func read(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
         // Handle artifact ID read (session-scoped) with bounded output, SHA, binary check
         if let artifactId = (json["artifactId"] as? String) ?? (json["artifact_id"] as? String) {
@@ -151,15 +211,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     }
                     let limit = json["limit"] as? Int ?? 200
                     let offset = json["offset"] as? Int ?? 0
-                    var effectiveLines = text.split(separator: "\n", omittingEmptySubsequences: false)
-                    if text.hasSuffix("\n") && !effectiveLines.isEmpty && effectiveLines.last == "" {
-                        effectiveLines.removeLast()
-                    }
-                    let effectiveArray = Array(effectiveLines)
-                    let start = min(offset, effectiveArray.count)
-                    let end = min(start + limit, effectiveArray.count)
-                    let truncated = end < effectiveArray.count
-                    let limited = effectiveArray[start..<end].joined(separator: "\n")
+                    let (limited, truncated) = Self.sliceTextExact(text, limit: limit, offset: offset)
                     let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
                     return ToolCallOutcome(callID: callID, status: "success", summary: "read artifact \(artifactId)", data: limited, truncated: truncated, path: artifactId, beforeHash: hash, started: true)
                 }
@@ -213,9 +265,16 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if Int64(st.st_size) > 32*1024*1024 {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "over size limit", data: "", error: "too large", started: true)
         }
-        // Read via fd
+        // Read via fd, bounded: st_size gate above is racy (file may grow after
+        // fstat), so the loop itself caps at maxReadFileBytes+1 and reports
+        // oversize instead of buffering unboundedly.
         var data = Data()
+        let readCap = Int(Self.maxReadFileBytes) + 1
+        if st.st_size >= 0 && st.st_size < 8 * 1024 * 1024 {
+            data.reserveCapacity(Int(st.st_size) + 1)
+        }
         var buf = [UInt8](repeating: 0, count: 8192)
+        var total = 0
         while true {
             let n = buf.withUnsafeMutableBytes { ptr in
                 Glibc.read(readFD, ptr.baseAddress, ptr.count)
@@ -225,6 +284,10 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 return ToolCallOutcome(callID: callID, status: "failed", summary: "read failed", data: "", error: String(cString: strerror(errno)), started: true)
             }
             if n == 0 { break }
+            total += n
+            if total > readCap {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "over size limit", data: "", error: "too large", started: true)
+            }
             data.append(contentsOf: buf[0..<n])
         }
         if data.contains(0) {
@@ -235,61 +298,364 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
         let limit = json["limit"] as? Int ?? 200
         let offset = json["offset"] as? Int ?? 0
-        var effectiveLines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        if text.hasSuffix("\n") && !effectiveLines.isEmpty && effectiveLines.last == "" {
-            effectiveLines.removeLast()
-        }
-        let effectiveArray = Array(effectiveLines)
-        let start = min(offset, effectiveArray.count)
-        let end = min(start + limit, effectiveArray.count)
-        let truncated = end < effectiveArray.count
-        let limited = effectiveArray[start..<end].joined(separator: "\n")
+        let (limited, truncated) = Self.sliceTextExact(text, limit: limit, offset: offset)
         let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         return ToolCallOutcome(callID: callID, status: "success", summary: "read \(path)", data: limited, truncated: truncated, path: path, beforeHash: hash, started: true)
     }
 
-    private func search(callID: String, json: [String: Any], reservation: EffectReservation) throws -> ToolCallOutcome {
+    /// Minimal sanitized environment for ripgrep: never inherits the parent
+    /// process environment, so RIPGREP_CONFIG_PATH/RIPGREP_CONFIG, PATH
+    /// shadowing entries, and preprocessor configuration cannot influence the
+    /// child. Combined with absolute-path launch + --no-config, poisoned env
+    /// is inert by construction.
+    static let sanitizedSearchEnv: [String: String] = [
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    ]
+
+    /// /proc/self/fd path for an open descriptor (Linux; /dev/fd elsewhere).
+    /// Used to hand an already-validated open directory to ripgrep: the child
+    /// resolves the same open file description, so pathname replacement or
+    /// symlink swapping after validation cannot redirect the search.
+    static func fdProcPath(_ fd: Int32) -> String {
+#if canImport(Glibc)
+        return "/proc/self/fd/\(fd)"
+#else
+        return "/dev/fd/\(fd)"
+#endif
+    }
+
+    /// Qualify the ripgrep executable and return an open FD to it (caller must
+    /// close after launch). lstat rejects symlinks without following; open
+    /// O_NOFOLLOW + fstat dev/ino equality with lstat rejects replacement
+    /// between stat and open; group/world-writable, non-regular, non-root and
+    /// non-owner executables are denied. Launching via /proc/self/fd/<fd>
+    /// executes exactly the qualified inode (no pathname TOCTOU). The FD is
+    /// deliberately inheritable (no O_CLOEXEC): script interpreters re-open
+    /// the /proc/self/fd path AFTER exec, so a CLOEXEC executable FD would
+    /// break #! probes/wrappers while ELF still worked — an asymmetric,
+    /// hard-to-diagnose failure. The child holding a read-only handle to its
+    /// own qualified binary is harmless.
+    private func qualifiedRgFD() throws -> Int32 {
         guard let rg = rgPath else {
             throw ToolFailure.preDispatch(status: "denied", summary: "rg not provisioned")
         }
-        // Pinned absolute executable, ownership/mode checks and version gate
         guard rg.hasPrefix("/") else {
             throw ToolFailure.preDispatch(status: "denied", summary: "rg must be absolute path")
         }
-        guard FileManager.default.fileExists(atPath: rg) else {
+        var lst = stat()
+        guard lstat(rg, &lst) == 0 else {
             throw ToolFailure.preDispatch(status: "denied", summary: "rg not found")
         }
+        if (lst.st_mode & S_IFMT) == S_IFLNK {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg is symlink")
+        }
+        let fd = rg.withCString { cstr in
+            open(cstr, O_RDONLY | O_NOFOLLOW)
+        }
+        guard fd >= 0 else {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg open failed (symlink or replaced)")
+        }
         var st = stat()
-        guard stat(rg, &st) == 0 else {
-            throw ToolFailure.preDispatch(status: "denied", summary: "rg stat failed")
+        guard fstat(fd, &st) == 0 else {
+            close(fd)
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg fstat failed")
+        }
+        guard UInt64(st.st_dev) == UInt64(lst.st_dev) && UInt64(st.st_ino) == UInt64(lst.st_ino) else {
+            close(fd)
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg replaced during qualification")
+        }
+        guard (st.st_mode & S_IFMT) == S_IFREG else {
+            close(fd)
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg is not a regular file")
         }
         if (st.st_mode & 0o002) != 0 {
+            close(fd)
             throw ToolFailure.preDispatch(status: "denied", summary: "rg is world-writable")
+        }
+        if (st.st_mode & 0o020) != 0 {
+            close(fd)
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg is group-writable")
         }
         let uid = getuid()
         if st.st_uid != 0 && st.st_uid != uid {
+            close(fd)
             throw ToolFailure.preDispatch(status: "denied", summary: "rg not owned by root or current user")
         }
-        // Version gate: rg --version must be >= 13.0.0, fail closed if regex doesn't match or version <13
+        if (st.st_mode & 0o111) == 0 {
+            close(fd)
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg is not executable")
+        }
+        return fd
+    }
+
+    /// Bounded child-process runner: concurrent stdout/stderr drain capped
+    /// during execution (never buffered unboundedly), wall-clock timeout with
+    /// terminate→SIGKILL escalation and reaping, cooperative cancellation.
+    /// Returns stdout/stderr (capped), exit status, truncation and timeout.
+    struct BoundedRunResult: Sendable {
+        var stdout: Data
+        var stderr: Data
+        var status: Int32
+        var truncated: Bool
+        var timedOut: Bool
+    }
+
+    /// Raw posix_spawn bounded runner. Foundation.Process closes inherited
+    /// FDs in the child, which would break /proc/self/fd execution and
+    /// directory-FD traversal; posix_spawn inherits exactly the FDs we leave
+    /// open (CLOEXEC ones excepted), so the qualified rg inode and the pinned
+    /// search-root FDs resolve inside the child. Stdout/stderr are drained
+    /// concurrently via poll() with in-loop caps (never buffered unboundedly);
+    /// wall-clock timeout escalates SIGTERM -> SIGKILL; the child is always
+    /// reaped via waitpid; Task cancellation terminates and throws.
+    private func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval) throws -> BoundedRunResult {
+        try Task.checkCancellation()
+        var outFds = [Int32](repeating: 0, count: 2)
+        var errFds = [Int32](repeating: 0, count: 2)
+        guard pipe(&outFds) == 0, pipe(&errFds) == 0 else {
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg pipe failed")
+        }
+        let outR = outFds[0], outW = outFds[1]
+        let errR = errFds[0], errW = errFds[1]
+        // Nonblocking reads for the poll drain loop.
+        for fd in [outR, errR] {
+            let flags = fcntl(fd, F_GETFL)
+            _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        }
+        // fork+exec (not posix_spawn): glibc posix_spawn fails scripts with
+        // ENOEXEC, while version probes and race-test wrappers are #! scripts
+        // launched via /proc/self/fd. fork+execve handles both ELF and
+        // scripts. All argv/env C strings are prepared pre-fork; the child
+        // performs only async-signal-safe dup2/close/execve/_exit.
+        let fullArgs = [executablePath] + args
+        var argv: [UnsafeMutablePointer<CChar>?] = fullArgs.map { strdup($0) }
+        argv.append(nil)
+        defer { for p in argv { if let p { free(p) } } }
+        let envList = Self.sanitizedSearchEnv.map { "\($0.key)=\($0.value)" }.sorted()
+        var envp: [UnsafeMutablePointer<CChar>?] = envList.map { strdup($0) }
+        envp.append(nil)
+        defer { for p in envp { if let p { free(p) } } }
+        guard let pathC = strdup(executablePath) else {
+            close(outR); close(errR); close(outW); close(errW)
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg launch failed: alloc")
+        }
+        defer { free(pathC) }
+        let pid: pid_t
+#if canImport(Glibc)
+        pid = Glibc.fork()
+#else
+        pid = Darwin.fork()
+#endif
+        if pid < 0 {
+            let e = errno
+            close(outR); close(errR); close(outW); close(errW)
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg fork failed: \(String(cString: strerror(e)))")
+        }
+        if pid == 0 {
+            // Child: wire pipes to stdio, drop pipe FDs, exec. The qualified
+            // rg FD (CLOEXEC) stays open through exec pathname resolution;
+            // search-root FDs (inheritable) survive into rg for /proc/self/fd
+            // traversal. No Swift runtime interaction here.
+            _ = dup2(outW, STDOUT_FILENO)
+            _ = dup2(errW, STDERR_FILENO)
+            close(outR); close(errR); close(outW); close(errW)
+            argv.withUnsafeMutableBufferPointer { abuf in
+                envp.withUnsafeMutableBufferPointer { ebuf in
+#if canImport(Glibc)
+                    _ = Glibc.execve(pathC, abuf.baseAddress!, ebuf.baseAddress!)
+#else
+                    _ = Darwin.execve(pathC, abuf.baseAddress!, ebuf.baseAddress!)
+#endif
+                }
+            }
+#if canImport(Glibc)
+            Glibc._exit(127)
+#else
+            Darwin._exit(127)
+#endif
+        }
+        // Parent closes write ends immediately so EOF is observable.
+        close(outW)
+        close(errW)
+        var outData = Data()
+        var errData = Data()
+        var outTrunc = false
+        var errTrunc = false
+        func appendBounded(_ chunk: Data, cap: Int, current: inout Data, trunc: inout Bool) {
+            if chunk.isEmpty { return }
+            if current.count >= cap {
+                trunc = true
+                return
+            }
+            let room = cap - current.count
+            if chunk.count <= room {
+                current.append(chunk)
+            } else {
+                current.append(chunk.prefix(room))
+                trunc = true
+            }
+        }
+        func drain(fd: Int32, eof: inout Bool, current: inout Data, trunc: inout Bool, cap: Int) {
+            if eof { return }
+            var buf = [UInt8](repeating: 0, count: 8192)
+            while true {
+                let n = buf.withUnsafeMutableBytes { ptr in
+#if canImport(Glibc)
+                    Glibc.read(fd, ptr.baseAddress, ptr.count)
+#else
+                    Darwin.read(fd, ptr.baseAddress, ptr.count)
+#endif
+                }
+                if n > 0 {
+                    appendBounded(Data(buf[0..<n]), cap: cap, current: &current, trunc: &trunc)
+                } else if n == 0 {
+                    eof = true
+                    break
+                } else {
+                    if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                    if errno == EINTR { continue }
+                    eof = true
+                    break
+                }
+            }
+        }
+        var outEOF = false
+        var errEOF = false
+        var exitStatus: Int32 = -1
+        var childDone = false
+        let deadline = Date().addingTimeInterval(timeout)
+        var termSent = false
+        var killSent = false
+        var killDeadline = Date.distantFuture
+        var cancelled = false
+        while true {
+            var pfds: [pollfd] = []
+            if !outEOF { pfds.append(pollfd(fd: outR, events: Int16(POLLIN), revents: 0)) }
+            if !errEOF { pfds.append(pollfd(fd: errR, events: Int16(POLLIN), revents: 0)) }
+            if !pfds.isEmpty {
+                _ = pfds.withUnsafeMutableBufferPointer { buf in
+                    poll(buf.baseAddress, nfds_t(buf.count), 100)
+                }
+                for pfd in pfds where pfd.revents != 0 {
+                    if pfd.fd == outR {
+                        drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTrunc, cap: stdoutCap)
+                    } else {
+                        drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTrunc, cap: stderrCap)
+                    }
+                }
+            }
+            var st: Int32 = 0
+            let wr = waitpid(pid, &st, WNOHANG)
+            if wr == pid {
+                childDone = true
+                if (st & 0x7F) == 0 {
+                    exitStatus = (st >> 8) & 0xFF
+                } else {
+                    exitStatus = 128
+                }
+            }
+            if childDone && outEOF && errEOF { break }
+            let now = Date()
+            if Task.isCancelled {
+                cancelled = true
+                break
+            }
+            if !childDone && now >= deadline && !termSent {
+#if canImport(Glibc)
+                Glibc.kill(pid, SIGTERM)
+#else
+                Darwin.kill(pid, SIGTERM)
+#endif
+                termSent = true
+                killDeadline = now.addingTimeInterval(2)
+            }
+            if !childDone && termSent && !killSent && now >= killDeadline {
+#if canImport(Glibc)
+                Glibc.kill(pid, SIGKILL)
+#else
+                Darwin.kill(pid, SIGKILL)
+#endif
+                killSent = true
+                killDeadline = now.addingTimeInterval(2)
+            }
+            if killSent && now >= killDeadline { break }
+            if childDone && outEOF && errEOF { break }
+        }
+        if cancelled || (!childDone) {
+            // Escalate and reap; cancellation always terminates the child.
+#if canImport(Glibc)
+            Glibc.kill(pid, SIGTERM)
+#else
+            Darwin.kill(pid, SIGTERM)
+#endif
+            var st: Int32 = 0
+            var waited = 0
+            while waitpid(pid, &st, WNOHANG) != pid && waited < 20 {
+                usleep(100_000)
+                waited += 1
+            }
+            if !childDone {
+#if canImport(Glibc)
+                Glibc.kill(pid, SIGKILL)
+#else
+                Darwin.kill(pid, SIGKILL)
+#endif
+                _ = waitpid(pid, &st, 0)
+                if (st & 0x7F) == 0 {
+                    exitStatus = (st >> 8) & 0xFF
+                }
+            }
+            // Final nonblocking drain after termination.
+            drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTrunc, cap: stdoutCap)
+            drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTrunc, cap: stderrCap)
+        }
+        close(outR)
+        close(errR)
+        if cancelled {
+            throw CancellationError()
+        }
+        let timedOut = !childDone
+        return BoundedRunResult(stdout: outData, stderr: errData, status: exitStatus, truncated: outTrunc || errTrunc, timedOut: timedOut)
+    }
+
+    /// Version gate over the qualified FD path with sanitized env, bounded
+    /// output and timeout. Must be >= 13.0.0; anything else fails closed.
+    private func rgVersionGate(execPath: String) throws {
+        let run: BoundedRunResult
         do {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: rg)
-            proc.arguments = ["--version"]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = Pipe()
-            try proc.run()
-            proc.waitUntilExit()
-            let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            let versionPattern = try NSRegularExpression(pattern: #"ripgrep (\d+)\."#)
-            guard let m = versionPattern.firstMatch(in: out, range: NSRange(out.startIndex..., in: out)),
-                  let r = Range(m.range(at: 1), in: out),
-                  let v = Int(out[r]) else {
-                throw ToolFailure.preDispatch(status: "denied", summary: "rg version check failed: unexpected output")
-            }
-            if v < 13 {
-                throw ToolFailure.preDispatch(status: "denied", summary: "rg too old")
-            }
+            run = try runBounded(executablePath: execPath, args: ["--version"], stdoutCap: 4096, stderrCap: 4096, timeout: Self.versionTimeoutSeconds)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg version check failed")
+        }
+        if run.timedOut || run.truncated || run.status != 0 {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg version check failed")
+        }
+        let out = String(decoding: run.stdout, as: UTF8.self)
+        let versionPattern = try NSRegularExpression(pattern: #"ripgrep (\d+)\."#)
+        guard let m = versionPattern.firstMatch(in: out, range: NSRange(out.startIndex..., in: out)),
+              let r = Range(m.range(at: 1), in: out),
+              let v = Int(out[r]) else {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg version check failed: unexpected output")
+        }
+        if v < 13 {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg too old")
+        }
+    }
+
+    private func search(callID: String, json: [String: Any], reservation: EffectReservation) throws -> ToolCallOutcome {
+        // Qualify executable once; hold the FD open across version probe and
+        // main launch so both execute the qualified inode.
+        let rgFD = try qualifiedRgFD()
+        defer { close(rgFD) }
+        let rgExec = Self.fdProcPath(rgFD)
+        do {
+            try rgVersionGate(execPath: rgExec)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let e as ToolFailure {
             throw e
         } catch {
@@ -299,8 +665,51 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if pattern.isEmpty {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing pattern")
         }
-        var args = [rg, "--json", "--hidden", "--max-count", "1000", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
-        // If search path is provided, validate and use it (relative to workspace/read-root)
+        // Approval-aware traversal pruning: absolute-denial categories
+        // (.needletail, credentials, artifacts) are ALWAYS pruned (approval can
+        // never grant them); grantable categories (.git/.ssh/.env) are pruned
+        // unless the reservation approves a path inside that category, in
+        // which case ripgrep traverses it and the per-line JSON classifier
+        // below enforces approval exactly (approved subtree visible,
+        // everything else still dropped).
+        var skipGitGlobs = false
+        var skipSshGlobs = false
+        var skipEnvGlobs = false
+        for a in reservation.approvedPaths {
+            let comps = a.split(separator: "/").map(String.init)
+            if comps.contains(".git") { skipGitGlobs = true }
+            if comps.contains(".ssh") { skipSshGlobs = true }
+            if comps.contains(where: { $0 == ".env" || $0.hasPrefix(".env.") }) { skipEnvGlobs = true }
+        }
+        var argv = ["--json", "--no-config", "--hidden", "--max-count", "1000"]
+        if !skipGitGlobs {
+            argv += ["--glob", "!.git/", "--glob", "!**/.git/**"]
+        }
+        if !skipEnvGlobs {
+            argv += ["--glob", "!.env*", "--glob", "!**/.env*"]
+        }
+        if !skipSshGlobs {
+            argv += ["--glob", "!.ssh/", "--glob", "!**/.ssh/**"]
+        }
+        argv += ["--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
+        // Resolve search roots to HELD OPEN directory FDs and pass only
+        // /proc/self/fd paths to ripgrep. The FDs stay open (cloexec cleared so
+        // the child inherits them) across process launch: ripgrep traverses
+        // the pinned open file descriptions, so symlink swapping or directory
+        // replacement of the validated path after validation cannot redirect
+        // the search. No workspace/read-root pathname ever reaches argv.
+        // Each entry maps the argv path to its logical base for output
+        // classification (relative portion within the root).
+        var heldRootFDs: [Int32] = []
+        defer { for fd in heldRootFDs { close(fd) } }
+        var roots: [(proc: String, logicalBase: String)] = []
+        func holdRootFD(_ fd: Int32) -> String {
+            // Child must inherit this FD so /proc/self/fd/<fd> resolves inside
+            // ripgrep after exec; clear FD_CLOEXEC (set by openRelative).
+            _ = fcntl(fd, F_SETFD, 0)
+            heldRootFDs.append(fd)
+            return Self.fdProcPath(fd)
+        }
         if let searchPath = json["path"] as? String, !searchPath.isEmpty {
             let cls = ToolValidator.protectedClassification(for: searchPath)
             if cls == .absoluteDenied {
@@ -309,15 +718,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             if cls == .grantable && !reservation.approvedPaths.contains(searchPath) {
                 throw ToolFailure.preDispatch(status: "denied", summary: "grantable search path requires approval")
             }
-            // Resolve searchPath relative to workspace/read-root and use as root
             var found = false
-            if let ws = resolver.workspaceRoot {
-                let dirFD = try resolver.validatedWorkspaceFD()
-                defer { close(dirFD) }
+            if resolver.workspaceRoot != nil {
                 do {
+                    let dirFD = try resolver.validatedWorkspaceFD()
+                    defer { close(dirFD) }
                     let fd = try resolver.openRelative(searchPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                    close(fd)
-                    args.append((ws.path.string as NSString).appendingPathComponent(searchPath))
+                    roots.append((holdRootFD(fd), searchPath))
                     found = true
                 } catch {}
             }
@@ -327,8 +734,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                         let dirFD = try resolver.revalidatedFD(for: rr)
                         defer { close(dirFD) }
                         let fd = try resolver.openRelative(searchPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                        close(fd)
-                        args.append((rr.path.string as NSString).appendingPathComponent(searchPath))
+                        roots.append((holdRootFD(fd), searchPath))
                         found = true
                         break
                     } catch { continue }
@@ -341,101 +747,156 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             guard resolver.workspaceRoot != nil || !resolver.readRoots.isEmpty else {
                 throw ToolFailure.preDispatch(status: "denied", summary: "no workspace/read-root for search")
             }
-            if let ws = resolver.workspaceRoot {
-                args.append(ws.path.string)
-            }
-            for rr in resolver.readRoots {
-                args.append(rr.path.string)
-            }
-        }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: rg)
-        process.arguments = Array(args.dropFirst())
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: "RIPGREP_CONFIG_PATH")
-        env.removeValue(forKey: "RIPGREP_CONFIG")
-        process.environment = env
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
-        final class DataBox: @unchecked Sendable { var data = Data(); let lock = NSLock() }
-        let outBox = DataBox()
-        let errBox = DataBox()
-        outPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-            } else {
-                outBox.lock.withLock { outBox.data.append(data) }
-            }
-        }
-        errPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-            } else {
-                errBox.lock.withLock { errBox.data.append(data) }
-            }
-        }
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            outPipe.fileHandleForReading.readabilityHandler = nil
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "\(error)", started: true)
-        }
-        outPipe.fileHandleForReading.readabilityHandler = nil
-        errPipe.fileHandleForReading.readabilityHandler = nil
-        // Drain any remaining
-        let remaining = outPipe.fileHandleForReading.readDataToEndOfFile()
-        if !remaining.isEmpty {
-            outBox.lock.withLock { outBox.data.append(remaining) }
-        }
-        let errRemaining = errPipe.fileHandleForReading.readDataToEndOfFile()
-        if !errRemaining.isEmpty {
-            errBox.lock.withLock { errBox.data.append(errRemaining) }
-        }
-        if process.terminationStatus != 0 && process.terminationStatus != 1 {
-            let text = String(decoding: outBox.data, as: UTF8.self)
-            if text.isEmpty {
-                return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "rg exit \(process.terminationStatus)", started: true)
-            }
-        }
-        // Global bounded output: cap at 1MB, truthful truncation
-        let maxBytes = 1 * 1024 * 1024
-        var truncated = false
-        var outputData = outBox.data
-        if outputData.count > maxBytes {
-            outputData = outputData.prefix(maxBytes)
-            truncated = true
-        }
-        var text = String(decoding: outputData, as: UTF8.self)
-        // Post-filter protected hits (defense-in-depth): remove any lines that contain protected paths
-        // This is in addition to the argv pruning, to catch harness bugs
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        let filtered = lines.filter { line in
-            // Check if line contains a protected path (simple check for .git etc.)
-            let s = String(line)
-            if s.contains(".git/") || s.contains(".env") || s.contains(".ssh/") || s.contains(".needletail/") || s.contains("credentials") || s.contains("artifacts") {
-                // Only filter if the line is a JSON hit with a path that is protected
-                // For now, do a simple check: if line contains "\"path\":\"" and then protected, filter
-                // This is a best-effort post-filter
-                if s.contains(".git") || s.contains(".env") || s.contains(".ssh") {
-                    // Check if the matched file is protected
-                    // For B2, we will filter any line that has a protected path
-                    return false
+            if resolver.workspaceRoot != nil {
+                do {
+                    let fd = try resolver.validatedWorkspaceFD()
+                    roots.append((holdRootFD(fd), ""))
+                } catch {
+                    throw ToolFailure.preDispatch(status: "denied", summary: "workspace root replaced")
                 }
             }
-            return true
+            for rr in resolver.readRoots {
+                do {
+                    let fd = try resolver.revalidatedFD(for: rr)
+                    roots.append((holdRootFD(fd), ""))
+                } catch {
+                    // A replaced read-root fails closed individually; others
+                    // still constrain the search to pinned directories.
+                    continue
+                }
+            }
+            if roots.isEmpty {
+                throw ToolFailure.preDispatch(status: "denied", summary: "no valid search root")
+            }
         }
-        if filtered.count != lines.count {
-            text = filtered.joined(separator: "\n")
+        for r in roots {
+            argv.append(r.proc)
+        }
+        // Launch via the qualified FD path with the sanitized environment.
+        // No parent env (no RIPGREP_CONFIG_PATH, no PATH) is inherited and
+        // --no-config is passed, so poisoned config / PATH shadowing /
+        // preprocessor injection is inert. Root FDs are held open across the
+        // run so the child always traverses the pinned directories.
+        let run: BoundedRunResult
+        do {
+            run = try runBounded(executablePath: rgExec, args: argv, stdoutCap: Self.maxSearchStdoutBytes, stderrCap: Self.maxSearchStderrBytes, timeout: Self.searchTimeoutSeconds)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let e as ToolFailure {
+            throw e
+        } catch {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "\(error)", started: true)
+        }
+        if run.timedOut {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "rg timed out", data: "", error: "timeout", started: true)
+        }
+        if run.status != 0 && run.status != 1 {
+            if run.stdout.isEmpty {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "rg exit \(run.status)", started: true)
+            }
+        }
+        // Cap was enforced during the drain; if the cap cut mid-line, drop the
+        // trailing partial JSON line so every retained line parses completely.
+        var outputData = run.stdout
+        var truncated = run.truncated
+        if truncated, let lastNL = outputData.lastIndex(of: 0x0A) {
+            outputData = outputData.prefix(through: lastNL)
+        } else if truncated {
+            outputData = Data()
+        }
+        let (text, omittedUnparseable) = Self.filterSearchJSON(outputData, roots: roots, approvedPaths: reservation.approvedPaths)
+        if omittedUnparseable {
             truncated = true
-        } else {
-            text = String(decoding: outputData, as: UTF8.self)
         }
         return ToolCallOutcome(callID: callID, status: "success", summary: "search \(pattern)", data: text, truncated: truncated, started: true)
+    }
+
+    /// Parse ripgrep --json output and keep only authorized lines. Each line
+    /// with data.path.text is classified by its LOGICAL path (argv
+    /// /proc/self/fd prefix stripped, joined to the root's logical base) via
+    /// ToolValidator.protectedClassification: absoluteDenied is always
+    /// dropped; grantable is kept only when the reservation approves the path
+    /// or an ancestor prefix. Lines without a path (summary) are kept;
+    /// unparseable non-empty lines are dropped fail-closed. Content
+    /// mentioning ".git"/".env" in ordinary files is preserved: only the
+    /// actual file path is classified, never the match text.
+    static func filterSearchJSON(_ output: Data, roots: [(proc: String, logicalBase: String)], approvedPaths: [String]) -> (String, Bool) {
+        guard !output.isEmpty else { return ("", false) }
+        let text = String(decoding: output, as: UTF8.self)
+        var kept: [String] = []
+        var omittedUnparseable = false
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        for raw in lines {
+            let line = String(raw)
+            guard let objData = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: objData) as? [String: Any] else {
+                omittedUnparseable = true
+                continue
+            }
+            var pathText: String? = nil
+            if let data = obj["data"] as? [String: Any],
+               let path = data["path"] as? [String: Any],
+               let t = path["text"] as? String {
+                pathText = t
+            }
+            guard let reported = pathText else {
+                kept.append(line)
+                continue
+            }
+            guard let logical = Self.logicalSearchPath(reported: reported, roots: roots) else {
+                continue
+            }
+            switch ToolValidator.protectedClassification(for: logical) {
+            case .absoluteDenied:
+                continue
+            case .grantable:
+                if Self.isSearchPathApproved(logical, approvedPaths: approvedPaths) {
+                    kept.append(line)
+                }
+            case .unprotected:
+                kept.append(line)
+            }
+        }
+        var out = kept.joined(separator: "\n")
+        if !out.isEmpty {
+            out += "\n"
+        }
+        return (out, omittedUnparseable)
+    }
+
+    /// Map an rg-reported path back to its logical relative path: strip the
+    /// matching /proc/self/fd argv prefix and join with the root's logical
+    /// base. Returns nil for paths outside every pinned root or containing
+    /// ".." (fail closed).
+    static func logicalSearchPath(reported: String, roots: [(proc: String, logicalBase: String)]) -> String? {
+        for r in roots {
+            if reported == r.proc {
+                return r.logicalBase.isEmpty ? nil : r.logicalBase
+            }
+            let prefix = r.proc + "/"
+            if reported.hasPrefix(prefix) {
+                let rel = String(reported.dropFirst(prefix.count))
+                if rel.isEmpty || rel.split(separator: "/").contains(where: { $0 == ".." }) {
+                    return nil
+                }
+                if r.logicalBase.isEmpty {
+                    return rel
+                }
+                return r.logicalBase + "/" + rel
+            }
+        }
+        return nil
+    }
+
+    /// Grantable approval covers the exact path or any ancestor prefix
+    /// (approving a search root authorizes its subtree view).
+    static func isSearchPathApproved(_ logical: String, approvedPaths: [String]) -> Bool {
+        for a in approvedPaths {
+            if logical == a || logical.hasPrefix(a + "/") {
+                return true
+            }
+        }
+        return false
     }
 
     private func edit(callID: String, json: [String: Any]) throws -> ToolCallOutcome {

@@ -55,26 +55,41 @@ struct B2ReadSearchTests {
         try "hello world".write(to: file, atomically: true, encoding: .utf8)
         let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
         let store = InMemorySessionStore()
-        // Create a fake rg that would be used if PATH shadowing happened
+        // Genuine injection into the PROCESS environment (not a local dict):
+        // poisoned PATH with a fake rg first, plus a RIPGREP_CONFIG_PATH
+        // preprocessor that would stamp PRE_POISON into every file.
         let fakeDir = FileManager.default.temporaryDirectory.appendingPathComponent("fake-rg-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: fakeDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: fakeDir) }
         let fakeRg = fakeDir.appendingPathComponent("rg")
         try "#!/bin/sh\necho 'fake'\nexit 0".write(to: fakeRg, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeRg.path)
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = fakeDir.path + ":" + (env["PATH"] ?? "")
-        env["RIPGREP_CONFIG_PATH"] = "/tmp/fake-config"
-        // Use real rg path (pinned)
+        let evilPre = fakeDir.appendingPathComponent("evil-pre.sh")
+        try "#!/bin/sh\necho PRE_POISON\ncat \"$1\"\n".write(to: evilPre, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: evilPre.path)
+        let poisonRC = fakeDir.appendingPathComponent("poison.rc")
+        try "--pre=\(evilPre.path)\n".write(to: poisonRC, atomically: true, encoding: .utf8)
+        let oldPath = getenv("PATH").map { String(cString: $0) }
+        let oldRC = getenv("RIPGREP_CONFIG_PATH").map { String(cString: $0) }
+        let oldRC2 = getenv("RIPGREP_CONFIG").map { String(cString: $0) }
+        setenv("PATH", "\(fakeDir.path):\(oldPath ?? "/usr/bin:/bin")", 1)
+        setenv("RIPGREP_CONFIG_PATH", poisonRC.path, 1)
+        setenv("RIPGREP_CONFIG", poisonRC.path, 1)
+        defer {
+            if let v = oldPath { setenv("PATH", v, 1) } else { unsetenv("PATH") }
+            if let v = oldRC { setenv("RIPGREP_CONFIG_PATH", v, 1) } else { unsetenv("RIPGREP_CONFIG_PATH") }
+            if let v = oldRC2 { setenv("RIPGREP_CONFIG", v, 1) } else { unsetenv("RIPGREP_CONFIG") }
+        }
         let realRg = "/usr/bin/rg"
         guard FileManager.default.fileExists(atPath: realRg) else { return }
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello\"}")])
         let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
         let result = try await exec.execute(batch: batch, reservation: res)
-        // Should not use fake rg, should use real rg and find the file
-        #expect(result.calls[0].status == "success", "search should succeed with real rg, not fake, got \(result.calls[0])")
-        #expect(!result.calls[0].data.contains("fake"), "should not use fake rg")
+        #expect(result.calls[0].status == "success", "poisoned env must not break pinned search, got \(result.calls[0])")
+        #expect(result.calls[0].data.contains("hello world"), "real match must be present")
+        #expect(!result.calls[0].data.contains("fake"), "PATH-shadowing fake rg must not be used")
+        #expect(!result.calls[0].data.contains("PRE_POISON"), "poisoned preprocessor config must not be applied")
     }
 
     @Test("TOOL_11_crossSession")
