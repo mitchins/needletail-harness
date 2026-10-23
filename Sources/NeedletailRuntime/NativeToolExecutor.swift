@@ -523,7 +523,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// alias 0/1/2), CLOEXEC (concurrent children must not inherit write
     /// ends, or EOF becomes unobservable), nonblocking read end for poll().
     /// Must be called with spawnLock held (see runBounded).
-    private func makeSpawnPipe() throws -> (Int32, Int32) {
+    static func makeSpawnPipe() throws -> (Int32, Int32) {
         var fds = [Int32](repeating: 0, count: 2)
         guard pipe(&fds) == 0 else {
             throw ToolFailure.preDispatch(status: "failed", summary: "rg pipe failed")
@@ -564,19 +564,24 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         return (cur[0], cur[1])
     }
 
-    private func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval) throws -> BoundedRunResult {
+    /// B5: `env` selects the child's environment (default: the rg
+    /// sanitization); `cwdFD` pins the child's working directory to an
+    /// already-validated open directory FD via fchdir (nil: inherit).
+    /// Both are internal so GitDiff reuses this runner without duplicating
+    /// the fork/exec/drain/escalation machinery.
+    static func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval, env: [String: String] = sanitizedSearchEnv, cwdFD: Int32? = nil) throws -> BoundedRunResult {
         try Task.checkCancellation()
         Self.spawnLock.lock()
         let (outR, outW): (Int32, Int32)
         do {
-            (outR, outW) = try makeSpawnPipe()
+            (outR, outW) = try Self.makeSpawnPipe()
         } catch {
             Self.spawnLock.unlock()
             throw error
         }
         let errPair: (Int32, Int32)
         do {
-            errPair = try makeSpawnPipe()
+            errPair = try Self.makeSpawnPipe()
         } catch {
             close(outR)
             close(outW)
@@ -593,7 +598,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var argv: [UnsafeMutablePointer<CChar>?] = fullArgs.map { strdup($0) }
         argv.append(nil)
         defer { for p in argv { if let p { free(p) } } }
-        let envList = Self.sanitizedSearchEnv.map { "\($0.key)=\($0.value)" }.sorted()
+        let envList = env.map { "\($0.key)=\($0.value)" }.sorted()
         var envp: [UnsafeMutablePointer<CChar>?] = envList.map { strdup($0) }
         envp.append(nil)
         defer { for p in envp { if let p { free(p) } } }
@@ -631,6 +636,16 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             if errR != STDIN_FILENO && errR != STDOUT_FILENO && errR != STDERR_FILENO { close(errR) }
             if outW != STDOUT_FILENO { close(outW) }
             if errW != STDERR_FILENO { close(errW) }
+            // B5: pinned working directory (validated open dir FD) before
+            // exec — no pathname TOCTOU between validation and the child.
+            // A failed pin aborts loudly (never diff the wrong directory).
+            if let dir = cwdFD {
+#if canImport(Glibc)
+                if Glibc.fchdir(dir) != 0 { Glibc._exit(127) }
+#else
+                if Darwin.fchdir(dir) != 0 { Darwin._exit(127) }
+#endif
+            }
             argv.withUnsafeMutableBufferPointer { abuf in
                 envp.withUnsafeMutableBufferPointer { ebuf in
 #if canImport(Glibc)
@@ -864,7 +879,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     private func rgVersionGate(execPath: String) throws {
         let run: BoundedRunResult
         do {
-            run = try runBounded(executablePath: execPath, args: ["--version"], stdoutCap: 4096, stderrCap: 4096, timeout: Self.versionTimeoutSeconds)
+            run = try Self.runBounded(executablePath: execPath, args: ["--version"], stdoutCap: 4096, stderrCap: 4096, timeout: Self.versionTimeoutSeconds)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -1103,7 +1118,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         // non-mutating search via the reducer), never a silent failure.
         let run: BoundedRunResult
         do {
-            run = try runBounded(executablePath: rgExec, args: argv, stdoutCap: Self.maxSearchStdoutBytes, stderrCap: Self.maxSearchStderrBytes, timeout: deadlines.search)
+            run = try Self.runBounded(executablePath: rgExec, args: argv, stdoutCap: Self.maxSearchStdoutBytes, stderrCap: Self.maxSearchStderrBytes, timeout: deadlines.search)
         } catch is CancellationError {
             throw CancellationError()
         } catch let e as ToolFailure {
