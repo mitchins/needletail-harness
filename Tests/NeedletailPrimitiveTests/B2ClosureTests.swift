@@ -387,6 +387,13 @@ struct B2ClosureTests {
             let trapResult = try await trapExec.execute(batch: trapBatch, reservation: Self.makeReservation(batch: trapBatch))
             #expect(trapResult.calls[0].status == "success", "bare .git file must be pruned, not read, got \(trapResult.calls[0])")
             #expect(trapResult.calls[0].data.isEmpty, "no output for pruned bare .git file")
+            // Executor search over the 000 suffix files: bare-name globs
+            // prune them before traversal (success, empty) rather than
+            // failing on EACCES like unpruned rg does.
+            let trapBatchSfx = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"TRAPMARK|TRAP2MARK\"}")])
+            let trapResultSfx = try await trapExec.execute(batch: trapBatchSfx, reservation: Self.makeReservation(batch: trapBatchSfx))
+            #expect(trapResultSfx.calls[0].status == "success", "bare artifact/suffix files must be pruned, got \(trapResultSfx.calls[0])")
+            #expect(trapResultSfx.calls[0].data.isEmpty, "no output for pruned bare artifact files")
         }
         // Legitimate content merely MENTIONING .env/.git is preserved.
         let batch2 = ToolBatch([ToolProposal(callID: "c2", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"mentions\"}")])

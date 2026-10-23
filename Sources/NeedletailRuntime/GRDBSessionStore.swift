@@ -743,16 +743,6 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             throw StoreError.integrity("artifact root is not private: \(root): \(error)")
         }
         let finalPath = try resolveArtifactPath(root: root, name: digest)
-        // Byte-quota preflight (advisory, fail fast, nothing written): same
-        // math as the authoritative check MINUS the reference-row overhead,
-        // so it can only under-count — never a false reject. The exact
-        // authoritative check runs inside the commit transaction.
-        let ref = ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID)
-        let payload = try RecordCodec.encode(DurableRecord.artifactPublished(ref))
-        do {
-            let preSnap = try queue.read { db in try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest) }
-            try checkByteQuotas(preSnap, session: identity.session.raw, payloadBytes: 0, digest: digest, size: Int64(bytes.count))
-        } catch { throw Self.translate(error) }
         // Hold the validated root open for descriptor-relative tmp
         // creation and rename (no pathname TOCTOU between validation and
         // use; a swapped root fails closed at open).
@@ -763,6 +753,35 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             throw StoreError.integrity("artifact root cannot be opened: \(String(cString: strerror(errno)))")
         }
         defer { closeArtifactFD(rootFD) }
+        // Preflight final-file check: a verifying final file means adoption
+        // (no new physical bytes), so exclude it from orphans and skip its
+        // size. Advisory only — the authoritative check re-verifies inside
+        // the commit transaction under the same lock.
+        var preAdopted = false
+        if FileManager.default.fileExists(atPath: finalPath) {
+            let pfd: Int32 = digest.withCString { name in
+                openat(rootFD, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            }
+            if pfd >= 0 {
+                defer { closeArtifactFD(pfd) }
+                var pst = stat()
+                if fstat(pfd, &pst) == 0, (pst.st_mode & S_IFMT) == S_IFREG,
+                   let pdata = try? readBoundedFD(pfd, bound: bytes.count + 1),
+                   pdata.count == bytes.count, artifactSHA256Hex(pdata) == digest {
+                    preAdopted = true
+                }
+            }
+        }
+        // Byte-quota preflight (advisory, fail fast, nothing written): same
+        // math as the authoritative check MINUS the reference-row overhead,
+        // so it can only under-count — never a false reject. The exact
+        // authoritative check runs inside the commit transaction.
+        let ref = ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID)
+        let payload = try RecordCodec.encode(DurableRecord.artifactPublished(ref))
+        do {
+            let preSnap = try queue.read { db in try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest, ignoreEntry: preAdopted ? digest : nil) }
+            try checkByteQuotas(preSnap, session: identity.session.raw, payloadBytes: 0, digest: digest, size: Int64(bytes.count), globalSizeAlreadyCounted: preAdopted)
+        } catch { throw Self.translate(error) }
         // Tmp file, created OUTSIDE the commit transaction but UNDER the
         // artifact lock (no other publisher can race the filesystem), with
         // O_NOFOLLOW so a planted symlink can never redirect it. The commit
@@ -829,8 +848,51 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             guard sessionRows + 1 <= sessionRecordLimit else {
                 throw StoreError.quotaExceeded(limit: sessionRecordLimit)
             }
-            let snap = try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest)
-            try checkByteQuotas(snap, session: identity.session.raw, payloadBytes: Int64(payload.count), digest: digest, size: Int64(bytes.count))
+            // Final-file check FIRST (before the quota snapshot): a verifying
+            // final file means the bytes are already durable — adopt it (no
+            // rename, no second file, no destructive overwrite). The snapshot
+            // then excludes it from orphans and the quota check skips its
+            // size, so adoption never double-counts. A missing file means
+            // this call's tmp provides the bytes; a present-but-wrong file
+            // fails closed without touching it. All opens are
+            // descriptor-relative with O_NOFOLLOW.
+            var adoptedFinal = false
+            if FileManager.default.fileExists(atPath: finalPath) {
+                let fd: Int32 = digest.withCString { name in
+                    openat(rootFD, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                }
+                guard fd >= 0 else {
+                    throw StoreError.integrity("artifact file cannot be opened (symlink?): \(digest)")
+                }
+                defer { closeArtifactFD(fd) }
+                var fileStatus = stat()
+                guard fstat(fd, &fileStatus) == 0,
+                      (fileStatus.st_mode & S_IFMT) == S_IFREG else {
+                    throw StoreError.integrity("artifact path is not a regular file: \(digest)")
+                }
+                let existing: Data
+                do {
+                    existing = try readBoundedFD(fd, bound: bytes.count + 1)
+                } catch let error as StoreError {
+                    throw error
+                } catch {
+                    throw StoreError.integrity("artifact verification failed for digest \(digest): \(error)")
+                }
+                guard existing.count == bytes.count,
+                      artifactSHA256Hex(existing) == digest else {
+                    throw StoreError.integrity("artifact collision at digest \(digest): stored bytes differ")
+                }
+                guard fchmod(fd, mode_t(0o600)) == 0 else {
+                    throw StoreError.integrity("artifact file mode cannot be repaired: \(digest)")
+                }
+                guard fsync(fd) == 0 else {
+                    throw StoreError.integrity("artifact file sync failed: \(digest)")
+                }
+                try syncArtifactDirectory(atPath: root)
+                adoptedFinal = true
+            }
+            let snap = try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest, ignoreEntry: adoptedFinal ? digest : nil)
+            try checkByteQuotas(snap, session: identity.session.raw, payloadBytes: Int64(payload.count), digest: digest, size: Int64(bytes.count), globalSizeAlreadyCounted: adoptedFinal)
             let sessionHasD = snap.sessionHasDigest
             // Re-verify the tmp we wrote (fresh open relative to the held
             // root FD, no-follow, digest). The held root FD pins the
@@ -849,49 +911,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             guard tmpVerified else {
                 throw StoreError.integrity("artifact tmp failed verification for digest \(digest)")
             }
-            // Final-file handling: a verifying final file (opened
-            // descriptor-relative with O_NOFOLLOW, so symlinks fail closed)
-            // means the bytes are already durable — adopt it instead of
-            // renaming (no second file, no destructive overwrite of a
-            // verified file). This covers both the committed-reference case
-            // and the crash-orphan case. A missing file means this call's
-            // tmp provides the bytes; a present-but-wrong file fails closed
-            // without touching it.
-            var provider = true
-            if FileManager.default.fileExists(atPath: finalPath) {
-                let fd: Int32 = digest.withCString { name in
-                    openat(rootFD, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-                }
-                guard fd >= 0 else {
-                    throw StoreError.integrity("artifact file cannot be opened (symlink?): \(digest)")
-                }
-                defer { closeArtifactFD(fd) }
-                var fileStatus = stat()
-                guard fstat(fd, &fileStatus) == 0,
-                      (fileStatus.st_mode & S_IFMT) == S_IFREG else {
-                    throw StoreError.integrity("artifact path is not a regular file: \(digest)")
-                }
-                do {
-                    let existing = try readBoundedFD(fd, bound: bytes.count + 1)
-                    guard existing.count == bytes.count,
-                          artifactSHA256Hex(existing) == digest else {
-                        throw StoreError.integrity("artifact collision at digest \(digest): stored bytes differ")
-                    }
-                } catch let error as StoreError {
-                    throw error
-                } catch {
-                    throw StoreError.integrity("artifact verification failed for digest \(digest): \(error)")
-                }
-                guard fchmod(fd, mode_t(0o600)) == 0 else {
-                    throw StoreError.integrity("artifact file mode cannot be repaired: \(digest)")
-                }
-                guard fsync(fd) == 0 else {
-                    throw StoreError.integrity("artifact file sync failed: \(digest)")
-                }
-                try syncArtifactDirectory(atPath: root)
-                provider = false
-            }
-            if provider {
+            // Adopt-or-provide: the final file was already verified
+            // above (adoptedFinal). If adopted, skip the rename entirely.
+            // Otherwise this call's tmp provides the bytes.
+            if !adoptedFinal {
                 let renameOK: Bool = digest.withCString { newName in
                     tmpName.withCString { tmpC in
                         renameat(rootFD, tmpC, rootFD, newName) == 0
@@ -1182,7 +1205,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         var sessionHasDigest: Bool
     }
 
-    static func snapshotByteQuotas(_ db: Database, artifactsRoot root: String, session: String, digest: String?) throws -> ByteQuotaView {
+    static func snapshotByteQuotas(_ db: Database, artifactsRoot root: String, session: String, digest: String?, ignoreEntry: String? = nil) throws -> ByteQuotaView {
         let logical: Int64? = try Int64.fetchOne(db, sql: "SELECT bytes FROM byte_usage WHERE session = ?", arguments: [session])
         let physicalSum = try Int64.fetchOne(db, sql: "SELECT COALESCE(SUM(size), 0) FROM artifact_physical") ?? 0
         let recordBytes = try Int64.fetchOne(db, sql: "SELECT COALESCE(SUM(length(CAST(payload AS BLOB))), 0) FROM records") ?? 0
@@ -1191,6 +1214,9 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             guard let d: String = row["digest"], let s: Int64 = row["size"] else {
                 throw StoreError.integrity("byte quota hit an unreadable artifact_physical row")
             }
+            if s < 0 {
+                throw StoreError.integrity("byte quota hit a negative artifact_physical size for digest \(d)")
+            }
             physicalRows[d] = s
         }
         var orphanBytes: Int64 = 0
@@ -1198,6 +1224,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             let entries = try FileManager.default.contentsOfDirectory(atPath: root)
             for entry in entries {
                 if entry.hasPrefix(artifactTmpPrefix) { continue }
+                if entry == ignoreEntry { continue }
                 if physicalRows[entry] != nil { continue }
                 if let size = Self.regularFileSize(root: root, entry: entry) {
                     orphanBytes += size
@@ -1293,11 +1320,14 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         return false
     }
 
-    func checkByteQuotas(_ view: ByteQuotaView, session: String, payloadBytes: Int64, digest: String?, size: Int64) throws {
+    func checkByteQuotas(_ view: ByteQuotaView, session: String, payloadBytes: Int64, digest: String?, size: Int64, globalSizeAlreadyCounted: Bool = false) throws {
         // Caller-supplied sizes are untrusted: reject negatives (which
         // would subtract from quotas) before any arithmetic, and use
         // overflow-checked addition so huge values fail closed as quota
         // errors instead of trapping.
+        // `globalSizeAlreadyCounted` covers the verified-adopt case: the
+        // digest's bytes are already durable on disk (and excluded from the
+        // orphan scan), so the global check must not add them again.
         guard size >= 0, payloadBytes >= 0 else {
             throw StoreError.integrity("negative artifact size or payload")
         }
@@ -1317,7 +1347,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             throw StoreError.quotaExceeded(limit: Int(sessionByteLimit))
         }
         var globalAdd = payloadBytes
-        if let d = digest, view.physicalRows[d] == nil {
+        if let d = digest, !globalSizeAlreadyCounted, view.physicalRows[d] == nil {
             let (g2, go) = globalAdd.addingReportingOverflow(size)
             guard !go else {
                 throw StoreError.quotaExceeded(limit: Int(globalByteLimit))

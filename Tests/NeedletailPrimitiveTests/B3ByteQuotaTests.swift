@@ -352,6 +352,28 @@ extension B3ByteQuotaTests {
         }
     }
 
+    @Test("TOOL_appendBatchCommittedSizeMismatch")
+    func appendBatchCommittedSizeMismatch() throws {
+        // Batch referencing a committed digest with a different size fails
+        // closed (exercises the moved committed-row check, not just the
+        // intra-batch check).
+        let (dir, store, session, writer) = try Self.freshStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        try store.claimWriterOwnership(session: session, writer: "w")
+        let digest = String(repeating: "d", count: 64)
+        let committed = ArtifactRef(digest: digest, size: 100, kind: "t", operationID: nil)
+        try store.append(.artifactPublished(committed), as: WriterIdentity(session: session, writer: "w"))
+        #expect(try store.artifactPhysicalForTesting()[digest] == 100)
+        let mismatched = ArtifactRef(digest: digest, size: 200, kind: "t", operationID: nil)
+        do {
+            try store.appendBatch([.artifactPublished(mismatched)], as: WriterIdentity(session: session, writer: "w"))
+            Issue.record("batch against mismatched committed row must fail")
+        } catch let error as StoreError {
+            guard case .integrity = error else { Issue.record("expected integrity, got \(error)"); return }
+        }
+        #expect(try store.artifactPhysicalForTesting()[digest] == 100, "committed row untouched")
+    }
+
     @Test("TOOL_crashOrphanRetrySucceeds")
     func crashOrphanRetrySucceeds() throws {
         // A crash between rename and reference commit leaves the final file.

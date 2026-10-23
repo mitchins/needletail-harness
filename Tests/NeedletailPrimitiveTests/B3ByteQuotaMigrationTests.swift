@@ -187,7 +187,15 @@ struct B3ByteQuotaMigrationTests {
         #expect(r2.physicalRowsRemoved >= 1, "unreferenced+missing row removed, got \(r2)")
         #expect(try store.artifactPhysicalForTesting()[ref.digest] == nil)
         let usage = try store.byteUsageForTesting()
-        #expect((usage[session.raw] ?? 0) < 999999999, "overcount lowered, got \(String(describing: usage[session.raw]))")
+        // The session's only record was deleted: its row is removed entirely.
+        #expect(usage[session.raw] == nil, "overcounted row for emptied session removed, got \(String(describing: usage[session.raw]))")
+        // Idempotent: a second run changes nothing.
+        let physBefore = try store.artifactPhysicalForTesting()
+        let usageBefore = try store.byteUsageForTesting()
+        let r3 = try store.reconcileByteUsage()
+        #expect(r3.physicalRowsAdded == 0 && r3.physicalRowsRemoved == 0 && r3.sessionsSet == usageBefore.count && r3.sessionsRemoved == 0, "second run is a no-op, got \(r3)")
+        #expect(try store.artifactPhysicalForTesting() == physBefore, "physical table byte-identical")
+        #expect(try store.byteUsageForTesting() == usageBefore, "usage table byte-identical")
     }
 
     @Test("TOOL_oldBinaryNewStore")
@@ -334,6 +342,16 @@ struct B3ByteQuotaMigrationTests {
         let holder = try GRDBSessionStore(path: path)
         defer { try? holder.close() }
         #expect(try holder.byteUsageForTesting() == [:], "fresh tables stay empty")
+        // The pre-existing writer claim survives (not dropped by migration):
+        // same writer re-claims idempotently, a different writer is refused.
+        let session = SessionID("s-keep")
+        try holder.claimWriterOwnership(session: session, writer: "w-keep")
+        do {
+            try holder.claimWriterOwnership(session: session, writer: "w-other")
+            Issue.record("a different writer must not steal the preserved claim")
+        } catch let error as StoreError {
+            guard case .alreadyOwned = error else { Issue.record("expected alreadyOwned, got \(error)"); return }
+        }
     }
 
     @Test("TOOL_v2MigrationCreatesIndex")
