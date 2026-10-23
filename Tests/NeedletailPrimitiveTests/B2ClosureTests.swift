@@ -276,6 +276,28 @@ struct B2ClosureTests {
         #expect(long.truncated == true, "single 2 MiB line must trigger the result-byte budget")
         #expect(long.data.utf8.count <= 1 * 1024 * 1024, "returned bytes must respect the budget")
         #expect(long.beforeHash == SHA256.hash(data: Data(longLine.utf8)).map { String(format: "%02x", $0) }.joined(), "hash must cover the full file even when output is budgeted")
+        // Exact budget boundaries (1 MiB cap): a final unterminated line is
+        // charged its bytes only (no phantom newline).
+        let cap = 1 * 1024 * 1024
+        let fitLine = String(repeating: "y", count: cap - 1)
+        try fitLine.write(to: ws.appendingPathComponent("fit.txt"), atomically: true, encoding: .utf8)
+        let fit = try await read("{\"path\":\"fit.txt\"}")
+        #expect(fit.status == "success" && fit.truncated == false, "cap-1 unterminated line fits exactly")
+        #expect(fit.data == fitLine, "exactly-fitting line returned whole")
+        let exactLine = String(repeating: "z", count: cap)
+        try exactLine.write(to: ws.appendingPathComponent("exactcap.txt"), atomically: true, encoding: .utf8)
+        let exactCap = try await read("{\"path\":\"exactcap.txt\"}")
+        #expect(exactCap.status == "success" && exactCap.truncated == false, "cap-sized unterminated line fits (no phantom newline charge)")
+        #expect(exactCap.data == exactLine)
+        let overLine = String(repeating: "w", count: cap + 1)
+        try overLine.write(to: ws.appendingPathComponent("over.txt"), atomically: true, encoding: .utf8)
+        let over = try await read("{\"path\":\"over.txt\"}")
+        #expect(over.status == "success" && over.truncated == true, "cap+1 line must truncate")
+        #expect(over.data == "", "over-budget single line truncates to empty at the line boundary")
+        let fitNL = String(repeating: "v", count: cap - 1) + "\n"
+        try fitNL.write(to: ws.appendingPathComponent("fitnl.txt"), atomically: true, encoding: .utf8)
+        let fitNLRead = try await read("{\"path\":\"fitnl.txt\"}")
+        #expect(fitNLRead.status == "success" && fitNLRead.truncated == false && fitNLRead.data == fitNL, "cap-1 plus newline fits exactly")
     }
 
     // MARK: - 6. Protected pruning by parsed path, legit content preserved
@@ -284,25 +306,37 @@ struct B2ClosureTests {
     func protectedPrune() async throws {
         let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let parent = try Self.tempParent()
-        defer { try? FileManager.default.removeItem(at: parent) }
         let ws = parent.appendingPathComponent("ws")
+        let lockedDir = ws.appendingPathComponent(".git/locked")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lockedDir.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
         try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
         let gitDir = ws.appendingPathComponent(".git")
         try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
         try "GIT_SENTINEL_111\n".write(to: gitDir.appendingPathComponent("config"), atomically: true, encoding: .utf8)
         try "GIT_HEAD_MARKER\n".write(to: gitDir.appendingPathComponent("HEAD"), atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(at: lockedDir, withIntermediateDirectories: true)
+        try "LOCKED_MARKER\n".write(to: lockedDir.appendingPathComponent("secret.txt"), atomically: true, encoding: .utf8)
+        // Unreadable even to the owner: any traversal into locked/ fails the
+        // whole rg run (exit 2). Precise approved targets never descend here.
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: lockedDir.path)
         try "ENV_SECRET_222=1\n".write(to: ws.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
         try "my .env file mentions git config\n".write(to: ws.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
         try "hello normal\n".write(to: ws.appendingPathComponent("normal.txt"), atomically: true, encoding: .utf8)
         let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
         let store = InMemorySessionStore()
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
-        // Protected content pruned without approval.
+        // Protected content pruned without approval — and summaries are
+        // dropped by design (stats would aggregate over traversed files),
+        // so a protected-only search returns exactly empty output.
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"SENTINEL_111|SECRET_222\"}")])
         let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
         #expect(result.calls[0].status == "success")
         #expect(!result.calls[0].data.contains("GIT_SENTINEL_111"), ".git content must be pruned")
         #expect(!result.calls[0].data.contains("ENV_SECRET_222"), ".env content must be pruned")
+        #expect(result.calls[0].data.isEmpty, "protected-only search must return empty output (no summary oracle), got \(result.calls[0].data.prefix(200))")
         // Legitimate content merely MENTIONING .env/.git is preserved.
         let batch2 = ToolBatch([ToolProposal(callID: "c2", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"mentions\"}")])
         let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2))
@@ -325,20 +359,38 @@ struct B2ClosureTests {
         // Counterfactual: without --hidden+--glob pruning, rg DOES see the protected files.
         let (direct, _) = try Self.runDirectRg(realRg, args: ["--hidden", "SENTINEL_111|SECRET_222", ws.path])
         #expect(direct.contains("GIT_SENTINEL_111") && direct.contains("ENV_SECRET_222"), "counterfactual: unpruned rg sees protected files")
-        // Approval relaxes pruning for the approved grantable category only:
-        // .env becomes visible, .git stays pruned.
+        // Approval delivers the approved file itself via an exact FD target
+        // (category globs stay fully armed): .env becomes visible, .git content
+        // is never traversed.
         let batch4 = ToolBatch([ToolProposal(callID: "c4", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"SECRET_222|SENTINEL_111\"}")])
         let result4 = try await exec.execute(batch: batch4, reservation: Self.makeReservation(batch: batch4, approved: [".env"]))
         #expect(result4.calls[0].status == "success")
         #expect(result4.calls[0].data.contains("ENV_SECRET_222"), "approved grantable path must be visible")
         #expect(!result4.calls[0].data.contains("GIT_SENTINEL_111"), "unapproved grantable category must stay pruned")
-        // Per-line classifier enforcement inside a relaxed category: approving
-        // .git/config relaxes .git traversal, but .git/HEAD must still drop.
-        let batch5 = ToolBatch([ToolProposal(callID: "c5", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"GIT_SENTINEL_111|GIT_HEAD_MARKER\"}")])
+        // Approving .git/config must not cause any other .git file to be
+        // opened: traversal stays out (classifier as backstop, not the gate).
+        // The locked/ subtree makes traversal observable: any descent into it
+        // fails the whole rg run (exit 2 → failed), so success proves precise
+        // access. The approved config itself is delivered via its own FD.
+        let batch5 = ToolBatch([ToolProposal(callID: "c5", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"GIT_SENTINEL_111|GIT_HEAD_MARKER|LOCKED_MARKER\"}")])
         let result5 = try await exec.execute(batch: batch5, reservation: Self.makeReservation(batch: batch5, approved: [".git/config"]))
-        #expect(result5.calls[0].status == "success")
+        #expect(result5.calls[0].status == "success", "precise approved access must not touch locked/, got \(result5.calls[0])")
         #expect(result5.calls[0].data.contains("GIT_SENTINEL_111"), "approved .git/config must be visible")
-        #expect(!result5.calls[0].data.contains("GIT_HEAD_MARKER"), "unapproved path inside relaxed category must drop via classifier")
+        #expect(!result5.calls[0].data.contains("GIT_HEAD_MARKER"), "unapproved .git/HEAD must not be visible")
+        #expect(!result5.calls[0].data.contains("LOCKED_MARKER"), "locked subtree must never be read")
+        // Counterfactuals: without hidden-traversal rg never reaches the trap
+        // (exit 1, skips dotfiles); with --hidden but no .git pruning it
+        // descends into locked/ and the whole run fails (exit 2). The trap is
+        // therefore sensitive exactly to traversal, which the executor never
+        // performs for unapproved content.
+        let (_, plainStatus) = try Self.runDirectRg(realRg, args: ["--json", "LOCKED_MARKER", ws.path])
+        #expect(plainStatus == 1, "sanity: default rg skips hidden dirs, got \(plainStatus)")
+        // Root bypasses permission bits, making the trap vacuous there; the
+        // precise-access assertions above hold regardless (globs + classifier).
+        if getuid() != 0 {
+            let (_, hiddenStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "LOCKED_MARKER", ws.path])
+            #expect(hiddenStatus == 2, "counterfactual: unpruned traversal bites the trap, got \(hiddenStatus)")
+        }
     }
 
     // MARK: - 10. Non-UTF-8 paths classified, never bypassed
@@ -383,8 +435,9 @@ struct B2ClosureTests {
         let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
         let store = InMemorySessionStore()
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
-        // Approving .git/config relaxes .git traversal: CONFIGMARK visible,
-        // GHOSTMARK2 (non-UTF-8 name inside grantable, unapproved) dropped.
+        // Approving .git/config delivers it via its own FD (traversal never
+        // relaxes): CONFIGMARK visible, GHOSTMARK2 (non-UTF-8 name inside
+        // grantable, unapproved) dropped by the classifier.
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"CONFIGMARK|GHOSTMARK2|TOPMARK\"}")])
         let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch, approved: [".git/config"]))
         #expect(result.calls[0].status == "success", "bytes-path search must succeed, got \(result.calls[0])")
@@ -615,6 +668,22 @@ struct B2ClosureTests {
             #expect(r.truncated == true, "concurrent runner \(i) output must be bounded")
             #expect(r.data.utf8.count <= 1 * 1024 * 1024, "concurrent runner \(i) respects the cap")
         }
+        // FD ownership: repeated runs must not leak descriptors (each spawn
+        // closes pipe ends, roots and rg FD exactly once). Sample /proc/self/fd
+        // around sequential runs; transient cross-suite FDs are tolerated via
+        // min-of-3, a leak would grow every window.
+        #if canImport(Glibc)
+        func fdCount() -> Int {
+            (try? FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd").count) ?? -1000
+        }
+        var deltas: [Int] = []
+        for _ in 0..<3 {
+            let before = fdCount()
+            for _ in 0..<10 { _ = try await runSearch(fpA) }
+            deltas.append(fdCount() - before)
+        }
+        #expect((deltas.min() ?? 999) <= 2, "FD count must be stable across runs, got deltas \(deltas)")
+        #endif
     }
 
     // MARK: - 14. Hard stop never masks as success; siblings unaffected
@@ -669,6 +738,45 @@ struct B2ClosureTests {
         #expect(ra.status == "failed" && ra.summary.contains("timed out"), "reaped exit-0 with held pipe must be timeout, got \(ra)")
         #expect(rb.status == "failed" && rb.summary.contains("timed out"), "hanging child must be timeout, got \(rb)")
         #expect(rq.status == "success" && rq.data.contains("hello quick"), "quick sibling must be unaffected, got \(rq)")
+    }
+
+    // MARK: - 15. Deadline expiry is sticky past clean exit
+
+    @Test("CLOSURE_15_deadlineSticky", .timeLimit(.minutes(2)))
+    func deadlineSticky() async throws {
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
+        let parent = try Self.tempParent()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ws = parent.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        try "hello late\n".write(to: ws.appendingPathComponent("late.txt"), atomically: true, encoding: .utf8)
+        // Slow probe: ignores TERM, sleeps past the 30 s budget, then execs
+        // real rg which exits 0 with genuine matches. The deadline expiry is
+        // sticky: post-deadline output is never reported as success.
+        let slow = parent.appendingPathComponent("slow.sh")
+        let slowScript = """
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+            echo 'ripgrep 99.0.0'
+            exit 0
+            fi
+            trap '' TERM
+            sleep 32
+            exec \(realRg) "$@"
+            """
+        try slowScript.write(to: slow, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: slow.path)
+        let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: slow.path)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello late\"}")])
+        let start = Date()
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(result.calls[0].status == "failed", "post-deadline exit-0 must be timeout, got \(result.calls[0])")
+        #expect(result.calls[0].summary.contains("timed out"), "timeout must be explicit, got \(result.calls[0])")
+        #expect(result.calls[0].data.isEmpty, "post-deadline output must be suppressed, got \(result.calls[0].data.prefix(200))")
+        #expect(elapsed >= 28 && elapsed < 60, "30 s budget must elapse (plus SIGKILL grace at most), took \(elapsed)s")
     }
 
     // MARK: - 9. artifactId alias pair rejected

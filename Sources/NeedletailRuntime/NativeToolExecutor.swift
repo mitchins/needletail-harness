@@ -443,24 +443,40 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         guard pipe(&fds) == 0 else {
             throw ToolFailure.preDispatch(status: "failed", summary: "rg pipe failed")
         }
-        func lift(_ fd: Int32) -> Int32 {
-            var f = fd
-            while f >= 0 && f <= 2 {
-                let n = fcntl(f, F_DUPFD, 3)
-                if n < 0 { return f }
-                close(f)
-                f = n
+        // Lift above stdio; F_DUPFD failure (EMFILE/EINTR) fails the whole
+        // spawn CLOSED — a low surviving fd would reintroduce stdio aliasing
+        // in the child's dup2 wiring. `cur` always holds exactly the open
+        // FDs (a moved original is closed at move time and replaced), so the
+        // catch below closes each FD exactly once.
+        var cur = fds
+        do {
+            for i in 0..<cur.count {
+                while cur[i] >= 0 && cur[i] <= 2 {
+                    var n: Int32 = -1
+                    var tries = 0
+                    while tries < 2 {
+                        n = fcntl(cur[i], F_DUPFD, 3)
+                        if n >= 0 || errno != EINTR { break }
+                        tries += 1
+                    }
+                    guard n >= 0 else {
+                        throw ToolFailure.preDispatch(status: "failed", summary: "rg pipe failed: dup")
+                    }
+                    close(cur[i])
+                    cur[i] = n
+                }
             }
-            return f
+        } catch {
+            for fd in cur { close(fd) }
+            throw error
         }
-        let owned = [lift(fds[0]), lift(fds[1])]
-        for fd in owned {
+        for fd in cur {
             let fdFlags = fcntl(fd, F_GETFD)
             _ = fcntl(fd, F_SETFD, fdFlags | FD_CLOEXEC)
         }
-        let flags = fcntl(owned[0], F_GETFL)
-        _ = fcntl(owned[0], F_SETFL, flags | O_NONBLOCK)
-        return (owned[0], owned[1])
+        let flags = fcntl(cur[0], F_GETFL)
+        _ = fcntl(cur[0], F_SETFL, flags | O_NONBLOCK)
+        return (cur[0], cur[1])
     }
 
     private func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval) throws -> BoundedRunResult {
@@ -643,8 +659,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 // unknown and the pid must never be signalled (reuse risk).
                 childDone = true
             }
-            if childDone && outEOF && errEOF { break }
+            if childDone && outEOF && errEOF && !deadlineExceeded { break }
             let now = Self.monotonicNanos()
+            // Deadline expiry is sticky and independent of child state: even
+            // a clean exit-0 with EOF observed after the deadline counts as
+            // a timeout (output past the budget is never success).
+            if now >= deadlineNanos { deadlineExceeded = true }
             if Task.isCancelled {
                 cancelled = true
                 break
@@ -797,33 +817,15 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if pattern.isEmpty {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing pattern")
         }
-        // Approval-aware traversal pruning: absolute-denial categories
-        // (.needletail, credentials, artifacts) are ALWAYS pruned (approval can
-        // never grant them); grantable categories (.git/.ssh/.env) are pruned
-        // unless the reservation approves a path inside that category, in
-        // which case ripgrep traverses it and the per-line JSON classifier
-        // below enforces approval exactly (approved subtree visible,
-        // everything else still dropped).
-        var skipGitGlobs = false
-        var skipSshGlobs = false
-        var skipEnvGlobs = false
-        for a in reservation.approvedPaths {
-            let comps = a.split(separator: "/").map(String.init)
-            if comps.contains(".git") { skipGitGlobs = true }
-            if comps.contains(".ssh") { skipSshGlobs = true }
-            if comps.contains(where: { $0 == ".env" || $0.hasPrefix(".env.") }) { skipEnvGlobs = true }
-        }
-        var argv = ["--json", "--no-config", "--hidden", "--max-count", "1000"]
-        if !skipGitGlobs {
-            argv += ["--glob", "!.git/", "--glob", "!**/.git/**"]
-        }
-        if !skipEnvGlobs {
-            argv += ["--glob", "!.env*", "--glob", "!**/.env*"]
-        }
-        if !skipSshGlobs {
-            argv += ["--glob", "!.ssh/", "--glob", "!**/.ssh/**"]
-        }
-        argv += ["--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
+        // Traversal pruning is UNCONDITIONAL: every protected category is
+        // excluded before traversal, whether or not the reservation approves
+        // something inside it. Approved grantable access is delivered not by
+        // relaxing these globs but by resolving each approved grantable path
+        // itself to a held-open FD and passing it as an extra search target
+        // below — so traversal (and hence every open()) is confined to
+        // exactly the approved inodes. The per-line JSON classifier remains as
+        // defense in depth (authorization decision per emitted line).
+        var argv = ["--json", "--no-config", "--hidden", "--max-count", "1000", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
         // Resolve search roots to HELD OPEN directory FDs and pass only
         // /proc/self/fd paths to ripgrep. The FDs stay open (cloexec cleared so
         // the child inherits them) across process launch: ripgrep traverses
@@ -838,6 +840,15 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         func holdRootFD(_ fd: Int32) -> String {
             // Child must inherit this FD so /proc/self/fd/<fd> resolves inside
             // ripgrep after exec; clear FD_CLOEXEC (set by openRelative).
+            // Concurrency note: these read-only directory/file FDs (and the
+            // qualified rg FD) are intentionally inheritable, so a concurrent
+            // runner's child also inherits them. That is safe by construction:
+            // (a) pipe write ends are CLOEXEC under spawnLock, so no foreign
+            // child can hold our pipes open and EOF stays observable; (b) an
+            // inherited FD alone grants no traversal — the child only walks
+            // argv paths, and every emitted line still passes the per-path
+            // classifier; (c) all held FDs are closed here exactly once via
+            // the defer below after the child is reaped.
             _ = fcntl(fd, F_SETFD, 0)
             heldRootFDs.append(fd)
             return Self.fdProcPath(fd)
@@ -899,6 +910,22 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
             if roots.isEmpty {
                 throw ToolFailure.preDispatch(status: "denied", summary: "no valid search root")
+            }
+        }
+        // Precise approved access: for each grantable approval NOT already
+        // covered by an explicitly requested search root, resolve the approved
+        // path itself (dir first, then regular file; symlinks and special
+        // files fail closed) and pass its held-open FD as an extra target.
+        // Because the category globs above stay fully armed, traversal from
+        // the broad roots never enters grantable content; ripgrep opens only
+        // the approved inodes via these FD targets (an open file FD reports
+        // as the bare /proc/self/fd path, mapped back via its logical base).
+        let explicitBase: String? = (json["path"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        for approved in reservation.approvedPaths {
+            guard ToolValidator.protectedClassification(for: approved) == .grantable else { continue }
+            if let base = explicitBase, approved == base || approved.hasPrefix(base + "/") { continue }
+            if let fd = openApprovedTarget(approved) {
+                roots.append((holdRootFD(fd), approved))
             }
         }
         for r in roots {
@@ -1071,6 +1098,37 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
         }
         return false
+    }
+
+    /// Resolve one approved grantable path to a held-open FD for use as an
+    /// exact search target (caller takes ownership via holdRootFD). Directory
+    /// first, then regular file; symlinks, missing paths and special files
+    /// fail closed (nil). Workspace is tried before read roots.
+    private func openApprovedTarget(_ approved: String) -> Int32? {
+        func attempt(from dirFD: Int32) -> Int32? {
+            if let fd = try? resolver.openRelative(approved, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) {
+                return fd
+            }
+            if let fd = try? resolver.openRelative(approved, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC) {
+                return fd
+            }
+            return nil
+        }
+        if resolver.workspaceRoot != nil {
+            do {
+                let dirFD = try resolver.validatedWorkspaceFD()
+                defer { close(dirFD) }
+                if let fd = attempt(from: dirFD) { return fd }
+            } catch {}
+        }
+        for rr in resolver.readRoots {
+            do {
+                let dirFD = try resolver.revalidatedFD(for: rr)
+                defer { close(dirFD) }
+                if let fd = attempt(from: dirFD) { return fd }
+            } catch { continue }
+        }
+        return nil
     }
 
     private func edit(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
