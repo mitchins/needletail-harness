@@ -208,11 +208,11 @@ struct TOOL09OrderedBatchTests {
         defer { try? FileManager.default.removeItem(at: dbDir) }
         let store = try GRDBSessionStore(path: dbDir.appendingPathComponent("store.sqlite").path)
         let session = SessionID("s-tool09")
-        let gate = DispatchSemaphore(value: 0)
         let enteredBox = LockedBox()
+        let release = AsyncRelease()
         let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
         let gated = NativeToolExecutor(resolver: resolver, store: store, sessionID: session, writer: WriterIdentity(session: session, writer: "tool09-w"),
-            preCallSuspension: { _ in enteredBox.note(); gate.wait() })
+            preCallSuspension: { _ in enteredBox.note(); await release.wait() })
         let transport = T09Transport()
         let batch = [
             ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: Self.writeArgs("b.txt", "new file\n")),
@@ -231,7 +231,7 @@ struct TOOL09OrderedBatchTests {
         let preIntents = Self.intents(preLog)
         #expect(Set(preIntents.map(\.callID)) == ["c1", "c2", "c3"], "all three intents durable before any effect, got \(preIntents)")
         #expect(!FileManager.default.fileExists(atPath: ws.appendingPathComponent("b.txt").path), "no effect before intent commit")
-        gate.signal(); gate.signal(); gate.signal()
+        release.release()
         try await Self.awaitState(actor, { Self.isDone($0) }, "run completed")
         #expect(transport.invocations.count == 2, "continuation proceeded to the provider")
 
@@ -274,6 +274,34 @@ struct TOOL09OrderedBatchTests {
         private var _value = false
         var value: Bool { lock.withLock { _value } }
         func note() { lock.withLock { _value = true } }
+    }
+
+    /// Async release gate: never blocks a thread (production seams forbid
+    /// synchronous blocking inside the deadline race — a blocked group
+    /// child stalls group progress in this toolchain).
+    final class AsyncRelease: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var open = false
+        func wait() async {
+            if lock.withLock({ open }) { return }
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                let alreadyOpen: Bool = lock.withLock {
+                    if open { return true }
+                    continuation = c
+                    return false
+                }
+                if alreadyOpen { c.resume() }
+            }
+        }
+        func release() {
+            let c: CheckedContinuation<Void, Never>? = lock.withLock {
+                open = true
+                defer { continuation = nil }
+                return continuation
+            }
+            c?.resume()
+        }
     }
 
     private struct T09Run<E: ToolExecutor> {

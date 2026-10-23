@@ -110,12 +110,14 @@ per batch, calls executed sequentially in order):
   statuses). `data` is MANDATORY (may be `""` only with an `error`
   explaining absence): read/search carry content/results; edit/write
   carry the machine-readable receipt (path/mode/before/after
-  hashes, per B4 below). `mutating` is NOT a per-call wire field:
-  the reducer derives it per proposal with the same predicate
-  used at dispatch (`tool != read/search/consult`), so there is
-  exactly one classification rule and no executor-attested
-  divergence is possible; intent/result agreement is checked
-  per call by the existing reconciler. `started: Bool? = nil` is the machine-readable dispatch bit
+   hashes, per B4 below). `mutating: Bool? = nil` IS a per-call wire
+   field (B4): the executor attests its own classification per call;
+   nil (legacy/scripted) falls back to the reducer's per-proposal
+   derivation with the same predicate used at dispatch
+   (`tool != read/search/consult`), and a non-nil attestation MUST
+   agree with the intent or the result is failed closed
+   (unknown+hold); intent/result agreement is checked per call by
+   the existing reconciler. `started: Bool? = nil` is the machine-readable dispatch bit
   (the executor sets false for never-dispatched calls, true
   once dispatched; the reducer keys on IT, never on summary
   prose). A missing key decodes as nil under synthesized Codable
