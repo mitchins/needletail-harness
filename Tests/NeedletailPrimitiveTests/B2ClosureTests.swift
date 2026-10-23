@@ -325,6 +325,10 @@ struct B2ClosureTests {
         try "ENV_SECRET_222=1\n".write(to: ws.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
         try "my .env file mentions git config\n".write(to: ws.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
         try "hello normal\n".write(to: ws.appendingPathComponent("normal.txt"), atomically: true, encoding: .utf8)
+        let subDir = ws.appendingPathComponent("sub")
+        try FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
+        try "SUB_SECRET=1\n".write(to: subDir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+        try "hello sub\n".write(to: subDir.appendingPathComponent("notes2.txt"), atomically: true, encoding: .utf8)
         let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
         let store = InMemorySessionStore()
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
@@ -378,6 +382,29 @@ struct B2ClosureTests {
         #expect(result5.calls[0].data.contains("GIT_SENTINEL_111"), "approved .git/config must be visible")
         #expect(!result5.calls[0].data.contains("GIT_HEAD_MARKER"), "unapproved .git/HEAD must not be visible")
         #expect(!result5.calls[0].data.contains("LOCKED_MARKER"), "locked subtree must never be read")
+        // Covered-root grantable descendant (regression): explicit sub/ search
+        // prunes .env via globs, so the approved sub/.env must arrive via its
+        // own target — skipping it would be a fail-closed false negative.
+        let batch6 = ToolBatch([ToolProposal(callID: "c6", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"SUB_SECRET|hello sub\",\"path\":\"sub\"}")])
+        let result6 = try await exec.execute(batch: batch6, reservation: Self.makeReservation(batch: batch6, approved: ["sub/.env"]))
+        #expect(result6.calls[0].status == "success", "approved grantable under explicit root must be visible, got \(result6.calls[0])")
+        #expect(result6.calls[0].data.contains("SUB_SECRET"), "approved sub/.env visible despite glob pruning")
+        #expect(result6.calls[0].data.contains("hello sub"), "unprotected subtree content still visible")
+        // Read-root fallback: an approval absent from the workspace resolves
+        // from the read root instead of vanishing.
+        let ws2 = parent.appendingPathComponent("ws2")
+        let rr = parent.appendingPathComponent("rr")
+        try FileManager.default.createDirectory(at: ws2, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: rr.appendingPathComponent("g"), withIntermediateDirectories: true)
+        try "hello base\n".write(to: ws2.appendingPathComponent("base.txt"), atomically: true, encoding: .utf8)
+        try "RR_SECRET=1\n".write(to: rr.appendingPathComponent("g/.env"), atomically: true, encoding: .utf8)
+        let resolver2 = try WorkspaceResolver(workspace: FilePath(ws2.path), readRoots: [FilePath(rr.path)])
+        let exec2 = NativeToolExecutor(resolver: resolver2, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
+        let batch7 = ToolBatch([ToolProposal(callID: "c7", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"RR_SECRET|hello base\"}")])
+        let result7 = try await exec2.execute(batch: batch7, reservation: Self.makeReservation(batch: batch7, approved: ["g/.env"]))
+        #expect(result7.calls[0].status == "success", "read-root approval must resolve, got \(result7.calls[0])")
+        #expect(result7.calls[0].data.contains("RR_SECRET"), "approved read-root grantable visible")
+        #expect(result7.calls[0].data.contains("hello base"), "workspace content still visible")
         // Counterfactuals: without hidden-traversal rg never reaches the trap
         // (exit 1, skips dotfiles); with --hidden but no .git pruning it
         // descends into locked/ and the whole run fails (exit 2). The trap is

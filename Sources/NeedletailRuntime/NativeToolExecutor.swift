@@ -402,6 +402,17 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             close(fd)
             throw ToolFailure.preDispatch(status: "denied", summary: "rg is not executable")
         }
+        // Lift above stdio (kept inheritable: script interpreters re-open
+        // the /proc/self/fd path after exec). Failure fails closed.
+        if fd >= 0 && fd <= 2 {
+            let n = fcntl(fd, F_DUPFD, 3)
+            guard n >= 0 else {
+                close(fd)
+                throw ToolFailure.preDispatch(status: "denied", summary: "rg fd lift failed")
+            }
+            close(fd)
+            return n
+        }
         return fd
     }
 
@@ -659,12 +670,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 // unknown and the pid must never be signalled (reuse risk).
                 childDone = true
             }
-            if childDone && outEOF && errEOF && !deadlineExceeded { break }
             let now = Self.monotonicNanos()
-            // Deadline expiry is sticky and independent of child state: even
-            // a clean exit-0 with EOF observed after the deadline counts as
-            // a timeout (output past the budget is never success).
+            // Deadline expiry is sticky and independent of child state: it is
+            // evaluated BEFORE any success break, so a clean exit-0 whose EOF
+            // is first observed after the deadline still counts as a timeout
+            // (output past the budget is never success). A success break is
+            // only valid while the deadline has not expired.
             if now >= deadlineNanos { deadlineExceeded = true }
+            if childDone && outEOF && errEOF && !deadlineExceeded { break }
             if Task.isCancelled {
                 cancelled = true
                 break
@@ -825,7 +838,16 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         // below — so traversal (and hence every open()) is confined to
         // exactly the approved inodes. The per-line JSON classifier remains as
         // defense in depth (authorization decision per emitted line).
-        var argv = ["--json", "--no-config", "--hidden", "--max-count", "1000", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--", pattern]
+        // Unconditional traversal pruning. Bare-name forms are included
+        // alongside dir forms so a regular FILE named exactly .git/.ssh/
+        // .needletail/credentials is also pruned before traversal (a file so
+        // named is still classified grantable/absolute-denied at the output
+        // layer, and an approved one is delivered via its own FD target whose
+        // /proc/self/fd path contains no protected name). Substring-style
+        // artifact globs are deliberately NOT added: classification denies
+        // only exact/suffixed components, and a broad *artifacts* glob would
+        // wrongly prune legitimate names with no approval recourse.
+        var argv = ["--json", "--no-config", "--hidden", "--max-count", "1000", "--glob", "!.git/", "--glob", "!**/.git/**", "--glob", "!.git", "--glob", "!.env*", "--glob", "!**/.env*", "--glob", "!.ssh/", "--glob", "!**/.ssh/**", "--glob", "!.ssh", "--glob", "!.needletail/", "--glob", "!**/.needletail/**", "--glob", "!.needletail", "--glob", "!*artifacts*/", "--glob", "!**/*artifacts*/**", "--glob", "!.credentials/", "--glob", "!**/.credentials/**", "--glob", "!.credentials", "--glob", "!credentials/", "--glob", "!**/credentials/**", "--glob", "!credentials", "--", pattern]
         // Resolve search roots to HELD OPEN directory FDs and pass only
         // /proc/self/fd paths to ripgrep. The FDs stay open (cloexec cleared so
         // the child inherits them) across process launch: ripgrep traverses
@@ -837,21 +859,39 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var heldRootFDs: [Int32] = []
         defer { for fd in heldRootFDs { close(fd) } }
         var roots: [(proc: String, logicalBase: String)] = []
-        func holdRootFD(_ fd: Int32) -> String {
+        // Domain identity for approval resolution: -1 = workspace, otherwise
+        // the readRoots index. Approvals resolve from the same domain first
+        // so an explicit read-root scope never shows a workspace twin.
+        var explicitDomain: Int? = nil
+        func holdRootFD(_ fd: Int32) throws -> String {
             // Child must inherit this FD so /proc/self/fd/<fd> resolves inside
             // ripgrep after exec; clear FD_CLOEXEC (set by openRelative).
-            // Concurrency note: these read-only directory/file FDs (and the
-            // qualified rg FD) are intentionally inheritable, so a concurrent
-            // runner's child also inherits them. That is safe by construction:
-            // (a) pipe write ends are CLOEXEC under spawnLock, so no foreign
-            // child can hold our pipes open and EOF stays observable; (b) an
-            // inherited FD alone grants no traversal — the child only walks
-            // argv paths, and every emitted line still passes the per-path
-            // classifier; (c) all held FDs are closed here exactly once via
-            // the defer below after the child is reaped.
-            _ = fcntl(fd, F_SETFD, 0)
-            heldRootFDs.append(fd)
-            return Self.fdProcPath(fd)
+            // Lift above stdio first: with stdio closed a held FD could land
+            // on 1/2 and be clobbered by the child's dup2 wiring. Lift failure
+            // (EMFILE) fails closed; the original is closed exactly once on
+            // either path. Concurrency note: these read-only directory/file
+            // FDs (and the qualified rg FD) are intentionally inheritable, so
+            // a concurrent runner's child also inherits them. That is safe by
+            // construction: (a) pipe write ends are CLOEXEC under spawnLock,
+            // so no foreign child can hold our pipes open and EOF stays
+            // observable; (b) an inherited FD alone grants no traversal —
+            // the child only walks argv paths, and every emitted line still
+            // passes the per-path classifier; (c) all held FDs are closed
+            // here exactly once via the defer below after the child is
+            // reaped.
+            var f = fd
+            if f >= 0 && f <= 2 {
+                let n = fcntl(f, F_DUPFD, 3)
+                guard n >= 0 else {
+                    close(f)
+                    throw ToolFailure.preDispatch(status: "failed", summary: "fd lift failed")
+                }
+                close(f)
+                f = n
+            }
+            _ = fcntl(f, F_SETFD, 0)
+            heldRootFDs.append(f)
+            return Self.fdProcPath(f)
         }
         if let searchPath = json["path"] as? String, !searchPath.isEmpty {
             let cls = ToolValidator.protectedClassification(for: searchPath)
@@ -867,19 +907,25 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     let dirFD = try resolver.validatedWorkspaceFD()
                     defer { close(dirFD) }
                     let fd = try resolver.openRelative(searchPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                    roots.append((holdRootFD(fd), searchPath))
+                    roots.append((try holdRootFD(fd), searchPath))
                     found = true
+                    explicitDomain = -1
+                } catch let e as ToolFailure {
+                    throw e
                 } catch {}
             }
             if !found {
-                for rr in resolver.readRoots {
+                for (i, rr) in resolver.readRoots.enumerated() {
                     do {
                         let dirFD = try resolver.revalidatedFD(for: rr)
                         defer { close(dirFD) }
                         let fd = try resolver.openRelative(searchPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                        roots.append((holdRootFD(fd), searchPath))
+                        roots.append((try holdRootFD(fd), searchPath))
                         found = true
+                        explicitDomain = i
                         break
+                    } catch let e as ToolFailure {
+                        throw e
                     } catch { continue }
                 }
             }
@@ -893,7 +939,9 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             if resolver.workspaceRoot != nil {
                 do {
                     let fd = try resolver.validatedWorkspaceFD()
-                    roots.append((holdRootFD(fd), ""))
+                    roots.append((try holdRootFD(fd), ""))
+                } catch let e as ToolFailure {
+                    throw e
                 } catch {
                     throw ToolFailure.preDispatch(status: "denied", summary: "workspace root replaced")
                 }
@@ -901,7 +949,9 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             for rr in resolver.readRoots {
                 do {
                     let fd = try resolver.revalidatedFD(for: rr)
-                    roots.append((holdRootFD(fd), ""))
+                    roots.append((try holdRootFD(fd), ""))
+                } catch let e as ToolFailure {
+                    throw e
                 } catch {
                     // A replaced read-root fails closed individually; others
                     // still constrain the search to pinned directories.
@@ -912,20 +962,28 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 throw ToolFailure.preDispatch(status: "denied", summary: "no valid search root")
             }
         }
-        // Precise approved access: for each grantable approval NOT already
-        // covered by an explicitly requested search root, resolve the approved
-        // path itself (dir first, then regular file; symlinks and special
-        // files fail closed) and pass its held-open FD as an extra target.
-        // Because the category globs above stay fully armed, traversal from
-        // the broad roots never enters grantable content; ripgrep opens only
-        // the approved inodes via these FD targets (an open file FD reports
-        // as the bare /proc/self/fd path, mapped back via its logical base).
+        // Precise approved access: every grantable approval except the exact
+        // explicit root gets its own held-open FD target. Approvals deliberately
+        // expand the search beyond an explicit path: the unconditioned globs
+        // above would otherwise prune an approved grantable descendant of the
+        // explicit root (fail-closed false negative), and only an exact root
+        // is already fully covered by traversal. Unprotected approvals need
+        // no target (broad roots already show them); absolute-denied
+        // approvals are never granted.
         let explicitBase: String? = (json["path"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        var domainOrder: [Int] = []
+        if let ed = explicitDomain { domainOrder.append(ed) }
+        domainOrder.append(-1)
+        for i in resolver.readRoots.indices where !domainOrder.contains(i) { domainOrder.append(i) }
         for approved in reservation.approvedPaths {
             guard ToolValidator.protectedClassification(for: approved) == .grantable else { continue }
-            if let base = explicitBase, approved == base || approved.hasPrefix(base + "/") { continue }
-            if let fd = openApprovedTarget(approved) {
-                roots.append((holdRootFD(fd), approved))
+            if let base = explicitBase, approved == base { continue }
+            do {
+                if let fd = try openApprovedTarget(approved, domainOrder: domainOrder) {
+                    roots.append((try holdRootFD(fd), approved))
+                }
+            } catch {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "approved target unavailable", data: "", error: "resource exhaustion", started: true)
             }
         }
         for r in roots {
@@ -983,12 +1041,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// ".git"/".env" in ordinary files is preserved: only the actual file
     /// path is classified, never the match text.
     ///
-    /// Enforcement model: argv globs prune unapproved categories BEFORE
-    /// traversal; approval relaxes traversal for that category only; this
-    /// per-line classifier is the authorization decision point for every
-    /// emitted line. Traversal of an unapproved file inside a relaxed
-    /// category opens it to rg's matcher but discloses nothing: no line for
-    /// it is ever emitted, and summaries are withheld.
+    /// Enforcement model: argv globs prune protected categories BEFORE
+    /// traversal, unconditionally. Approved grantable paths are delivered as
+    /// their own held-open FD targets (never by relaxing the globs), so
+    /// traversal never enters unapproved grantable content. This per-line
+    /// classifier remains as defense in depth: the authorization decision
+    /// point for every emitted line. Summaries are withheld.
     static func filterSearchJSON(_ output: Data, roots: [(proc: String, logicalBase: String)], approvedPaths: [String]) -> (String, Bool) {
         guard !output.isEmpty else { return ("", false) }
         let text = String(decoding: output, as: UTF8.self)
@@ -1103,32 +1161,57 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// Resolve one approved grantable path to a held-open FD for use as an
     /// exact search target (caller takes ownership via holdRootFD). Directory
     /// first, then regular file; symlinks, missing paths and special files
-    /// fail closed (nil). Workspace is tried before read roots.
-    private func openApprovedTarget(_ approved: String) -> Int32? {
+    /// fail closed (nil). Domains are tried in the caller-supplied order
+    /// (explicit search domain first). Resource exhaustion (EMFILE/ENFILE)
+    /// throws instead of returning nil so an unavailable approved target is
+    /// reported as a failure rather than silently skipped like a missing path.
+    private func openApprovedTarget(_ approved: String, domainOrder: [Int]) throws -> Int32? {
+        var resourceHit = false
         func attempt(from dirFD: Int32) -> Int32? {
-            if let fd = try? resolver.openRelative(approved, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) {
-                return fd
+            do {
+                return try resolver.openRelative(approved, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            } catch {
+                if Self.isResourceError(error) { resourceHit = true }
             }
-            if let fd = try? resolver.openRelative(approved, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC) {
-                return fd
+            do {
+                return try resolver.openRelative(approved, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            } catch {
+                if Self.isResourceError(error) { resourceHit = true }
             }
             return nil
         }
-        if resolver.workspaceRoot != nil {
-            do {
-                let dirFD = try resolver.validatedWorkspaceFD()
-                defer { close(dirFD) }
-                if let fd = attempt(from: dirFD) { return fd }
-            } catch {}
+        for domain in domainOrder {
+            if domain == -1 {
+                guard resolver.workspaceRoot != nil else { continue }
+                do {
+                    let dirFD = try resolver.validatedWorkspaceFD()
+                    defer { close(dirFD) }
+                    if let fd = attempt(from: dirFD) { return fd }
+                } catch {
+                    if Self.isResourceError(error) { resourceHit = true }
+                    continue
+                }
+            } else if domain >= 0 && domain < resolver.readRoots.count {
+                do {
+                    let dirFD = try resolver.revalidatedFD(for: resolver.readRoots[domain])
+                    defer { close(dirFD) }
+                    if let fd = attempt(from: dirFD) { return fd }
+                } catch {
+                    if Self.isResourceError(error) { resourceHit = true }
+                    continue
+                }
+            }
         }
-        for rr in resolver.readRoots {
-            do {
-                let dirFD = try resolver.revalidatedFD(for: rr)
-                defer { close(dirFD) }
-                if let fd = attempt(from: dirFD) { return fd }
-            } catch { continue }
+        if resourceHit {
+            throw ToolFailure.preDispatch(status: "failed", summary: "approved target unavailable: resource exhaustion")
         }
         return nil
+    }
+
+    static func isResourceError(_ error: Error) -> Bool {
+        // openat/fstat surface errno via strerror in StoreError messages.
+        let s = "\(error)"
+        return s.contains("Too many open files")
     }
 
     private func edit(callID: String, json: [String: Any]) throws -> ToolCallOutcome {
