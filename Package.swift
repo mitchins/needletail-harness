@@ -68,7 +68,13 @@ let package = Package(
         ),
         .target(
             name: "NeedletailTestSupport",
-            dependencies: ["NeedletailCore"]
+            dependencies: [
+                "NeedletailCore",
+                // B3-A: InMemorySessionStore.publishArtifact needs SHA-256
+                // (same swift-crypto edge as production targets; no new
+                // resolved package).
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
         ),
         .target(
             name: "NeedletailPresentation",

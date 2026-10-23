@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import NeedletailCore
 
@@ -139,16 +140,47 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
+    /// B3-A scripted publication mirror: same contract as the GRDB publication
+    /// (fencing, non-empty kind/bytes, 32 MiB cap, content-addressed dedup,
+    /// per-session reference row). Bytes live in a dict (no filesystem).
+    public static let artifactByteLimit = 32 * 1024 * 1024
+
+    private var artifactBytes: [String: Data] = [:]
+
+    public func publishArtifact(session: SessionID, as identity: WriterIdentity, kind: String, operationID: OperationID?, bytes: Data) throws -> ArtifactRef {
+        try lock.withLock {
+            guard session == identity.session else {
+                throw StoreError.integrity("publish session/identity mismatch")
+            }
+            guard let owner = claims[identity.session.raw], owner == identity.writer else {
+                throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+            }
+            guard !kind.isEmpty else {
+                throw StoreError.integrity("artifact kind must not be empty")
+            }
+            guard !bytes.isEmpty else {
+                throw StoreError.integrity("artifact bytes must not be empty")
+            }
+            guard bytes.count <= Self.artifactByteLimit else {
+                throw StoreError.quotaExceeded(limit: Self.artifactByteLimit)
+            }
+            let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            if artifactBytes[digest] == nil {
+                artifactBytes[digest] = bytes
+            }
+            sequence += 1
+            log.append(SequencedRecord(sequence: SequenceNumber(sequence),
+                                       record: .artifactPublished(ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID))))
+            sessions.append(identity.session.raw)
+            return ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID)
+        }
+    }
+
     public func artifactRecord(session: SessionID, digest: String) throws -> Data? {
-        // For InMemory, check log for artifactPublished for this session with digest
-        // Note: InMemory doesn't store artifact bytes, so we return nil (not found) for now
-        // B2 tests using GRDB will use the real store; InMemory artifact reads are not covered
         return try lock.withLock {
             for (idx, rec) in log.enumerated() where sessions[idx] == session.raw {
                 if case .artifactPublished(let ref) = rec.record, ref.digest == digest {
-                    // InMemory doesn't have file storage, so we can't return bytes
-                    // Return nil to indicate not found (will be denied)
-                    return nil
+                    return artifactBytes[digest]
                 }
             }
             return nil

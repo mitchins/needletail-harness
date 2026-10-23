@@ -223,6 +223,10 @@ public struct Acknowledgment: Sendable, Equatable, Codable {
 public protocol SessionStore: Sendable {
     /// Artifact lookup for B2: returns the artifact bytes for `digest` iff an `artifactPublished` row for `session` names that digest.
     func artifactRecord(session: SessionID, digest: String) throws -> Data?
+    /// Artifact publication for B3 (preimages, exec outputs): fenced,
+    /// content-addressed, dedup-aware. The default refuses closed so only
+    /// conformances with a real mechanism (GRDB, scripted InMemory) publish.
+    func publishArtifact(session: SessionID, as identity: WriterIdentity, kind: String, operationID: OperationID?, bytes: Data) throws -> ArtifactRef
     /// FENCED durable append: implementations validate, INSIDE the
     /// mutation's own transaction, that `identity.writer` currently owns
     /// `identity.session`. A stale writer (never claimed, superseded, or
@@ -274,6 +278,13 @@ public protocol SessionStore: Sendable {
 
 extension SessionStore {
     public func artifactRecord(session: SessionID, digest: String) throws -> Data? { nil }
+
+    /// Default publication refusal: stores without a fenced content-addressed
+    /// mechanism fail closed rather than half-publish.
+    public func publishArtifact(session: SessionID, as identity: WriterIdentity, kind: String, operationID: OperationID?, bytes: Data) throws -> ArtifactRef {
+        _ = session; _ = identity; _ = kind; _ = operationID; _ = bytes
+        throw StoreError.integrity("artifact publication is not supported by this store")
+    }
 
     /// Default sequential batch (NO atomicity claim): diagnostic-only
     /// conformances inherit this. Durable paths must override.

@@ -310,7 +310,9 @@ public enum ToolValidator {
     }
 
     private static func validateWrite(callID: String, json: [String: Any], raw: String) throws -> ValidatedToolCall {
-        let allowed: Set<String> = ["path", "content"]
+        // B3: create_new is exclusive; replacement is authorized ONLY by an
+        // expectedHash over the exact current bytes (same contract as edit).
+        let allowed: Set<String> = ["path", "content", "expectedHash"]
         for key in json.keys where !allowed.contains(key) {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown field \(key) for write \(callID)")
         }
@@ -327,6 +329,12 @@ public enum ToolValidator {
         let s = content as! String
         if s.utf8.count > 32*1024*1024 { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "content too large") }
         if s.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "content contains NUL") }
+        if let expectedHash = json["expectedHash"] {
+            guard let h = expectedHash as? String,
+                  h.utf8.count == 64, h.allSatisfy({ $0.isHexDigit }) else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "expectedHash must be 64 hex for write \(callID)")
+            }
+        }
         return ValidatedToolCall(callID: callID, tool: "write", paths: [path], isMutating: true, rawArguments: raw)
     }
 
