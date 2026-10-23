@@ -149,9 +149,13 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 }
                 if !userTables.isEmpty && userTables == Set(Self.declaredShape.keys) {
                     // Unversioned file that already has the full current
-                    // shape: validate it and stamp it, without dropping any
-                    // writer claims through the versioned path.
+                    // shape: validate it, ensure the session index (a v0
+                    // file may predate it), and stamp it — without dropping
+                    // any writer claims through the versioned path.
                     try Self.assertSchemaShape(db)
+                    try db.execute(sql: """
+                        CREATE INDEX IF NOT EXISTS records_session ON records(session, seq)
+                        """)
                     try db.execute(sql: "PRAGMA user_version = \(Self.schemaVersion)")
                     return
                 }
@@ -711,7 +715,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         // still fails closed).
         do {
             let fsPath = URL(fileURLWithPath: path).deletingLastPathComponent().path
-            if let free = Self.freeBytesAvailable(atPath: fsPath), free < UInt64(freeSpaceReserve) {
+            guard freeSpaceReserve >= 0 else {
+                throw StoreError.integrity("negative free-space reserve")
+            }
+            if let free = Self.freeBytesAvailable(atPath: fsPath), free < UInt64(bitPattern: freeSpaceReserve) {
                 throw StoreError.quotaExceeded(limit: Int(freeSpaceReserve))
             }
         }
@@ -754,9 +761,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         }
         defer { closeArtifactFD(rootFD) }
         // Preflight final-file check: a verifying final file means adoption
-        // (no new physical bytes), so exclude it from orphans and skip its
-        // size. Advisory only — the authoritative check re-verifies inside
-        // the commit transaction under the same lock.
+        // (no new physical bytes), so skip its size (the orphan scan still
+        // counts it — exactly once either way). Advisory only — the
+        // authoritative check re-verifies inside the commit transaction
+        // under the same lock.
         var preAdopted = false
         if FileManager.default.fileExists(atPath: finalPath) {
             let pfd: Int32 = digest.withCString { name in
@@ -850,9 +858,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             }
             // Final-file check FIRST (before the quota snapshot): a verifying
             // final file means the bytes are already durable — adopt it (no
-            // rename, no second file, no destructive overwrite). The snapshot
-            // then excludes it from orphans and the quota check skips its
-            // size, so adoption never double-counts. A missing file means
+            // rename, no second file, no destructive overwrite). The quota
+            // check then skips its size (globalSizeAlreadyCounted) while the
+            // snapshot still counts it as an orphan if unreferenced, so the
+            // bytes are counted exactly once either way. A missing file means
             // this call's tmp provides the bytes; a present-but-wrong file
             // fails closed without touching it. All opens are
             // descriptor-relative with O_NOFOLLOW.
@@ -923,8 +932,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 guard renameOK else {
                     throw StoreError.integrity("artifact rename failed: \(String(cString: strerror(errno)))")
                 }
-                try syncArtifactDirectory(atPath: root)
+                // Mark immediately after a successful rename so that even a
+                // subsequent dirsync failure still cleans up this call's file.
                 didRename = true
+                try syncArtifactDirectory(atPath: root)
             }
             try commitRecordBytes(db, session: identity.session.raw, payload: payload, digest: digest, size: Int64(bytes.count), sessionHasDigest: sessionHasD)
         } } catch {
@@ -1242,7 +1253,11 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 if entry.hasPrefix(artifactTmpPrefix) { continue }
                 if physicalRows[entry] != nil { continue }
                 if let size = Self.regularFileSize(root: root, entry: entry) {
-                    orphanBytes += size
+                    let (nb, no) = orphanBytes.addingReportingOverflow(size)
+                    guard !no else {
+                        throw StoreError.integrity("byte ledger totals overflowed")
+                    }
+                    orphanBytes = nb
                 }
             }
         }
@@ -1348,9 +1363,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         // would subtract from quotas) before any arithmetic, and use
         // overflow-checked addition so huge values fail closed as quota
         // errors instead of trapping.
-        // `globalSizeAlreadyCounted` covers the verified-adopt case: the
-        // digest's bytes are already durable on disk (and excluded from the
-        // orphan scan), so the global check must not add them again.
+    // `globalSizeAlreadyCounted` covers the verified-adopt case: the
+    // digest's bytes are already durable on disk (and still counted by the
+    // orphan scan when unreferenced), so the global check must not add
+    // them again — exactly-once counting either way.
         guard size >= 0, payloadBytes >= 0 else {
             throw StoreError.integrity("negative artifact size or payload")
         }
@@ -1394,10 +1410,17 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// transaction (no committed state can change in between: the lock
     /// serializes publishers and GRDB serializes write transactions).
     func commitRecordBytes(_ db: Database, session: String, payload: Data, digest: String?, size: Int64, sessionHasDigest: Bool) throws {
+        guard size >= 0, payload.count >= 0 else {
+            throw StoreError.integrity("negative artifact size or payload in commit path")
+        }
         let last = try Int64.fetchOne(db, sql: "SELECT MAX(seq) FROM records") ?? 0
+        let (nextSeq, seqOverflow) = last.addingReportingOverflow(1)
+        guard !seqOverflow else {
+            throw StoreError.integrity("record sequence exhausted")
+        }
         try db.execute(
             sql: "INSERT INTO records (seq, session, payload) VALUES (?, ?, ?)",
-            arguments: [last + 1, session, String(decoding: payload, as: UTF8.self)])
+            arguments: [nextSeq, session, String(decoding: payload, as: UTF8.self)])
         var bump = Int64(payload.count)
         if digest != nil, !sessionHasDigest {
             let (nb, no) = bump.addingReportingOverflow(size)
@@ -1456,6 +1479,9 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 throw StoreError.integrity("undecodable record payload in quota path: \(error)")
             }
             if case .artifactPublished(let ref) = record {
+                guard ref.size >= 0 else {
+                    throw StoreError.integrity("negative artifact size for digest \(ref.digest)")
+                }
                 items.append(Item(payload: payload, digest: ref.digest, size: Int64(ref.size)))
                 if !seenNew.contains(ref.digest) {
                     seenNew.insert(ref.digest)

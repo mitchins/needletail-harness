@@ -386,10 +386,43 @@ extension B3ByteQuotaTests {
         let root = GRDBSessionStore.artifactsRoot(for: dir.appendingPathComponent("store.sqlite").path)
         try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
         try bytes.write(to: URL(fileURLWithPath: root + "/" + digest))
+        let before = try FileManager.default.contentsOfDirectory(atPath: root)
         let ref = try store.publishArtifact(session: session, as: writer, kind: "t", operationID: nil, bytes: bytes)
         #expect(ref.digest == digest, "crash-orphan retry must succeed by adopting the verified file")
         #expect(try store.artifactRecord(session: session, digest: digest) == bytes)
         #expect(try store.artifactPhysicalForTesting()[digest] == Int64(bytes.count))
+        let after = try FileManager.default.contentsOfDirectory(atPath: root)
+        #expect(after.filter({ $0.hasPrefix(".tmp-") }).isEmpty, "no tmp leftovers from adopt path")
+        #expect(after.filter({ !$0.hasPrefix(".tmp-") }) == [digest], "exactly one final file (adopted, not duplicated), got \(after)")
+        #expect(before.count == after.count, "adopt creates no new file")
+    }
+
+    @Test("TOOL_crashOrphanAdoptQuotaExact")
+    func crashOrphanAdoptQuotaExact() throws {
+        // Adopted bytes count exactly once against the global quota.
+        // Global limit admits S + refLen but not 2S + refLen: success here
+        // proves no double-count (orphan scan + size add would reject).
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let bytes = Data(repeating: 0x43, count: 1000)
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let refLen: Int = {
+            let ref = ArtifactRef(digest: digest, size: bytes.count, kind: "t", operationID: nil)
+            return (try? RecordCodec.encode(DurableRecord.artifactPublished(ref)).count) ?? 200
+        }()
+        let limit = Int64(1000 + refLen)
+        let store = try GRDBSessionStore(path: dir.appendingPathComponent("store.sqlite").path,
+                                         sessionByteLimit: 10_000_000, globalByteLimit: limit, freeSpaceReserve: 0)
+        defer { try? store.close() }
+        let session = SessionID("s-adopt")
+        try store.claimWriterOwnership(session: session, writer: "w")
+        let identity = WriterIdentity(session: session, writer: "w")
+        let root = GRDBSessionStore.artifactsRoot(for: dir.appendingPathComponent("store.sqlite").path)
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        try bytes.write(to: URL(fileURLWithPath: root + "/" + digest))
+        let ref = try store.publishArtifact(session: session, as: identity, kind: "t", operationID: nil, bytes: bytes)
+        #expect(ref.digest == digest, "adopt at exact quota boundary succeeds: \(ref)")
+        #expect(try store.artifactRecord(session: session, digest: digest) == bytes)
     }
 
     @Test("TOOL_preflightQuotaBeforeFs")
