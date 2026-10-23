@@ -342,21 +342,37 @@ struct B2ClosureTests {
         #expect(!result.calls[0].data.contains("ENV_SECRET_222"), ".env content must be pruned")
         #expect(result.calls[0].data.isEmpty, "protected-only search must return empty output (no summary oracle), got \(result.calls[0].data.prefix(200))")
 
-        // Bare protected FILE (not a directory): a regular file named exactly
-        // "artifacts" must be pruned before traversal too. Without the bare-name
-        // glob rg would open it (EACCES on 000 -> exit 2); with pruning the search
-        // succeeds empty.
+        // Bare protected FILES (not directories): regular files named exactly
+        // "credentials"/"artifacts" or ending "-artifacts" must be pruned
+        // before traversal. If rg ever opened one, the 000 mode would fail
+        // the run (exit 2); success with empty output proves pruning.
+        let bareCred = ws.appendingPathComponent("credentials")
+        try "BAREMARK=1\n".write(to: bareCred, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: bareCred.path)
         let bareArt = ws.appendingPathComponent("artifacts")
-        try "BAREMARK=1\n".write(to: bareArt, atomically: true, encoding: .utf8)
+        try "BAREMARK2=1\n".write(to: bareArt, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: bareArt.path)
-        let batchArt = ToolBatch([ToolProposal(callID: "ca", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"BAREMARK\"}")])
-        let resultArt = try await exec.execute(batch: batchArt, reservation: Self.makeReservation(batch: batchArt))
-        #expect(resultArt.calls[0].status == "success", "bare protected file must be pruned, got \(resultArt.calls[0])")
-        #expect(resultArt.calls[0].data.isEmpty, "no output for pruned-only match")
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bareArt.path)
+        let bareSfx = ws.appendingPathComponent("x-artifacts")
+        try "SFXMARK=1\n".write(to: bareSfx, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: bareSfx.path)
+        let batchB = ToolBatch([ToolProposal(callID: "cb", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"BAREMARK|BAREMARK2|SFXMARK\"}")])
+        let resultB = try await exec.execute(batch: batchB, reservation: Self.makeReservation(batch: batchB))
+        #expect(resultB.calls[0].status == "success", "bare protected files must be pruned, got \(resultB.calls[0])")
+        #expect(resultB.calls[0].data.isEmpty, "no output for pruned-only matches")
+        for f in [bareCred, bareArt, bareSfx] { try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: f.path) }
         if getuid() != 0 {
-            let (_, bareStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "BAREMARK", ws.path])
-            #expect(bareStatus == 2, "counterfactual: unpruned open of 000 file fails, got \(bareStatus)")
+            // Isolated trap workspace (no .git/locked confound): unpruned
+            // rg must attempt the 000 files and fail the run.
+            let trap = parent.appendingPathComponent("trap-ws")
+            try FileManager.default.createDirectory(at: trap, withIntermediateDirectories: true)
+            let trapArt = trap.appendingPathComponent("artifacts")
+            try "TRAPMARK=1\n".write(to: trapArt, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: trapArt.path)
+            let trapSfx = trap.appendingPathComponent("x-artifacts")
+            try "TRAP2MARK=1\n".write(to: trapSfx, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: trapSfx.path)
+            let (_, trapStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "TRAPMARK|TRAP2MARK", trap.path])
+            #expect(trapStatus == 2, "counterfactual: unpruned open of 000 files fails, got \(trapStatus)")
         }
         // Legitimate content merely MENTIONING .env/.git is preserved.
         let batch2 = ToolBatch([ToolProposal(callID: "c2", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"mentions\"}")])
@@ -434,22 +450,6 @@ struct B2ClosureTests {
         if getuid() != 0 {
             let (_, hiddenStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "LOCKED_MARKER", ws.path])
             #expect(hiddenStatus == 2, "counterfactual: unpruned traversal bites the trap, got \(hiddenStatus)")
-        }
-        // Bare protected filename (not a directory): a regular file named
-        // exactly "credentials" must be pruned before traversal too. If rg
-        // ever opened it, the 000 mode would fail the run (exit 2); success
-        // with empty output proves the bare-name glob pruned it.
-        let bareFile = ws.appendingPathComponent("credentials")
-        try "CREDMARK=1\n".write(to: bareFile, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: bareFile.path)
-        let batchB = ToolBatch([ToolProposal(callID: "cb", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"CREDMARK\"}")])
-        let resultB = try await exec.execute(batch: batchB, reservation: Self.makeReservation(batch: batchB))
-        #expect(resultB.calls[0].status == "success", "bare protected file must be pruned, not error, got \(resultB.calls[0])")
-        #expect(resultB.calls[0].data.isEmpty, "no summary oracle for pruned-only matches")
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bareFile.path)
-        if getuid() != 0 {
-            let (_, bareStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "CREDMARK", ws.path])
-            #expect(bareStatus == 2, "counterfactual: unpruned open of 000 file fails, got \(bareStatus)")
         }
     }
 

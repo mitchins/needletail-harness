@@ -595,6 +595,10 @@ struct B3EditWriteTests {
         #expect(ToolValidator.isApprovedPath(".env.\u{00E9}", approvedPaths: [".env.e\u{0301}"]) == false, "canonically-equal twin must not approve")
         #expect(ToolValidator.isApprovedPath(".env.\u{00E9}", approvedPaths: [".env.\u{00E9}"]) == true, "exact twin approves")
         #expect(ToolValidator.dedupeByteDistinct(["a", ".env.\u{00E9}", ".env.e\u{0301}", "a"]).count == 3, "byte-distinct dedup keeps NFC/NFD twins")
+        #expect(ToolValidator.isApprovedPrefix("sub/x", approvedPaths: ["sub"]) == true, "exact prefix grants subtree")
+        #expect(ToolValidator.isApprovedPrefix(".env/x", approvedPaths: [".env.\u{00E9}"]) == false, "different names never prefix-match")
+        #expect(ToolValidator.isApprovedPrefix("d\u{00E9}/f", approvedPaths: ["d\u{00E9}"]) == true, "exact dir grants subtree")
+        #expect(ToolValidator.isApprovedPrefix("de\u{0301}/f", approvedPaths: ["d\u{00E9}"]) == false, "NFD path never matches NFC dir grant")
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let (dir, store, session, writer) = try Self.tempStore()

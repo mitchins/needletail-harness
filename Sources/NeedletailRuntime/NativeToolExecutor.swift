@@ -913,14 +913,17 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 } catch let e as ToolFailure {
                     throw e
                 } catch {
-                    // A symlink in the path is a traversal refusal (denied),
-                    // not a missing path; resource exhaustion fails the call.
-                    // Anything else (not found, replaced root) falls through
-                    // to the read-root attempt and finally to no-match.
-                    if Self.isSymlinkError(error) {
+                    // Precedence: a missing path (even one NAMED like a
+                    // symlink, or a replaced root that no longer opens) falls
+                    // through to the read-root attempt and finally to
+                    // no-match. Only a genuine symlink encounter denies, and
+                    // resource exhaustion fails. Never let a path substring
+                    // decide.
+                    if Self.isNotFound(error) {
+                        // fall through
+                    } else if Self.isSymlinkError(error) {
                         throw ToolFailure.preDispatch(status: "denied", summary: "symlink in search path")
-                    }
-                    if Self.isResourceError(error) {
+                    } else if Self.isResourceError(error) {
                         throw ToolFailure.preDispatch(status: "failed", summary: "search root unavailable: \(error)")
                     }
                 }
@@ -938,6 +941,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     } catch let e as ToolFailure {
                         throw e
                     } catch {
+                        // Precedence: a missing path (even one NAMED like a
+                        // symlink, or a replaced root) falls through to the
+                        // next domain and finally to no-match; only a genuine
+                        // symlink encounter denies, and resource exhaustion
+                        // fails. Never let a path substring decide.
+                        if Self.isNotFound(error) {
+                            continue
+                        }
                         if Self.isSymlinkError(error) {
                             throw ToolFailure.preDispatch(status: "denied", summary: "symlink in search path")
                         }
@@ -996,7 +1007,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         for i in resolver.readRoots.indices where !domainOrder.contains(i) { domainOrder.append(i) }
         for approved in reservation.approvedPaths {
             guard ToolValidator.protectedClassification(for: approved) == .grantable else { continue }
-            if let base = explicitBase, approved == base { continue }
+            if let base = explicitBase, ToolValidator.byteEqual(approved, base) { continue }
             do {
                 if let fd = try openApprovedTarget(approved, domainOrder: domainOrder) {
                     roots.append((try holdRootFD(fd), approved))
