@@ -973,7 +973,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         let explicitBase: String? = (json["path"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         var domainOrder: [Int] = []
         if let ed = explicitDomain { domainOrder.append(ed) }
-        domainOrder.append(-1)
+        if !domainOrder.contains(-1) { domainOrder.append(-1) }
         for i in resolver.readRoots.indices where !domainOrder.contains(i) { domainOrder.append(i) }
         for approved in reservation.approvedPaths {
             guard ToolValidator.protectedClassification(for: approved) == .grantable else { continue }
@@ -1443,11 +1443,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
             offset += n
         }
-        guard fsync(tmpFD) == 0 else {
-            throw StoreError.integrity("tmp fsync failed: \(String(cString: strerror(errno)))")
-        }
+        // fchmod BEFORE fsync so the single sync covers the mode change too.
         guard fchmod(tmpFD, fileMode) == 0 else {
             throw StoreError.integrity("tmp mode preserve failed: \(String(cString: strerror(errno)))")
+        }
+        guard fsync(tmpFD) == 0 else {
+            throw StoreError.integrity("tmp fsync failed: \(String(cString: strerror(errno)))")
         }
         committed = true
         return tmpName
@@ -1473,9 +1474,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             return ToolCallOutcome(callID: callID, status: "conflict", summary: summary, data: "", error: "conflict", path: path, beforeHash: beforeHash, started: true)
         }
         // Fresh open of the PATH (O_NOFOLLOW): the held fileFD cannot see a
-        // swap, so only this open can.
+        // swap, so only this open can. O_NONBLOCK: a swapped-in FIFO must not
+        // block the opener while the workspace lock is held (it then fails
+        // the regular-file check below and conflicts).
         let checkFD: Int32 = fileName.withCString { name in
-            openat(parentFD, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         }
         guard checkFD >= 0 else {
             let e = errno
@@ -1490,9 +1493,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         defer { close(checkFD) }
         var origST = stat()
         var freshST = stat()
-        guard fstat(fileFD, &origST) == 0, fstat(checkFD, &freshST) == 0,
-              (freshST.st_mode & S_IFMT) == S_IFREG else {
+        guard fstat(fileFD, &origST) == 0, fstat(checkFD, &freshST) == 0 else {
             return fail("re-open fstat failed", "integrity", beforeHash: expectedHash)
+        }
+        guard (freshST.st_mode & S_IFMT) == S_IFREG else {
+            return conflict("target replaced by special file before commit", beforeHash: expectedHash)
         }
         guard origST.st_dev == freshST.st_dev, origST.st_ino == freshST.st_ino else {
             return conflict("target replaced before commit", beforeHash: expectedHash)

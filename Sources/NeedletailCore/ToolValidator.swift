@@ -349,21 +349,15 @@ public enum ToolValidator {
         }
     }
 
-    private static func validatePath(_ path: String, callID: String, tool: String) throws {
-        if path.isEmpty { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty path for \(tool) \(callID)") }
-        if path.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path contains NUL for \(tool) \(callID)") }
-        if path.utf8.count > maxPathLength { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path too long for \(tool) \(callID)") }
-        if path.hasPrefix("/") { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "absolute path not allowed for \(tool) \(callID)") }
-        // Check for // or trailing / gives empty component
-        if path.contains("//") { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty component in path for \(tool) \(callID)") }
-        if path.hasSuffix("/") { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "trailing slash in path for \(tool) \(callID)") }
-        // Check each component for "." and ".." and length. Split on UTF-8
-        // BYTES at 0x2F: "/" + combining mark is one grapheme, so a
-        // Character split would hide an embedded separator from these
-        // checks (and from openRelative's per-component no-follow).
-        // ASCII boundaries align with scalar boundaries: lossless.
+    /// Byte-exact path components: split UTF-8 bytes at 0x2F. Character
+    /// splitting is WRONG here ("/" + combining mark is one grapheme, so it
+    /// would hide an embedded separator from every per-component check).
+    /// ASCII boundaries align with scalar boundaries, so decoding each
+    /// piece is lossless.
+    static func byteComponents(of path: String) -> [String] {
         var parts: [String] = []
         var piece: [UInt8] = []
+        piece.reserveCapacity(64)
         for b in path.utf8 {
             if b == 0x2F {
                 parts.append(String(decoding: piece, as: UTF8.self))
@@ -373,6 +367,30 @@ public enum ToolValidator {
             }
         }
         parts.append(String(decoding: piece, as: UTF8.self))
+        return parts
+    }
+
+    private static func validatePath(_ path: String, callID: String, tool: String) throws {
+        if path.isEmpty { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty path for \(tool) \(callID)") }
+        if path.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path contains NUL for \(tool) \(callID)") }
+        if path.utf8.count > maxPathLength { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path too long for \(tool) \(callID)") }
+        // Byte-level edge checks (grapheme hasPrefix/hasSuffix can misread a
+        // leading/trailing "/" glued to a combining mark).
+        if path.utf8.first == 0x2F { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "absolute path not allowed for \(tool) \(callID)") }
+        if path.utf8.last == 0x2F { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "trailing slash in path for \(tool) \(callID)") }
+        var sawEmpty = false
+        var prevWasSlash = false
+        for b in path.utf8 {
+            if b == 0x2F {
+                if prevWasSlash { sawEmpty = true }
+                prevWasSlash = true
+            } else {
+                prevWasSlash = false
+            }
+        }
+        if sawEmpty { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty component in path for \(tool) \(callID)") }
+        // Check each component for "." and ".." and length.
+        let parts = Self.byteComponents(of: path)
         for p in parts {
             if p.isEmpty { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty component in path for \(tool) \(callID)") }
             if p == "." { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "dot component not allowed for \(tool) \(callID)") }
@@ -382,19 +400,22 @@ public enum ToolValidator {
     }
 
     public static func protectedClassification(for path: String) -> ProtectedClassification {
-        let components = path.split(separator: "/")
-        for comp in components {
-            let c = String(comp)
+        // Byte-split components (same grapheme-hiding hazard as validatePath:
+        // "artifacts/<U+0301>pwn" must still see the "artifacts" component).
+        // hasPrefix/hasSuffix/contains below all use pure-ASCII needles, so
+        // combining marks elsewhere can neither hide nor forge a match.
+        let components = Self.byteComponents(of: path)
+        for c in components {
             if c == ".needletail" { return .absoluteDenied }
             if c == "credentials" || c == ".credentials" { return .absoluteDenied }
             if c == "artifacts" || c.hasSuffix("-artifacts") { return .absoluteDenied }
         }
         if path.contains(".needletail/") || path == ".needletail" { return .absoluteDenied }
         if path.contains("/credentials") || path == "credentials" { return .absoluteDenied }
-        guard let first = components.first.map(String.init) else { return .unprotected }
-        if first == ".git" || first.hasPrefix(".git/") { return .grantable }
+        guard let first = components.first else { return .unprotected }
+        if first == ".git" { return .grantable }
         if components.contains(where: { $0 == ".git" }) { return .grantable }
-        if first == ".ssh" || first.hasPrefix(".ssh/") { return .grantable }
+        if first == ".ssh" { return .grantable }
         if components.contains(where: { $0 == ".ssh" }) { return .grantable }
         if first == ".env" || first.hasPrefix(".env.") { return .grantable }
         if components.contains(where: { $0 == ".env" || $0.hasPrefix(".env.") }) { return .grantable }

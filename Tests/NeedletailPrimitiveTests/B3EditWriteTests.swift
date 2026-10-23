@@ -478,6 +478,23 @@ struct B3EditWriteTests {
         #expect(Self.tmpFiles(under: url).isEmpty, "tmp cleaned")
     }
 
+    @Test("TOOL_05_phaseFifoSwap", .timeLimit(.minutes(2)))
+    func tool05PhaseFifoSwap() async throws {
+        // T6: target swapped for a FIFO between prepare and finalize. The
+        // re-open uses O_NONBLOCK so the opener cannot hang while holding
+        // the workspace lock; the fifo then fails the regular-file check.
+        let (url, _, store, session, _, exec, file, dirFD, fileFD, h) = try Self.phaseSetup(body: "original\n")
+        defer { close(dirFD); close(fileFD); try? FileManager.default.removeItem(at: url) }
+        let tmp = try exec.prepareCommitTmp(newData: Data("MUTANT\n".utf8), fileMode: 0o640, parentFD: dirFD)
+        try FileManager.default.removeItem(at: file)
+        let fifoC = file.path.withCString { Glibc.mkfifo($0, mode_t(0o644)) }
+        #expect(fifoC == 0, "test setup: mkfifo must work")
+        let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: Data("MUTANT\n".utf8), fileMode: 0o640, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
+        #expect(out.status == "conflict", "fifo swap must conflict without hanging, got \(out)")
+        #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on conflict")
+        #expect(Self.tmpFiles(under: url).isEmpty, "tmp cleaned")
+    }
+
     @Test("TOOL_05_phaseHappyPath")
     func tool05PhaseHappyPath() async throws {
         // T5: phases composed with no interference commit with full receipts.
@@ -488,6 +505,7 @@ struct B3EditWriteTests {
         let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: newData, fileMode: 0o640, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
         #expect(out.status == "success", "undisturbed phases must commit, got \(out)")
         #expect(out.beforeHash == h && out.afterHash == Self.sha("MUTANT\n"), "receipts carry both hashes")
+        #expect(out.mode == "640", "receipt carries preserved mode")
         #expect(out.artifactID == h, "preimage published")
         #expect(try String(contentsOf: file, encoding: .utf8) == "MUTANT\n")
         #expect(Self.tmpFiles(under: url).isEmpty, "no tmp leftovers")
@@ -528,6 +546,38 @@ struct B3EditWriteTests {
         let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2))
         #expect(result2.calls[0].status == "success", "combining-mark filename must edit, got \(result2.calls[0])")
         #expect(try Data(contentsOf: url.appendingPathComponent("e\u{0301}.txt")) == Data("bye\n".utf8))
+    }
+
+    // MARK: - TOOL-06 protected classification under combining marks
+
+    @Test("TOOL_06_protectedCombining")
+    func tool06ProtectedCombining() async throws {
+        // F1: "artifacts/<U+0301>pwn" must still see the "artifacts"
+        // component (absolute denial, never grantable); ".git/<U+0301>config"
+        // stays grantable (approval-gated); unapproved access never proceeds.
+        #expect(ToolValidator.protectedClassification(for: "artifacts/\u{0301}pwn") == .absoluteDenied)
+        #expect(ToolValidator.protectedClassification(for: ".git/\u{0301}config") == .grantable)
+        #expect(ToolValidator.protectedClassification(for: "credentials/\u{0301}x") == .absoluteDenied)
+        #expect(ToolValidator.protectedClassification(for: "sub/.git") == .grantable)
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (dir, store, session, writer) = try Self.tempStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: session, writer: writer)
+        // Write into a protected dir through a combining-mark component:
+        // denied pre-dispatch, no lock, no directory created.
+        let evil = "artifacts/" + "\u{0301}pwn"
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"" + evil + "\",\"content\":\"x\"}")])
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
+        #expect(result.calls[0].status == "denied", "combining-mark protected path must be denied, got \(result.calls[0])")
+        #expect(result.calls[0].started == false, "denial must be pre-dispatch")
+        #expect(!FileManager.default.fileExists(atPath: url.appendingPathComponent("artifacts").path), "no protected directory created")
+        // Note: the workspace lock file may exist: grantable denial happens per-call after per-batch lock acquisition, before any file mutation.
+        // Grantable through a combining-mark component still needs approval.
+        let batch2 = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\".git/\u{0301}config\",\"content\":\"x\"}")])
+        let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2))
+        #expect(result2.calls[0].status == "denied", "grantable combining-mark path needs approval, got \(result2.calls[0])")
     }
 
     // MARK: - TOOL-08 write

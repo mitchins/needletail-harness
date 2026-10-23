@@ -418,6 +418,22 @@ struct B2ClosureTests {
             let (_, hiddenStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "LOCKED_MARKER", ws.path])
             #expect(hiddenStatus == 2, "counterfactual: unpruned traversal bites the trap, got \(hiddenStatus)")
         }
+        // Bare protected filename (not a directory): a regular file named
+        // exactly "credentials" must be pruned before traversal too. If rg
+        // ever opened it, the 000 mode would fail the run (exit 2); success
+        // with empty output proves the bare-name glob pruned it.
+        let bareFile = ws.appendingPathComponent("credentials")
+        try "CREDMARK=1\n".write(to: bareFile, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: bareFile.path)
+        let batchB = ToolBatch([ToolProposal(callID: "cb", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"CREDMARK\"}")])
+        let resultB = try await exec.execute(batch: batchB, reservation: Self.makeReservation(batch: batchB))
+        #expect(resultB.calls[0].status == "success", "bare protected file must be pruned, not error, got \(resultB.calls[0])")
+        #expect(resultB.calls[0].data.isEmpty, "no summary oracle for pruned-only matches")
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bareFile.path)
+        if getuid() != 0 {
+            let (_, bareStatus) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "CREDMARK", ws.path])
+            #expect(bareStatus == 2, "counterfactual: unpruned open of 000 file fails, got \(bareStatus)")
+        }
     }
 
     // MARK: - 10. Non-UTF-8 paths classified, never bypassed
