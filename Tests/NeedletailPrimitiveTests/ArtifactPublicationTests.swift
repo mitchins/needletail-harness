@@ -116,8 +116,10 @@ struct ArtifactPublicationTests {
         let (directory, path) = try Self.freshPath()
         defer { try? FileManager.default.removeItem(at: directory) }
         let session = SessionID("s-orphan")
-        // Session quota of 1: the ledger row is full, but the file half of
-        // publication has no quota — rename succeeds, commit fails.
+        // Session quota of 1: the authoritative check fails BEFORE any
+        // rename, so a failed commit leaves nothing behind — no orphan file,
+        // no tmp leftover, no reference, no physical row (B3-B contract:
+        // "nothing renamed" on quota failure).
         let store = try GRDBSessionStore(
             path: path, sessionRecordLimit: 1, globalRecordLimit: 100_000)
         try store.claimWriterOwnership(session: session, writer: "w-1")
@@ -129,15 +131,22 @@ struct ArtifactPublicationTests {
                 session: session, as: identity, kind: "exec-output",
                 operationID: OperationID("e9/c1"), bytes: Self.payload("orphaned bytes"))
         }
-        // The file IS durable (rename happened) with NO database reference:
-        // a textbook orphan — reported, never silently deleted, never
-        // attached to the operation.
+        let rootContents = (try? FileManager.default.contentsOfDirectory(atPath: Self.artifactsRoot(for: path))) ?? []
+        #expect(rootContents.isEmpty, "failed commit leaves no file and no tmp, found \(rootContents)")
         let report = try store.detectArtifactOrphans()
-        #expect(report.orphaned.count == 1, "exactly the renamed-but-unreferenced file, got \(report.orphaned)")
+        #expect(report.orphaned.isEmpty, "nothing renamed, nothing to report, got \(report.orphaned)")
         #expect(report.interrupted.isEmpty)
         let (page, _) = try store.records(session: session, since: 0, limit: 100)
         #expect(!page.contains { if case .artifactPublished = $0.record { return true }; return false },
                 "failed commit leaves no reference row")
+        // A crash between rename and reference commit still leaves a
+        // textbook orphan (file with no reference): reported, never silently
+        // deleted, never attached to the operation. Simulate by placing the
+        // final file directly.
+        let crashDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        try Data("crash bytes".utf8).write(to: URL(fileURLWithPath: Self.artifactsRoot(for: path) + "/" + crashDigest))
+        let crashReport = try store.detectArtifactOrphans()
+        #expect(crashReport.orphaned == [crashDigest], "crash orphan is reported, got \(crashReport.orphaned)")
         // Reconcile is unaffected: no operation records exist here, and the
         // orphan file is invisible to it.
         let reconciled = try store.reconcile(session: session)
@@ -147,7 +156,7 @@ struct ArtifactPublicationTests {
             to: URL(fileURLWithPath: Self.artifactsRoot(for: path) + "/.tmp-abandoned"))
         let report2 = try store.detectArtifactOrphans()
         #expect(report2.interrupted == [".tmp-abandoned"])
-        #expect(report2.orphaned == report.orphaned, "buckets stay distinct")
+        #expect(report2.orphaned == crashReport.orphaned, "buckets stay distinct")
         // A normally published artifact is never reported.
         let roomy = try GRDBSessionStore(path: directory.appendingPathComponent("roomy.sqlite").path)
         let session2 = SessionID("s-clean")
