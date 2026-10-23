@@ -113,6 +113,146 @@ struct B0ActorIntegrationTests {
         return page.map(\.record)
     }
 
+    // MARK: - 8. Executor-handled cancellation (own deadline, no external cancel)
+
+    @Test("B4 8: executor-handled cancellation reports started/unstarted with reservation live")
+    func executorHandledCancellation() async throws {
+        // The executor's OWN deadline fires (modelled as a deterministic
+        // driver release — no external actor.cancel, no consumed timer):
+        // A started/cancelled + B unstarted-cancelled through completeEffect
+        // with the reservation still live → A unknown+hold, B
+        // done-cancelled with NO hold.
+        let exec = GatedExecutor()
+        let transport = ScriptedTransport()
+        transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
+                ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}"),
+            ], isFinal: false))]
+        let approvals = ScriptedApprovals()
+        approvals.script = [.approve]
+        let store = InMemorySessionStore()
+        let actor = try Self.gatedActor(transport: transport, executor: exec, approvals: approvals, store: store)
+
+        await actor.submitText(commandID: CommandID("a-8"), text: "run", kind: .followUp, sealed: false)
+        try await Self.awaitPhase(actor, { $0.phase == .executing }, "executing")
+        try await Self.awaitExecutorEntry(exec, count: 1)
+
+        exec.release(ExecutorResult(receipt: ExecutorReceipt(callID: "mix", status: "cancelled", summary: "executor deadline"),
+            calls: [
+                ToolCallOutcome(callID: "c1", status: "cancelled", summary: "deadline during execution", data: "x", started: true),
+                ToolCallOutcome(callID: "c2", status: "cancelled", summary: "unstarted: executor deadline", data: "", started: false),
+            ]))
+        try await Self.awaitPhase(actor, { $0.queueHeld && $0.unresolvedOperations.contains(where: { $0.callID == "c1" }) }, "hold on A")
+        let after = await actor.currentState()
+        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown && $0.mutating }), "started-cancelled mutating must be unknown+hold")
+        #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c2" }), "unstarted-cancelled takes no marker")
+        let log = try Self.records(store)
+        #expect(log.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c2" && r.state == .done && o == "cancelled: unstarted" } else { return false } }), "B done-cancelled, no hold")
+        #expect(transport.invocations.count == 1, "no provider continuation while A unresolved")
+    }
+
+    // MARK: - 9. Direct cancelled report while reservation live (no external cancel)
+
+    @Test("B4 9: direct started-cancelled report holds mutating, transcripts non-mutating")
+    func directCancelledReportSplit() async throws {
+        let exec = GatedExecutor()
+        let transport = ScriptedTransport()
+        transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
+                ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}"),
+            ], isFinal: false))]
+        let approvals = ScriptedApprovals()
+        approvals.script = [.approve]
+        let store = InMemorySessionStore()
+        let actor = try Self.gatedActor(transport: transport, executor: exec, approvals: approvals, store: store)
+
+        await actor.submitText(commandID: CommandID("a-9"), text: "run", kind: .followUp, sealed: false)
+        try await Self.awaitPhase(actor, { $0.phase == .executing }, "executing")
+        try await Self.awaitExecutorEntry(exec, count: 1)
+
+        // No actor.cancel: the executor itself reports mid-flight cancellation.
+        exec.release(ExecutorResult(receipt: ExecutorReceipt(callID: "mix", status: "cancelled", summary: "cancelled"),
+            calls: [
+                ToolCallOutcome(callID: "c1", status: "cancelled", summary: "cancelled mid-flight", data: "x", started: true),
+                ToolCallOutcome(callID: "c2", status: "cancelled", summary: "cancelled mid-flight", data: "y", started: true),
+            ]))
+        try await Self.awaitPhase(actor, { $0.queueHeld }, "hold")
+        let after = await actor.currentState()
+        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown }), "mutating started-cancelled must hold")
+        #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c2" }), "non-mutating never marks")
+        let log = try Self.records(store)
+        #expect(!log.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c2" } else { return false } }), "non-mutating cancel is transcript-only, no durable result")
+        #expect(log.contains(where: { if case .transcriptAppended(.toolResponse(let id, _)) = $0 { return id == "c2" } else { return false } }), "non-mutating cancel still reaches the transcript")
+    }
+
+    // MARK: - 10. No-entry through the real actor
+
+    @Test("B4 10: backend omitting dispatched calls holds mutating, transcripts non-mutating")
+    func noEntryThroughActor() async throws {
+        let exec = GatedExecutor()
+        let transport = ScriptedTransport()
+        transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
+                ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"b\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
+                ToolProposal(callID: "c3", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"c\"}"),
+            ], isFinal: false))]
+        let approvals = ScriptedApprovals()
+        approvals.script = [.approve]
+        let store = InMemorySessionStore()
+        let actor = try Self.gatedActor(transport: transport, executor: exec, approvals: approvals, store: store)
+
+        await actor.submitText(commandID: CommandID("a-10"), text: "run", kind: .followUp, sealed: false)
+        try await Self.awaitPhase(actor, { $0.phase == .executing }, "executing")
+        try await Self.awaitExecutorEntry(exec, count: 1)
+
+        // Backend violates the contract: no entry for c2 (mutating) or c3.
+        exec.release(ExecutorResult(receipt: ExecutorReceipt(callID: "partial", status: "ok", summary: "partial"),
+            calls: [ToolCallOutcome(callID: "c1", status: "success", summary: "ok", data: "ok", started: true)]))
+        try await Self.awaitPhase(actor, { $0.queueHeld }, "hold on missing c2")
+        let after = await actor.currentState()
+        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c2" && $0.state == .unknown }), "omitted mutating call must be unknown+hold")
+        #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c3" }), "omitted non-mutating call takes no marker")
+        let log = try Self.records(store)
+        #expect(log.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .done } else { return false } }), "reported call still completes")
+        #expect(!log.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c3" } else { return false } }), "omitted non-mutating call takes no durable result")
+        #expect(log.contains(where: { if case .transcriptAppended(.toolResponse(let id, let t)) = $0 { return id == "c3" && t.contains("no-entry") } else { return false } }), "omitted call is transcript-visible")
+        #expect(transport.invocations.count == 1, "no continuation past the missing call")
+    }
+
+    // MARK: - 11. Untyped executor throw (not CancellationError, not ToolFailure)
+
+    @Test("B4 11: untyped executor throw holds mutating, transcripts non-mutating")
+    func untypedThrowSplit() async throws {
+        struct Boom: Error {}
+        let exec = GatedExecutor()
+        let transport = ScriptedTransport()
+        transport.script = [ProviderResponse(requestID: RequestID("scripted"), generation: Revision(0),
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
+                ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}"),
+            ], isFinal: false))]
+        let approvals = ScriptedApprovals()
+        approvals.script = [.approve]
+        let store = InMemorySessionStore()
+        let actor = try Self.gatedActor(transport: transport, executor: exec, approvals: approvals, store: store)
+
+        await actor.submitText(commandID: CommandID("a-11"), text: "run", kind: .followUp, sealed: false)
+        try await Self.awaitPhase(actor, { $0.phase == .executing }, "executing")
+        try await Self.awaitExecutorEntry(exec, count: 1)
+
+        exec.throwError(Boom())
+        try await Self.awaitPhase(actor, { $0.queueHeld }, "hold on untyped throw")
+        let after = await actor.currentState()
+        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown }), "untyped throw must be unknown+hold for mutating")
+        #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c2" }), "non-mutating takes no marker")
+        let log = try Self.records(store)
+        #expect(!log.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .done } else { return false } }), "no false done for the mutating call")
+        #expect(!log.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c2" } else { return false } }), "non-mutating untyped throw is transcript-only")
+    }
+
     // MARK: - 1. Cancel during execution, late started=true remains held
 
     @Test("B0-F2A 1: cancel during execution then late started=true remains held")

@@ -161,18 +161,21 @@ struct B3EditWriteTests {
         try "data".write(to: url.appendingPathComponent("f"), atomically: true, encoding: .utf8)
         let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: session, writer: writer)
+        // B4: batch-head validation rejects missing/empty old pre-dispatch
+        // with a TYPED throw (the actor synthesizes per-call done receipts
+        // from it) — execute() no longer synthesizes per-call outcomes.
         // Missing old_string and empty oldBytes are both invalid pre-dispatch.
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"expectedHash\":\"\(String(repeating: "0", count: 64))\",\"new_string\":\"x\"}")])
-        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
-        #expect(result.calls[0].status == "invalid-arguments")
-        #expect(result.calls[0].started == false, "empty old must be pre-dispatch")
+        await #expect(throws: ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing oldBytes/old_string for edit c1")) {
+            try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
+        }
         #expect(!FileManager.default.fileExists(atPath: url.appendingPathComponent(".needletail/lock").path), "no lock on invalid args")
         #expect(Self.tmpFiles(under: url).isEmpty, "no tmp on invalid args")
         // Explicit empty old_string is also invalid pre-dispatch (not merely missing).
         let batch2 = ToolBatch([ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"expectedHash\":\"" + String(repeating: "0", count: 64) + "\",\"old_string\":\"\",\"new_string\":\"x\"}")])
-        let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2))
-        #expect(result2.calls[0].status == "invalid-arguments", "empty old must be invalid-arguments, got \(result2.calls[0])")
-        #expect(result2.calls[0].started == false, "empty old must be pre-dispatch")
+        await #expect(throws: ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty oldBytes/old_string for edit c2")) {
+            try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2))
+        }
         #expect(!FileManager.default.fileExists(atPath: url.appendingPathComponent(".needletail/lock").path), "no lock on empty old")
     }
 
@@ -576,7 +579,8 @@ struct B3EditWriteTests {
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"" + evil + "\",\"content\":\"x\"}")])
         let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
         #expect(result.calls[0].status == "denied", "combining-mark protected path must be denied, got \(result.calls[0])")
-        #expect(result.calls[0].started == false, "denial must be pre-dispatch")
+        #expect(result.calls[0].started == nil, "B4: provably-undispatched denial declines the started claim (done, no hold)")
+        #expect(result.calls[0].mutating == true, "executor attests the mutating classification")
         #expect(!FileManager.default.fileExists(atPath: url.appendingPathComponent("artifacts").path), "no protected directory created")
         // Note: the workspace lock file may exist: grantable denial happens per-call after per-batch lock acquisition, before any file mutation.
         // Grantable through a combining-mark component still needs approval.

@@ -126,8 +126,15 @@ public struct ToolCallOutcome: Sendable, Equatable, Codable {
     public let beforeHash: String?
     public let afterHash: String?
     public let started: Bool?
+    /// B4 per-call result classification: the executor's attestation of
+    /// whether THIS call mutates. Nil = legacy/scripted (the reducer falls
+    /// back to the proposal-derived classification); non-nil MUST agree
+    /// with the dispatch-time intent or the result is failed closed
+    /// (unknown+hold). Verified end-to-end by reopen+reconcile, which
+    /// requires done results to agree with their intent on this flag.
+    public let mutating: Bool?
 
-    public init(callID: String, status: String, summary: String, data: String, artifactID: String? = nil, truncated: Bool = false, warnings: [String] = [], error: String? = nil, path: String? = nil, mode: String? = nil, beforeHash: String? = nil, afterHash: String? = nil, started: Bool? = nil) {
+    public init(callID: String, status: String, summary: String, data: String, artifactID: String? = nil, truncated: Bool = false, warnings: [String] = [], error: String? = nil, path: String? = nil, mode: String? = nil, beforeHash: String? = nil, afterHash: String? = nil, started: Bool? = nil, mutating: Bool? = nil) {
         self.callID = callID
         self.status = status
         self.summary = summary
@@ -141,6 +148,7 @@ public struct ToolCallOutcome: Sendable, Equatable, Codable {
         self.beforeHash = beforeHash
         self.afterHash = afterHash
         self.started = started
+        self.mutating = mutating
     }
 }
 
@@ -1731,6 +1739,22 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             continue
         }
         let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+        // B4 per-call agreement: a non-nil executor attestation MUST match
+        // the dispatch-time intent classification. A mismatch means the
+        // executor's report contradicts what was authorized — fail closed
+        // (unknown+hold with the conservative mutating claim) in BOTH
+        // directions: a denied mutation claim could hide a real side
+        // effect, and an invented one could mask a lost update. Nil
+        // (legacy/scripted) falls back to the proposal derivation below.
+        if let reported = outcome.mutating, reported != isMutating {
+            let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .unknown, mutating: true)
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.operationResult(ref, outcome: "unknown: mutating mismatch (intent \(isMutating) vs result \(reported)) for \(proposal.callID)"))
+            transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+            continue
+        }
         let status = outcome.status
         let started = outcome.started
         // Check if this proposal was tainted as duplicate — already handled as unknown

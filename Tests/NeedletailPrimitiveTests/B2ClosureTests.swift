@@ -696,22 +696,25 @@ struct B2ClosureTests {
         try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
         try "hello\n".write(to: ws.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
         // Hanging probe: fast --version, then execs a 60 s sleep so SIGTERM
-        // at the 30 s budget kills the direct child itself (no orphan).
+        // at the injected 5 s budget kills the direct child itself (no orphan).
+        // B4: the deadline is injectable (production 120 s); expiry reports
+        // the `timeout` outcome, never partial success.
         let hanging = parent.appendingPathComponent("hang.sh")
         let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho 'ripgrep 99.0.0'\nexit 0\nfi\nexec sleep 60\n"
         try script.write(to: hanging, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hanging.path)
         let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
         let store = InMemorySessionStore()
-        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: hanging.path)
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: hanging.path, deadlines: ToolDeadlines(localIO: 30, search: 5))
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello\"}")])
         let start = Date()
         let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
         let elapsed = Date().timeIntervalSince(start)
-        #expect(result.calls[0].status == "failed", "timeout must be failure, got \(result.calls[0])")
+        #expect(result.calls[0].status == "timeout", "deadline expiry must be the timeout outcome, got \(result.calls[0])")
         #expect(result.calls[0].summary.contains("timed out"), "timeout must be explicit, got \(result.calls[0])")
-        #expect(elapsed < 60, "SIGTERM escalation must bound the wait, took \(elapsed)s")
-        #expect(elapsed >= 25, "sanity: the 30 s budget must actually elapse, took \(elapsed)s")
+        #expect(result.calls[0].started == true, "the hung search did start")
+        #expect(elapsed < 30, "SIGTERM escalation must bound the wait, took \(elapsed)s")
+        #expect(elapsed >= 4, "sanity: the 5 s budget must actually elapse, took \(elapsed)s")
     }
 
     // MARK: - 13. Concurrent bounded runners stay independent
@@ -776,10 +779,11 @@ struct B2ClosureTests {
         let ws = parent.appendingPathComponent("ws")
         try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
         try "hello quick\n".write(to: ws.appendingPathComponent("q.txt"), atomically: true, encoding: .utf8)
-        // Probe A: exits 0 immediately but leaves a background sleep holding
+                // Probe A: exits 0 immediately but leaves a background sleep holding
         // stdout open. Reaped exit-0 + unobservable EOF must be a timeout,
         // never success-with-partial.
         let leaver = parent.appendingPathComponent("leaver.sh")
+
         let leaverScript = """
             #!/bin/sh
             if [ "$1" = "--version" ]; then
@@ -792,7 +796,7 @@ struct B2ClosureTests {
             """
         try leaverScript.write(to: leaver, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: leaver.path)
-        // Probe B: hangs past the 30 s budget (SIGTERM must reap the execd sleep).
+        // Probe B: hangs past the injected 5 s budget (SIGTERM must reap the execd sleep).
         let hanging = parent.appendingPathComponent("hang14.sh")
         let hangScript = """
             #!/bin/sh
@@ -807,17 +811,18 @@ struct B2ClosureTests {
         let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
         let store = InMemorySessionStore()
-        func runSearch(rg: String, pattern: String) async throws -> ToolCallOutcome {
-            let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: rg)
+        // B4: injected 5 s search budgets (production is 120 s).
+        func runSearch(rg: String, pattern: String, searchBudget: TimeInterval = 5) async throws -> ToolCallOutcome {
+            let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: rg, deadlines: ToolDeadlines(localIO: 30, search: searchBudget))
             let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"" + pattern + "\"}")])
             return try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch)).calls[0]
         }
         async let a = runSearch(rg: leaver.path, pattern: "hello")
         async let b = runSearch(rg: hanging.path, pattern: "hello")
-        async let q = runSearch(rg: realRg, pattern: "hello quick")
+        async let q = runSearch(rg: realRg, pattern: "hello quick", searchBudget: 120)
         let (ra, rb, rq) = try await (a, b, q)
-        #expect(ra.status == "failed" && ra.summary.contains("timed out"), "reaped exit-0 with held pipe must be timeout, got \(ra)")
-        #expect(rb.status == "failed" && rb.summary.contains("timed out"), "hanging child must be timeout, got \(rb)")
+        #expect(ra.status == "timeout" && ra.summary.contains("timed out"), "reaped exit-0 with held pipe must be timeout, got \(ra)")
+        #expect(rb.status == "timeout" && rb.summary.contains("timed out"), "hanging child must be timeout, got \(rb)")
         #expect(rq.status == "success" && rq.data.contains("hello quick"), "quick sibling must be unaffected, got \(rq)")
     }
 
@@ -831,9 +836,10 @@ struct B2ClosureTests {
         let ws = parent.appendingPathComponent("ws")
         try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
         try "hello late\n".write(to: ws.appendingPathComponent("late.txt"), atomically: true, encoding: .utf8)
-        // Slow probe: ignores TERM, sleeps past the 30 s budget, then execs
-        // real rg which exits 0 with genuine matches. The deadline expiry is
-        // sticky: post-deadline output is never reported as success.
+        // Slow probe: ignores TERM, sleeps past the injected 5 s budget,
+        // then execs real rg which exits 0 with genuine matches. The
+        // deadline expiry is sticky: post-deadline output is never reported
+        // as success (SIGKILL escalation reaps the sleeper).
         let slow = parent.appendingPathComponent("slow.sh")
         let slowScript = """
             #!/bin/sh
@@ -849,15 +855,15 @@ struct B2ClosureTests {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: slow.path)
         let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
         let store = InMemorySessionStore()
-        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: slow.path)
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: slow.path, deadlines: ToolDeadlines(localIO: 30, search: 5))
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello late\"}")])
         let start = Date()
         let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
         let elapsed = Date().timeIntervalSince(start)
-        #expect(result.calls[0].status == "failed", "post-deadline exit-0 must be timeout, got \(result.calls[0])")
+        #expect(result.calls[0].status == "timeout", "post-deadline exit-0 must be timeout, got \(result.calls[0])")
         #expect(result.calls[0].summary.contains("timed out"), "timeout must be explicit, got \(result.calls[0])")
         #expect(result.calls[0].data.isEmpty, "post-deadline output must be suppressed, got \(result.calls[0].data.prefix(200))")
-        #expect(elapsed >= 28 && elapsed < 60, "30 s budget must elapse (plus SIGKILL grace at most), took \(elapsed)s")
+        #expect(elapsed >= 4 && elapsed < 30, "5 s budget must elapse (plus SIGKILL grace at most), took \(elapsed)s")
     }
 
     // MARK: - 9. artifactId alias pair rejected
@@ -873,8 +879,11 @@ struct B2ClosureTests {
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"))
         let hex = String(repeating: "c", count: 64)
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"artifactId\":\"\(hex)\",\"artifact_id\":\"\(hex)\"}")])
-        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
-        #expect(result.calls[0].status == "invalid-arguments", "both alias forms must be rejected, got \(result.calls[0])")
-        #expect(result.calls[0].started == false)
+        // B4: batch-head validation rejects the alias pair with a typed
+        // pre-dispatch throw (the actor synthesizes per-call done receipts
+        // from it).
+        await #expect(throws: ToolFailure.preDispatch(status: "invalid-arguments", summary: "both artifactId and artifact_id for read c1")) {
+            try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
+        }
     }
 }

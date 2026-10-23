@@ -395,12 +395,14 @@ struct B1ContainmentTests {
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-inv"), writer: WriterIdentity(session: SessionID("s-inv"), writer: "w"))
         let lockPath = url.appendingPathComponent(".needletail/lock").path
         #expect(!FileManager.default.fileExists(atPath: lockPath), "no lock before invalid batch")
-        // Invalid edit (missing expectedHash) should be rejected pre-side-effect
+        // B4: batch-head validation rejects the invalid edit with a TYPED
+        // pre-dispatch throw (the actor synthesizes per-call done receipts
+        // from it) — execute() no longer synthesizes per-call outcomes.
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"target\",\"old_string\":\"orig\",\"new_string\":\"new\"}")])
         let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: true, batch: batch, kind: .executor, approvedPaths: [])
-        let result = try await exec.execute(batch: batch, reservation: res)
-        #expect(result.calls[0].status == "invalid-arguments", "invalid edit should be rejected, got \(result.calls[0])")
-        #expect(result.calls[0].started == false, "invalid edit must be pre-dispatch (no side effect)")
+        await #expect(throws: ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing expectedHash for edit c1")) {
+            try await exec.execute(batch: batch, reservation: res)
+        }
         #expect(!FileManager.default.fileExists(atPath: lockPath), "no lock file on invalid args")
         // No temp file
         let tmpFiles = (try? FileManager.default.contentsOfDirectory(atPath: url.path).filter { $0.hasSuffix(".tmp") }) ?? []
@@ -727,7 +729,8 @@ struct B1ContainmentTests {
         holder.waitUntilExit()
         #expect(result.calls.count == 2)
         #expect(result.calls[0].status == "failed", "first mutating should fail due to lock contention")
-        #expect(result.calls[0].started == false, "lock contention must be pre-dispatch")
+        #expect(result.calls[0].started == nil, "B4: lock contention is provably undispatched (done-failed, no hold)")
+        #expect(result.calls[0].mutating == true, "executor attests mutating")
         #expect(result.calls[1].status == "cancelled" && result.calls[1].started == false, "later read must be unstarted halt, got \(result.calls[1])")
     }
 

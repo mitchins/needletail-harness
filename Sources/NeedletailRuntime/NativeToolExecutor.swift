@@ -10,6 +10,9 @@ import Darwin
 
 /// B1 NativeToolExecutor: descriptor-relative via WorkspaceResolver, strict validation pre-side-effect,
 /// protected-path enforcement, and per-mutating-batch nonblocking lock.
+/// B4: ordered partial batches with per-call halt, injectable per-tool
+/// deadlines (local I/O 30 s, search 120 s), and per-call mutating
+/// attestation on every outcome.
 public struct NativeToolExecutor: ToolExecutor, Sendable {
     public let resolver: WorkspaceResolver
     public let store: any SessionStore
@@ -17,14 +20,43 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     public let writer: WriterIdentity
     public let rgPath: String?
     public let gitPath: String?
+    /// B4 injectable per-tool deadlines (production default; tests inject
+    /// sub-second values with the suspension seams for deterministic legs).
+    public let deadlines: ToolDeadlines
+    /// B4 test-only suspension seams (nil in production). Both run inside
+    /// the deadline race; both are async-throwing so group cancellation
+    /// ends a suspended call instead of resuming into a side effect (a
+    /// synchronously blocked group child stalls group progress in this
+    /// toolchain — observed — so seams must never block a thread).
+    /// Pre-call runs before dispatch (a never-released suspension
+    /// deterministically produces a timeout outcome). Post-success runs
+    /// after a mutating call applied its effect but before its receipt is
+    /// built (holding past the deadline proves post-commit timeout stays
+    /// unknown despite the applied write).
+    public let preCallSuspension: (@Sendable (ToolProposal) async throws -> Void)?
+    public let postCommitSuspension: (@Sendable () async throws -> Void)?
 
-    public init(resolver: WorkspaceResolver, store: any SessionStore, sessionID: SessionID, writer: WriterIdentity, rgPath: String? = nil, gitPath: String? = nil) {
+    public init(resolver: WorkspaceResolver, store: any SessionStore, sessionID: SessionID, writer: WriterIdentity, rgPath: String? = nil, gitPath: String? = nil, deadlines: ToolDeadlines = ToolDeadlines(), preCallSuspension: (@Sendable (ToolProposal) async throws -> Void)? = nil, postCommitSuspension: (@Sendable () async throws -> Void)? = nil) {
         self.resolver = resolver
         self.store = store
         self.sessionID = sessionID
         self.writer = writer
         self.rgPath = rgPath
         self.gitPath = gitPath
+        self.deadlines = deadlines
+        self.preCallSuspension = preCallSuspension
+        self.postCommitSuspension = postCommitSuspension
+    }
+
+    /// Internal: a fired per-tool deadline. Never thrown past the loop —
+    /// mapped to a `timeout` outcome (unknown+hold for mutating).
+    private struct DeadlineExceeded: Error {}
+
+    /// B4: applies the B1 mutating classifier at the execution site, so the
+    /// per-call result carries the executor's attestation (the reducer
+    /// verifies agreement with the dispatch-time intent).
+    private func stamped(_ outcome: ToolCallOutcome, isMutating: Bool) -> ToolCallOutcome {
+        ToolCallOutcome(callID: outcome.callID, status: outcome.status, summary: outcome.summary, data: outcome.data, artifactID: outcome.artifactID, truncated: outcome.truncated, warnings: outcome.warnings, error: outcome.error, path: outcome.path, mode: outcome.mode, beforeHash: outcome.beforeHash, afterHash: outcome.afterHash, started: outcome.started, mutating: isMutating)
     }
 
     public func describe(batch: ToolBatch) -> String {
@@ -38,21 +70,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     }
 
     public func execute(batch: ToolBatch, reservation: EffectReservation) async throws -> ExecutorResult {
-        // Strict validation before any side effect
-        do {
-            _ = try ToolValidator.validateBatchArguments(batch: batch)
-        } catch let ToolFailure.preDispatch(status, summary) {
-            var outcomes: [ToolCallOutcome] = []
-            for p in batch.proposals {
-                let isMut = p.tool != "read" && p.tool != "search" && p.tool != "consult"
-                // For preDispatch, even mutating is done with no side effect, so started false
-                outcomes.append(ToolCallOutcome(callID: p.callID, status: status, summary: summary, data: "", error: summary, started: false))
-            }
-            let receipt = ExecutorReceipt(callID: batch.proposals.first?.callID ?? "batch", status: status, summary: summary)
-            return ExecutorResult(receipt: receipt, calls: outcomes)
-        } catch {
-            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "\(error)")
-        }
+        // B4: batch-head validation is an atomic pre-dispatch gate — nothing
+        // has executed, so a typed throw lets the actor synthesize per-call
+        // done receipts preserving status (no hold, continuation proceeds).
+        // This matches ScriptedToolBackend (throws preDispatch) exactly.
+        _ = try ToolValidator.validateBatchArguments(batch: batch)
 
         var outcomes: [ToolCallOutcome] = []
         var halted = false
@@ -66,26 +88,32 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         let hasMutating = batch.proposals.contains { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" }
 
         for proposal in batch.proposals {
+            // B4: the execution-site classification stamps every outcome
+            // (the reducer verifies it against the dispatch-time intent).
+            let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
             if halted {
                 let summary = "unstarted: halted after \(haltAfter ?? "unknown")"
-                outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "cancelled", summary: summary, data: "", started: false))
+                outcomes.append(stamped(ToolCallOutcome(callID: proposal.callID, status: "cancelled", summary: summary, data: "", started: false), isMutating: isMutating))
                 continue
             }
             // Acquire lock once, before first mutating call, after validation
-            let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
             if isMutating && hasMutating && lockFD == nil {
                 if let ws = resolver.workspaceRoot {
                     do {
                         lockFD = try WorkspaceLock.acquire(workspace: ws)
                     } catch {
+                        // Provably undispatched (the lock gate precedes every
+                        // FS effect): nil declines the started claim and the
+                        // deterministic verdict stands done with no hold.
+                        // `false` is reserved for halt-unstarted claims.
                         let summary = "workspace lock failed: \(error)"
-                        outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "failed", summary: summary, data: "", error: summary, started: false))
+                        outcomes.append(stamped(ToolCallOutcome(callID: proposal.callID, status: "failed", summary: summary, data: "", error: summary, started: nil), isMutating: isMutating))
                         halted = true
                         haltAfter = proposal.callID
                         continue
                     }
                 } else {
-                    outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "denied", summary: "no workspace", data: "", error: "no workspace", started: false))
+                    outcomes.append(stamped(ToolCallOutcome(callID: proposal.callID, status: "denied", summary: "no workspace", data: "", error: "no workspace", started: nil), isMutating: isMutating))
                     halted = true
                     haltAfter = proposal.callID
                     continue
@@ -93,13 +121,30 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
             let outcome: ToolCallOutcome
             do {
-                outcome = try executeOne(proposal: proposal, reservation: reservation)
+                outcome = stamped(try await executeWithDeadline(proposal: proposal, reservation: reservation), isMutating: isMutating)
             } catch is CancellationError {
                 throw CancellationError()
+            } catch is DeadlineExceeded {
+                // Genuine uncertainty: the call was dispatched but its
+                // completion is unknown → timeout (unknown+hold for mutating
+                // via the reducer; transcript-only for non-mutating).
+                outcome = ToolCallOutcome(callID: proposal.callID, status: "timeout", summary: "timed out: tool deadline exceeded", data: "", error: "timeout", started: true, mutating: isMutating)
             } catch let ToolFailure.preDispatch(status, summary) {
-                outcome = ToolCallOutcome(callID: proposal.callID, status: status, summary: summary, data: "", error: summary, started: false)
+                // Provably undispatched (thrown before any FS effect for this
+                // call): deterministic verdict stands done with no hold for
+                // mutating (nil); non-mutating keeps the legacy transcript
+                // form (false).
+                outcome = ToolCallOutcome(callID: proposal.callID, status: status, summary: summary, data: "", error: summary, started: isMutating ? nil : false, mutating: isMutating)
             } catch {
-                outcome = ToolCallOutcome(callID: proposal.callID, status: "failed", summary: "\(error)", data: "", error: "\(error)", started: true)
+                // B4: an untyped post-dispatch throw must never certify a
+                // mutating call as a deterministic failure — it is genuinely
+                // uncertain (timeout → unknown+hold). Non-mutating calls
+                // cannot have side effects, so failed+started stands as done.
+                if isMutating {
+                    outcome = ToolCallOutcome(callID: proposal.callID, status: "timeout", summary: "untyped throw: \(error)", data: "", error: "\(error)", started: true, mutating: true)
+                } else {
+                    outcome = ToolCallOutcome(callID: proposal.callID, status: "failed", summary: "\(error)", data: "", error: "\(error)", started: true, mutating: false)
+                }
             }
             outcomes.append(outcome)
             if outcome.status != "success" && outcome.status != "no-match" {
@@ -109,6 +154,36 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
         let receipt = ExecutorReceipt(callID: batch.proposals.first?.callID ?? "batch", status: outcomes.first?.status ?? "failed", summary: outcomes.map { "\($0.callID):\($0.status)" }.joined(separator: ", "))
         return ExecutorResult(receipt: receipt, calls: outcomes)
+    }
+
+    /// B4: races one synchronous call against its per-tool deadline. The
+    /// pre-call test suspension runs inside the race (a never-released
+    /// suspension deterministically loses to the deadline); group exit
+    /// cancels the loser, so no task leaks. Outer cancellation propagates
+    /// as CancellationError (never converted to a timeout outcome).
+    private func executeWithDeadline(proposal: ToolProposal, reservation: EffectReservation) async throws -> ToolCallOutcome {
+        let limit = deadlines.seconds(for: proposal.tool)
+        let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+        return try await withThrowingTaskGroup(of: ToolCallOutcome.self) { group in
+            group.addTask {
+                if let pre = self.preCallSuspension { try await pre(proposal) }
+                let out = try self.executeOne(proposal: proposal, reservation: reservation)
+                // Post-effect suspension (test-only): the mutation above
+                // already applied (rename committed / file created / bytes
+                // read) but the receipt below is not built yet.
+                if isMutating, out.status == "success" { try await self.postCommitSuspension?() }
+                return out
+            }
+            group.addTask {
+                let nanos = UInt64(min(max(limit, 0), 3_600) * 1_000_000_000)
+                try await Task.sleep(nanoseconds: nanos)
+                throw DeadlineExceeded()
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else { throw CancellationError() }
+            group.cancelAll()
+            return first
+        }
     }
 
     private func executeOne(proposal: ToolProposal, reservation: EffectReservation) throws -> ToolCallOutcome {
@@ -151,7 +226,6 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     static let maxResultBytes = 1 * 1024 * 1024
     static let maxSearchStdoutBytes = 1 * 1024 * 1024
     static let maxSearchStderrBytes = 64 * 1024
-    static let searchTimeoutSeconds: TimeInterval = 30
     static let versionTimeoutSeconds: TimeInterval = 10
 
     /// Slice text into exact bytes: lines [offset, offset+limit), preserving a
@@ -1024,9 +1098,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         // --no-config is passed, so poisoned config / PATH shadowing /
         // preprocessor injection is inert. Root FDs are held open across the
         // run so the child always traverses the pinned directories.
+        // B4: the search deadline is the injectable per-tool value
+        // (production 120 s); expiry reports timeout (transcript-only for
+        // non-mutating search via the reducer), never a silent failure.
         let run: BoundedRunResult
         do {
-            run = try runBounded(executablePath: rgExec, args: argv, stdoutCap: Self.maxSearchStdoutBytes, stderrCap: Self.maxSearchStderrBytes, timeout: Self.searchTimeoutSeconds)
+            run = try runBounded(executablePath: rgExec, args: argv, stdoutCap: Self.maxSearchStdoutBytes, stderrCap: Self.maxSearchStderrBytes, timeout: deadlines.search)
         } catch is CancellationError {
             throw CancellationError()
         } catch let e as ToolFailure {
@@ -1035,7 +1112,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "\(error)", started: true)
         }
         if run.timedOut {
-            return ToolCallOutcome(callID: callID, status: "failed", summary: "rg timed out", data: "", error: "timeout", started: true)
+            return ToolCallOutcome(callID: callID, status: "timeout", summary: "rg timed out", data: "", error: "timeout", started: true)
         }
         // rg exit codes are 0 (match), 1 (no match), 2+ (error). Partial
         // stdout alongside an error is not a successful search.
@@ -1282,7 +1359,15 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         // fd (commit goes via same-dir tmp + rename). openRelative already
         // rejects directories, FIFOs, sockets and devices for file opens,
         // and symlinks anywhere via O_NOFOLLOW.
-        let dirFD = try resolver.validatedWorkspaceFD()
+        // B4: pre-mutation setup failures (workspace FD, opens) are
+        // provably undispatched deterministic failures — nil started, done
+        // with no hold — never the uncertain-timeout path.
+        let dirFD: Int32
+        do {
+            dirFD = try resolver.validatedWorkspaceFD()
+        } catch {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "workspace unavailable: \(error)", data: "", error: "\(error)", path: path, started: nil)
+        }
         defer { close(dirFD) }
         let fd: Int32
         do {
@@ -1291,7 +1376,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             if Self.isNotFound(error) {
                 return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found", data: "", path: path, started: true)
             }
-            throw error
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "open failed: \(error)", data: "", error: "\(error)", path: path, started: nil)
         }
         defer { close(fd) }
         var st = stat()
@@ -1342,7 +1427,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             parentFD = dirFD
             ownsParentFD = false
         } else {
-            parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            do {
+                parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            } catch {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "parent unavailable: \(error)", data: "", error: "\(error)", path: path, started: nil)
+            }
             ownsParentFD = true
         }
         defer { if ownsParentFD { close(parentFD) } }
@@ -1605,7 +1694,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         guard resolver.workspaceRoot != nil else {
             throw ToolFailure.preDispatch(status: "denied", summary: "no workspace")
         }
-        let dirFD = try resolver.validatedWorkspaceFD()
+        let dirFD: Int32
+        do {
+            dirFD = try resolver.validatedWorkspaceFD()
+        } catch {
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "workspace unavailable: \(error)", data: "", error: "\(error)", path: path, started: nil)
+        }
         defer { close(dirFD) }
         if let expectedHash = expectedHashOpt {
             return try writeReplacement(callID: callID, path: path, content: content, expectedHash: expectedHash, dirFD: dirFD)
@@ -1618,7 +1712,9 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             close(fd)
             return ToolCallOutcome(callID: callID, status: "failed", summary: "exists", data: "", error: "exists", path: path, started: true)
         } catch {
-            if !Self.isNotFound(error) { throw error }
+            if !Self.isNotFound(error) {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "probe failed: \(error)", data: "", error: "\(error)", path: path, started: nil)
+            }
         }
         // NOTE: the cleanup defer is at FUNCTION scope — a defer inside the
         // else branch would run at BRANCH exit and close parentFD early.
@@ -1629,13 +1725,18 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             parentFD = dirFD
             ownsParentFD = false
         } else {
-            // Create parent dirs descriptor-relative via mkdirat chain (no FileManager path following symlinks)
+            // Create parent dirs descriptor-relative via mkdirat chain (no FileManager path following symlinks).
+            // B4: mkdir/open failures here precede every file effect (nil started, deterministic done).
             do {
                 parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             } catch {
-                // Try to create the missing parent chain via mkdirat
-                try Self.mkdirs(dirPath, from: dirFD)
-                parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                do {
+                    // Try to create the missing parent chain via mkdirat
+                    try Self.mkdirs(dirPath, from: dirFD)
+                    parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                } catch {
+                    return ToolCallOutcome(callID: callID, status: "failed", summary: "parent unavailable: \(error)", data: "", error: "\(error)", path: path, started: nil)
+                }
             }
             ownsParentFD = true
         }
@@ -1706,7 +1807,8 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             if Self.isNotFound(error) {
                 return ToolCallOutcome(callID: callID, status: "no-match", summary: "not found for replacement", data: "", path: path, started: true)
             }
-            throw error
+            // B4: probe failures precede every file effect (nil started).
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "open failed: \(error)", data: "", error: "\(error)", path: path, started: nil)
         }
         defer { close(fd) }
         var st = stat()
@@ -1738,7 +1840,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             parentFD = dirFD
             ownsParentFD = false
         } else {
-            parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            do {
+                parentFD = try resolver.openRelative(dirPath, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            } catch {
+                return ToolCallOutcome(callID: callID, status: "failed", summary: "parent unavailable: \(error)", data: "", error: "\(error)", path: path, started: nil)
+            }
             ownsParentFD = true
         }
         defer { if ownsParentFD { close(parentFD) } }
