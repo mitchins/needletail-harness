@@ -81,7 +81,7 @@ struct B2ReadSearchTests {
             if let v = oldRC2 { setenv("RIPGREP_CONFIG", v, 1) } else { unsetenv("RIPGREP_CONFIG") }
         }
         let realRg = "/usr/bin/rg"
-        guard FileManager.default.fileExists(atPath: realRg) else { return }
+        try #require(FileManager.default.fileExists(atPath: realRg), "rg required for B2 search evidence; silent skip is not evidence")
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello\"}")])
         let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
@@ -208,7 +208,7 @@ struct B2ReadSearchTests {
         let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
         let store = InMemorySessionStore()
         let realRg = "/usr/bin/rg"
-        guard FileManager.default.fileExists(atPath: realRg) else { return }
+        try #require(FileManager.default.fileExists(atPath: realRg), "rg required for B2 search evidence; silent skip is not evidence")
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello\"}")])
         let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])

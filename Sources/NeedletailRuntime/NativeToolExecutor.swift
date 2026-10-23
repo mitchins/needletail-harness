@@ -179,12 +179,15 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
         }
         if limited.utf8.count > maxResultBytes {
+            // Charge each kept line exactly what it costs in the output: a
+            // trailing "\n" except for a final unterminated file line, so a
+            // line that exactly fits is never dropped on a phantom newline.
+            let lastKeepsNewline = (end < count) || hadTrailing
             var acc = 0
             var keep = 0
-            for line in slice {
-                // Each kept line is followed by "\n" in the output (mid-file cut
-                // always ends at a line boundary; EOF-newline case keeps it).
-                let lb = line.utf8.count + 1
+            for (i, line) in slice.enumerated() {
+                let isLast = i == slice.count - 1
+                let lb = line.utf8.count + ((isLast && !lastKeepsNewline) ? 0 : 1)
                 if acc + lb > maxResultBytes { break }
                 acc += lb
                 keep += 1
@@ -399,6 +402,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var stderr: Data
         var status: Int32
         var truncated: Bool
+        var stdoutTruncated: Bool
         var timedOut: Bool
     }
 
@@ -410,20 +414,40 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// concurrently via poll() with in-loop caps (never buffered unboundedly);
     /// wall-clock timeout escalates SIGTERM -> SIGKILL; the child is always
     /// reaped via waitpid; Task cancellation terminates and throws.
-    private func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval) throws -> BoundedRunResult {
-        try Task.checkCancellation()
-        var outFds = [Int32](repeating: 0, count: 2)
-        var errFds = [Int32](repeating: 0, count: 2)
-        guard pipe(&outFds) == 0, pipe(&errFds) == 0 else {
+    /// CLOEXEC pipe pair with a nonblocking read end. CLOEXEC is load-bearing:
+    /// a concurrent fork/exec in another thread must not inherit our pipe
+    /// write ends, or EOF becomes unobservable and the drain hangs.
+    private func makeCloexecPipe() throws -> (Int32, Int32) {
+        var fds = [Int32](repeating: 0, count: 2)
+        guard pipe(&fds) == 0 else {
             throw ToolFailure.preDispatch(status: "failed", summary: "rg pipe failed")
         }
-        let outR = outFds[0], outW = outFds[1]
-        let errR = errFds[0], errW = errFds[1]
-        // Nonblocking reads for the poll drain loop.
-        for fd in [outR, errR] {
-            let flags = fcntl(fd, F_GETFL)
-            _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        for fd in fds {
+            let fdFlags = fcntl(fd, F_GETFD)
+            _ = fcntl(fd, F_SETFD, fdFlags | FD_CLOEXEC)
         }
+        let flags = fcntl(fds[0], F_GETFL)
+        _ = fcntl(fds[0], F_SETFL, flags | O_NONBLOCK)
+        return (fds[0], fds[1])
+    }
+
+    private func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval) throws -> BoundedRunResult {
+        try Task.checkCancellation()
+        let (outR, outW): (Int32, Int32)
+        do {
+            (outR, outW) = try makeCloexecPipe()
+        } catch {
+            throw error
+        }
+        let errPair: (Int32, Int32)
+        do {
+            errPair = try makeCloexecPipe()
+        } catch {
+            close(outR)
+            close(outW)
+            throw error
+        }
+        let (errR, errW) = errPair
         // fork+exec (not posix_spawn): glibc posix_spawn fails scripts with
         // ENOEXEC, while version probes and race-test wrappers are #! scripts
         // launched via /proc/self/fd. fork+execve handles both ELF and
@@ -455,12 +479,15 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
         if pid == 0 {
             // Child: wire pipes to stdio, drop pipe FDs, exec. The qualified
-            // rg FD (CLOEXEC) stays open through exec pathname resolution;
-            // search-root FDs (inheritable) survive into rg for /proc/self/fd
-            // traversal. No Swift runtime interaction here.
+            // rg FD and search-root FDs are inheritable and survive into rg
+            // for /proc/self/fd resolution. Guards avoid closing stdio itself
+            // if a pipe FD ever lands on 0/1/2. No Swift runtime interaction.
             _ = dup2(outW, STDOUT_FILENO)
             _ = dup2(errW, STDERR_FILENO)
-            close(outR); close(errR); close(outW); close(errW)
+            if outR != STDIN_FILENO && outR != STDOUT_FILENO && outR != STDERR_FILENO { close(outR) }
+            if errR != STDIN_FILENO && errR != STDOUT_FILENO && errR != STDERR_FILENO { close(errR) }
+            if outW != STDOUT_FILENO { close(outW) }
+            if errW != STDERR_FILENO { close(errW) }
             argv.withUnsafeMutableBufferPointer { abuf in
                 envp.withUnsafeMutableBufferPointer { ebuf in
 #if canImport(Glibc)
@@ -497,10 +524,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 trunc = true
             }
         }
-        func drain(fd: Int32, eof: inout Bool, current: inout Data, trunc: inout Bool, cap: Int) {
+        // Bounded per-wakeup drain: sustained output must not starve the
+        // timeout/cancellation checks below.
+        func drain(fd: Int32, eof: inout Bool, current: inout Data, trunc: inout Bool, cap: Int, budget: Int) {
             if eof { return }
             var buf = [UInt8](repeating: 0, count: 8192)
-            while true {
+            var remaining = budget
+            while remaining > 0 {
                 let n = buf.withUnsafeMutableBytes { ptr in
 #if canImport(Glibc)
                     Glibc.read(fd, ptr.baseAddress, ptr.count)
@@ -510,6 +540,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 }
                 if n > 0 {
                     appendBounded(Data(buf[0..<n]), cap: cap, current: &current, trunc: &trunc)
+                    remaining -= 1
                 } else if n == 0 {
                     eof = true
                     break
@@ -523,9 +554,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         }
         var outEOF = false
         var errEOF = false
+        var outTruncCap = false
+        var errTruncCap = false
         var exitStatus: Int32 = -1
         var childDone = false
         let deadline = Date().addingTimeInterval(timeout)
+        let hardDeadline = deadline.addingTimeInterval(6)
+        var deadlineExceeded = false
         var termSent = false
         var killSent = false
         var killDeadline = Date.distantFuture
@@ -540,11 +575,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 }
                 for pfd in pfds where pfd.revents != 0 {
                     if pfd.fd == outR {
-                        drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTrunc, cap: stdoutCap)
+                        drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, cap: stdoutCap, budget: 64)
                     } else {
-                        drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTrunc, cap: stderrCap)
+                        drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, cap: stderrCap, budget: 64)
                     }
                 }
+            } else {
+                // Both pipes EOF but the child lives: do not busy-spin.
+                usleep(10_000)
             }
             var st: Int32 = 0
             let wr = waitpid(pid, &st, WNOHANG)
@@ -555,6 +593,10 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 } else {
                     exitStatus = 128
                 }
+            } else if wr < 0 && errno == ECHILD {
+                // Reaped elsewhere: no zombie can remain, but the status is
+                // unknown and the pid must never be signalled (reuse risk).
+                childDone = true
             }
             if childDone && outEOF && errEOF { break }
             let now = Date()
@@ -563,12 +605,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 break
             }
             if !childDone && now >= deadline && !termSent {
+                deadlineExceeded = true
+                termSent = true
 #if canImport(Glibc)
                 Glibc.kill(pid, SIGTERM)
 #else
                 Darwin.kill(pid, SIGTERM)
 #endif
-                termSent = true
                 killDeadline = now.addingTimeInterval(2)
             }
             if !childDone && termSent && !killSent && now >= killDeadline {
@@ -580,19 +623,39 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 killSent = true
                 killDeadline = now.addingTimeInterval(2)
             }
-            if killSent && now >= killDeadline { break }
+            // Elapsed hard stop: never depend on childDone alone (a reaped
+            // child plus an unobservable EOF must not hang the caller).
+            if (killSent && now >= killDeadline) || now >= hardDeadline { break }
             if childDone && outEOF && errEOF { break }
         }
         if cancelled || (!childDone) {
             // Escalate and reap; cancellation always terminates the child.
+            // Never signal a reaped pid (reuse risk): waitpid ECHILD marks
+            // childDone above, and every kill below is guarded by !childDone.
+            if !childDone {
 #if canImport(Glibc)
-            Glibc.kill(pid, SIGTERM)
+                Glibc.kill(pid, SIGTERM)
 #else
-            Darwin.kill(pid, SIGTERM)
+                Darwin.kill(pid, SIGTERM)
 #endif
+            }
             var st: Int32 = 0
             var waited = 0
-            while waitpid(pid, &st, WNOHANG) != pid && waited < 20 {
+            while !childDone && waited < 20 {
+                let wr2 = waitpid(pid, &st, WNOHANG)
+                if wr2 == pid {
+                    childDone = true
+                    if (st & 0x7F) == 0 {
+                        exitStatus = (st >> 8) & 0xFF
+                    } else {
+                        exitStatus = 128
+                    }
+                    break
+                }
+                if wr2 < 0 && errno == ECHILD {
+                    childDone = true
+                    break
+                }
                 usleep(100_000)
                 waited += 1
             }
@@ -602,22 +665,40 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
 #else
                 Darwin.kill(pid, SIGKILL)
 #endif
-                _ = waitpid(pid, &st, 0)
-                if (st & 0x7F) == 0 {
-                    exitStatus = (st >> 8) & 0xFF
+                var waited2 = 0
+                while !childDone && waited2 < 20 {
+                    let wr3 = waitpid(pid, &st, WNOHANG)
+                    if wr3 == pid {
+                        childDone = true
+                        if (st & 0x7F) == 0 {
+                            exitStatus = (st >> 8) & 0xFF
+                        } else {
+                            exitStatus = 128
+                        }
+                        break
+                    }
+                    if wr3 < 0 && errno == ECHILD {
+                        childDone = true
+                        break
+                    }
+                    usleep(100_000)
+                    waited2 += 1
                 }
             }
-            // Final nonblocking drain after termination.
-            drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTrunc, cap: stdoutCap)
-            drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTrunc, cap: stderrCap)
+            // Final bounded drain after termination.
+            drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, cap: stdoutCap, budget: 1024)
+            drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, cap: stderrCap, budget: 1024)
         }
         close(outR)
         close(errR)
         if cancelled {
             throw CancellationError()
         }
-        let timedOut = !childDone
-        return BoundedRunResult(stdout: outData, stderr: errData, status: exitStatus, truncated: outTrunc || errTrunc, timedOut: timedOut)
+        // deadlineExceeded is sticky: a SIGTERM that successfully killed rg
+        // still counts as a timeout (partial output is never success).
+        // An unreaped survivor past the hard stop is likewise a timeout.
+        let timedOut = deadlineExceeded || !childDone
+        return BoundedRunResult(stdout: outData, stderr: errData, status: exitStatus, truncated: outTruncCap || errTruncCap, stdoutTruncated: outTruncCap, timedOut: timedOut)
     }
 
     /// Version gate over the qualified FD path with sanitized env, bounded
@@ -790,18 +871,19 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if run.timedOut {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "rg timed out", data: "", error: "timeout", started: true)
         }
+        // rg exit codes are 0 (match), 1 (no match), 2+ (error). Partial
+        // stdout alongside an error is not a successful search.
         if run.status != 0 && run.status != 1 {
-            if run.stdout.isEmpty {
-                return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "rg exit \(run.status)", started: true)
-            }
+            return ToolCallOutcome(callID: callID, status: "failed", summary: "rg failed", data: "", error: "rg exit \(run.status)", started: true)
         }
-        // Cap was enforced during the drain; if the cap cut mid-line, drop the
-        // trailing partial JSON line so every retained line parses completely.
+        // The stdout cap was enforced during the drain; if the cap cut
+        // mid-line, drop the trailing partial JSON line so every retained
+        // line parses completely. (Stderr capping never discards stdout.)
         var outputData = run.stdout
         var truncated = run.truncated
-        if truncated, let lastNL = outputData.lastIndex(of: 0x0A) {
+        if run.stdoutTruncated, let lastNL = outputData.lastIndex(of: 0x0A) {
             outputData = outputData.prefix(through: lastNL)
-        } else if truncated {
+        } else if run.stdoutTruncated {
             outputData = Data()
         }
         let (text, omittedUnparseable) = Self.filterSearchJSON(outputData, roots: roots, approvedPaths: reservation.approvedPaths)
@@ -833,14 +915,38 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 omittedUnparseable = true
                 continue
             }
+            // ripgrep reports non-UTF-8 paths as {"path":{"bytes":base64}}.
+            // Lossy-decode preserves every ASCII byte exactly (protected names
+            // are pure ASCII; U+FFFD substitution can neither hide nor forge
+            // them), so the existing classifier stays sound on the decoded
+            // skeleton. Undecodable base64 fails closed.
             var pathText: String? = nil
+            var pathPresent = false
             if let data = obj["data"] as? [String: Any],
-               let path = data["path"] as? [String: Any],
-               let t = path["text"] as? String {
-                pathText = t
+               let path = data["path"] as? [String: Any] {
+                pathPresent = true
+                if let t = path["text"] as? String {
+                    pathText = t
+                } else if let b = path["bytes"] as? String,
+                          let rawBytes = Data(base64Encoded: b) {
+                    pathText = String(decoding: rawBytes, as: UTF8.self)
+                }
             }
             guard let reported = pathText else {
-                kept.append(line)
+                if pathPresent {
+                    // Path object present but unusable (e.g. bad base64):
+                    // fail closed on unclassifiable paths.
+                    omittedUnparseable = true
+                    continue
+                }
+                // Pathless lines are kept only when they are the explicit
+                // summary record; any other pathless type is dropped
+                // fail-closed rather than emitted unclassified.
+                if (obj["type"] as? String) == "summary" {
+                    kept.append(line)
+                } else {
+                    omittedUnparseable = true
+                }
                 continue
             }
             guard let logical = Self.logicalSearchPath(reported: reported, roots: roots) else {

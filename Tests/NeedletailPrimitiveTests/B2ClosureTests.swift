@@ -72,7 +72,7 @@ struct B2ClosureTests {
 
     @Test("CLOSURE_01_explicitRootRace")
     func explicitRootRace() async throws {
-        guard let realRg = Self.locateRg() else { return }
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let parent = try Self.tempParent()
         defer { try? FileManager.default.removeItem(at: parent) }
         let ws = parent.appendingPathComponent("ws")
@@ -112,7 +112,7 @@ struct B2ClosureTests {
 
     @Test("CLOSURE_02_workspaceRootRace")
     func workspaceRootRace() async throws {
-        guard let realRg = Self.locateRg() else { return }
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let parent = try Self.tempParent()
         defer {
             let ws = parent.appendingPathComponent("ws")
@@ -153,7 +153,7 @@ struct B2ClosureTests {
 
     @Test("CLOSURE_03_poisonedEnvReal")
     func poisonedEnvReal() async throws {
-        guard let realRg = Self.locateRg() else { return }
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let parent = try Self.tempParent()
         defer { try? FileManager.default.removeItem(at: parent) }
         let ws = parent.appendingPathComponent("ws")
@@ -209,7 +209,7 @@ struct B2ClosureTests {
 
     @Test("CLOSURE_04_searchBounded")
     func searchBounded() async throws {
-        guard let realRg = Self.locateRg() else { return }
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let parent = try Self.tempParent()
         defer { try? FileManager.default.removeItem(at: parent) }
         let ws = parent.appendingPathComponent("ws")
@@ -280,7 +280,7 @@ struct B2ClosureTests {
 
     @Test("CLOSURE_06_protectedPrune")
     func protectedPrune() async throws {
-        guard let realRg = Self.locateRg() else { return }
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let parent = try Self.tempParent()
         defer { try? FileManager.default.removeItem(at: parent) }
         let ws = parent.appendingPathComponent("ws")
@@ -288,6 +288,7 @@ struct B2ClosureTests {
         let gitDir = ws.appendingPathComponent(".git")
         try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
         try "GIT_SENTINEL_111\n".write(to: gitDir.appendingPathComponent("config"), atomically: true, encoding: .utf8)
+        try "GIT_HEAD_MARKER\n".write(to: gitDir.appendingPathComponent("HEAD"), atomically: true, encoding: .utf8)
         try "ENV_SECRET_222=1\n".write(to: ws.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
         try "my .env file mentions git config\n".write(to: ws.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
         try "hello normal\n".write(to: ws.appendingPathComponent("normal.txt"), atomically: true, encoding: .utf8)
@@ -329,13 +330,75 @@ struct B2ClosureTests {
         #expect(result4.calls[0].status == "success")
         #expect(result4.calls[0].data.contains("ENV_SECRET_222"), "approved grantable path must be visible")
         #expect(!result4.calls[0].data.contains("GIT_SENTINEL_111"), "unapproved grantable category must stay pruned")
+        // Per-line classifier enforcement inside a relaxed category: approving
+        // .git/config relaxes .git traversal, but .git/HEAD must still drop.
+        let batch5 = ToolBatch([ToolProposal(callID: "c5", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"GIT_SENTINEL_111|GIT_HEAD_MARKER\"}")])
+        let result5 = try await exec.execute(batch: batch5, reservation: Self.makeReservation(batch: batch5, approved: [".git/config"]))
+        #expect(result5.calls[0].status == "success")
+        #expect(result5.calls[0].data.contains("GIT_SENTINEL_111"), "approved .git/config must be visible")
+        #expect(!result5.calls[0].data.contains("GIT_HEAD_MARKER"), "unapproved path inside relaxed category must drop via classifier")
+    }
+
+    // MARK: - 10. Non-UTF-8 paths classified, never bypassed
+
+    @Test("CLOSURE_10_nonUTF8Paths")
+    func nonUTF8Paths() async throws {
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
+        let parent = try Self.tempParent()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ws = parent.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        let wsFD = ws.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        try #require(wsFD >= 0, "workspace must open")
+        defer { close(wsFD) }
+        func createRaw(_ name: [UInt8], under dirFD: Int32, content: String) throws {
+            var cname = name + [0]
+            let fd = cname.withUnsafeMutableBytes { ptr in
+                openat(dirFD, ptr.baseAddress!.assumingMemoryBound(to: CChar.self), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o644))
+            }
+            try #require(fd >= 0, "raw file must create: \(name)")
+            defer { close(fd) }
+            let bytes = Array(content.utf8)
+            var written = 0
+            while written < bytes.count {
+                let n = bytes.withUnsafeBufferPointer { ptr in
+                    write(fd, ptr.baseAddress! + written, bytes.count - written)
+                }
+                try #require(n > 0, "raw file must write")
+                written += n
+            }
+        }
+        // .git/config (approved later) + .git/<0xFF> (must never leak).
+        let gitDir = ws.appendingPathComponent(".git")
+        try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
+        try "cfg CONFIGMARK\n".write(to: gitDir.appendingPathComponent("config"), atomically: true, encoding: .utf8)
+        let gitFD = ".git".withCString { openat(wsFD, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        try #require(gitFD >= 0, ".git must open")
+        defer { close(gitFD) }
+        try createRaw([0x62, 0x61, 0x64, 0xFF, 0x6E, 0x61, 0x6D, 0x65], under: gitFD, content: "marker GHOSTMARK2\n")
+        // Unprotected dir with a non-UTF-8 name stays searchable.
+        try createRaw([0x74, 0x6F, 0x70, 0xFF, 0x2E, 0x74, 0x78, 0x74], under: wsFD, content: "top TOPMARK\n")
+        let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
+        // Approving .git/config relaxes .git traversal: CONFIGMARK visible,
+        // GHOSTMARK2 (non-UTF-8 name inside grantable, unapproved) dropped.
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"CONFIGMARK|GHOSTMARK2|TOPMARK\"}")])
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch, approved: [".git/config"]))
+        #expect(result.calls[0].status == "success", "bytes-path search must succeed, got \(result.calls[0])")
+        #expect(result.calls[0].data.contains("CONFIGMARK"), "approved config visible")
+        #expect(!result.calls[0].data.contains("GHOSTMARK2"), "non-UTF-8 path inside grantable must not bypass classification")
+        #expect(result.calls[0].data.contains("TOPMARK"), "non-UTF-8 name in unprotected dir stays searchable")
+        // Counterfactual: unpruned rg DOES see the ghost file via path.bytes.
+        let (direct, _) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "GHOSTMARK2", ws.path])
+        #expect(direct.contains("\"bytes\"") && direct.contains("GHOSTMARK2"), "counterfactual: raw rg reports the ghost via path.bytes")
     }
 
     // MARK: - 7. Ripgrep qualification matrix
 
     @Test("CLOSURE_07_rgQualification")
     func rgQualification() async throws {
-        guard let realRg = Self.locateRg() else { return }
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let parent = try Self.tempParent()
         defer { try? FileManager.default.removeItem(at: parent) }
         let ws = parent.appendingPathComponent("ws")
@@ -398,7 +461,7 @@ struct B2ClosureTests {
 
     @Test("CLOSURE_08_rgExecIdentityRace")
     func rgExecIdentityRace() async throws {
-        guard let realRg = Self.locateRg() else { return }
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let parent = try Self.tempParent()
         defer { try? FileManager.default.removeItem(at: parent) }
         let ws = parent.appendingPathComponent("ws")
@@ -427,6 +490,118 @@ struct B2ClosureTests {
         #expect(direct.contains("RG_EVIL_XYZ"), "counterfactual: replaced file runs evil by pathname")
         try? FileManager.default.removeItem(at: wrapper)
         try? FileManager.default.moveItem(at: parent.appendingPathComponent("wrap8.sh.orig"), to: wrapper)
+    }
+
+    // MARK: - 11. Sanitized environment proven by in-child probe
+
+    @Test("CLOSURE_11_envSanitizationProbe")
+    func envSanitizationProbe() async throws {
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
+        let parent = try Self.tempParent()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ws = parent.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        try "hello\n".write(to: ws.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        // Probe executable: passes the version gate, then reports the exact
+        // environment it observes inside a fixed-shape match record whose
+        // path is the argv root it was given (so classification passes).
+        let probe = parent.appendingPathComponent("envprobe.sh")
+        let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho 'ripgrep 99.0.0'\necho 'features:none'\nexit 0\nfi\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"%s/probe.txt\"},\"lines\":{\"text\":\"PATH=%s RC=%s HOME=%s\\\\n\"},\"line_number\":1,\"absolute_offset\":0,\"submatches\":[]}}\\n' \"$last\" \"$PATH\" \"${RIPGREP_CONFIG_PATH-unset}\" \"${HOME-unset}\"\n"
+        try script.write(to: probe, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: probe.path)
+        let poisonDir = parent.appendingPathComponent("poisonbin")
+        try FileManager.default.createDirectory(at: poisonDir, withIntermediateDirectories: true)
+        let oldPath = getenv("PATH").map { String(cString: $0) }
+        let oldRC = getenv("RIPGREP_CONFIG_PATH").map { String(cString: $0) }
+        let oldHome = getenv("HOME").map { String(cString: $0) }
+        setenv("PATH", "\(poisonDir.path):\(oldPath ?? "/usr/bin:/bin")", 1)
+        setenv("RIPGREP_CONFIG_PATH", "/tmp/definitely-poisoned.rc", 1)
+        setenv("HOME", "/tmp/poison-home", 1)
+        defer {
+            if let v = oldPath { setenv("PATH", v, 1) } else { unsetenv("PATH") }
+            if let v = oldRC { setenv("RIPGREP_CONFIG_PATH", v, 1) } else { unsetenv("RIPGREP_CONFIG_PATH") }
+            if let v = oldHome { setenv("HOME", v, 1) } else { unsetenv("HOME") }
+        }
+        let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: probe.path)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"anything\"}")])
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
+        #expect(result.calls[0].status == "success", "probe search must succeed, got \(result.calls[0])")
+        #expect(result.calls[0].data.contains("PATH=/usr/bin:/bin"), "child must observe exactly the sanitized PATH, got \(result.calls[0].data.prefix(300))")
+        #expect(result.calls[0].data.contains("RC=unset"), "RIPGREP_CONFIG_PATH must be absent in child")
+        #expect(result.calls[0].data.contains("HOME=unset"), "HOME must be absent in child")
+        #expect(!result.calls[0].data.contains(poisonDir.path), "poisoned PATH prefix must not leak into child")
+        // Counterfactual: the same probe with inherited env observes poison.
+        var poisonEnv = ProcessInfo.processInfo.environment
+        poisonEnv["RIPGREP_CONFIG_PATH"] = "/tmp/definitely-poisoned.rc"
+        let (direct, _) = try Self.runDirectRg(probe.path, args: ["anything", ws.path], env: poisonEnv)
+        #expect(direct.contains("RC=/tmp/definitely-poisoned.rc"), "counterfactual: inherited env reaches an unsanitized child")
+        _ = realRg
+    }
+
+    // MARK: - 12. Timeout is failure, never partial success
+
+    @Test("CLOSURE_12_searchTimeout", .timeLimit(.minutes(2)))
+    func searchTimeout() async throws {
+        let parent = try Self.tempParent()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ws = parent.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        try "hello\n".write(to: ws.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        // Hanging probe: fast --version, then sleeps past the 30 s budget.
+        let hanging = parent.appendingPathComponent("hang.sh")
+        let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho 'ripgrep 99.0.0'\nexit 0\nfi\nsleep 60\n"
+        try script.write(to: hanging, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hanging.path)
+        let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: hanging.path)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello\"}")])
+        let start = Date()
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch))
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(result.calls[0].status == "failed", "timeout must be failure, got \(result.calls[0])")
+        #expect(result.calls[0].summary.contains("timed out"), "timeout must be explicit, got \(result.calls[0])")
+        #expect(elapsed < 60, "SIGTERM escalation must bound the wait, took \(elapsed)s")
+        #expect(elapsed >= 25, "sanity: the 30 s budget must actually elapse, took \(elapsed)s")
+    }
+
+    // MARK: - 13. Concurrent bounded runners stay independent
+
+    @Test("CLOSURE_13_concurrentRunners")
+    func concurrentRunners() async throws {
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
+        let parent = try Self.tempParent()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let line = "hello concurrent padding padding\n"
+        func makeWS(_ name: String) throws -> FilePath {
+            let ws = parent.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+            for i in 0..<50 {
+                var big = ""
+                for _ in 0..<200 { big += line }
+                try big.write(to: ws.appendingPathComponent("f\(i).txt"), atomically: true, encoding: .utf8)
+            }
+            return FilePath(ws.path)
+        }
+        let fpA = try makeWS("wsA")
+        let fpB = try makeWS("wsB")
+        let store = InMemorySessionStore()
+        func runSearch(_ fp: FilePath) async throws -> ToolCallOutcome {
+            let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+            let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello\"}")])
+            return try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch)).calls[0]
+        }
+        async let a = runSearch(fpA)
+        async let b = runSearch(fpB)
+        let (ra, rb) = try await (a, b)
+        for (i, r) in [ra, rb].enumerated() {
+            #expect(r.status == "success", "concurrent runner \(i) must succeed, got \(r)")
+            #expect(r.truncated == true, "concurrent runner \(i) output must be bounded")
+            #expect(r.data.utf8.count <= 1 * 1024 * 1024, "concurrent runner \(i) respects the cap")
+        }
     }
 
     // MARK: - 9. artifactId alias pair rejected
