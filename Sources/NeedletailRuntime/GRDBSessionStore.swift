@@ -779,7 +779,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         let ref = ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID)
         let payload = try RecordCodec.encode(DurableRecord.artifactPublished(ref))
         do {
-            let preSnap = try queue.read { db in try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest, ignoreEntry: preAdopted ? digest : nil) }
+            let preSnap = try queue.read { db in try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest) }
             try checkByteQuotas(preSnap, session: identity.session.raw, payloadBytes: 0, digest: digest, size: Int64(bytes.count), globalSizeAlreadyCounted: preAdopted)
         } catch { throw Self.translate(error) }
         // Tmp file, created OUTSIDE the commit transaction but UNDER the
@@ -891,7 +891,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 try syncArtifactDirectory(atPath: root)
                 adoptedFinal = true
             }
-            let snap = try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest, ignoreEntry: adoptedFinal ? digest : nil)
+            let snap = try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest)
             try checkByteQuotas(snap, session: identity.session.raw, payloadBytes: Int64(payload.count), digest: digest, size: Int64(bytes.count), globalSizeAlreadyCounted: adoptedFinal)
             let sessionHasD = snap.sessionHasDigest
             // Re-verify the tmp we wrote (fresh open relative to the held
@@ -1113,8 +1113,16 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                   let nbytes: Int64 = row["nbytes"] else {
                 throw StoreError.integrity("byte ledger hit an unreadable record row")
             }
-            snap.globalRecordBytes += nbytes
-            snap.perSessionRecordBytes[session, default: 0] += nbytes
+            let (gr1, go1) = snap.globalRecordBytes.addingReportingOverflow(nbytes)
+            guard !go1 else {
+                throw StoreError.integrity("byte ledger totals overflowed")
+            }
+            snap.globalRecordBytes = gr1
+            let (pr1, po1) = (snap.perSessionRecordBytes[session] ?? 0).addingReportingOverflow(nbytes)
+            guard !po1 else {
+                throw StoreError.integrity("byte ledger totals overflowed")
+            }
+            snap.perSessionRecordBytes[session] = pr1
             guard let data = payload.data(using: .utf8) else {
                 throw StoreError.integrity("byte ledger hit a non-UTF-8 record row")
             }
@@ -1147,7 +1155,11 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 throw StoreError.integrity("byte ledger hit a negative artifact_physical size")
             }
             snap.physicalRows[digest] = size
-            snap.physicalSum += size
+            let (ps, po) = snap.physicalSum.addingReportingOverflow(size)
+            guard !po else {
+                throw StoreError.integrity("byte ledger totals overflowed")
+            }
+            snap.physicalSum = ps
         }
         if FileManager.default.fileExists(atPath: root) {
             let entries: [String]
@@ -1163,7 +1175,11 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 // follows symlinks — a symlink must not inherit its target's
                 // size into the quota) plus S_ISREG, else skipped.
                 if let size = Self.regularFileSize(root: root, entry: entry) {
-                    snap.orphanBytes += size
+                    let (ob, oo) = snap.orphanBytes.addingReportingOverflow(size)
+                    guard !oo else {
+                        throw StoreError.integrity("byte ledger totals overflowed")
+                    }
+                    snap.orphanBytes = ob
                     snap.orphanSizes[entry] = size
                 }
             }
@@ -1205,7 +1221,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         var sessionHasDigest: Bool
     }
 
-    static func snapshotByteQuotas(_ db: Database, artifactsRoot root: String, session: String, digest: String?, ignoreEntry: String? = nil) throws -> ByteQuotaView {
+    static func snapshotByteQuotas(_ db: Database, artifactsRoot root: String, session: String, digest: String?) throws -> ByteQuotaView {
         let logical: Int64? = try Int64.fetchOne(db, sql: "SELECT bytes FROM byte_usage WHERE session = ?", arguments: [session])
         let physicalSum = try Int64.fetchOne(db, sql: "SELECT COALESCE(SUM(size), 0) FROM artifact_physical") ?? 0
         let recordBytes = try Int64.fetchOne(db, sql: "SELECT COALESCE(SUM(length(CAST(payload AS BLOB))), 0) FROM records") ?? 0
@@ -1224,7 +1240,6 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             let entries = try FileManager.default.contentsOfDirectory(atPath: root)
             for entry in entries {
                 if entry.hasPrefix(artifactTmpPrefix) { continue }
-                if entry == ignoreEntry { continue }
                 if physicalRows[entry] != nil { continue }
                 if let size = Self.regularFileSize(root: root, entry: entry) {
                     orphanBytes += size
@@ -1260,7 +1275,11 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             guard let payload: String = row["payload"], let n: Int64 = row["n"] else {
                 throw StoreError.integrity("byte quota hit an unreadable record row")
             }
-            total += n
+            let (t1, o1) = total.addingReportingOverflow(n)
+            guard !o1 else {
+                throw StoreError.integrity("byte quota totals overflowed")
+            }
+            total = t1
             guard let data = payload.data(using: .utf8) else {
                 throw StoreError.integrity("byte quota hit a non-UTF-8 record row")
             }
@@ -1272,7 +1291,11 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             }
             if case .artifactPublished(let ref) = record, !seen.contains(ref.digest) {
                 seen.insert(ref.digest)
-                total += Int64(ref.size)
+                let (t2, o2) = total.addingReportingOverflow(Int64(ref.size))
+                guard !o2 else {
+                    throw StoreError.integrity("byte quota totals overflowed")
+                }
+                total = t2
             }
         }
         return total
@@ -1377,7 +1400,11 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             arguments: [last + 1, session, String(decoding: payload, as: UTF8.self)])
         var bump = Int64(payload.count)
         if digest != nil, !sessionHasDigest {
-            bump += size
+            let (nb, no) = bump.addingReportingOverflow(size)
+            guard !no else {
+                throw StoreError.quotaExceeded(limit: Int(globalByteLimit))
+            }
+            bump = nb
         }
         try db.execute(
             sql: "INSERT INTO byte_usage (session, bytes) VALUES (?, ?) ON CONFLICT(session) DO UPDATE SET bytes = bytes + excluded.bytes",
@@ -1464,12 +1491,21 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             }
         }
         var logicalRunning = view.logicalCurrent
-        var globalRunning = view.physicalSum + view.globalRecordBytes + view.orphanBytes
+        let (g1, go1) = view.physicalSum.addingReportingOverflow(view.globalRecordBytes)
+        let (g2, go2) = g1.addingReportingOverflow(view.orphanBytes)
+        guard !go1, !go2 else {
+            throw StoreError.integrity("byte quota totals overflowed")
+        }
+        var globalRunning = g2
         var physicalKnown = view.physicalRows
         for item in items {
             var logicalAdd = Int64(item.payload.count)
             if let d = item.digest, !sessionHas.contains(d) {
-                logicalAdd += item.size
+                let (la, lo) = logicalAdd.addingReportingOverflow(item.size)
+                guard !lo else {
+                    throw StoreError.quotaExceeded(limit: Int(sessionByteLimit))
+                }
+                logicalAdd = la
             }
             let (newLogical, logicalOverflow) = logicalRunning.addingReportingOverflow(logicalAdd)
             guard !logicalOverflow, newLogical <= sessionByteLimit else {
@@ -1477,7 +1513,11 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             }
             var globalAdd = Int64(item.payload.count)
             if let d = item.digest, physicalKnown[d] == nil {
-                globalAdd += item.size
+                let (ga, go) = globalAdd.addingReportingOverflow(item.size)
+                guard !go else {
+                    throw StoreError.quotaExceeded(limit: Int(globalByteLimit))
+                }
+                globalAdd = ga
             }
             let (newGlobal, globalOverflow) = globalRunning.addingReportingOverflow(globalAdd)
             guard !globalOverflow, newGlobal <= globalByteLimit else {
@@ -1547,7 +1587,11 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 guard let s = snap.digestSize[d] else {
                     throw StoreError.integrity("reconcile found reference without size for digest \(d)")
                 }
-                total += s
+                let (nt, no) = total.addingReportingOverflow(s)
+                guard !no else {
+                    throw StoreError.integrity("byte ledger totals overflowed")
+                }
+                total = nt
             }
             expectedUsage[sess] = total
         }
