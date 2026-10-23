@@ -329,6 +329,18 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
 #endif
     }
 
+    /// Monotonic nanoseconds for timeout accounting (immune to wall-clock
+    /// adjustments, unlike Date()).
+    static func monotonicNanos() -> UInt64 {
+        var ts = timespec()
+#if canImport(Glibc)
+        _ = Glibc.clock_gettime(CLOCK_MONOTONIC, &ts)
+#else
+        _ = Darwin.clock_gettime(CLOCK_MONOTONIC, &ts)
+#endif
+        return UInt64(ts.tv_sec) * 1_000_000_000 + UInt64(ts.tv_nsec)
+    }
+
     /// Qualify the ripgrep executable and return an open FD to it (caller must
     /// close after launch). lstat rejects symlinks without following; open
     /// O_NOFOLLOW + fstat dev/ino equality with lstat rejects replacement
@@ -414,37 +426,60 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// concurrently via poll() with in-loop caps (never buffered unboundedly);
     /// wall-clock timeout escalates SIGTERM -> SIGKILL; the child is always
     /// reaped via waitpid; Task cancellation terminates and throws.
-    /// CLOEXEC pipe pair with a nonblocking read end. CLOEXEC is load-bearing:
-    /// a concurrent fork/exec in another thread must not inherit our pipe
-    /// write ends, or EOF becomes unobservable and the drain hangs.
-    private func makeCloexecPipe() throws -> (Int32, Int32) {
+    /// Process-wide spawn lock: pipe() + FD_CLOEXEC + fork() are separate
+    /// syscalls, so a concurrent fork in another thread could otherwise land
+    /// inside the pipe-to-CLOEXEC window and inherit a write end without
+    /// CLOEXEC (this toolchain's Glibc overlay exposes no pipe2). The lock is
+    /// held from pipe creation through fork return, making the whole spawn
+    /// section atomic across runners. The child never touches the lock.
+    private static let spawnLock = NSLock()
+
+    /// Spawn pipe pair: FDs lifted above stdio (dup2/close wiring can never
+    /// alias 0/1/2), CLOEXEC (concurrent children must not inherit write
+    /// ends, or EOF becomes unobservable), nonblocking read end for poll().
+    /// Must be called with spawnLock held (see runBounded).
+    private func makeSpawnPipe() throws -> (Int32, Int32) {
         var fds = [Int32](repeating: 0, count: 2)
         guard pipe(&fds) == 0 else {
             throw ToolFailure.preDispatch(status: "failed", summary: "rg pipe failed")
         }
-        for fd in fds {
+        func lift(_ fd: Int32) -> Int32 {
+            var f = fd
+            while f >= 0 && f <= 2 {
+                let n = fcntl(f, F_DUPFD, 3)
+                if n < 0 { return f }
+                close(f)
+                f = n
+            }
+            return f
+        }
+        let owned = [lift(fds[0]), lift(fds[1])]
+        for fd in owned {
             let fdFlags = fcntl(fd, F_GETFD)
             _ = fcntl(fd, F_SETFD, fdFlags | FD_CLOEXEC)
         }
-        let flags = fcntl(fds[0], F_GETFL)
-        _ = fcntl(fds[0], F_SETFL, flags | O_NONBLOCK)
-        return (fds[0], fds[1])
+        let flags = fcntl(owned[0], F_GETFL)
+        _ = fcntl(owned[0], F_SETFL, flags | O_NONBLOCK)
+        return (owned[0], owned[1])
     }
 
     private func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval) throws -> BoundedRunResult {
         try Task.checkCancellation()
+        Self.spawnLock.lock()
         let (outR, outW): (Int32, Int32)
         do {
-            (outR, outW) = try makeCloexecPipe()
+            (outR, outW) = try makeSpawnPipe()
         } catch {
+            Self.spawnLock.unlock()
             throw error
         }
         let errPair: (Int32, Int32)
         do {
-            errPair = try makeCloexecPipe()
+            errPair = try makeSpawnPipe()
         } catch {
             close(outR)
             close(outW)
+            Self.spawnLock.unlock()
             throw error
         }
         let (errR, errW) = errPair
@@ -463,6 +498,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         defer { for p in envp { if let p { free(p) } } }
         guard let pathC = strdup(executablePath) else {
             close(outR); close(errR); close(outW); close(errW)
+            Self.spawnLock.unlock()
             throw ToolFailure.preDispatch(status: "failed", summary: "rg launch failed: alloc")
         }
         defer { free(pathC) }
@@ -475,7 +511,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if pid < 0 {
             let e = errno
             close(outR); close(errR); close(outW); close(errW)
+            Self.spawnLock.unlock()
             throw ToolFailure.preDispatch(status: "failed", summary: "rg fork failed: \(String(cString: strerror(e)))")
+        }
+        // Parent leaves the spawn section here; the drain loop below runs
+        // unlocked so concurrent runners proceed independently.
+        if pid != 0 {
+            Self.spawnLock.unlock()
         }
         if pid == 0 {
             // Child: wire pipes to stdio, drop pipe FDs, exec. The qualified
@@ -508,8 +550,6 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         close(errW)
         var outData = Data()
         var errData = Data()
-        var outTrunc = false
-        var errTrunc = false
         func appendBounded(_ chunk: Data, cap: Int, current: inout Data, trunc: inout Bool) {
             if chunk.isEmpty { return }
             if current.count >= cap {
@@ -558,12 +598,17 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var errTruncCap = false
         var exitStatus: Int32 = -1
         var childDone = false
-        let deadline = Date().addingTimeInterval(timeout)
-        let hardDeadline = deadline.addingTimeInterval(6)
+        // Monotonic clock: wall-clock changes must not extend/truncate the
+        // timeout. Hard stop is deadline+6 s; cleanup loops can add ~4 s, so
+        // the real bound is ~timeout+10 s.
+        let startNanos = Self.monotonicNanos()
+        let deadlineNanos = startNanos + UInt64(timeout * 1_000_000_000)
+        let hardNanos = deadlineNanos + 6_000_000_000
+        var killNanos = UInt64.max
         var deadlineExceeded = false
+        var hardStopped = false
         var termSent = false
         var killSent = false
-        var killDeadline = Date.distantFuture
         var cancelled = false
         while true {
             var pfds: [pollfd] = []
@@ -599,12 +644,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 childDone = true
             }
             if childDone && outEOF && errEOF { break }
-            let now = Date()
+            let now = Self.monotonicNanos()
             if Task.isCancelled {
                 cancelled = true
                 break
             }
-            if !childDone && now >= deadline && !termSent {
+            if !childDone && now >= deadlineNanos && !termSent {
                 deadlineExceeded = true
                 termSent = true
 #if canImport(Glibc)
@@ -612,20 +657,24 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
 #else
                 Darwin.kill(pid, SIGTERM)
 #endif
-                killDeadline = now.addingTimeInterval(2)
+                killNanos = now + 2_000_000_000
             }
-            if !childDone && termSent && !killSent && now >= killDeadline {
+            if !childDone && termSent && !killSent && now >= killNanos {
 #if canImport(Glibc)
                 Glibc.kill(pid, SIGKILL)
 #else
                 Darwin.kill(pid, SIGKILL)
 #endif
                 killSent = true
-                killDeadline = now.addingTimeInterval(2)
+                killNanos = now + 2_000_000_000
             }
             // Elapsed hard stop: never depend on childDone alone (a reaped
-            // child plus an unobservable EOF must not hang the caller).
-            if (killSent && now >= killDeadline) || now >= hardDeadline { break }
+            // child plus an unobservable EOF must not hang the caller, and
+            // must never be reported as success when reached).
+            if (killSent && now >= killNanos) || now >= hardNanos {
+                hardStopped = true
+                break
+            }
             if childDone && outEOF && errEOF { break }
         }
         if cancelled || (!childDone) {
@@ -695,9 +744,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             throw CancellationError()
         }
         // deadlineExceeded is sticky: a SIGTERM that successfully killed rg
-        // still counts as a timeout (partial output is never success).
-        // An unreaped survivor past the hard stop is likewise a timeout.
-        let timedOut = deadlineExceeded || !childDone
+        // still counts as a timeout (partial output is never success). An
+        // unreaped survivor past the hard stop, or a hard stop with
+        // unobservable EOF (reaped child, descendant-held pipe), is likewise
+        // a timeout — never masked as success.
+        let timedOut = deadlineExceeded || hardStopped || !childDone
         return BoundedRunResult(stdout: outData, stderr: errData, status: exitStatus, truncated: outTruncCap || errTruncCap, stdoutTruncated: outTruncCap, timedOut: timedOut)
     }
 
@@ -893,15 +944,24 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         return ToolCallOutcome(callID: callID, status: "success", summary: "search \(pattern)", data: text, truncated: truncated, started: true)
     }
 
-    /// Parse ripgrep --json output and keep only authorized lines. Each line
-    /// with data.path.text is classified by its LOGICAL path (argv
-    /// /proc/self/fd prefix stripped, joined to the root's logical base) via
-    /// ToolValidator.protectedClassification: absoluteDenied is always
-    /// dropped; grantable is kept only when the reservation approves the path
-    /// or an ancestor prefix. Lines without a path (summary) are kept;
-    /// unparseable non-empty lines are dropped fail-closed. Content
-    /// mentioning ".git"/".env" in ordinary files is preserved: only the
-    /// actual file path is classified, never the match text.
+    /// Parse ripgrep --json output and keep only authorized match records.
+    /// Each line with a path (text, or base64 bytes) is mapped to its LOGICAL
+    /// path (argv /proc/self/fd prefix stripped, joined to the root's logical
+    /// base) and classified via ToolValidator.protectedClassification:
+    /// absoluteDenied is always dropped; grantable is kept only when the
+    /// reservation approves the exact path or an ancestor prefix (lossy
+    /// names never approve); unprotected is kept. Summary/metadata lines are
+    /// dropped by design (stats aggregate over traversed files). Unparseable
+    /// or unclassifiable lines are dropped fail-closed. Content mentioning
+    /// ".git"/".env" in ordinary files is preserved: only the actual file
+    /// path is classified, never the match text.
+    ///
+    /// Enforcement model: argv globs prune unapproved categories BEFORE
+    /// traversal; approval relaxes traversal for that category only; this
+    /// per-line classifier is the authorization decision point for every
+    /// emitted line. Traversal of an unapproved file inside a relaxed
+    /// category opens it to rg's matcher but discloses nothing: no line for
+    /// it is ever emitted, and summaries are withheld.
     static func filterSearchJSON(_ output: Data, roots: [(proc: String, logicalBase: String)], approvedPaths: [String]) -> (String, Bool) {
         guard !output.isEmpty else { return ("", false) }
         let text = String(decoding: output, as: UTF8.self)
@@ -916,12 +976,16 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 continue
             }
             // ripgrep reports non-UTF-8 paths as {"path":{"bytes":base64}}.
-            // Lossy-decode preserves every ASCII byte exactly (protected names
-            // are pure ASCII; U+FFFD substitution can neither hide nor forge
-            // them), so the existing classifier stays sound on the decoded
-            // skeleton. Undecodable base64 fails closed.
+            // A lossless UTF-8 decode proceeds exactly; otherwise the lossy
+            // skeleton is used for CLASSIFICATION only (every ASCII byte is
+            // preserved exactly, and protected names are pure ASCII, so
+            // markers can be neither hidden nor forged). Lossy paths can
+            // never satisfy an approval below: distinct raw names decode to
+            // the same U+FFFD skeleton, so a literal-U+FFFD approval must not
+            // collide across inodes. Undecodable base64 fails closed.
             var pathText: String? = nil
             var pathPresent = false
+            var pathLossy = false
             if let data = obj["data"] as? [String: Any],
                let path = data["path"] as? [String: Any] {
                 pathPresent = true
@@ -929,22 +993,23 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     pathText = t
                 } else if let b = path["bytes"] as? String,
                           let rawBytes = Data(base64Encoded: b) {
-                    pathText = String(decoding: rawBytes, as: UTF8.self)
+                    if let exact = String(data: rawBytes, encoding: .utf8) {
+                        pathText = exact
+                    } else {
+                        pathText = String(decoding: rawBytes, as: UTF8.self)
+                        pathLossy = true
+                    }
                 }
             }
             guard let reported = pathText else {
                 if pathPresent {
-                    // Path object present but unusable (e.g. bad base64):
-                    // fail closed on unclassifiable paths.
+                    // Path object present but unusable: fail closed.
                     omittedUnparseable = true
-                    continue
-                }
-                // Pathless lines are kept only when they are the explicit
-                // summary record; any other pathless type is dropped
-                // fail-closed rather than emitted unclassified.
-                if (obj["type"] as? String) == "summary" {
-                    kept.append(line)
-                } else {
+                } else if (obj["type"] as? String) != "summary" {
+                    // Unknown pathless record: fail closed. Summaries are
+                    // dropped by design (their stats aggregate over all
+                    // traversed files, including unapproved-relaxed ones —
+                    // an existence oracle), never emitted.
                     omittedUnparseable = true
                 }
                 continue
@@ -956,7 +1021,10 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             case .absoluteDenied:
                 continue
             case .grantable:
-                if Self.isSearchPathApproved(logical, approvedPaths: approvedPaths) {
+                // Lossy-decoded names never match approvals (U+FFFD
+                // collisions across distinct raw inodes); only exact names
+                // the operator approved are visible.
+                if !pathLossy && Self.isSearchPathApproved(logical, approvedPaths: approvedPaths) {
                     kept.append(line)
                 }
             case .unprotected:

@@ -150,6 +150,8 @@ struct B2ClosureTests {
     }
 
     // MARK: - 3. Genuine poisoned environment + PATH shadowing
+    // (Process-global setenv; benign per the note in TOOL_03_poisonedEnv —
+    // the executor ignores the parent environment entirely.)
 
     @Test("CLOSURE_03_poisonedEnvReal")
     func poisonedEnvReal() async throws {
@@ -392,6 +394,16 @@ struct B2ClosureTests {
         // Counterfactual: unpruned rg DOES see the ghost file via path.bytes.
         let (direct, _) = try Self.runDirectRg(realRg, args: ["--hidden", "--json", "GHOSTMARK2", ws.path])
         #expect(direct.contains("\"bytes\"") && direct.contains("GHOSTMARK2"), "counterfactual: raw rg reports the ghost via path.bytes")
+        // U+FFFD approval collision: a literal-U+FFFD name and an invalid-byte
+        // name share the same lossy skeleton; only the exact one approves.
+        try "real REAL3MARK\n".write(to: gitDir.appendingPathComponent("README�"), atomically: true, encoding: .utf8)
+        try createRaw([0x52, 0x45, 0x41, 0x44, 0x4D, 0x45, 0xFF], under: gitFD, content: "ghost GHOST3MARK\n")
+        let approvedLiteral = ".git/README�"
+        let batch2 = ToolBatch([ToolProposal(callID: "c2", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"REAL3MARK|GHOST3MARK\"}")])
+        let result2 = try await exec.execute(batch: batch2, reservation: Self.makeReservation(batch: batch2, approved: [approvedLiteral]))
+        #expect(result2.calls[0].status == "success", "collision search must succeed, got \(result2.calls[0])")
+        #expect(result2.calls[0].data.contains("REAL3MARK"), "exact literal-U+FFFD approval must show its own file")
+        #expect(!result2.calls[0].data.contains("GHOST3MARK"), "lossy skeleton must never satisfy an approval")
     }
 
     // MARK: - 7. Ripgrep qualification matrix
@@ -549,9 +561,10 @@ struct B2ClosureTests {
         let ws = parent.appendingPathComponent("ws")
         try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
         try "hello\n".write(to: ws.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
-        // Hanging probe: fast --version, then sleeps past the 30 s budget.
+        // Hanging probe: fast --version, then execs a 60 s sleep so SIGTERM
+        // at the 30 s budget kills the direct child itself (no orphan).
         let hanging = parent.appendingPathComponent("hang.sh")
-        let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho 'ripgrep 99.0.0'\nexit 0\nfi\nsleep 60\n"
+        let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho 'ripgrep 99.0.0'\nexit 0\nfi\nexec sleep 60\n"
         try script.write(to: hanging, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hanging.path)
         let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
@@ -602,6 +615,60 @@ struct B2ClosureTests {
             #expect(r.truncated == true, "concurrent runner \(i) output must be bounded")
             #expect(r.data.utf8.count <= 1 * 1024 * 1024, "concurrent runner \(i) respects the cap")
         }
+    }
+
+    // MARK: - 14. Hard stop never masks as success; siblings unaffected
+
+    @Test("CLOSURE_14_hardStopNoMask", .timeLimit(.minutes(2)))
+    func hardStopNoMask() async throws {
+        let parent = try Self.tempParent()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ws = parent.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        try "hello quick\n".write(to: ws.appendingPathComponent("q.txt"), atomically: true, encoding: .utf8)
+        // Probe A: exits 0 immediately but leaves a background sleep holding
+        // stdout open. Reaped exit-0 + unobservable EOF must be a timeout,
+        // never success-with-partial.
+        let leaver = parent.appendingPathComponent("leaver.sh")
+        let leaverScript = """
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+            echo 'ripgrep 99.0.0'
+            exit 0
+            fi
+            ( exec sleep 60 >&1 & )
+            echo '{"type":"summary","data":{"stats":{}}}'
+            exit 0
+            """
+        try leaverScript.write(to: leaver, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: leaver.path)
+        // Probe B: hangs past the 30 s budget (SIGTERM must reap the execd sleep).
+        let hanging = parent.appendingPathComponent("hang14.sh")
+        let hangScript = """
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+            echo 'ripgrep 99.0.0'
+            exit 0
+            fi
+            exec sleep 60
+            """
+        try hangScript.write(to: hanging, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hanging.path)
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
+        let resolver = try WorkspaceResolver(workspace: FilePath(ws.path), readRoots: [])
+        let store = InMemorySessionStore()
+        func runSearch(rg: String, pattern: String) async throws -> ToolCallOutcome {
+            let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: rg)
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"" + pattern + "\"}")])
+            return try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch)).calls[0]
+        }
+        async let a = runSearch(rg: leaver.path, pattern: "hello")
+        async let b = runSearch(rg: hanging.path, pattern: "hello")
+        async let q = runSearch(rg: realRg, pattern: "hello quick")
+        let (ra, rb, rq) = try await (a, b, q)
+        #expect(ra.status == "failed" && ra.summary.contains("timed out"), "reaped exit-0 with held pipe must be timeout, got \(ra)")
+        #expect(rb.status == "failed" && rb.summary.contains("timed out"), "hanging child must be timeout, got \(rb)")
+        #expect(rq.status == "success" && rq.data.contains("hello quick"), "quick sibling must be unaffected, got \(rq)")
     }
 
     // MARK: - 9. artifactId alias pair rejected

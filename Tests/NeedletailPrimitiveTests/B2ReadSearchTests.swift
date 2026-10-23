@@ -58,6 +58,10 @@ struct B2ReadSearchTests {
         // Genuine injection into the PROCESS environment (not a local dict):
         // poisoned PATH with a fake rg first, plus a RIPGREP_CONFIG_PATH
         // preprocessor that would stamp PRE_POISON into every file.
+        // Cross-suite note: setenv is process-global, but interference is
+        // benign by construction — the executor never reads the parent
+        // environment (sanitized env + --no-config), and every direct-rg
+        // counterfactual passes an explicit env. Restores run in defer.
         let fakeDir = FileManager.default.temporaryDirectory.appendingPathComponent("fake-rg-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: fakeDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: fakeDir) }
