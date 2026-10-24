@@ -249,6 +249,15 @@ public protocol SessionStore: Sendable {
     /// UNSCOPED diagnostic read (support tooling/tests only): pages the
     /// WHOLE store across sessions. Never feed this to a model request.
     func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?)
+    /// B5-B read-only session enumeration: every session with at least one
+    /// durable record, sorted by session ID for deterministic output. Used
+    /// by the cross-run unresolved-outcome gate (and only there in
+    /// production) to find every ledger the gate must classify. A new
+    /// protocol requirement — every conformance implements it in the same
+    /// slice. There is deliberately NO default: a permissive default that
+    /// silently returned an empty collection would blind the gate on any
+    /// store that forgot to implement it, failing OPEN on dirty history.
+    func sessions() throws -> [SessionID]
     /// Claim exclusive write ownership of `session` for `writer`. A
     /// different live writer holding the session fails with
     /// `.alreadyOwned(session:writer:)` (both identities travel);

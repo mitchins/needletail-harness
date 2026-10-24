@@ -44,6 +44,11 @@ struct OperationIntentActorTests {
             try inner.claimWriterOwnership(session: session, writer: writer)
         }
 
+        /// B5-B enumeration forwarding (mechanical, like every other seam).
+        func sessions() throws -> [SessionID] {
+            try inner.sessions()
+        }
+
         func releaseWriterOwnership(session: SessionID, writer: String) throws {
             try inner.releaseWriterOwnership(session: session, writer: writer)
         }
@@ -297,5 +302,17 @@ struct OperationIntentActorTests {
         if case .failed = state.phase { } else {
             Issue.record("expected failed phase")
         }
+    }
+
+    @Test("B5-B GatedCommitStore forwards sessions()")
+    func gatedCommitStoreForwardsSessions() throws {
+        let store = GatedCommitStore()
+        #expect(try store.sessions().isEmpty)
+        let id = SessionID("s-gated")
+        try store.claimWriterOwnership(session: id, writer: "w")
+        try store.append(
+            .sessionOpened(session: id, atMillis: 1),
+            as: WriterIdentity(session: id, writer: "w"))
+        #expect(try store.sessions() == [id])
     }
 }

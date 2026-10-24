@@ -436,6 +436,22 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         return (batch, next)
     }
 
+    /// B5-B read-only session enumeration: every session with at least one
+    /// durable record (`SELECT DISTINCT session`, no row data), sorted for
+    /// deterministic gate output. A record-less claimed session holds no
+    /// operations and reconciles clean, so it cannot trip the gate.
+    public func sessions() throws -> [SessionID] {
+        gate.lock()
+        defer { gate.unlock() }
+        try assertOpenLocked()
+        do {
+            let raws = try queue.read { db in
+                try String.fetchAll(db, sql: "SELECT DISTINCT session FROM records ORDER BY session")
+            }
+            return raws.map(SessionID.init)
+        } catch { throw Self.translate(error) }
+    }
+
     /// UNSCOPED diagnostic read (support tooling/tests only): pages the
     /// WHOLE store across sessions. Never feed this to a model request.
     public func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?) {

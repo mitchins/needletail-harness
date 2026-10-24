@@ -52,6 +52,8 @@ struct B0ActorIntegrationTests {
         var failWhen: (@Sendable ([DurableRecord]) -> Bool)?
 
         func claimWriterOwnership(session: SessionID, writer: String) throws { try inner.claimWriterOwnership(session: session, writer: writer) }
+        /// B5-B enumeration forwarding (mechanical, like every other seam).
+        func sessions() throws -> [SessionID] { try inner.sessions() }
         func releaseWriterOwnership(session: SessionID, writer: String) throws { try inner.releaseWriterOwnership(session: session, writer: writer) }
         func append(_ record: DurableRecord, as identity: WriterIdentity) throws { try inner.append(record, as: identity) }
         func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {
@@ -581,5 +583,17 @@ struct B0ActorIntegrationTests {
         try await Self.awaitPhase(actor2, { $0.cancelledPendingReservations.count == 1 }, "executor pending exists")
         let hasMarker2 = try Self.records(store2).contains(where: { if case .cancelledPendingMarker(let r, _) = $0 { return r.callID == "c1" } else { return false } })
         #expect(hasMarker2, "executor cancel MUST create marker — RED/GREEN proves discrimination")
+    }
+
+    @Test("B5-B FailingBatchStore forwards sessions()")
+    func failingBatchStoreForwardsSessions() throws {
+        let store = FailingBatchStore()
+        #expect(try store.sessions().isEmpty)
+        let id = SessionID("s-failing")
+        try store.claimWriterOwnership(session: id, writer: "w")
+        try store.append(
+            .sessionOpened(session: id, atMillis: 1),
+            as: WriterIdentity(session: id, writer: "w"))
+        #expect(try store.sessions() == [id])
     }
 }

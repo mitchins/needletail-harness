@@ -18,7 +18,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
     private let lock = NSRecursiveLock()
     private var log: [SequencedRecord] = []
     /// Per-record session attribution, index-aligned with `log`.
-    private var sessions: [String] = []
+    private var sessionRows: [String] = []
     private var sequence: UInt64 = 0
     /// session → owning writer (A2 fencing).
     private var claims: [String: String] = [:]
@@ -38,7 +38,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             }
             sequence += 1
             log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
-            sessions.append(identity.session.raw)
+            sessionRows.append(identity.session.raw)
         }
     }
 
@@ -56,7 +56,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             for record in records {
                 sequence += 1
                 log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
-                sessions.append(identity.session.raw)
+                sessionRows.append(identity.session.raw)
             }
         }
     }
@@ -67,7 +67,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
         return try lock.withLock {
             let window = log.enumerated().filter {
-                $0.element.sequence.value > since && sessions[$0.offset] == session.raw
+                $0.element.sequence.value > since && sessionRows[$0.offset] == session.raw
             }.prefix(limit).map { $0.element }
             let next: UInt64? = window.count < limit ? nil : window.last?.sequence.value
             return (window, next)
@@ -121,7 +121,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
                 throw StoreError.alreadyOwned(session: session.raw, writer: current)
             }
             let stream = log.enumerated()
-                .filter { sessions[$0.offset] == session.raw }
+                .filter { sessionRows[$0.offset] == session.raw }
                 .map { $0.element.record }
             let report = try reconcileOperations(stream)
             guard log.count + 1 <= Self.recordCap else {
@@ -136,7 +136,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
                     operatorID: authorization.operatorID, reference: authorization.reference,
                     reason: authorization.reason, atMillis: authorization.atMillis,
                     unresolvedOperations: report.heldOperations))))
-            sessions.append(session.raw)
+            sessionRows.append(session.raw)
         }
     }
 
@@ -174,19 +174,27 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             sequence += 1
             log.append(SequencedRecord(sequence: SequenceNumber(sequence),
                                        record: .artifactPublished(ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID))))
-            sessions.append(identity.session.raw)
+            sessionRows.append(identity.session.raw)
             return ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID)
         }
     }
 
     public func artifactRecord(session: SessionID, digest: String) throws -> Data? {
         return try lock.withLock {
-            for (idx, rec) in log.enumerated() where sessions[idx] == session.raw {
+            for (idx, rec) in log.enumerated() where sessionRows[idx] == session.raw {
                 if case .artifactPublished(let ref) = rec.record, ref.digest == digest {
                     return artifactBytes[digest]
                 }
             }
             return nil
+        }
+    }
+
+    /// B5-B read-only session enumeration: every session with at least
+    /// one appended record, sorted for deterministic gate output.
+    public func sessions() throws -> [SessionID] {
+        lock.withLock {
+            Array(Set(sessionRows)).sorted().map(SessionID.init)
         }
     }
 

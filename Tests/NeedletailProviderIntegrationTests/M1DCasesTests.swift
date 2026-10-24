@@ -132,10 +132,19 @@ private enum M1DCases {
     }
 
     static func run(_ arguments: [String]) throws -> (exit: Int32, stdout: String, stderr: String) {
+        // B5-B hermetic store: every headed run gets a FRESH state
+        // directory (the cross-run gate is store-wide, so sharing the
+        // ambient store would couple scenarios to each other's history
+        // and to whatever the machine ran before). Removed afterwards.
+        let stateDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("needletail-m1d-store-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: stateDir) }
+        var runEnv = environment()
+        runEnv["NEEDLETAIL_STATE_DIR"] = stateDir.path
         let process = Process()
         process.executableURL = URL(fileURLWithPath: try binary())
         process.arguments = arguments
-        process.environment = environment()
+        process.environment = runEnv
         let outPipe = Pipe()
         let errPipe = Pipe()
         process.standardOutput = outPipe
@@ -280,7 +289,12 @@ struct M1DCasesTests {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: try M1DCases.binary())
         process.arguments = M1DCases.runArguments(config: config, trace: trace, trusted: true)
-        process.environment = M1DCases.environment()
+        var head02Env = M1DCases.environment()
+        // B5-B hermetic store (see M1DCases.run): this scenario owns its
+        // directory, so the store nests inside it and is removed by the
+        // existing defer.
+        head02Env["NEEDLETAIL_STATE_DIR"] = directory.appendingPathComponent("state").path
+        process.environment = head02Env
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
