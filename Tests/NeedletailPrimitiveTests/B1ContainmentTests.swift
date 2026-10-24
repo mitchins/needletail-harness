@@ -406,6 +406,63 @@ struct B1ContainmentTests {
 
     // MARK: - Lock
 
+    /// Deterministic cross-process lock holder: a shell child that opens
+    /// `lockPath`, acquires it with `flock -n`, creates `readyFile` ONLY
+    /// once the lock is held, then waits for `releaseFile` before exiting
+    /// (releasing the lock on exit). Every hand-off is an explicit
+    /// filesystem signal with a bounded wait — no sleeps as readiness
+    /// evidence. The holder is a separate process locking the same file,
+    /// so contention evidence stays cross-process (never an in-process
+    /// mock); cleanup releases + reaps on every path via the caller's
+    /// defer, including assertion failure and cancellation.
+    private struct LockHolder {
+        let process: Process
+        let releaseFile: URL
+    }
+
+    private static func spawnLockHolder(
+        lockPath: String, readyFile: URL, releaseFile: URL, in directory: URL
+    ) throws -> LockHolder {
+        let script = directory.appendingPathComponent("hold-lock.sh")
+        try """
+        #!/bin/sh
+        exec 9>"$1"
+        if ! flock -n 9; then exit 1; fi
+        touch "$2"
+        while [ ! -e "$3" ]; do sleep 0.05; done
+        exit 0
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [script.path, lockPath, readyFile.path, releaseFile.path]
+        try process.run()
+        return LockHolder(process: process, releaseFile: releaseFile)
+    }
+
+    /// Bounded readiness: the file appears only after the holder acquired.
+    private static func awaitFile(_ url: URL, timeout: TimeInterval, _ label: String) async throws {
+        let stop = Date().addingTimeInterval(timeout)
+        while !FileManager.default.fileExists(atPath: url.path), Date() < stop {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try #require(FileManager.default.fileExists(atPath: url.path), "\(label) within \(timeout)s")
+    }
+
+    /// Release a waiting holder and reap it within a bound; terminate a
+    /// stuck holder rather than hanging teardown.
+    private static func releaseAndReap(_ holder: LockHolder, timeout: TimeInterval = 10) {
+        try? "".write(to: holder.releaseFile, atomically: true, encoding: .utf8)
+        let stop = Date().addingTimeInterval(timeout)
+        while holder.process.isRunning, Date() < stop {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if holder.process.isRunning {
+            holder.process.terminate()
+            holder.process.waitUntilExit()
+        }
+    }
+
     @Test("B1_lockContention")
     func b1LockContention() async throws {
         let (url, fp) = try Self.tempRoot()
@@ -415,21 +472,22 @@ struct B1ContainmentTests {
         let fdTmp = try WorkspaceLock.acquire(workspace: pinned)
         WorkspaceLock.release(fdTmp)
         let lockPath = url.appendingPathComponent(".needletail/lock").path
-        // Hold lock in subprocess via flock -n
-        let holder = Process()
-        holder.executableURL = URL(fileURLWithPath: "/usr/bin/flock")
-        holder.arguments = ["-n", lockPath, "sleep", "2"]
-        try holder.run()
-        // Give subprocess time to acquire
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        #expect(holder.isRunning, "holder should be holding lock")
-        // Second acquisition nonblocking should fail with contention
+        let holder = try Self.spawnLockHolder(
+            lockPath: lockPath,
+            readyFile: url.appendingPathComponent("ready"),
+            releaseFile: url.appendingPathComponent("release"),
+            in: url)
+        defer { Self.releaseAndReap(holder) }
+        // Deterministic: the ready file exists ONLY after the holder
+        // acquired, and the holder retains the lock until released.
+        try await Self.awaitFile(url.appendingPathComponent("ready"), timeout: 10, "holder acquires the lock")
+        #expect(holder.process.isRunning, "holder retains the lock until released")
+        // Second acquisition nonblocking must fail with contention
         #expect(throws: StoreError.self) {
             _ = try WorkspaceLock.acquire(workspace: pinned)
         }
-        holder.terminate()
-        holder.waitUntilExit()
-        // After holder exits, acquisition should succeed
+        Self.releaseAndReap(holder)
+        // After holder exits, acquisition must succeed
         let fd2 = try WorkspaceLock.acquire(workspace: pinned)
         WorkspaceLock.release(fd2)
     }
@@ -768,20 +826,23 @@ struct B1ContainmentTests {
         let pinned = try #require(resolver.workspaceRoot)
         let tmpFD = try WorkspaceLock.acquire(workspace: pinned)
         WorkspaceLock.release(tmpFD)
-        let holder = Process()
-        holder.executableURL = URL(fileURLWithPath: "/usr/bin/flock")
-        holder.arguments = ["-n", lockPath, "sleep", "2"]
-        try holder.run()
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        #expect(holder.isRunning, "holder should hold lock")
+        // Deterministic holder: contention is guaranteed, not hoped for —
+        // the ready file proves the subprocess acquired before we assert.
+        let holder = try Self.spawnLockHolder(
+            lockPath: lockPath,
+            readyFile: url.appendingPathComponent("ready"),
+            releaseFile: url.appendingPathComponent("release"),
+            in: url)
+        defer { Self.releaseAndReap(holder) }
+        try await Self.awaitFile(url.appendingPathComponent("ready"), timeout: 10, "holder acquires the lock")
+        #expect(holder.process.isRunning, "holder retains the lock until released")
         let batch = ToolBatch([
             ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"f\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"f\"}"),
         ])
         let reservation = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: true, batch: batch, kind: .executor)
         let result = try await exec.execute(batch: batch, reservation: reservation)
-        holder.terminate()
-        holder.waitUntilExit()
+        Self.releaseAndReap(holder)
         #expect(result.calls.count == 2)
         #expect(result.calls[0].status == "failed", "first mutating should fail due to lock contention")
         #expect(result.calls[0].started == nil, "B4: lock contention is provably undispatched (done-failed, no hold)")
