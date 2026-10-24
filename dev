@@ -512,7 +512,8 @@ coverage-sonar)
     # the same job so the report is imported by the same analysis.
     _covdir="$root_dir/.needletail-dev/coverage"
     _covchild="$_covdir/child"
-    mkdir -p "$_covdir" "$_covchild"
+    _sonar_log="$root_dir/.needletail-dev/logs/dev-coverage-sonar.log"
+    mkdir -p "$_covdir" "$_covchild" "$(dirname "$_sonar_log")"
     rm -f "$_covdir"/*.profraw "$_covchild"/*.profraw "$root_dir/coverage-generic.xml"
     _swiftbin=$(command -v "$NEEDLETAIL_SWIFT")
     _swiftreal=$(readlink -f "$_swiftbin" 2>/dev/null || printf '%s' "$_swiftbin")
@@ -535,7 +536,6 @@ coverage-sonar)
     } > "$_wrap"
     chmod +x "$_wrap"
     echo "== coverage-sonar: full instrumented test run (assertions non-blocking) =="
-    _sonar_log="$root_dir/.needletail-dev/logs/dev-coverage-sonar.log"
     if NEEDLETAIL_BIN="$_wrap" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution > "$_sonar_log" 2>&1; then
         _sonar_rc=0
     else
