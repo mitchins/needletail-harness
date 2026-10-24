@@ -2031,7 +2031,6 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
     var pending: [EffectReservation] = state.cancelledPendingReservations
     var live: [EffectReservation] = []
     var consumed = state.consumedEffects
-    var hasPending = false
 
     for reservation in state.liveReservations {
         // Provider reservations: not retained, just consumed.
@@ -2050,7 +2049,6 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
                 if overflow { return integrityStop(state, ids: &ids) }
                 records.append(.cancelledPendingMarker(ref, outcome: "cancelled: pending executor \(reservation.effectID.raw)"))
                 pending.append(reservation)
-                hasPending = true
             } else {
                 consumed.insert(reservation.effectID)
             }
@@ -2077,7 +2075,6 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
             records.append(.cancelledPendingMarker(ref, outcome: "cancelled: pending \(ref.callID ?? "")"))
         }
         pending.append(reservation)
-        hasPending = true
         // Non-mutating proposals in mixed batch are ignored (no record, but effectID is pending so late report routes to completeCancelledPending which will ignore them).
     }
 
@@ -2087,7 +2084,7 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
     if let request = state.activeRequest {
         active = ActiveRequest(requestID: request.requestID, runID: request.runID, generation: request.generation, delivery: .deliveryUnknown, bytesOut: request.bytesOut)
     }
-    let nextPhase: SessionPhase = hasPending ? .cancelling : .cancelling
+    let nextPhase: SessionPhase = .cancelling
     let next = s1.replacing(
         phase: nextPhase, activeRequest: active,
         queueHeld: true, heldReason: .cancelled(sinceMillis: atMillis),

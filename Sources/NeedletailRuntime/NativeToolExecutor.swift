@@ -1293,16 +1293,19 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// reported as a failure rather than silently skipped like a missing path.
     private func openApprovedTarget(_ approved: String, domainOrder: [Int]) throws -> Int32? {
         var resourceHit = false
+        func noteResourceError(_ error: Error) {
+            if Self.isResourceError(error) { resourceHit = true }
+        }
         func attempt(from dirFD: Int32) -> Int32? {
             do {
                 return try resolver.openRelative(approved, from: dirFD, flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             } catch {
-                if Self.isResourceError(error) { resourceHit = true }
+                noteResourceError(error)
             }
             do {
                 return try resolver.openRelative(approved, from: dirFD, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
             } catch {
-                if Self.isResourceError(error) { resourceHit = true }
+                noteResourceError(error)
             }
             return nil
         }
@@ -1314,7 +1317,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     defer { close(dirFD) }
                     if let fd = attempt(from: dirFD) { return fd }
                 } catch {
-                    if Self.isResourceError(error) { resourceHit = true }
+                    noteResourceError(error)
                     continue
                 }
             } else if domain >= 0 && domain < resolver.readRoots.count {
@@ -1323,7 +1326,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                     defer { close(dirFD) }
                     if let fd = attempt(from: dirFD) { return fd }
                 } catch {
-                    if Self.isResourceError(error) { resourceHit = true }
+                    noteResourceError(error)
                     continue
                 }
             }

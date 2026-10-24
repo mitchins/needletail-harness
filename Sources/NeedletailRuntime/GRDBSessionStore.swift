@@ -1432,8 +1432,8 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// transaction (no committed state can change in between: the lock
     /// serializes publishers and GRDB serializes write transactions).
     func commitRecordBytes(_ db: Database, session: String, payload: Data, digest: String?, size: Int64, sessionHasDigest: Bool) throws {
-        guard size >= 0, payload.count >= 0 else {
-            throw StoreError.integrity("negative artifact size or payload in commit path")
+        guard size >= 0 else {
+            throw StoreError.integrity("negative artifact size in commit path")
         }
         let last = try Int64.fetchOne(db, sql: "SELECT MAX(seq) FROM records") ?? 0
         let (nextSeq, seqOverflow) = last.addingReportingOverflow(1)

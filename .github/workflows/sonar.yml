@@ -56,7 +56,7 @@ jobs:
         run: |
           command -v swift >/dev/null 2>&1 && swift --version || echo "no image-provided swift"
           arch="$(uname -m)"
-          curl -fsSL -o /tmp/swiftly.tar.gz "https://download.swift.org/swiftly/linux/swiftly-${arch}.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/swiftly.tar.gz "https://download.swift.org/swiftly/linux/swiftly-${arch}.tar.gz"
           echo "0b26b568811404374c7d7f07276b6aad4145db5d1893a45f307de6a94ca8d9c3  /tmp/swiftly.tar.gz" | sha256sum -c -
           tar -xzf /tmp/swiftly.tar.gz -C /tmp && rm -f /tmp/swiftly.tar.gz
           /tmp/swiftly init --quiet-shell-followup
