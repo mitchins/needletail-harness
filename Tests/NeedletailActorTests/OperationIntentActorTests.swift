@@ -44,6 +44,11 @@ struct OperationIntentActorTests {
             try inner.claimWriterOwnership(session: session, writer: writer)
         }
 
+        /// B5-B enumeration forwarding (mechanical, like every other seam).
+        func sessions() throws -> [SessionID] {
+            try inner.sessions()
+        }
+
         func releaseWriterOwnership(session: SessionID, writer: String) throws {
             try inner.releaseWriterOwnership(session: session, writer: writer)
         }
@@ -111,8 +116,8 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
-                ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
+                ToolProposal(callID: "c2", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"b\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, { $0.phase == .executing }, "dispatch reached executing")
@@ -127,9 +132,10 @@ struct OperationIntentActorTests {
         let completed = Self.results(in: log).filter { $0.0.state == .done }
         #expect(Set(completed.map { $0.0.operationID }) == Set(found.map(\.operationID)),
                 "results reuse the intent IDs")
-        let byID = Dictionary(uniqueKeysWithValues: found.map { ($0.operationID, $0) })
-        #expect(byID.values.allSatisfy { $0.mutating }, "edit/read batch dispatches mutating")
-        #expect(completed.allSatisfy { $0.0.mutating }, "completion keeps the mutating flag")
+        #expect(found.first(where: { $0.callID == "c1" })?.mutating == true, "edit dispatches mutating")
+        #expect(found.first(where: { $0.callID == "c2" })?.mutating == false, "read dispatches non-mutating per-proposal")
+        #expect(completed.first(where: { $0.0.callID == "c1" })?.0.mutating == true)
+        #expect(completed.first(where: { $0.0.callID == "c2" })?.0.mutating == false)
     }
 
     @Test("A3-1 intent is committed before the executor can observe it")
@@ -146,7 +152,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, { $0.phase == .executing }, "dispatch reached executing")
@@ -170,7 +176,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, {
@@ -200,7 +206,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, {
@@ -240,7 +246,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, {
@@ -284,7 +290,7 @@ struct OperationIntentActorTests {
         transport.script = [ProviderResponse(
             requestID: RequestID("scripted"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
-                ToolProposal(callID: "c9", tool: "read", argumentsDigest: "d"),
+                ToolProposal(callID: "c9", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"a\"}"),
             ], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "read run", kind: .followUp, sealed: false)
         try await Self.awaitGatedPhase(actor, {
@@ -296,5 +302,17 @@ struct OperationIntentActorTests {
         if case .failed = state.phase { } else {
             Issue.record("expected failed phase")
         }
+    }
+
+    @Test("B5-B GatedCommitStore forwards sessions()")
+    func gatedCommitStoreForwardsSessions() throws {
+        let store = GatedCommitStore()
+        #expect(try store.sessions().isEmpty)
+        let id = SessionID("s-gated")
+        try store.claimWriterOwnership(session: id, writer: "w")
+        try store.append(
+            .sessionOpened(session: id, atMillis: 1),
+            as: WriterIdentity(session: id, writer: "w"))
+        #expect(try store.sessions() == [id])
     }
 }

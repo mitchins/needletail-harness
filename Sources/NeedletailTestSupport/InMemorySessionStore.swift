@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import NeedletailCore
 
@@ -14,10 +15,10 @@ import NeedletailCore
 public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
     public static let recordCap = 10_000
 
-    private let lock = NSLock()
+    private let lock = NSRecursiveLock()
     private var log: [SequencedRecord] = []
     /// Per-record session attribution, index-aligned with `log`.
-    private var sessions: [String] = []
+    private var sessionRows: [String] = []
     private var sequence: UInt64 = 0
     /// session → owning writer (A2 fencing).
     private var claims: [String: String] = [:]
@@ -37,7 +38,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             }
             sequence += 1
             log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
-            sessions.append(identity.session.raw)
+            sessionRows.append(identity.session.raw)
         }
     }
 
@@ -55,7 +56,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             for record in records {
                 sequence += 1
                 log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
-                sessions.append(identity.session.raw)
+                sessionRows.append(identity.session.raw)
             }
         }
     }
@@ -66,7 +67,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
         return try lock.withLock {
             let window = log.enumerated().filter {
-                $0.element.sequence.value > since && sessions[$0.offset] == session.raw
+                $0.element.sequence.value > since && sessionRows[$0.offset] == session.raw
             }.prefix(limit).map { $0.element }
             let next: UInt64? = window.count < limit ? nil : window.last?.sequence.value
             return (window, next)
@@ -120,7 +121,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
                 throw StoreError.alreadyOwned(session: session.raw, writer: current)
             }
             let stream = log.enumerated()
-                .filter { sessions[$0.offset] == session.raw }
+                .filter { sessionRows[$0.offset] == session.raw }
                 .map { $0.element.record }
             let report = try reconcileOperations(stream)
             guard log.count + 1 <= Self.recordCap else {
@@ -135,7 +136,65 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
                     operatorID: authorization.operatorID, reference: authorization.reference,
                     reason: authorization.reason, atMillis: authorization.atMillis,
                     unresolvedOperations: report.heldOperations))))
-            sessions.append(session.raw)
+            sessionRows.append(session.raw)
+        }
+    }
+
+    /// B3-A scripted publication mirror: same contract as the GRDB publication
+    /// (fencing, non-empty kind/bytes, 32 MiB cap, content-addressed dedup,
+    /// per-session reference row). Bytes live in a dict (no filesystem).
+    public static let artifactByteLimit = 32 * 1024 * 1024
+
+    private var artifactBytes: [String: Data] = [:]
+
+    public func publishArtifact(session: SessionID, as identity: WriterIdentity, kind: String, operationID: OperationID?, bytes: Data) throws -> ArtifactRef {
+        try lock.withLock {
+            guard session == identity.session else {
+                throw StoreError.integrity("publish session/identity mismatch")
+            }
+            guard let owner = claims[identity.session.raw], owner == identity.writer else {
+                throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer)
+            }
+            guard !kind.isEmpty else {
+                throw StoreError.integrity("artifact kind must not be empty")
+            }
+            guard !bytes.isEmpty else {
+                throw StoreError.integrity("artifact bytes must not be empty")
+            }
+            guard bytes.count <= Self.artifactByteLimit else {
+                throw StoreError.quotaExceeded(limit: Self.artifactByteLimit)
+            }
+            guard log.count + 1 <= Self.recordCap else {
+                throw StoreError.quotaExceeded(limit: Self.recordCap)
+            }
+            let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            if artifactBytes[digest] == nil {
+                artifactBytes[digest] = bytes
+            }
+            sequence += 1
+            log.append(SequencedRecord(sequence: SequenceNumber(sequence),
+                                       record: .artifactPublished(ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID))))
+            sessionRows.append(identity.session.raw)
+            return ArtifactRef(digest: digest, size: bytes.count, kind: kind, operationID: operationID)
+        }
+    }
+
+    public func artifactRecord(session: SessionID, digest: String) throws -> Data? {
+        return try lock.withLock {
+            for (idx, rec) in log.enumerated() where sessionRows[idx] == session.raw {
+                if case .artifactPublished(let ref) = rec.record, ref.digest == digest {
+                    return artifactBytes[digest]
+                }
+            }
+            return nil
+        }
+    }
+
+    /// B5-B read-only session enumeration: every session with at least
+    /// one appended record, sorted for deterministic gate output.
+    public func sessions() throws -> [SessionID] {
+        lock.withLock {
+            Array(Set(sessionRows)).sorted().map(SessionID.init)
         }
     }
 

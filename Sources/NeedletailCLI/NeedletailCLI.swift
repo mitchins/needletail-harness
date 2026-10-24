@@ -11,7 +11,7 @@ struct NeedletailCLI: ParsableCommand {
         commandName: "needletail",
         abstract: "Needletail — minimal local-first Swift coding harness (M0 bootstrap).",
         version: NeedletailVersion(major: 0, minor: 3, patch: 0).description,
-        subcommands: [ConfigCommand.self, Doctor.self, RunCommand.self, SessionCommand.self]
+        subcommands: [ConfigCommand.self, Doctor.self, RunCommand.self, SessionCommand.self, DiffCommand.self]
     )
 
     mutating func run() throws {

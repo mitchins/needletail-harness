@@ -1,3 +1,4 @@
+import Foundation
 /// M1-B durability shapes + store seams (SPEC §9, ARCH §§1/7). The row
 /// shapes mirror the normative tables (sessions/epochs/events/operations/
 //// queue) as values; SQL lives in M2-A. M1-B appends to the seam and proves
@@ -28,6 +29,12 @@ public enum DurableRecord: Sendable, Equatable, Codable {
     /// (write → fsync → atomic rename → dirsync → txn). Reads re-verify
     /// size and digest and fail typed `.integrity` on any mismatch.
     case artifactPublished(ArtifactRef)
+    /// REV25 B4: cancelled-pending marker (durable HOLD, supersedable by operationResult).
+    case cancelledPendingMarker(OperationRef, outcome: String)
+    /// REV25 B4: cancelled-pending error attachment for effectFailed path.
+    case cancelledPendingError(CancelledPendingError)
+    /// REV25 B5: explicit operator acknowledgment of unresolved outcomes (SPEC §9.1).
+    case acknowledgedUnresolved(Acknowledgment)
 }
 
 public struct SequencedRecord: Sendable, Equatable {
@@ -187,7 +194,39 @@ public struct ArtifactRef: Sendable, Equatable, Codable {
     public var relativePath: String { digest }
 }
 
+public struct CancelledPendingError: Sendable, Equatable, Codable {
+    public let effectID: EffectID
+    public let operationIDs: [OperationID]
+    public let error: String
+    public let atMillis: UInt64
+    public init(effectID: EffectID, operationIDs: [OperationID], error: String, atMillis: UInt64) {
+        self.effectID = effectID
+        self.operationIDs = operationIDs
+        self.error = error
+        self.atMillis = atMillis
+    }
+}
+
+public struct Acknowledgment: Sendable, Equatable, Codable {
+    public let subjectSessions: [SessionID]
+    public let operationIDs: [OperationID]
+    public let determination: String
+    public let atMillis: UInt64
+    public init(subjectSessions: [SessionID], operationIDs: [OperationID], determination: String, atMillis: UInt64) {
+        self.subjectSessions = subjectSessions
+        self.operationIDs = operationIDs
+        self.determination = determination
+        self.atMillis = atMillis
+    }
+}
+
 public protocol SessionStore: Sendable {
+    /// Artifact lookup for B2: returns the artifact bytes for `digest` iff an `artifactPublished` row for `session` names that digest.
+    func artifactRecord(session: SessionID, digest: String) throws -> Data?
+    /// Artifact publication for B3 (preimages, exec outputs): fenced,
+    /// content-addressed, dedup-aware. The default refuses closed so only
+    /// conformances with a real mechanism (GRDB, scripted InMemory) publish.
+    func publishArtifact(session: SessionID, as identity: WriterIdentity, kind: String, operationID: OperationID?, bytes: Data) throws -> ArtifactRef
     /// FENCED durable append: implementations validate, INSIDE the
     /// mutation's own transaction, that `identity.writer` currently owns
     /// `identity.session`. A stale writer (never claimed, superseded, or
@@ -210,6 +249,15 @@ public protocol SessionStore: Sendable {
     /// UNSCOPED diagnostic read (support tooling/tests only): pages the
     /// WHOLE store across sessions. Never feed this to a model request.
     func records(since: UInt64, limit: Int) throws -> ([SequencedRecord], nextCursor: UInt64?)
+    /// B5-B read-only session enumeration: every session with at least one
+    /// durable record, sorted by session ID for deterministic output. Used
+    /// by the cross-run unresolved-outcome gate (and only there in
+    /// production) to find every ledger the gate must classify. A new
+    /// protocol requirement — every conformance implements it in the same
+    /// slice. There is deliberately NO default: a permissive default that
+    /// silently returned an empty collection would blind the gate on any
+    /// store that forgot to implement it, failing OPEN on dirty history.
+    func sessions() throws -> [SessionID]
     /// Claim exclusive write ownership of `session` for `writer`. A
     /// different live writer holding the session fails with
     /// `.alreadyOwned(session:writer:)` (both identities travel);
@@ -238,6 +286,15 @@ public protocol SessionStore: Sendable {
 }
 
 extension SessionStore {
+    public func artifactRecord(session: SessionID, digest: String) throws -> Data? { nil }
+
+    /// Default publication refusal: stores without a fenced content-addressed
+    /// mechanism fail closed rather than half-publish.
+    public func publishArtifact(session: SessionID, as identity: WriterIdentity, kind: String, operationID: OperationID?, bytes: Data) throws -> ArtifactRef {
+        _ = session; _ = identity; _ = kind; _ = operationID; _ = bytes
+        throw StoreError.integrity("artifact publication is not supported by this store")
+    }
+
     /// Default sequential batch (NO atomicity claim): diagnostic-only
     /// conformances inherit this. Durable paths must override.
     public func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {

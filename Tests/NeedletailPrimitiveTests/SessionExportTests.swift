@@ -160,6 +160,7 @@ struct SessionExportTests {
             "previousWriterHash", "newWriterHash", "reason", "operatorID",
             "reference", "unresolved",
             "artifactKind", "size", "relativePath", "digest",
+            "effectID", "operationIDs", "error", "determination", "subjectSessions",
             "complete", "recordCount",
             "operations", "completed", "held", "unstarted", "orphaned",
         ]
@@ -645,6 +646,69 @@ struct SessionExportTests {
         return try db.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records") ?? -1
         }
+    }
+
+    @Test("B5-B acknowledgment export redacts determination by default")
+    func acknowledgmentExportRedactedByDefault() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dbPath = directory.appendingPathComponent("store.sqlite").path
+        let store = try GRDBSessionStore(path: dbPath)
+        defer { try? store.close() }
+        let session = SessionID("s-ack")
+        try store.claimWriterOwnership(session: session, writer: "w")
+        let identity = WriterIdentity(session: session, writer: "w")
+        let ack = Acknowledgment(
+            subjectSessions: [SessionID("s-old")],
+            operationIDs: [OperationID("eo/c1")],
+            determination: "manually-reconciled:SECRET-NOTE-777", atMillis: 4242)
+        try store.appendBatch([
+            .sessionOpened(session: session, atMillis: 1000),
+            .acknowledgedUnresolved(ack),
+        ], as: identity)
+        let lines = try SessionExport.lines(
+            dbPath: dbPath, session: session, includeContent: false,
+            exportedAt: 1_000_000, limits: .default)
+        let blob = lines.joined()
+        #expect(!blob.contains("SECRET-NOTE-777"), "free-text determination must not leak by default")
+        let objects = try Self.decodeLines(lines)
+        let rows = objects.filter { $0["kind"] as? String == "acknowledgedUnresolved" }
+        #expect(rows.count == 1)
+        let row = try #require(rows.first)
+        // Exact structural identity survives redaction.
+        #expect(row["subjectSessions"] as? [String] == ["s-old"])
+        #expect(row["operationIDs"] as? [String] == ["eo/c1"])
+        #expect(row["atMillis"] as? Int == 4242)
+        #expect(row["redacted"] as? Bool == true)
+        #expect(row["determination"] == nil, "determination key absent without --include-content")
+    }
+
+    @Test("B5-B acknowledgment export includes determination with content")
+    func acknowledgmentExportIncludesDeterminationWithContent() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dbPath = directory.appendingPathComponent("store.sqlite").path
+        let store = try GRDBSessionStore(path: dbPath)
+        defer { try? store.close() }
+        let session = SessionID("s-ack")
+        try store.claimWriterOwnership(session: session, writer: "w")
+        let identity = WriterIdentity(session: session, writer: "w")
+        try store.appendBatch([
+            .sessionOpened(session: session, atMillis: 1000),
+            .acknowledgedUnresolved(Acknowledgment(
+                subjectSessions: [SessionID("s-old")],
+                operationIDs: [OperationID("eo/c1")],
+                determination: "operator-accepted-risk", atMillis: 4242)),
+        ], as: identity)
+        let lines = try SessionExport.lines(
+            dbPath: dbPath, session: session, includeContent: true,
+            exportedAt: 1_000_000, limits: .default)
+        let objects = try Self.decodeLines(lines)
+        let rows = objects.filter { $0["kind"] as? String == "acknowledgedUnresolved" }
+        #expect(rows.count == 1)
+        let row = try #require(rows.first)
+        #expect(row["determination"] as? String == "operator-accepted-risk")
+        #expect(row["redacted"] as? Bool == false)
     }
 }
 

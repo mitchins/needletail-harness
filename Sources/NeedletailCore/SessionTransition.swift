@@ -60,6 +60,10 @@ public struct ProviderInvocation: Sendable, Equatable {
 }
 
 public struct EffectReservation: Sendable, Equatable {
+    public enum Kind: String, Sendable, Equatable, Codable {
+        case executor
+        case provider
+    }
     public let effectID: EffectID
     public let runID: RunID
     public let requestID: RequestID?
@@ -67,8 +71,10 @@ public struct EffectReservation: Sendable, Equatable {
     public let revision: Revision
     public let mutating: Bool
     public let batch: ToolBatch
+    public let kind: Kind
+    public let approvedPaths: [String]
 
-    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch()) {
+    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch(), kind: Kind, approvedPaths: [String] = []) {
         self.effectID = effectID
         self.runID = runID
         self.requestID = requestID
@@ -76,6 +82,8 @@ public struct EffectReservation: Sendable, Equatable {
         self.revision = revision
         self.mutating = mutating
         self.batch = batch
+        self.kind = kind
+        self.approvedPaths = approvedPaths
     }
 }
 
@@ -104,9 +112,57 @@ public struct ExecutorReceipt: Sendable, Equatable {
     }
 }
 
+public struct ToolCallOutcome: Sendable, Equatable, Codable {
+    public let callID: String
+    public let status: String
+    public let summary: String
+    public let data: String
+    public let artifactID: String?
+    public let truncated: Bool
+    public let warnings: [String]
+    public let error: String?
+    public let path: String?
+    public let mode: String?
+    public let beforeHash: String?
+    public let afterHash: String?
+    public let started: Bool?
+    /// B4 per-call result classification: the executor's attestation of
+    /// whether THIS call mutates. Nil = legacy/scripted (the reducer falls
+    /// back to the proposal-derived classification); non-nil MUST agree
+    /// with the dispatch-time intent or the result is failed closed
+    /// (unknown+hold). Verified end-to-end by reopen+reconcile, which
+    /// requires done results to agree with their intent on this flag.
+    public let mutating: Bool?
+
+    public init(callID: String, status: String, summary: String, data: String, artifactID: String? = nil, truncated: Bool = false, warnings: [String] = [], error: String? = nil, path: String? = nil, mode: String? = nil, beforeHash: String? = nil, afterHash: String? = nil, started: Bool? = nil, mutating: Bool? = nil) {
+        self.callID = callID
+        self.status = status
+        self.summary = summary
+        self.data = data
+        self.artifactID = artifactID
+        self.truncated = truncated
+        self.warnings = warnings
+        self.error = error
+        self.path = path
+        self.mode = mode
+        self.beforeHash = beforeHash
+        self.afterHash = afterHash
+        self.started = started
+        self.mutating = mutating
+    }
+}
+
+public enum ToolFailure: Error, Sendable, Equatable {
+    case preDispatch(status: String, summary: String)
+}
+
 public struct ExecutorResult: Sendable, Equatable {
     public let receipt: ExecutorReceipt
-    public init(receipt: ExecutorReceipt) { self.receipt = receipt }
+    public let calls: [ToolCallOutcome]
+    public init(receipt: ExecutorReceipt, calls: [ToolCallOutcome] = []) {
+        self.receipt = receipt
+        self.calls = calls
+    }
 }
 
 public protocol ModelTransport: Sendable {
@@ -296,12 +352,18 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.executing, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
+    case (.cancelling, .effectCompleted(let effectID, _, _, _, _, let outcome, _)):
+        return completeCancelledPending(state, effectID: effectID, outcome: outcome, ids: &ids)
+    case (.cancelling, .effectFailed(let effectID, _, _, _, _, let error, let at)):
+        return completeCancelledPendingFailed(state, effectID: effectID, error: error, atMillis: at, ids: &ids)
     case (.cancelling, .tick(let now)):
         return tickCancelling(state, nowMillis: now, ids: &ids)
     case (.cancelling, .transportFailed(_, _, _, _, let at)):
         return interruptRun(state, note: "transport confirmed cancel", atMillis: at, ids: &ids)
     case (.cancelling, .cancelRequested):
         return Transition(state: state, effects: [], records: [])
+    case (_, .cancelledPendingRemoved(let effectID, let at)):
+        return handleCancelledPendingRemoved(state, effectID: effectID, atMillis: at, ids: &ids)
     case (.failed, .dismissRun(let at)), (.completed, .dismissRun(let at)), (.interrupted, .dismissRun(let at)):
         return dismissTerminal(state, atMillis: at, ids: &ids)
     case (.failed, .queueResume(let at)), (.completed, .queueResume(let at)), (.interrupted, .queueResume(let at)):
@@ -411,8 +473,10 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
             return drop(state)
         }
         return nil
-    case .effectCompleted(let effectID, let runID, let generation, let revision, _, _, _),
-         .effectFailed(let effectID, let runID, let generation, let revision, _, _, _):
+    case .effectCompleted(let effectID, let runID, let generation, let revision, _, _, _):
+        if state.cancelledPendingReservations.contains(where: { $0.effectID == effectID }) {
+            return nil
+        }
         if state.consumedEffects.contains(effectID) {
             return drop(state)
         }
@@ -427,6 +491,29 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
             return drop(state)
         }
         return nil
+    case .effectFailed(let effectID, let runID, let generation, let revision, _, _, _):
+        if state.cancelledPendingReservations.contains(where: { $0.effectID == effectID }) {
+            return nil
+        }
+        if state.consumedEffects.contains(effectID) {
+            return drop(state)
+        }
+        guard let run = state.activeRun,
+              run.runID == runID, run.revision == generation,
+              state.liveReservations.first(where: { $0.effectID == effectID })?.revision == revision
+        else {
+            let mutating = state.liveReservations.first(where: { $0.effectID == effectID })?.mutating ?? false
+            if mutating {
+                return dropRetaining(state, effectID: effectID, ids: &ids)
+            }
+            return drop(state)
+        }
+        return nil
+    case .cancelledPendingRemoved(let effectID, _):
+        if state.cancelledPendingReservations.contains(where: { $0.effectID == effectID }) {
+            return nil
+        }
+        return drop(state)
     case .requestDispatched(let requestID, _):
         guard state.phase == .admitting,
               let run = state.activeRun, run.requestID == requestID
@@ -472,10 +559,18 @@ private func dropRetaining<I: IDSource>(_ state: SessionState, effectID: EffectI
             operationID: OperationID(effectID.raw), callID: effectID.raw,
             state: .unknown, mutating: mutating)]
     } else {
-        refs = proposals.map {
-            OperationRef(
+        refs = proposals.compactMap {
+            let isMutating = $0.tool != "read" && $0.tool != "search" && $0.tool != "consult"
+            guard isMutating else { return nil }
+            return OperationRef(
                 operationID: operationID(effectID: effectID, callID: $0.callID),
-                callID: $0.callID, state: .unknown, mutating: mutating)
+                callID: $0.callID, state: .unknown, mutating: true)
+        }
+        // If no mutating proposals, no retained markers (transcript-only)
+        if refs.isEmpty {
+            var live = state.liveReservations
+            live.removeAll(where: { $0.effectID == effectID })
+            return Transition(state: bumped(state, live: live), effects: [], records: [])
         }
     }
     var unresolved = state.unresolvedOperations
@@ -569,7 +664,7 @@ private func admitFreshRun<I: IDSource>(
     let run = RunDescriptor(runID: runID, requestID: requestID, revision: revision, startedAtMillis: atMillis, sealed: sealed)
     let reservation = EffectReservation(
         effectID: effectID, runID: runID, requestID: requestID,
-        generation: revision, revision: revision, mutating: false)
+        generation: revision, revision: revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(
         effectID: effectID, requestID: requestID, runID: runID, generation: revision,
         alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: sealed,
@@ -1018,7 +1113,7 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
     let run = RunDescriptor(runID: runID, requestID: requestID, revision: revision, startedAtMillis: atMillis, sealed: entry.sealed)
     let reservation = EffectReservation(
         effectID: effectID, runID: runID, requestID: requestID,
-        generation: revision, revision: revision, mutating: false)
+        generation: revision, revision: revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(
         effectID: effectID, requestID: requestID, runID: runID, generation: revision,
         alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: entry.sealed,
@@ -1191,6 +1286,80 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
             return failRun(state, failure: .providerError("malformed tool batch: empty or duplicate call identity"), hold: true, atMillis: atMillis, ids: &ids)
         }
     }
+    // B1 strict validator: validate every call before side effects
+    let validated: [ValidatedToolCall]
+    do {
+        validated = try ToolValidator.validateBatchArguments(batch: batch)
+    } catch let ToolFailure.preDispatch(status, summary) {
+        // Deterministic per-call done receipts preserving SPEC status, no FS touch
+        // Synthesize a provider continuation with per-call operationResults
+        let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("preDispatch", status), ids: &ids)
+        guard let run = s1.activeRun else {
+            return failRun(state, failure: .providerError("validation without run"), hold: true, atMillis: atMillis, ids: &ids)
+        }
+        guard s1.turnsUsed < s1.turnLimit else {
+            return failRun(state, failure: .budgetExhausted("turn budget exhausted after validation"), hold: true, atMillis: atMillis, ids: &ids)
+        }
+        // Per-call mutating classification derived from tool name, not model flag
+        // For preDispatch, create matching intent+result so reopen sees completed, not held orphan
+        var records: [DurableRecord] = []
+        var transcripts: [DurableRecord] = []
+        for prop in batch.proposals {
+            let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            let opID = ids.nextOperationID()
+            let intentRef = OperationRef(operationID: opID, callID: prop.callID, state: .intent, mutating: isMut)
+            let resultRef = OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut)
+            records.append(.operationIntent(intentRef))
+            records.append(.operationResult(resultRef, outcome: "tool-failure: \(summary) (\(status))"))
+            transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "preDispatch \(status): \(summary)")))
+        }
+        let nextEffectID = ids.nextEffectID()
+        let seq = ids.nextSequence()
+        let reservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+        let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed, turnsLeft: state.turnLimit - s1.turnsUsed, deadlineMillis: state.runDeadlineMillis, historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):preDispatch"))
+        let next = s1.replacing(phase: .requesting, consumedEffects: s1.consumedEffects, turnsUsed: s1.turnsUsed + 1, pendingBatch: .some(nil), liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+        return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
+    } catch {
+        return failRun(state, failure: .providerError("validation error: \(error)"), hold: true, atMillis: atMillis, ids: &ids)
+    }
+    // Absolute protected paths (never grantable) -> deterministic denied
+    var absoluteDenied: [String] = []
+    var grantablePaths: [String] = []
+    for v in validated {
+        for p in v.paths {
+            let cls = ToolValidator.protectedClassification(for: p)
+            if cls == .absoluteDenied { absoluteDenied.append(p) }
+            else if cls == .grantable { grantablePaths.append(p) }
+        }
+    }
+    // Byte-distinct grantable enumeration: NFC/NFD twins are distinct
+    // inodes and must both be listed for approval (Swift Set would
+    // collapse them via canonical equality).
+    grantablePaths = ToolValidator.dedupeByteDistinct(grantablePaths)
+    if !absoluteDenied.isEmpty {
+        let status = "denied"
+        let summary = "absolute protected path denied: \(absoluteDenied.joined(separator: ","))"
+        let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("absolute-denied", summary), ids: &ids)
+        guard let run = s1.activeRun else { return failRun(state, failure: .providerError("absolute denied without run"), hold: true, atMillis: atMillis, ids: &ids) }
+        guard s1.turnsUsed < s1.turnLimit else { return failRun(state, failure: .budgetExhausted("turn budget exhausted"), hold: true, atMillis: atMillis, ids: &ids) }
+        var records: [DurableRecord] = []
+        var transcripts: [DurableRecord] = []
+        for prop in batch.proposals {
+            let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            let opID = ids.nextOperationID()
+            let intentRef = OperationRef(operationID: opID, callID: prop.callID, state: .intent, mutating: isMut)
+            let resultRef = OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut)
+            records.append(.operationIntent(intentRef))
+            records.append(.operationResult(resultRef, outcome: "tool-failure: \(summary) (\(status))"))
+            transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "denied: \(summary)")))
+        }
+        let nextEffectID = ids.nextEffectID()
+        let seq = ids.nextSequence()
+        let reservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+        let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed, turnsLeft: state.turnLimit - s1.turnsUsed, deadlineMillis: state.runDeadlineMillis, historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):absolute"))
+        let next = s1.replacing(phase: .requesting, turnsUsed: s1.turnsUsed + 1, pendingBatch: .some(nil), liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+        return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
+    }
     // Capability grant check (I05): proposals without an effective grant
     // are denied as typed receipts — never executed, never silently dropped.
     let denied = batch.proposals.map(\.tool).filter { !toolAllowed($0, caps: state.epoch.effectiveCaps.tools) }
@@ -1207,7 +1376,7 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         let seq = ids.nextSequence()
         let reservation = EffectReservation(
             effectID: nextEffectID, runID: run.runID, requestID: run.requestID,
-            generation: run.revision, revision: run.revision, mutating: false)
+            generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
         let invocation = ProviderInvocation(
             effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
             alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,
@@ -1238,11 +1407,15 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         return Transition(state: s1.replacing(phase: .requesting, pendingBatch: .some(nil)), effects: [], records: prefix)
     }
     let names = batch.proposals.map(\.tool)
-    let needsApproval = batchNeedsApproval(
+    var needsApproval = batchNeedsApproval(
         toolNames: names, execPolicy: state.epoch.effectiveCaps.tools.exec,
         mode: state.trustMode, sealed: state.activeRun?.sealed ?? false)
+    // B1: grantable protected paths always require explicit approval, even for read
+    if !grantablePaths.isEmpty {
+        needsApproval = true
+    }
     if !needsApproval {
-        return dispatchTrustedBatch(state, batch: batch, ids: &ids)
+        return dispatchTrustedBatch(state, batch: batch, approvedPaths: grantablePaths, ids: &ids)
     }
     guard let run = state.activeRun else {
         return failRun(state, failure: .providerError("authorising without a run"), hold: true, atMillis: atMillis, ids: &ids)
@@ -1250,7 +1423,8 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
     let request = ApprovalRequest(
         requestID: run.requestID, runID: run.runID, generation: run.revision,
         operation: "tool batch: \(names.joined(separator: ", "))",
-        requiredGrant: "explicit approval")
+        requiredGrant: "explicit approval",
+        protectedPaths: grantablePaths.sorted())
     let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("approval", run.requestID.raw), ids: &ids)
     let next = s1.replacing(phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch))
     return Transition(
@@ -1270,7 +1444,7 @@ private func operationID(effectID: EffectID, callID: String) -> OperationID {
     OperationID("\(effectID.raw)/\(callID)")
 }
 
-private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: ToolBatch, ids: inout I) -> Transition {
+private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: ToolBatch, approvedPaths: [String] = [], ids: inout I) -> Transition {
     guard let run = state.activeRun else {
         let (s1, prefix) = sequenced(state, kind: "failed", digest: "no-run", ids: &ids)
         return Transition(state: s1.replacing(phase: .failed(.providerError("trusted dispatch without a run"))), effects: [], records: prefix)
@@ -1289,7 +1463,7 @@ private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: Too
     let mutating = batch.proposals.contains { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" }
     let reservation = EffectReservation(
         effectID: effectID, runID: run.runID, requestID: run.requestID,
-        generation: run.revision, revision: run.revision, mutating: mutating, batch: batch)
+        generation: run.revision, revision: run.revision, mutating: mutating, batch: batch, kind: .executor, approvedPaths: approvedPaths)
     let (s1, prefix) = sequenced(state, kind: "executing", digest: eventDigest("exec", run.requestID.raw), ids: &ids)
     let next = s1.replacing(
         phase: .executing, pendingApproval: .some(nil), pendingBatch: .some(nil),
@@ -1299,9 +1473,10 @@ private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: Too
     // atomically BEFORE performing `.reserveEffect`, so no external side
     // effect exists without its identifiable intent.
     let intents = batch.proposals.map {
-        DurableRecord.operationIntent(OperationRef(
+        let isMutating = $0.tool != "read" && $0.tool != "search" && $0.tool != "consult"
+        return DurableRecord.operationIntent(OperationRef(
             operationID: operationID(effectID: effectID, callID: $0.callID),
-            callID: $0.callID, state: .intent, mutating: mutating))
+            callID: $0.callID, state: .intent, mutating: isMutating))
     }
     return Transition(
         state: next,
@@ -1315,7 +1490,8 @@ private func grantApproval<I: IDSource>(_ state: SessionState, requestID: Reques
         let (s1, prefix) = sequenced(state, kind: "authorising", digest: "grant-no-batch", ids: &ids)
         return Transition(state: s1, effects: [], records: prefix)
     }
-    return dispatchTrustedBatch(state, batch: batch, ids: &ids)
+    let approved = state.pendingApproval?.protectedPaths ?? []
+    return dispatchTrustedBatch(state, batch: batch, approvedPaths: approved, ids: &ids)
 }
 
 private func denyApproval<I: IDSource>(_ state: SessionState, ids: inout I) -> Transition {
@@ -1364,7 +1540,7 @@ private func continueAfterEffect<I: IDSource>(
     let seq = ids.nextSequence()
     let reservation = EffectReservation(
         effectID: nextEffectID, runID: run.runID, requestID: run.requestID,
-        generation: run.revision, revision: run.revision, mutating: false)
+        generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(
         effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
         alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,
@@ -1421,7 +1597,390 @@ private func completeEffect<I: IDSource>(
         return continueAfterEffect(state, effectID: effectID, receipt: summary, atMillis: 0, ids: &ids)
     case .failureReceipt(let summary):
         return continueAfterEffect(state, effectID: effectID, receipt: "tool-failure: \(summary)", atMillis: 0, ids: &ids)
+    case .perCall(let result):
+        return continueAfterEffectPerCall(state, effectID: effectID, result: result, ids: &ids)
+    case .preDispatchFailure(let failure):
+        return continueAfterPreDispatchFailure(state, effectID: effectID, failure: failure, ids: &ids)
     }
+}
+
+private func continueAfterPreDispatchFailure<I: IDSource>(_ state: SessionState, effectID: EffectID, failure: ToolFailure, ids: inout I) -> Transition {
+    guard let reservation = state.liveReservations.first(where: { $0.effectID == effectID }) else {
+        return Transition(state: state, effects: [], records: [])
+    }
+    let proposals = reservation.batch.proposals
+    var records: [DurableRecord] = []
+    var transcript: [DurableRecord] = []
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    var live = state.liveReservations.filter { $0.effectID != effectID }
+    let status: String
+    let summary: String
+    switch failure {
+    case .preDispatch(let s, let m): status = s; summary = m
+    }
+    for proposal in proposals {
+        let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+        let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .done, mutating: isMutating)
+        let outcomeText = "tool-failure: \(summary) (\(status))"
+        records.append(.operationResult(ref, outcome: outcomeText))
+        transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "preDispatch \(status): \(summary)")))
+    }
+    var interimState = state.replacing(consumedEffects: consumed, liveReservations: live)
+    // Pre-dispatch never holds, but preserve already-generated records if turn-budget or missing-run fails
+    guard interimState.turnsUsed < interimState.turnLimit else {
+        let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+        return Transition(state: failed.state, effects: failed.effects, records: records + transcript + failed.records)
+    }
+    guard let run = interimState.activeRun else {
+        let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+        return Transition(state: failed.state, effects: failed.effects, records: records + transcript + failed.records)
+    }
+    let nextEffectID = ids.nextEffectID()
+    let seq = ids.nextSequence()
+    let nextReservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+    let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: interimState.epoch.profile.alias, epochID: interimState.epoch.epochID, sealed: run.sealed, turnsLeft: interimState.turnLimit - interimState.turnsUsed, deadlineMillis: interimState.runDeadlineMillis, historyDigest: fnv1aHex("\(interimState.sessionID.raw):\(seq.value):continue"))
+    let (s1, prefix) = sequenced(interimState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
+    let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live, lastSequence: seq.value)
+    return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + records + transcript)
+}
+
+private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effectID: EffectID, result: ExecutorResult, ids: inout I) -> Transition {
+    guard let reservation = state.liveReservations.first(where: { $0.effectID == effectID }) else {
+        return Transition(state: state, effects: [], records: [])
+    }
+    let proposals = reservation.batch.proposals
+    var records: [DurableRecord] = []
+    var transcript: [DurableRecord] = []
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    var live = state.liveReservations.filter { $0.effectID != effectID }
+    var unresolved = state.unresolvedOperations
+
+    // F5: duplicate callIDs fail closed before mapping — track tainted IDs
+    var seenCallIDs: Set<String> = []
+    var taintedCallIDs: Set<String> = []
+    for call in result.calls {
+        if seenCallIDs.contains(call.callID) {
+            taintedCallIDs.insert(call.callID)
+        } else {
+            seenCallIDs.insert(call.callID)
+        }
+    }
+    // For tainted IDs, emit deterministically in proposal order (not Set iteration)
+    for proposal in proposals where taintedCallIDs.contains(proposal.callID) {
+        let dupID = proposal.callID
+        let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+        if isMutating {
+            let ref = OperationRef(operationID: operationID(effectID: effectID, callID: dupID), callID: dupID, state: .unknown, mutating: true)
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+            // Only append one result per tainted ID, even if duplicated multiple times
+            if !records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == dupID } else { return false } }) {
+                records.append(.operationResult(ref, outcome: "unknown: duplicate callID \(dupID)"))
+            }
+        }
+        if !transcript.contains(where: { if case .transcriptAppended(.toolResponse(let id, _)) = $0 { return id == dupID } else { return false } }) {
+            transcript.append(.transcriptAppended(.toolResponse(callID: dupID, text: "duplicate callID: \(dupID)")))
+        }
+    }
+    // Build map from callID to outcome (first wins, but tainted IDs will be handled as unknown above and skipped below)
+    var outcomeMap: [String: ToolCallOutcome] = [:]
+    for call in result.calls where !taintedCallIDs.contains(call.callID) && outcomeMap[call.callID] == nil {
+        outcomeMap[call.callID] = call
+    }
+    // F5: unexpected callIDs (not in reservation) — transcript only, no durable result, and remove from map if any
+    for call in result.calls where !proposals.contains(where: { $0.callID == call.callID }) {
+        outcomeMap.removeValue(forKey: call.callID)
+        // Already handled tainted, but for unexpected, just transcript (already added via tainted? No, unexpected not tainted, so add transcript)
+        if !taintedCallIDs.contains(call.callID) {
+            transcript.append(.transcriptAppended(.toolResponse(callID: call.callID, text: "unexpected callID: \(call.callID)")))
+        }
+    }
+
+    // Ordered halt: find first missing/tainted/non-success/contradictory-success in proposal order — conservative boundary
+    var firstHaltIndex: Int? = nil
+    for (idx, prop) in proposals.enumerated() {
+        if taintedCallIDs.contains(prop.callID) {
+            firstHaltIndex = idx
+            break
+        }
+        guard let out = outcomeMap[prop.callID] else {
+            firstHaltIndex = idx
+            break
+        }
+        if out.status != "success" && out.status != "no-match" {
+            firstHaltIndex = idx
+            break
+        }
+        if out.status == "success" && out.started == false {
+            // Contradictory success+started==false is a halt boundary, even for non-mutating (transcript-only) — subsequent success must be violation
+            firstHaltIndex = idx
+            break
+        }
+    }
+    for proposal in proposals {
+        // Tainted IDs already carry their unknown marker + result above.
+        if taintedCallIDs.contains(proposal.callID) {
+            continue
+        }
+        guard let outcome = outcomeMap[proposal.callID] else {
+            // No-entry: contract violation, treat as unknown for mutating, transcript-only for non-mutating
+            let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+            if isMutating {
+                let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .unknown, mutating: true)
+                let (markers, overflow) = appendUnresolved(unresolved, ref)
+                unresolved = markers
+                if overflow { return integrityStop(state, ids: &ids) }
+                records.append(.operationResult(ref, outcome: "unknown"))
+            }
+            transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "no-entry: \(proposal.callID)")))
+            continue
+        }
+        let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
+        // B4 per-call agreement: a non-nil executor attestation MUST match
+        // the dispatch-time intent classification. A mismatch means the
+        // executor's report contradicts what was authorized — fail closed
+        // (unknown+hold with the conservative mutating claim) in BOTH
+        // directions: a denied mutation claim could hide a real side
+        // effect, and an invented one could mask a lost update. Nil
+        // (legacy/scripted) falls back to the proposal derivation below.
+        if let reported = outcome.mutating, reported != isMutating {
+            let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .unknown, mutating: true)
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.operationResult(ref, outcome: "unknown: mutating mismatch (intent \(isMutating) vs result \(reported)) for \(proposal.callID)"))
+            transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+            continue
+        }
+        let status = outcome.status
+        let started = outcome.started
+        // Check if this proposal was tainted as duplicate — already handled as unknown
+        if taintedCallIDs.contains(proposal.callID) {
+            continue
+        }
+        // Ordered halt defensive: after first non-success, later calls must be cancelled unstarted
+        if let firstHalt = firstHaltIndex, let currentIndex = proposals.firstIndex(where: { $0.callID == proposal.callID }), currentIndex > firstHalt {
+            if !(status == "cancelled" && started == false) {
+                if isMutating {
+                    let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: .unknown, mutating: true)
+                    let (markers, overflow) = appendUnresolved(unresolved, ref)
+                    unresolved = markers
+                    if overflow { return integrityStop(state, ids: &ids) }
+                    records.append(.operationResult(ref, outcome: "unknown: halt violation \(proposal.callID)"))
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "halt violation: \(proposal.callID)")))
+                } else {
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "halt violation: \(proposal.callID)")))
+                }
+                continue
+            }
+        }
+        let deterministic: Set<String> = ["success", "no-match", "denied", "conflict", "invalid-arguments", "failed"]
+        var stateForResult: OperationState = .done
+        var hold = false
+        var outcomeText = outcome.summary
+        if deterministic.contains(status) {
+            if started == false {
+                // RED/GREEN: deterministic + started==false is contradictory → unknown for mutating, transcript-only for non-mutating.
+                // Only the typed preDispatchFailure path may certify no dispatch; arbitrary ToolCallOutcome data never does.
+                if isMutating {
+                    stateForResult = .unknown
+                    hold = true
+                    outcomeText = "unknown: contradictory \(status) with started==false"
+                } else {
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+                    continue
+                }
+            } else {
+                stateForResult = .done
+                if status != "success" && status != "no-match" {
+                    outcomeText = "tool-failure: \(outcome.summary)"
+                }
+            }
+        } else if status == "cancelled" || status == "timeout" {
+            if started == false {
+                stateForResult = .done
+                outcomeText = "cancelled: unstarted"
+            } else {
+                // started true or nil → unknown for mutating, transcript-only for non-mutating
+                if isMutating {
+                    stateForResult = .unknown
+                    hold = true
+                    outcomeText = "unknown: \(status) after started"
+                } else {
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+                    continue
+                }
+            }
+        } else {
+            // Unknown status: treat as unknown for mutating
+            if isMutating {
+                stateForResult = .unknown
+                hold = true
+            } else {
+                transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+                continue
+            }
+        }
+
+        let ref = OperationRef(operationID: operationID(effectID: effectID, callID: proposal.callID), callID: proposal.callID, state: stateForResult, mutating: isMutating)
+        if hold {
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.operationResult(ref, outcome: "unknown: \(outcomeText)"))
+        } else {
+            records.append(.operationResult(ref, outcome: outcomeText))
+        }
+        transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+        // Artifact handling: if outcome has artifactID, publish reference already done by executor; here we just record
+    }
+
+    // Handle empty batch fallback
+    if proposals.isEmpty {
+        let ref = OperationRef(operationID: OperationID(effectID.raw), callID: effectID.raw, state: .done, mutating: reservation.mutating)
+        let newRecords: [DurableRecord] = [.operationResult(ref, outcome: result.receipt.summary)] + transcript
+        var fallbackState = state.replacing(consumedEffects: consumed, liveReservations: live, unresolvedOperations: unresolved)
+        // Continue or hold as per normal continuation
+        if !fallbackState.unresolvedOperations.isEmpty {
+            let (s1, prefix) = sequenced(fallbackState, kind: "continuation-blocked", digest: "markers", ids: &ids)
+            let next = s1.replacing(queueHeld: true, heldReason: .error("unresolved operations block continuation"))
+            return Transition(state: next, effects: [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + newRecords)
+        }
+        guard fallbackState.turnsUsed < fallbackState.turnLimit else {
+            return failRun(fallbackState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+        }
+        guard let run = fallbackState.activeRun else {
+            return failRun(fallbackState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+        }
+        let nextEffectID = ids.nextEffectID()
+        let seq = ids.nextSequence()
+        let nextReservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+        let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: fallbackState.epoch.profile.alias, epochID: fallbackState.epoch.epochID, sealed: run.sealed, turnsLeft: fallbackState.turnLimit - fallbackState.turnsUsed, deadlineMillis: fallbackState.runDeadlineMillis, historyDigest: fnv1aHex("\(fallbackState.sessionID.raw):\(seq.value):continue"))
+        var nextLive = fallbackState.liveReservations
+        nextLive.removeAll(where: { $0.effectID == effectID })
+        let (s1, prefix) = sequenced(fallbackState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
+        let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: fallbackState.turnsUsed + 1, liveReservations: nextLive, lastSequence: seq.value)
+        return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + newRecords)
+    }
+
+    let allRecords = records + transcript
+    // F1: continuation policy — if unresolved (unknown) exists, hold; else continue to next turn
+    var interimState = state.replacing(consumedEffects: consumed, liveReservations: live, unresolvedOperations: unresolved)
+    if !unresolved.isEmpty {
+        let (s1, prefix) = sequenced(interimState, kind: "continuation-blocked", digest: "markers", ids: &ids)
+        let next = s1.replacing(queueHeld: true, heldReason: .error("unresolved operations block continuation"))
+        return Transition(state: next, effects: [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + allRecords)
+    }
+    guard interimState.turnsUsed < interimState.turnLimit else {
+        let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+        return Transition(state: failed.state, effects: failed.effects, records: allRecords + failed.records)
+    }
+    guard let run = interimState.activeRun else {
+        let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
+        return Transition(state: failed.state, effects: failed.effects, records: allRecords + failed.records)
+    }
+    let nextEffectID = ids.nextEffectID()
+    let seq = ids.nextSequence()
+    let nextReservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+    let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: interimState.epoch.profile.alias, epochID: interimState.epoch.epochID, sealed: run.sealed, turnsLeft: interimState.turnLimit - interimState.turnsUsed, deadlineMillis: interimState.runDeadlineMillis, historyDigest: fnv1aHex("\(interimState.sessionID.raw):\(seq.value):continue"))
+    let (s1, prefix) = sequenced(interimState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
+    let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live, lastSequence: seq.value)
+    return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + allRecords)
+}
+
+private func completeCancelledPending<I: IDSource>(_ state: SessionState, effectID: EffectID, outcome: EffectOutcome, ids: inout I) -> Transition {
+    guard let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) else {
+        return Transition(state: state, effects: [], records: [])
+    }
+    var pending = state.cancelledPendingReservations.filter { $0.effectID != effectID }
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    var unresolved = state.unresolvedOperations
+    var records: [DurableRecord] = []
+
+    switch outcome {
+    case .preDispatchFailure:
+        // Typed proof that no dispatch occurred: discharge every mutating marker as done
+        for prop in reservation.batch.proposals {
+            let isMutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            if !isMutating { continue }
+            let ref = OperationRef(operationID: operationID(effectID: effectID, callID: prop.callID), callID: prop.callID, state: .done, mutating: true)
+            records.append(.operationResult(ref, outcome: "cancelled: unstarted"))
+            unresolved.removeAll(where: { $0.operationID == ref.operationID })
+        }
+        break
+    case .success, .failureReceipt:
+        break
+    case .perCall(let result):
+        // F5: duplicate and unexpected handling for cancelled-pending path — tainted IDs never supersede
+        var seen: Set<String> = []
+        var tainted: Set<String> = []
+        for call in result.calls {
+            if seen.contains(call.callID) { tainted.insert(call.callID) } else { seen.insert(call.callID) }
+        }
+        for call in result.calls {
+            if tainted.contains(call.callID) { continue }
+            let proposal = reservation.batch.proposals.first(where: { $0.callID == call.callID })
+            guard let prop = proposal else {
+                // Unexpected callID: ignore, no result for non-reserved operation (authoritative discharge only described)
+                continue
+            }
+            let mutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            if !mutating { continue } // non-mutating never gets a record on cancel path
+            if (call.status == "cancelled" || call.status == "timeout") && call.started == false {
+                // Unstarted: supersede pending marker with done (both cancelled and timeout unstarted are valid proofs)
+                let ref = OperationRef(operationID: operationID(effectID: effectID, callID: call.callID), callID: call.callID, state: .done, mutating: true)
+                records.append(.operationResult(ref, outcome: "cancelled: unstarted"))
+                // Remove the pending marker from unresolved if present (supersession)
+                unresolved.removeAll(where: { $0.operationID == ref.operationID })
+            } else {
+                // Started or unknown: keep marker, no new record (hold remains)
+                continue
+            }
+        }
+    }
+
+    let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending, unresolvedOperations: unresolved)
+    return Transition(state: next, effects: [], records: records)
+}
+
+private func completeCancelledPendingFailed<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, atMillis: UInt64, ids: inout I) -> Transition {
+    guard let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) else {
+        return Transition(state: state, effects: [], records: [])
+    }
+    var pending = state.cancelledPendingReservations.filter { $0.effectID != effectID }
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    let errRecord = CancelledPendingError(effectID: effectID, operationIDs: reservation.batch.proposals.map { operationID(effectID: effectID, callID: $0.callID) }, error: error, atMillis: atMillis)
+    let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending)
+    return Transition(state: next, effects: [], records: [.cancelledPendingError(errRecord)])
+}
+
+private func handleCancelledPendingRemoved<I: IDSource>(_ state: SessionState, effectID: EffectID, atMillis: UInt64, ids: inout I) -> Transition {
+    var pending = state.cancelledPendingReservations.filter { $0.effectID != effectID }
+    var consumed = state.consumedEffects
+    consumed.insert(effectID)
+    var unresolved = state.unresolvedOperations
+    var records: [DurableRecord] = []
+    // Promote pending markers to unknown for still-pending operationIDs — always, even if marker already in unresolved (supersession)
+    if let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) {
+        for prop in reservation.batch.proposals {
+            let isMutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            if !isMutating { continue }
+            let ref = OperationRef(operationID: operationID(effectID: effectID, callID: prop.callID), callID: prop.callID, state: .unknown, mutating: true)
+            // Remove the pending marker from unresolved if present, then add the unknown (supersession)
+            unresolved.removeAll(where: { $0.operationID == ref.operationID })
+            let (markers, overflow) = appendUnresolved(unresolved, ref)
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.operationResult(ref, outcome: "unknown: cancelled pending terminated"))
+        }
+    }
+    let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending, unresolvedOperations: unresolved)
+    return Transition(state: next, effects: [], records: records)
 }
 
 private func failEffect<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, ids: inout I) -> Transition {
@@ -1433,50 +1992,76 @@ private func failEffect<I: IDSource>(_ state: SessionState, effectID: EffectID, 
 // MARK: Cancellation (C3: retention BEFORE invalidation)
 
 private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, ids: inout I) -> Transition {
-    // C3: every live MUTATING reservation keeps its unknown markers +
-    // records FIRST; only then are the tables cleared and the generation
-    // bumped. A3-1: markers derive the SAME per-proposal operation IDs as
-    // the dispatch-time intents, so each unmatched intent later reconciles
-    // to unknown instead of an unpairable effect-level guess.
+    // REV25 C3: per-proposal mutating, Kind-filtered, cancelledPendingReservations with supersession.
     var unresolved = state.unresolvedOperations
     var records: [DurableRecord] = []
-    for reservation in state.liveReservations where reservation.mutating {
+    var pending: [EffectReservation] = state.cancelledPendingReservations
+    var live: [EffectReservation] = []
+    var consumed = state.consumedEffects
+    var hasPending = false
+
+    for reservation in state.liveReservations {
+        // Provider reservations: not retained, just consumed.
+        if reservation.kind == .provider {
+            consumed.insert(reservation.effectID)
+            continue
+        }
+        // Executor reservations: per-proposal mutating classification.
         let proposals = reservation.batch.proposals
-        let refs: [OperationRef]
         if proposals.isEmpty {
-            refs = [OperationRef(
-                operationID: OperationID(reservation.effectID.raw), callID: reservation.effectID.raw,
-                state: .unknown, mutating: true)]
-        } else {
-            refs = proposals.map {
-                OperationRef(
-                    operationID: operationID(effectID: reservation.effectID, callID: $0.callID),
-                    callID: $0.callID, state: .unknown, mutating: true)
+            // Empty fallback uses reservation-level mutating.
+            if reservation.mutating {
+                let ref = OperationRef(operationID: OperationID(reservation.effectID.raw), callID: reservation.effectID.raw, state: .unknown, mutating: true)
+                let (markers, overflow) = appendUnresolved(unresolved, ref)
+                unresolved = markers
+                if overflow { return integrityStop(state, ids: &ids) }
+                records.append(.cancelledPendingMarker(ref, outcome: "cancelled: pending executor \(reservation.effectID.raw)"))
+                pending.append(reservation)
+                hasPending = true
+            } else {
+                consumed.insert(reservation.effectID)
+            }
+            continue
+        }
+        var mutatingRefs: [OperationRef] = []
+        for prop in proposals {
+            let isMutating = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+            if isMutating {
+                let ref = OperationRef(operationID: operationID(effectID: reservation.effectID, callID: prop.callID), callID: prop.callID, state: .unknown, mutating: true)
+                mutatingRefs.append(ref)
             }
         }
-        for ref in refs {
+        if mutatingRefs.isEmpty {
+            // Pure read-only batch: not retained, consumed.
+            consumed.insert(reservation.effectID)
+            continue
+        }
+        // Retain reservation for mutating proposals only.
+        for ref in mutatingRefs {
             let (markers, overflow) = appendUnresolved(unresolved, ref)
             unresolved = markers
-            if overflow {
-                return integrityStop(state, ids: &ids)
-            }
-            records.append(.operationResult(ref, outcome: "unknown"))
+            if overflow { return integrityStop(state, ids: &ids) }
+            records.append(.cancelledPendingMarker(ref, outcome: "cancelled: pending \(ref.callID ?? "")"))
         }
+        pending.append(reservation)
+        hasPending = true
+        // Non-mutating proposals in mixed batch are ignored (no record, but effectID is pending so late report routes to completeCancelledPending which will ignore them).
     }
+
+    // Idempotent: if no new pending and no live executor left, no duplicate markers (already handled by filtering).
     let (s1, prefix) = sequenced(state, kind: "cancelling", digest: "cancel", ids: &ids)
     var active: ActiveRequest? = nil
     if let request = state.activeRequest {
-        active = ActiveRequest(
-            requestID: request.requestID, runID: request.runID,
-            generation: request.generation, delivery: .deliveryUnknown, bytesOut: request.bytesOut)
+        active = ActiveRequest(requestID: request.requestID, runID: request.runID, generation: request.generation, delivery: .deliveryUnknown, bytesOut: request.bytesOut)
     }
-    // liveReservations cleared HERE (after the retention loop above):
-    // invalidation follows preservation, never precedes it (C3).
+    let nextPhase: SessionPhase = hasPending ? .cancelling : .cancelling
     let next = s1.replacing(
-        phase: .cancelling, activeRequest: active,
+        phase: nextPhase, activeRequest: active,
         queueHeld: true, heldReason: .cancelled(sinceMillis: atMillis),
+        consumedEffects: consumed,
         pendingApproval: .some(nil), pendingBatch: .some(nil),
-        retryDeadlineMillis: .some(nil), liveReservations: [],
+        retryDeadlineMillis: .some(nil), liveReservations: live,
+        cancelledPendingReservations: pending,
         generation: state.generation + 1,
         unresolvedOperations: unresolved)
     var effects: [Effect] = [.emitUI(.runUpdate(phase: "cancelling", detail: "cancelled; queue held"))]
@@ -1541,7 +2126,7 @@ private func consumeRetryDeadline<I: IDSource>(_ state: SessionState, nowMillis:
     let seq = ids.nextSequence()
     let reservation = EffectReservation(
         effectID: effectID, runID: run.runID, requestID: run.requestID,
-        generation: run.revision, revision: run.revision, mutating: false)
+        generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
     let invocation = ProviderInvocation(
         effectID: effectID, requestID: run.requestID, runID: run.runID, generation: run.revision,
         alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed,

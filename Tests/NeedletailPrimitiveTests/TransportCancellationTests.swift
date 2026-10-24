@@ -181,6 +181,19 @@ private func classifyRequestError(_ error: Error) -> String {
     return "failed: \(error)"
 }
 
+/// Monotonic elapsed helper (FINAL-02 A): wall-clock `Date` can step
+/// under NTP, so promptness bounds are measured on `ContinuousClock`
+/// (CLOCK_MONOTONIC). This removes wall-step confounds; it does not cure
+/// scheduler descheduling (a starved task still observes late) — that is
+/// what the serialized timing lane (`./dev test timing`) is for. All
+/// assertions are unchanged: the timeout outcome, the >= deadline lower
+/// bound (starvation-proof: descheduling only inflates elapsed), the
+/// promptness upper bound, and resource release.
+private func monotonicSeconds(since start: ContinuousClock.Instant, now: ContinuousClock.Instant) -> Double {
+    let delta = now - start
+    return Double(delta.components.seconds) + Double(delta.components.attoseconds) / 1_000_000_000_000_000_000.0
+}
+
 /// Races `produce` against a wall-clock deadline WITHOUT a task group. A
 /// task-group race cannot return past a stalled child: the group awaits
 /// cancelled children at scope exit, and awaiting a task value is not
@@ -207,8 +220,10 @@ private func raceToCompletion(
     }
     let latch = Latch()
     Task { await latch.set(await produce()) }
-    let deadline = Date().addingTimeInterval(deadlineSeconds)
-    while Date() < deadline {
+    let clock = ContinuousClock()
+    let start = clock.now
+    let deadline = start + .seconds(deadlineSeconds)
+    while clock.now < deadline {
         if let done = latch.get() { return done }
         try? await Task.sleep(nanoseconds: 20_000_000)
     }
@@ -317,14 +332,15 @@ struct TransportCancellationTests {
             func release() { released = true }
         }
         let gate = ReleaseGate()
-        let start = Date()
+        let clock = ContinuousClock()
+        let start = clock.now
         let outcome = await raceToCompletion(produce: {
             while await gate.released == false {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
             return "released"
         }, deadlineSeconds: 1)
-        let elapsed = Date().timeIntervalSince(start)
+        let elapsed = monotonicSeconds(since: start, now: clock.now)
         #expect(outcome == "timeout", "a stalled producer must hit the deadline, got \(outcome)")
         #expect(elapsed >= 1.0, "the full deadline must elapse, returned after \(elapsed)s")
         #expect(elapsed < 5.0, "the deadline must fire at ~1s, took \(elapsed)s")
@@ -383,9 +399,10 @@ struct TransportCancellationTests {
         // cr-red-readiness-hang.log, killed by timeout). The bounded
         // handshake must report false at ~the deadline instead.
         let server = try SyntheticLoopbackServer()
-        let start = Date()
+        let clock = ContinuousClock()
+        let start = clock.now
         let ready = await awaitRequestHead(server, deadlineSeconds: 1)
-        let elapsed = Date().timeIntervalSince(start)
+        let elapsed = monotonicSeconds(since: start, now: clock.now)
         #expect(!ready, "an unstarted server must not report readiness")
         #expect(elapsed >= 1.0, "the full deadline must elapse, returned after \(elapsed)s")
         #expect(elapsed < 5.0, "readiness must fail at ~1s, took \(elapsed)s")
@@ -400,14 +417,15 @@ struct TransportCancellationTests {
         // hanging the suite).
         let server = try SyntheticLoopbackServer()
         server.start()
-        let start = Date()
+        let clock = ContinuousClock()
+        let start = clock.now
         let ready = await awaitRequestHead(server, deadlineSeconds: 1)
         #expect(!ready, "an idle server must not report readiness")
-        let deadline = Date().addingTimeInterval(5)
-        while !server.threadExited && Date() < deadline {
+        let deadline = clock.now + .seconds(5)
+        while !server.threadExited && clock.now < deadline {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        let elapsed = Date().timeIntervalSince(start)
+        let elapsed = monotonicSeconds(since: start, now: clock.now)
         #expect(server.threadExited, "idle listener thread must terminate after timeout")
         #expect(elapsed < 6.0, "termination must be prompt, took \(elapsed)s")
         server.stop()

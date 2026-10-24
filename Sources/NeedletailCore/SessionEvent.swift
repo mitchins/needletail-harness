@@ -30,6 +30,7 @@ public enum SessionEvent: Sendable, Equatable {
     case validationCompleted(requestID: RequestID, generation: Revision, batch: ToolBatch, atMillis: UInt64)
     case effectCompleted(effectID: EffectID, runID: RunID, generation: Revision, expectedRevision: Revision, mutating: Bool, outcome: EffectOutcome, atMillis: UInt64)
     case effectFailed(effectID: EffectID, runID: RunID, generation: Revision, expectedRevision: Revision, mutating: Bool, error: String, atMillis: UInt64)
+    case cancelledPendingRemoved(effectID: EffectID, atMillis: UInt64)
     case tick(nowMillis: UInt64)
 }
 
@@ -45,6 +46,8 @@ public enum TransportPhase: Sendable, Equatable {
 public enum EffectOutcome: Sendable, Equatable {
     case success(String)
     case failureReceipt(String)
+    case perCall(ExecutorResult)
+    case preDispatchFailure(ToolFailure)
 }
 
 /// Minimal M1-C handoff (detail deferred to M1-C): the completion boundary

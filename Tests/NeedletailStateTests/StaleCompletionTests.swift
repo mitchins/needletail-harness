@@ -17,7 +17,7 @@ struct StaleCompletionTests {
         let effectID = EffectID("eff-live")
         let reservation = EffectReservation(
             effectID: effectID, runID: run.runID, requestID: run.requestID,
-            generation: run.revision, revision: run.revision, mutating: false)
+            generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
         return (streaming.replacing(liveReservations: [reservation]), run, effectID)
     }
 
@@ -68,7 +68,7 @@ struct StaleCompletionTests {
         var reservations = streaming.liveReservations
         reservations.append(EffectReservation(
             effectID: EffectID("eff-mut"), runID: run.runID, requestID: run.requestID,
-            generation: run.revision, revision: run.revision, mutating: true))
+            generation: run.revision, revision: run.revision, mutating: true, kind: .executor))
         let armed = streaming.replacing(liveReservations: reservations)
         // Wrong revision for a live mutating effect: outcome unknowable.
         let dropped = transition(armed, .effectCompleted(

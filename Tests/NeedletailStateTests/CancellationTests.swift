@@ -59,17 +59,18 @@ struct CancellationTests {
         reservations.append(EffectReservation(
             effectID: EffectID("eff-live"), runID: streaming.activeRun!.runID,
             requestID: streaming.activeRun!.requestID, generation: streaming.activeRun!.revision,
-            revision: streaming.activeRun!.revision, mutating: true))
+            revision: streaming.activeRun!.revision, mutating: true, kind: .executor))
         streaming = streaming.replacing(liveReservations: reservations)
         let cancelled = transition(streaming, .cancelRequested(atMillis: 2000), &ids)
         #expect(cancelled.state.unresolvedOperations.count == 1, "one unknown marker retained")
         #expect(cancelled.state.unresolvedOperations.first?.state == .unknown)
         #expect(cancelled.state.unresolvedOperations.first?.mutating == true)
         #expect(cancelled.records.contains(where: {
-            if case .operationResult(_, let outcome) = $0 { return outcome == "unknown" }
+            if case .cancelledPendingMarker = $0 { return true }
             return false
-        }), "unknown record precedes invalidation")
-        #expect(cancelled.state.liveReservations.isEmpty, "tables clear after retention")
+        }), "pending marker precedes invalidation")
+        #expect(cancelled.state.liveReservations.isEmpty, "live tables clear after retention")
+        #expect(cancelled.state.cancelledPendingReservations.count == 1, "pending retained")
     }
 
     @Test("CORE-02 cancel grace forces interrupted without confirmation")
