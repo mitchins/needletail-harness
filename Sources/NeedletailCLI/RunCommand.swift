@@ -118,6 +118,11 @@ struct RunCommand: ParsableCommand {
                 throw ExitCode(2)
             }
         }
+        // B5-C: whether an interactive approval decision is possible.
+        // Computed once, up front, on the process standards the gateway
+        // itself consults: a TTY here means the gateway will prompt and
+        // the run loop must await the decision instead of exiting 3.
+        let interactiveApprovalTTY = isatty(STDIN_FILENO) != 0 && isatty(STDERR_FILENO) != 0
         // Capture values for Sendable closure (mutating self cannot be captured)
         let promptCopy = prompt
         let configCopy = config
@@ -148,7 +153,7 @@ struct RunCommand: ParsableCommand {
                 try await RunCommand.executeStatic(
                     prompt: promptCopy, config: configCopy, trace: traceCopy,
                     format: formatCopy, tools: toolsCopy, alias: aliasCopy,
-                    maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy, workspace: workspaceCopy, readRoot: readRootCopy, acknowledgedDetermination: acknowledgedDetermination, isJSONL: isJSONL)
+                    maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy, workspace: workspaceCopy, readRoot: readRootCopy,                     acknowledgedDetermination: acknowledgedDetermination, interactiveApproval: interactiveApprovalTTY, isJSONL: isJSONL)
             } catch let error as ExitCode {
                 box.lock.withLock { box.exitCode = error.rawValue }
             } catch {
@@ -340,7 +345,7 @@ struct RunCommand: ParsableCommand {
         return store
     }
 
-    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, workspace: String?, readRoot: [String], acknowledgedDetermination: String?, isJSONL: Bool) async throws {
+    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, workspace: String?, readRoot: [String], acknowledgedDetermination: String?, interactiveApproval: Bool, isJSONL: Bool) async throws {
         // Unused format param kept for future envelope versioning
         _ = format
         // Private-by-default file creation for EVERYTHING this process
@@ -833,6 +838,17 @@ struct RunCommand: ParsableCommand {
                 finalState = current
                 break
             case .authorising where current.pendingApproval != nil:
+                if interactiveApproval {
+                    // An interactive decision is in flight on the
+                    // operator's terminal: wait for the grant/deny
+                    // instead of mistaking the prompt for a headless
+                    // verdict. (Pre-buffered test input resolves on the
+                    // first poll; a human answers whenever ready.) The
+                    // wall deadline below still bounds the wait; headless
+                    // runs resolve immediately via .unavailable.
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    continue
+                }
                 // Headless approval never blocks forever (POLICY-04, SPEC
                 // §12.2 exit 3): capture the structured request and return.
                 approvalRequest = current.pendingApproval

@@ -136,11 +136,13 @@ struct B5CEndToEndTests {
 
     /// Spawn with stdin AND stderr on one fresh PTY slave (isatty passes
     /// for both, mirroring a real terminal where stdout may still be
-    /// piped) and `input` pre-buffered in the PTY input queue —
-    /// deterministic, no sleeps. The approval prompt travels on the PTY
-    /// master (with terminal \r\n translation); stdout stays piped.
+    /// piped). With `delayInput` false (default) `input` is pre-buffered
+    /// in the PTY input queue — deterministic, no sleeps. With true, the
+    /// driver waits for the approval prompt, proves the process is still
+    /// alive (a premature exit-3 would fail here), waits a beat, and only
+    /// then answers — the human-operator shape no pre-buffering can fake.
     private static func runWithPTY(
-        _ arguments: [String], env: [String: String], input: String
+        _ arguments: [String], env: [String: String], input: String, delayInput: Bool = false
     ) throws -> (exit: Int32, stdout: String, ptyOutput: String) {
         var master: Int32 = -1
         var slave: Int32 = -1
@@ -161,13 +163,20 @@ struct B5CEndToEndTests {
         let outPipe = Pipe()
         process.standardOutput = outPipe
         final class DataBox: @unchecked Sendable { var value = Data() }
+        final class LockedBox: @unchecked Sendable {
+            private var value = Data()
+            private let lock = NSLock()
+            func append(_ bytes: Data) { lock.withLock { value.append(bytes) } }
+            func snapshot() -> Data { lock.withLock { value } }
+            func set(_ bytes: Data) { lock.withLock { value = bytes } }
+        }
         final class FlagBox: @unchecked Sendable {
             var done = false
             let lock = NSLock()
             func set() { lock.withLock { done = true } }
             func get() -> Bool { lock.withLock { done } }
         }
-        let masterBox = DataBox()
+        let masterBox = LockedBox()
         let doneFlag = FlagBox()
         let group = DispatchGroup()
         group.enter()
@@ -175,7 +184,6 @@ struct B5CEndToEndTests {
             // PTY master drain (prompt + echo): poll so the loop always
             // terminates — after the child exits no new master-bound byte
             // can ever arrive (everything is kernel-buffered).
-            var drained = Data()
             var buf = [UInt8](repeating: 0, count: 4096)
             while true {
                 var pfd = pollfd(fd: masterFD, events: Int16(POLLIN), revents: 0)
@@ -193,22 +201,38 @@ struct B5CEndToEndTests {
 #endif
                     }
                     if count > 0 {
-                        drained.append(contentsOf: buf.prefix(count))
+                        masterBox.append(Data(buf.prefix(count)))
                         continue
                     }
                     break
                 }
                 if doneFlag.get() { break }
             }
-            masterBox.value = drained
             group.leave()
         }
         try process.run()
         // The child holds its own dup of the slave from here on; the
         // parent copy closes so PTY EOF semantics stay natural.
         try stdinHandle.close()
-        // Pre-buffered decision input (PTY input queue holds it until the
-        // gateway reads past its prompt write — no timing involved).
+        if delayInput {
+            // Human shape: wait for the prompt, prove the process is
+            // AWAITING the decision (a premature exit-3 would already be
+            // reaped here), pause, then answer.
+            let promptStop = Date().addingTimeInterval(30)
+            var sawPrompt = false
+            while Date() < promptStop {
+                if String(data: masterBox.snapshot(), encoding: .utf8)?.contains("Approve and execute?") == true {
+                    sawPrompt = true
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            #expect(sawPrompt, "approval prompt must render on the terminal")
+            #expect(process.isRunning, "the run waits for the operator decision (no premature exit)")
+            Thread.sleep(forTimeInterval: 1.0)
+            #expect(process.isRunning, "still awaiting the decision after a beat")
+        }
+        // Decision input (pre-buffered, or post-prompt in delayed mode).
         let inputBytes = Array(input.utf8)
         _ = inputBytes.withUnsafeBufferPointer { buf in
 #if canImport(Glibc)
@@ -230,7 +254,7 @@ struct B5CEndToEndTests {
             Issue.record("child binary died from signal \(process.terminationStatus)")
             throw WiringError.childCrashed(process.terminationStatus)
         }
-        let ptyText = String(data: masterBox.value, encoding: .utf8) ?? ""
+        let ptyText = String(data: masterBox.snapshot(), encoding: .utf8) ?? ""
         return (process.terminationStatus, String(decoding: outData, as: UTF8.self), ptyText)
     }
 
@@ -482,6 +506,38 @@ struct B5CEndToEndTests {
 
     @Test("TOOL_04_binaryEditOccurrences")
     func TOOL_04_binaryEditOccurrences() throws {
+        // Exactly one occurrence: succeeds, bytes and receipt exact.
+        do {
+            let server = try LoopbackSSEServer()
+            let file = "solo\n"
+            let args = try Self.editArgs(
+                path: "one.txt", expectedHash: Self.sha256hex(file),
+                old: "solo\n", new: "replaced\n")
+            server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(
+                Self.toolCallChunk(callID: "c1", tool: "edit", arguments: args).utf8))]))
+            server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("done").utf8))]))
+            server.start()
+            defer { server.stop() }
+            let directory = try Self.freshDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let config = try Self.writeConfig(directory, port: Int(server.port))
+            let stateDir = try Self.freshState(in: directory)
+            let workspace = directory.appendingPathComponent("ws")
+            try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+            try file.write(to: workspace.appendingPathComponent("one.txt"), atomically: true, encoding: .utf8)
+            let result = try Self.runWithPTY(
+                ["run", "--config", config, "--prompt", "edit it", "--format", "jsonl", "--alias", "loop",
+                 "--workspace", workspace.path],
+                env: Self.environment(stateDir: stateDir), input: "y\n")
+            #expect(result.exit == 0, "one-occurrence edit applies: \(result.ptyOutput.prefix(200))")
+            let applied = try String(contentsOf: workspace.appendingPathComponent("one.txt"), encoding: .utf8)
+            #expect(applied == "replaced\n")
+            let sessions = try Self.storeSessions(at: stateDir)
+            let (_, results) = Self.intentsAndResults(
+                try Self.sessionRecords(at: stateDir, session: sessions[0]))
+            #expect(results.count == 1)
+            #expect(results.first?.1 == "edited one.txt", "exactly one occurrence reports success")
+        }
         // Zero occurrences: old text absent → refused, filesystem untouched.
         do {
             let server = try LoopbackSSEServer()
@@ -580,6 +636,43 @@ struct B5CEndToEndTests {
         let (_, results) = Self.intentsAndResults(
             try Self.sessionRecords(at: stateDir, session: sessions[0]))
         #expect(!results.contains(where: { Self.isMutatingSuccess($0.1) }))
+    }
+
+    // MARK: - Support: interactive decisions are awaited, not raced
+
+    @Test("interactiveDecisionIsAwaited")
+    func interactiveDecisionIsAwaited() throws {
+        // The human-operator shape: the prompt renders, the operator
+        // deliberates, and only then answers. A run loop that mistook the
+        // prompt for a headless verdict would exit 3 before the answer.
+        let server = try LoopbackSSEServer()
+        let file = "wait\n"
+        let args = try Self.editArgs(
+            path: "w.txt", expectedHash: Self.sha256hex(file),
+            old: "wait\n", new: "done\n")
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(
+            Self.toolCallChunk(callID: "c1", tool: "edit", arguments: args).utf8))]))
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("done").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Self.writeConfig(directory, port: Int(server.port))
+        let stateDir = try Self.freshState(in: directory)
+        let workspace = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        try file.write(to: workspace.appendingPathComponent("w.txt"), atomically: true, encoding: .utf8)
+        let result = try Self.runWithPTY(
+            ["run", "--config", config, "--prompt", "edit it", "--format", "jsonl", "--alias", "loop",
+             "--workspace", workspace.path],
+            env: Self.environment(stateDir: stateDir), input: "y\n", delayInput: true)
+        #expect(result.exit == 0, "the awaited decision applies the edit: \(result.ptyOutput.suffix(300))")
+        #expect(try String(contentsOf: workspace.appendingPathComponent("w.txt"), encoding: .utf8) == "done\n")
+        let sessions = try Self.storeSessions(at: stateDir)
+        let (_, results) = Self.intentsAndResults(
+            try Self.sessionRecords(at: stateDir, session: sessions[0]))
+        #expect(results.count == 1)
+        #expect(results.first?.1 == "edited w.txt")
     }
 
     // MARK: - Support: PTY deny + headless approval
@@ -1090,8 +1183,8 @@ struct B5CEndToEndTests {
         let (intents, results) = Self.intentsAndResults(
             try Self.sessionRecords(at: stateDir, session: sessions[0]))
         #expect(intents.count == 1)
-        #expect(results.count == 1)
-        #expect(!Self.isMutatingSuccess(results[0].1), "caps-denied exec records denial, never success")
+            #expect(results.count == 1)
+            #expect(!results.contains(where: { Self.isMutatingSuccess($0.1) }), "caps-denied exec records denial, never success")
     }
 
     // MARK: - Support: trusted demo cannot mutate real files
