@@ -998,11 +998,17 @@ struct B5CEndToEndTests {
         process.executableURL = URL(fileURLWithPath: git)
         process.arguments = args
         process.currentDirectoryURL = cwd
-        if let env {
-            var merged = ProcessInfo.processInfo.environment
-            for (key, value) in env { merged[key] = value }
-            process.environment = merged
+        // Fixture hermeticity (see TOOL10DiffTests.runGit): strip inherited
+        // repository-location variables so fixture commands cannot act on
+        // the caller's repository; explicit overrides apply afterwards.
+        var merged = ProcessInfo.processInfo.environment
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE"] {
+            merged.removeValue(forKey: key)
         }
+        if let env {
+            for (key, value) in env { merged[key] = value }
+        }
+        process.environment = merged
         let outPipe = Pipe()
         let errPipe = Pipe()
         process.standardOutput = outPipe
