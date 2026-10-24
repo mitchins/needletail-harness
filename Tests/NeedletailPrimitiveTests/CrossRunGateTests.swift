@@ -473,7 +473,8 @@ struct CrossRunGateTests {
 
     @Test("B5-B flag without a committed acknowledgment is not authorization")
     func missingPersistenceBlocks() throws {
-        // (a) Loud append failure throws.
+        // (a) Loud append failure: fencing rejects a stale writer, so the
+        // commit throws and the run must not proceed.
         let inner = InMemorySessionStore()
         try Self.seed(inner, session: "s-d", writer: "w", records: [
             Self.intent("e9/c1", call: "c1", mutating: true),
@@ -484,6 +485,10 @@ struct CrossRunGateTests {
         let ack = Acknowledgment(
             subjectSessions: [SessionID("s-d")], operationIDs: [OperationID("e9/c1")],
             determination: "operator-accepted-risk", atMillis: 1)
+        let impostor = WriterIdentity(session: idN, writer: "impostor")
+        #expect(throws: StoreError.self) {
+            try CrossRunGate.appendAcknowledgment(store: inner, as: impostor, acknowledgment: ack)
+        }
         // (b) Silent drop: append "succeeds" but nothing lands — the
         // read-back verification still refuses to proceed.
         let silent = SilentDropStore(inner: InMemorySessionStore())
