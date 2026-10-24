@@ -63,6 +63,23 @@ struct B5CEndToEndTests {
         var env = ProcessInfo.processInfo.environment
         env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
         env["NEEDLETAIL_STATE_DIR"] = stateDir.path
+        // FINAL-02 B fixture hermeticity: the CLI binary resolves rg/git
+        // via inherited PATH, but B2ClosureTests poisons the RUNNER's
+        // process-global PATH (fake-rg shadowing) while sibling suites
+        // spawn binaries. Inheriting the live PATH let a poison window
+        // shadow rg for TOOL-03 on CI (in-root match missing, exit 0).
+        // Temp-dir entries can only be test fixtures — never system
+        // tools — so strip them; system dirs are preserved. Same for
+        // RIPGREP_CONFIG_PATH/RIPGREP_CONFIG: inherited poison would
+        // defeat the foreign-config tests, so start clean; callers that
+        // need a config (e.g. TOOL-03's evil config) set it afterwards.
+        let tmpPrefix = FileManager.default.temporaryDirectory.path
+        let cleanPath = (env["PATH"] ?? "/usr/bin:/bin").split(separator: ":").map(String.init).filter {
+            !$0.hasPrefix(tmpPrefix)
+        }
+        env["PATH"] = cleanPath.isEmpty ? "/usr/bin:/bin" : cleanPath.joined(separator: ":")
+        env.removeValue(forKey: "RIPGREP_CONFIG_PATH")
+        env.removeValue(forKey: "RIPGREP_CONFIG")
         for (key, value) in extra { env[key] = value }
         return env
     }
