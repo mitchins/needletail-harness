@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import Dispatch
 import NeedletailCore
+import NeedletailTestSupport
 @testable import NeedletailRuntime
 import SystemPackage
 #if canImport(Glibc)
@@ -331,9 +332,14 @@ struct TOOL10DiffTests {
         p.arguments = args
         p.currentDirectoryURL = cwd
         if let env {
-            var e = ProcessInfo.processInfo.environment
+            // Explicit caller entries win (including a deliberate PATH
+            // override such as the empty-PATH test); everything else is
+            // hermetic (FINAL-02 B: never inherit a poisoned runner PATH).
+            var e = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
             for (k, v) in env { e[k] = v }
             p.environment = e
+        } else {
+            p.environment = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
         }
         let outPipe = Pipe()
         let errPipe = Pipe()

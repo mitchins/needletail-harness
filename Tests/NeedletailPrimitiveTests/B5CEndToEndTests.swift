@@ -60,26 +60,9 @@ struct B5CEndToEndTests {
     }
 
     private static func environment(stateDir: URL, extra: [String: String] = [:]) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
+        var env = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
         env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
         env["NEEDLETAIL_STATE_DIR"] = stateDir.path
-        // FINAL-02 B fixture hermeticity: the CLI binary resolves rg/git
-        // via inherited PATH, but B2ClosureTests poisons the RUNNER's
-        // process-global PATH (fake-rg shadowing) while sibling suites
-        // spawn binaries. Inheriting the live PATH let a poison window
-        // shadow rg for TOOL-03 on CI (in-root match missing, exit 0).
-        // Temp-dir entries can only be test fixtures — never system
-        // tools — so strip them; system dirs are preserved. Same for
-        // RIPGREP_CONFIG_PATH/RIPGREP_CONFIG: inherited poison would
-        // defeat the foreign-config tests, so start clean; callers that
-        // need a config (e.g. TOOL-03's evil config) set it afterwards.
-        let tmpPrefix = FileManager.default.temporaryDirectory.path
-        let cleanPath = (env["PATH"] ?? "/usr/bin:/bin").split(separator: ":").map(String.init).filter {
-            !$0.hasPrefix(tmpPrefix)
-        }
-        env["PATH"] = cleanPath.isEmpty ? "/usr/bin:/bin" : cleanPath.joined(separator: ":")
-        env.removeValue(forKey: "RIPGREP_CONFIG_PATH")
-        env.removeValue(forKey: "RIPGREP_CONFIG")
         for (key, value) in extra { env[key] = value }
         return env
     }
@@ -977,7 +960,9 @@ struct B5CEndToEndTests {
         _ = try Self.runGit(git, args: ["config", "core.fsmonitor", "touch \(fsMarker)"], cwd: repo)
         // Poisoned drivers in the child environment: the fixed argv/env
         // pins neutralize them (B5-A contract, certified at the binary).
-        var env = ProcessInfo.processInfo.environment
+        // Hermetic base (FINAL-02 B): the deliberate GIT_* poison is the
+        // test's intent and stays; runner PATH/RIPGREP poison never leaks.
+        var env = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
         env["GIT_EXTERNAL_DIFF"] = "echo HACKED"
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "diff.external"

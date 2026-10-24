@@ -257,7 +257,7 @@ struct CrashMatrixTests {
             let child = Process()
             child.executableURL = URL(fileURLWithPath: argv0)
             child.arguments = ["--filter", "StagingChild", "--testing-library", "swift-testing"]
-            var env = ProcessInfo.processInfo.environment
+            var env = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
             env["NT_CRASH_DIR"] = directory.path
             env["NT_CRASH_STAGE"] = stage
             child.environment = env

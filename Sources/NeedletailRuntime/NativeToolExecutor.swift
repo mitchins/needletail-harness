@@ -354,7 +354,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var total = 0
         while true {
             let n = buf.withUnsafeMutableBytes { ptr in
+#if canImport(Glibc)
                 Glibc.read(readFD, ptr.baseAddress, ptr.count)
+#else
+                Darwin.read(readFD, ptr.baseAddress, ptr.count)
+#endif
             }
             if n < 0 {
                 if errno == EINTR { continue }
@@ -1464,7 +1468,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         // with silently truncated bytes that would then hash-mismatch).
         let cap = Int(Self.maxReadFileBytes)
         while true {
-            let n = buf.withUnsafeMutableBytes { ptr in Glibc.read(fd, ptr.baseAddress, ptr.count) }
+            let n = buf.withUnsafeMutableBytes { ptr in
+#if canImport(Glibc)
+                Glibc.read(fd, ptr.baseAddress, ptr.count)
+#else
+                Darwin.read(fd, ptr.baseAddress, ptr.count)
+#endif
+            }
             if n < 0 {
                 if errno == EINTR { continue }
                 throw StoreError.integrity("edit read failed: \(String(cString: strerror(errno)))")
@@ -1571,7 +1581,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         let total = newData.count
         while offset < total {
             let n = newData.withUnsafeBytes { raw -> Int in
+#if canImport(Glibc)
                 Glibc.write(tmpFD, raw.baseAddress!.advanced(by: offset), total - offset)
+#else
+                Darwin.write(tmpFD, raw.baseAddress!.advanced(by: offset), total - offset)
+#endif
             }
             if n < 0 {
                 if errno == EINTR { continue }
@@ -1771,7 +1785,11 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         let total = content.count
         while offset < total {
             let n = content.withUnsafeBytes { raw -> Int in
+#if canImport(Glibc)
                 Glibc.write(fd, raw.baseAddress!.advanced(by: offset), total - offset)
+#else
+                Darwin.write(fd, raw.baseAddress!.advanced(by: offset), total - offset)
+#endif
             }
             if n < 0 {
                 if errno == EINTR { continue }

@@ -544,7 +544,7 @@ struct B1ContainmentTests {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: bin)
             proc.arguments = args
-            proc.environment = env ?? ProcessInfo.processInfo.environment
+            proc.environment = env ?? hermeticChildEnvironment(ProcessInfo.processInfo.environment)
             proc.standardOutput = Pipe()
             proc.standardError = Pipe()
             try proc.run()

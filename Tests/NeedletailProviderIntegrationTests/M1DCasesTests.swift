@@ -25,7 +25,10 @@ private enum M1DCases {
     }
 
     static func environment() -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
+        // FINAL-02 B: same hermetic child env as the primitive binary
+        // legs (see hermeticChildEnvironment): never inherit a poisoned
+        // runner PATH/RIPGREP_CONFIG into spawned binaries.
+        var env = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
         env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
         return env
     }

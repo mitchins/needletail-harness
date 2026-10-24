@@ -56,14 +56,14 @@ struct ProductionCLIWiringTests {
     }
 
     private static func environment(stateDir: URL) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
+        var env = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
         env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
         env["NEEDLETAIL_STATE_DIR"] = stateDir.path
         return env
     }
 
     private static func environmentWithout(keys: Set<String>) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
+        var env = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
         for key in keys { env.removeValue(forKey: key) }
         env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
         return env
