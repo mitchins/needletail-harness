@@ -79,6 +79,14 @@ struct RunCommand: ParsableCommand {
             eprint("error: --read-root and --sealed are mutually exclusive")
             throw ExitCode(2)
         }
+        // B5-C + CodeRabbit final review: --trusted is the scripted demo
+        // fixture (caps allAllowed, no roots consulted); combining it with
+        // any real-root grant is contradictory operator intent and fails
+        // closed like every other backend conflict.
+        if !readRoot.isEmpty && trusted {
+            eprint("error: --read-root and --trusted are mutually exclusive")
+            throw ExitCode(2)
+        }
         // B5-C: script entries drive the scripted backend only; native
         // execution (--workspace/--read-root) never consumes them — a
         // silently ignored tool script would be a dispatch ambiguity.

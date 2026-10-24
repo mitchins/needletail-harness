@@ -66,30 +66,6 @@ struct B3ByteQuotaTests {
         EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: approved)
     }
 
-    @Test("TOOL_approvalTwin")
-    func approvalTwin() async throws {
-        // NFC vs NFD twin: approving one must not authorize the other.
-        #expect(ToolValidator.isApprovedPath(".env.\u{00E9}", approvedPaths: [".env.\u{00E9}"]) == true)
-        #expect(ToolValidator.isApprovedPath(".env.e\u{0301}", approvedPaths: [".env.\u{00E9}"]) == false, "canonically equal but byte-distinct paths must not match")
-        #expect(ToolValidator.isApprovedPrefix("sub/x", approvedPaths: ["sub"]) == true)
-        #expect(ToolValidator.isApprovedPrefix(".env/x", approvedPaths: [".env.\u{00E9}"]) == false)
-        #expect(ToolValidator.isApprovedPrefix("d\u{00E9}/f", approvedPaths: ["d\u{00E9}"]) == true)
-        #expect(ToolValidator.isApprovedPrefix("de\u{0301}/f", approvedPaths: ["d\u{00E9}"]) == false, "NFD path must not match NFC grant")
-        #expect(ToolValidator.dedupeByteDistinct(["a", ".env.\u{00E9}", ".env.e\u{0301}", "a"]).count == 3)
-        let (dir, store, session, writer) = try Self.freshStore()
-        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
-        let nfc = ".env.\u{00E9}"
-        let nfd = ".env.e\u{0301}"
-        let exec = NativeToolExecutor(resolver: try WorkspaceResolver(workspace: FilePath(dir.path), readRoots: []), store: store, sessionID: session, writer: writer, rgPath: nil)
-        let wb = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"" + nfc + "\",\"content\":\"x\\n\"}")])
-        let resA = try await exec.execute(batch: wb, reservation: Self.makeReservation(batch: wb, approved: [nfc]))
-        #expect(resA.calls[0].status == "success", "approved NFC form writes, got \(resA.calls[0])")
-        let wb2 = ToolBatch([ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"" + nfd + "\",\"content\":\"x\\n\"}")])
-        let resB = try await exec.execute(batch: wb2, reservation: Self.makeReservation(batch: wb2, approved: [nfc]))
-        #expect(resB.calls[0].status == "denied", "unlisted NFD twin must stay denied, got \(resB.calls[0])")
-        #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent(nfd).path), "twin file must not be created")
-    }
-
     @Test("TOOL_quotaAppendCountsUtf8Bytes")
     func quotaAppendCountsUtf8Bytes() async throws {
         let (dir, store, session, writer) = try Self.freshStore()

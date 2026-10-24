@@ -591,7 +591,7 @@ struct B3EditWriteTests {
 
     // MARK: - B3 approval byte-exactness (NFC vs NFD twins)
 
-    @Test("TOOL_approvalTwin")
+    @Test("approvalTwin byte-exact grants")
     func approvalTwin() async throws {
         // NFC ".env.\u{00E9}" and NFD ".env.e\u{0301}" are canonically equal
         // as Swift Strings but distinct inodes. Approving only the NFC form

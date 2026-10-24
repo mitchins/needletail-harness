@@ -288,6 +288,15 @@ public enum ToolValidator {
         if expectedHash.utf8.count != 64 || !expectedHash.allSatisfy({ $0.isHexDigit }) {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "expectedHash must be 64 hex for edit \(callID)")
         }
+        // Alias pairs are alternatives, not supplements: providing both
+        // spellings is ambiguous and fails closed (first-wins would
+        // silently discard operator/model content).
+        if json["oldBytes"] != nil && json["old_string"] != nil {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "oldBytes and old_string are mutually exclusive for edit \(callID)")
+        }
+        if json["newBytes"] != nil && json["new_string"] != nil {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "newBytes and new_string are mutually exclusive for edit \(callID)")
+        }
         let hasOld = (json["oldBytes"] as? String) ?? (json["old_string"] as? String)
         guard hasOld != nil else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing oldBytes/old_string for edit \(callID)")
@@ -445,21 +454,32 @@ public enum ToolValidator {
         // "artifacts/<U+0301>pwn" must still see the "artifacts" component).
         // hasPrefix/hasSuffix/contains below all use pure-ASCII needles, so
         // combining marks elsewhere can neither hide nor forge a match.
+        // Protected-name matching is ASCII case-insensitive: on
+        // case-insensitive filesystems ".NEEDLETAIL" IS ".needletail", so a
+        // case variant must classify identically. This affects CLASSIFICATION
+        // only — isApprovedPath/byteEqual stay byte-exact, so no approval
+        // can be forged across case variants.
+        func folded(_ s: String) -> String {
+            // ASCII-only case fold (A-Z → a-z); every other byte passes
+            // through, so UTF-8 validity is preserved by construction.
+            String(bytes: s.utf8.map { $0 >= 0x41 && $0 <= 0x5A ? $0 + 0x20 : $0 }, encoding: .utf8) ?? s
+        }
         let components = Self.byteComponents(of: path)
-        for c in components {
+        for c in components.map(folded) {
             if c == ".needletail" { return .absoluteDenied }
             if c == "credentials" || c == ".credentials" { return .absoluteDenied }
             if c == "artifacts" || c.hasSuffix("-artifacts") { return .absoluteDenied }
         }
-        if path.contains(".needletail/") || path == ".needletail" { return .absoluteDenied }
-        if path.contains("/credentials") || path == "credentials" { return .absoluteDenied }
-        guard let first = components.first else { return .unprotected }
+        let lowered = folded(path)
+        if lowered.contains(".needletail/") || lowered == ".needletail" { return .absoluteDenied }
+        if lowered.contains("/credentials") || lowered == "credentials" { return .absoluteDenied }
+        guard let first = components.first.map(folded) else { return .unprotected }
         if first == ".git" { return .grantable }
-        if components.contains(where: { $0 == ".git" }) { return .grantable }
+        if components.map(folded).contains(where: { $0 == ".git" }) { return .grantable }
         if first == ".ssh" { return .grantable }
-        if components.contains(where: { $0 == ".ssh" }) { return .grantable }
+        if components.map(folded).contains(where: { $0 == ".ssh" }) { return .grantable }
         if first == ".env" || first.hasPrefix(".env.") { return .grantable }
-        if components.contains(where: { $0 == ".env" || $0.hasPrefix(".env.") }) { return .grantable }
+        if components.map(folded).contains(where: { $0 == ".env" || $0.hasPrefix(".env.") }) { return .grantable }
         return .unprotected
     }
 }

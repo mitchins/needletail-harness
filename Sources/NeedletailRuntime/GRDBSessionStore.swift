@@ -824,7 +824,13 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             let total = bytes.count
             while offset < total {
                 let n = bytes.withUnsafeBytes { raw -> Int in
+#if canImport(Glibc)
                     Glibc.write(tmpFD, raw.baseAddress!.advanced(by: offset), total - offset)
+#elseif canImport(Darwin)
+                    Darwin.write(tmpFD, raw.baseAddress!.advanced(by: offset), total - offset)
+#else
+                    fatalError("unsupported platform")
+#endif
                 }
                 if n < 0 {
                     if errno == EINTR { continue }
@@ -1742,13 +1748,17 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             }
         } catch { throw Self.translate(error) }
         var found: ArtifactRef?
-        for payload in payloads {
-            guard let data = payload.data(using: .utf8),
-                  let rec = try? RecordCodec.decode(data),
-                  case .artifactPublished(let ref) = rec, ref.digest == digest else { continue }
-            found = ref
-            break
-        }
+            for payload in payloads {
+                guard let data = payload.data(using: .utf8) else {
+                    throw StoreError.integrity("record row payload is not UTF-8")
+                }
+                // Fail closed on undecodable rows: skipping a corrupt row
+                // would silently substitute absence for evidence.
+                let rec = try RecordCodec.decode(data)
+                guard case .artifactPublished(let ref) = rec, ref.digest == digest else { continue }
+                found = ref
+                break
+            }
         guard let ref = found else { return nil }
         return try readArtifact(ref)
     }

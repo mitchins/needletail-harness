@@ -21,9 +21,12 @@ import Darwin
 public enum GitDiff {
     /// Fixed argv per REV25 §4/B5 (global flags before the subcommand,
     /// diff-level flags after — the SET is fixed and pinned by tests):
-    /// `--no-color --no-ext-diff --no-textconv --no-pager
-    /// --no-optional-locks` + `diff`.
-    public static let fixedArgv = ["--no-pager", "--no-optional-locks", "diff", "--no-color", "--no-ext-diff", "--no-textconv"]
+    /// `--no-pager --no-optional-locks -c core.fsmonitor=false` + `diff`
+    /// + `--no-color --no-ext-diff --no-textconv`. The `-c` override
+    /// neutralizes repository-configured fsmonitor hooks (arbitrary
+    /// command execution during diff); env scrubbing cannot cover
+    /// file-based config, so the override travels in argv instead.
+    public static let fixedArgv = ["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "diff", "--no-color", "--no-ext-diff", "--no-textconv"]
     /// Minimal environment allowlist: LANG + TZ only. The child inherits
     /// nothing else — GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE,
     /// GIT_OBJECT_DIRECTORY, GIT_EXTERNAL_DIFF, GIT_CONFIG_PARAMETERS and

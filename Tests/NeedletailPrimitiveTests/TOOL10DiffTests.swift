@@ -71,10 +71,28 @@ struct TOOL10DiffTests {
 
     @Test("TOOL_10_argvPinned")
     func argvPinned() {
-        #expect(GitDiff.fixedArgv == ["--no-pager", "--no-optional-locks", "diff", "--no-color", "--no-ext-diff", "--no-textconv"])
+        #expect(GitDiff.fixedArgv == ["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "diff", "--no-color", "--no-ext-diff", "--no-textconv"])
         for flag in ["--no-color", "--no-ext-diff", "--no-textconv", "--no-pager", "--no-optional-locks"] {
             #expect(GitDiff.fixedArgv.contains(flag), "contract flag missing: \(flag)")
         }
+        #expect(GitDiff.fixedArgv.contains("core.fsmonitor=false"), "fsmonitor override pinned: repo config must not execute hooks")
+    }
+
+    @Test("TOOL_10_fsmonitorNeutralized")
+    func fsmonitorNeutralized() throws {
+        let (dir, git) = try Self.makeRepo()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // Repo-configured fsmonitor hook that would execute during diff.
+        let marker = dir.appendingPathComponent("fsmonitor-fired").path
+        _ = try Self.runGit(git, args: ["config", "core.fsmonitor", "touch \(marker)"], cwd: dir)
+        try "changed\n".write(to: dir.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
+        let out = try GitDiff.run(workspace: dir, gitPath: git)
+        let text = String(data: out.stdout, encoding: .utf8) ?? ""
+        #expect(!FileManager.default.fileExists(atPath: marker), "fsmonitor hook must not execute")
+        #expect(text.contains("+changed"), "normal diff still produced, got \(text)")
+        // Sensitivity: raw git without our -c override fires the hook.
+        _ = try Self.runGit(git, args: ["diff"], cwd: dir)
+        #expect(FileManager.default.fileExists(atPath: marker), "sensitivity: unsanitized git honors core.fsmonitor")
     }
 
     @Test("TOOL_10_sanitizedEnvExact")
@@ -194,7 +212,7 @@ struct TOOL10DiffTests {
         }
     }
 
-    enum TOOL10Error: Error { case noGit }
+    enum TOOL10Error: Error { case noGit, missingBinary }
 
     @Test("TOOL_10_largeOutputTruncated")
     func largeOutputTruncated() throws {
@@ -270,15 +288,27 @@ struct TOOL10DiffTests {
     // MARK: - Binary legs (real needletail CLI)
 
     private static func binary() throws -> URL {
-        if let env = ProcessInfo.processInfo.environment["NEEDLETAIL_BIN"] {
+        // NEEDLETAIL_BIN wins when set AND executable; otherwise resolve
+        // the product beside THIS test runner (built fresh from the same
+        // revision, whatever the build dir is); the legacy .build/debug
+        // path remains for hand-invoked runs. A missing binary fails
+        // loudly as missingBinary, never as noGit (which means "no
+        // system git", a different precondition).
+        if let env = ProcessInfo.processInfo.environment["NEEDLETAIL_BIN"],
+           FileManager.default.isExecutableFile(atPath: env) {
             return URL(fileURLWithPath: env)
         }
-        let runner = URL(fileURLWithPath: CommandLine.arguments[0])
+        var runner = URL(fileURLWithPath: CommandLine.arguments[0])
+        if !runner.path.hasPrefix("/") {
+            runner = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(CommandLine.arguments[0])
+        }
         let sibling = runner.deletingLastPathComponent().appendingPathComponent("needletail")
         if FileManager.default.isExecutableFile(atPath: sibling.path) { return sibling }
         let built = URL(fileURLWithPath: "/data/coding/needletail/.build/debug/needletail")
         if FileManager.default.isExecutableFile(atPath: built.path) { return built }
-        throw TOOL10Error.noGit
+        Issue.record("needletail binary missing; build the product before diff binary legs")
+        throw TOOL10Error.missingBinary
     }
 
     private static func run(_ bin: URL, args: [String], cwd: URL, env: [String: String]? = nil) throws -> (Int32, String, String) {

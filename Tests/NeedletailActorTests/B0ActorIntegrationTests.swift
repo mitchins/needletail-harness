@@ -280,7 +280,6 @@ struct B0ActorIntegrationTests {
         await actor.cancel()
         try await Self.awaitPhase(actor, { $0.phase == .cancelling && $0.cancelledPendingReservations.count == 1 && $0.queueHeld }, "cancelling with pending")
 
-        let pendingEff = try #require(await actor.currentState().cancelledPendingReservations.first).effectID
         // Late report would try to supersede — but started=true must NOT discharge, must remain held
         let late = ExecutorResult(receipt: ExecutorReceipt(callID: "c1", status: "ok", summary: "late"), calls: [ToolCallOutcome(callID: "c1", status: "cancelled", summary: "late", data: "late", started: true)])
         // Deliver via actor (routes to completeCancelledPending) — also release gated executor to avoid leak
@@ -300,12 +299,6 @@ struct B0ActorIntegrationTests {
         #expect(log.contains(where: { if case .cancelledPendingMarker(let r, _) = $0 { return r.callID == "c1" } else { return false } }), "pending marker durable")
         // No provider continuation after late report (transport invocations stays 1)
         #expect(transport.invocations.count == 1, "no provider continuation after unresolved hold")
-
-        // RED/GREEN: inverting to started=false would discharge to done — prove by direct reducer that started=false => done, started=true => unknown
-        var ids = DeterministicIDSource(prefix: "rg")
-        let s0 = try ActorFixtures.idleState(mode: .workspace, permissive: true)
-        // Minimal transition check: perCall with started=false yields done, started=true yields unknown (via continueAfterEffectPerCall). We assert via state above: started=true did NOT yield done, proving fail-closed.
-        _ = ids; _ = s0
     }
 
     // MARK: - 2. Propagated CancellationError fallback preserves mutating uncertainty

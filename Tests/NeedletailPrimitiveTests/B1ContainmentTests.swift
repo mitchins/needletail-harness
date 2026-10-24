@@ -218,6 +218,11 @@ struct B1ContainmentTests {
             let req = ApprovalRequest(requestID: RequestID("r"), runID: RunID("run"), generation: Revision(1), operation: "edit", requiredGrant: "x", protectedPaths: [p])
             #expect(!req.protectedPaths.contains(where: { $0 == p && cls == .grantable }), "absolute must not be in grantable")
         }
+        // ASCII case variants classify identically (case-insensitive
+        // filesystems): the protection cannot be evaded by case.
+        for p in [".NEEDLETAIL/lock", "A/.Needletail/B", "CREDENTIALS", ".Credentials", "ARTIFACTS/file", "x-ARTIFACTS", "Artifacts/\u{0301}pwn"] {
+            #expect(ToolValidator.protectedClassification(for: p) == .absoluteDenied, "\(p) case variant must stay absoluteDenied")
+        }
     }
 
     @Test("B1_protectedGrantable")
@@ -227,10 +232,38 @@ struct B1ContainmentTests {
             let cls = ToolValidator.protectedClassification(for: p)
             #expect(cls == .grantable, "\(p) grantable")
         }
+        // Case variants of grantable names grant identically.
+        for p in [".GIT/config", "A/.Git/B", ".SSH/id_rsa", ".ENV", ".env.LOCAL"] {
+            #expect(ToolValidator.protectedClassification(for: p) == .grantable, "\(p) case variant grantable")
+        }
         let unprotected = ["src/main.swift", "README.md"]
         for p in unprotected {
             #expect(ToolValidator.protectedClassification(for: p) == .unprotected)
         }
+        // Case folding never promotes an unprotected name.
+        #expect(ToolValidator.protectedClassification(for: "SRC/MAIN.SWIFT") == .unprotected)
+    }
+
+    @Test("B1_editAliasPairsMutuallyExclusive")
+    func b1EditAliasPairsMutuallyExclusive() throws {
+        let hash = String(repeating: "a", count: 64)
+        func batch(_ args: String) -> ToolBatch {
+            ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: args)])
+        }
+        // Both old spellings: ambiguous, fails closed.
+        #expect(throws: ToolFailure.preDispatch(status: "invalid-arguments", summary: "oldBytes and old_string are mutually exclusive for edit c1")) {
+            _ = try ToolValidator.validateBatchArguments(batch: batch(
+                "{\"path\":\"f\",\"expectedHash\":\"\(hash)\",\"oldBytes\":\"a\",\"old_string\":\"a\",\"new_string\":\"b\"}"))
+        }
+        // Both new spellings: ambiguous, fails closed.
+        #expect(throws: ToolFailure.preDispatch(status: "invalid-arguments", summary: "newBytes and new_string are mutually exclusive for edit c1")) {
+            _ = try ToolValidator.validateBatchArguments(batch: batch(
+                "{\"path\":\"f\",\"expectedHash\":\"\(hash)\",\"old_string\":\"a\",\"newBytes\":\"b\",\"new_string\":\"b\"}"))
+        }
+        // Single alias each: shape-valid (dispatch may still refuse later).
+        let ok = try ToolValidator.validateBatchArguments(batch: batch(
+            "{\"path\":\"f\",\"expectedHash\":\"\(hash)\",\"oldBytes\":\"a\",\"newBytes\":\"b\"}"))
+        #expect(ok.count == 1)
     }
 
     @Test("B1_approvalGrant")
@@ -451,6 +484,9 @@ struct B1ContainmentTests {
         let stateDir3 = cfgDir.appendingPathComponent("state3").path
         #expect(try run(["run", "--config", cfgPath, "--prompt", "hi", "--read-root", rrURL.path, "--sealed"], env: ["NEEDLETAIL_STATE_DIR": stateDir3]) == 2)
         #expect(!FileManager.default.fileExists(atPath: stateDir3 + "/store.sqlite"))
+        let stateDir3b = cfgDir.appendingPathComponent("state3b").path
+        #expect(try run(["run", "--config", cfgPath, "--prompt", "hi", "--read-root", rrURL.path, "--trusted"], env: ["NEEDLETAIL_STATE_DIR": stateDir3b]) == 2, "read-root+trusted must exit 2")
+        #expect(!FileManager.default.fileExists(atPath: stateDir3b + "/store.sqlite"), "no state store on flag conflict")
         // Missing workspace must exit 2
         let missing = "/tmp/b1-missing-\(UUID().uuidString)"
         let stateDir4 = cfgDir.appendingPathComponent("state4").path

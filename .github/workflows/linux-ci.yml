@@ -40,8 +40,9 @@ jobs:
         run: |
           # Build-host dependencies only, never shipped with Needletail.
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev python3-yaml
+          sudo apt-get install -y libsqlite3-dev python3-yaml ripgrep
           test -f /usr/include/sqlite3.h
+          test -x /usr/bin/rg || { echo "FAIL: rg missing after install"; exit 1; }
           /usr/bin/python3 -c 'import yaml'
 
       - name: Validate audited Node 24 action pins (YAML-aware)
@@ -170,8 +171,9 @@ jobs:
       - name: Provision SQLite headers (GRDB system-library requirement)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev
+          sudo apt-get install -y libsqlite3-dev ripgrep
           test -f /usr/include/sqlite3.h || { echo "FAIL: sqlite3.h missing after install"; exit 1; }
+          test -x /usr/bin/rg || { echo "FAIL: rg missing after install"; exit 1; }
 
       - name: Resolve the locked graph (pinned)
         run: |

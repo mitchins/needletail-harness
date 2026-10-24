@@ -955,6 +955,9 @@ struct B5CEndToEndTests {
         _ = try Self.runGit(git, args: ["add", "-A"], cwd: repo)
         _ = try Self.runGit(git, args: ["commit", "-qm", "init"], cwd: repo)
         try "base\nuser change\n".write(to: repo.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
+        // Repo-configured fsmonitor hook: executes on diff unless disabled.
+        let fsMarker = repo.appendingPathComponent("fsmonitor-fired").path
+        _ = try Self.runGit(git, args: ["config", "core.fsmonitor", "touch \(fsMarker)"], cwd: repo)
         // Poisoned drivers in the child environment: the fixed argv/env
         // pins neutralize them (B5-A contract, certified at the binary).
         var env = ProcessInfo.processInfo.environment
@@ -978,6 +981,7 @@ struct B5CEndToEndTests {
         let stdout = String(decoding: outData, as: UTF8.self)
         #expect(stdout.contains("user change"), "user modification in output")
         #expect(!stdout.contains("HACKED"), "external diff driver neutralized")
+        #expect(!FileManager.default.fileExists(atPath: fsMarker), "repo fsmonitor hook neutralized")
         #expect(!String(decoding: errData, as: UTF8.self).contains("HACKED"))
     }
 

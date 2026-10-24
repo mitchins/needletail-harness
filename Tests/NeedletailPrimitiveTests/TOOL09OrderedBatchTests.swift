@@ -693,8 +693,6 @@ struct TOOL09OrderedBatchTests {
         let ws = try Self.tempDir(prefix: "tool09-ws")
         defer { try? FileManager.default.removeItem(at: ws) }
         try "hello\n".write(to: ws.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
-        guard let rg = Self.locateRg() else { throw T09Error.outOfScript }
-        _ = rg
         let hang = ws.appendingPathComponent("hang.sh")
         let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\necho 'ripgrep 99.0.0'\nexit 0\nfi\nexec sleep 60\n"
         try script.write(to: hang, atomically: true, encoding: .utf8)
