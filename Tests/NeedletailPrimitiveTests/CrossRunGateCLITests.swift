@@ -184,8 +184,12 @@ struct CrossRunGateCLITests {
         let stateDir = directory.appendingPathComponent("state")
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try Self.seedDirtyStore(at: stateDir)
+        // Mutating-capable invocation: the gate protects mutating runs.
+        let workspace = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let result = try Self.run(
-            ["run", "--config", config, "--prompt", "do work", "--format", "jsonl", "--alias", "loop"],
+            ["run", "--config", config, "--prompt", "do work", "--format", "jsonl", "--alias", "loop",
+             "--workspace", workspace.path],
             env: Self.environment(stateDir: stateDir))
         #expect(result.exit == 3, "gate trip without authorization exits 3, got \(result.exit): \(result.stderr)")
         #expect(result.stderr.contains("s-prior"), "block message names the dirty session")
@@ -193,6 +197,8 @@ struct CrossRunGateCLITests {
         #expect(result.stderr.contains("session export"), "block message points at export for audit")
         #expect(server.connectionCount == 0, "no provider traffic before the gate decision")
         #expect(server.requests.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: workspace.path).isEmpty,
+                "blocked run performs zero filesystem mutation")
     }
 
     @Test("B5-B CLI proceeds with flag: durable ack committed, run completes")
@@ -207,8 +213,11 @@ struct CrossRunGateCLITests {
         let stateDir = directory.appendingPathComponent("state")
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try Self.seedDirtyStore(at: stateDir)
+        let workspace = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let result = try Self.run(
             ["run", "--config", config, "--prompt", "do work", "--format", "jsonl", "--alias", "loop",
+             "--workspace", workspace.path,
              "--acknowledge-unresolved-outcomes", "operator-accepted-risk"],
             env: Self.environment(stateDir: stateDir))
         #expect(result.exit == 0, "authorized run completes, got \(result.exit): \(result.stderr)")
@@ -319,6 +328,33 @@ struct CrossRunGateCLITests {
         #expect(server.connectionCount == 0)
     }
 
+    @Test("B5-C CLI read-only run proceeds despite unrelated history (no ack needed)")
+    func cliReadOnlyProceedsDespiteHistory() throws {
+        let server = try LoopbackSSEServer()
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("read-only").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Self.writeConfig(directory, port: Int(server.port))
+        let stateDir = directory.appendingPathComponent("state")
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        try Self.seedDirtyStore(at: stateDir)
+        let readRoot = directory.appendingPathComponent("docs")
+        try FileManager.default.createDirectory(at: readRoot, withIntermediateDirectories: true)
+        try "reference\n".write(to: readRoot.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
+        let result = try Self.run(
+            ["run", "--config", config, "--prompt", "read the notes", "--format", "jsonl", "--alias", "loop",
+             "--read-root", readRoot.path],
+            env: Self.environment(stateDir: stateDir))
+        #expect(result.exit == 0, "read-only run needs no risk acknowledgment, got \(result.exit): \(result.stderr)")
+        let sessions = try Self.storeSessions(at: stateDir)
+        #expect(sessions.count == 2)
+        let newSession = try #require(sessions.first(where: { $0 != "s-prior" }))
+        #expect(try Self.acknowledgments(at: stateDir, session: newSession).isEmpty,
+                "proceeding read-only records no acknowledgment")
+    }
+
     @Test("B5-B CLI manually-reconciled determination records the note")
     func cliManuallyReconciledNote() throws {
         let server = try LoopbackSSEServer()
@@ -331,8 +367,11 @@ struct CrossRunGateCLITests {
         let stateDir = directory.appendingPathComponent("state")
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try Self.seedDirtyStore(at: stateDir)
+        let workspace = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let result = try Self.run(
             ["run", "--config", config, "--prompt", "do work", "--alias", "loop",
+             "--workspace", workspace.path,
              "--acknowledge-unresolved-outcomes", "manually-reconciled:ops-verified-by-hand"],
             env: Self.environment(stateDir: stateDir))
         #expect(result.exit == 0, "noted acknowledgment proceeds, got \(result.exit): \(result.stderr)")
@@ -356,14 +395,18 @@ struct CrossRunGateCLITests {
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try Self.seedDirtyStore(at: stateDir)
         // Run 1: authorized, completes.
+        let workspace = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let first = try Self.run(
             ["run", "--config", config, "--prompt", "first", "--alias", "loop",
+             "--workspace", workspace.path,
              "--acknowledge-unresolved-outcomes", "operator-accepted-risk"],
             env: Self.environment(stateDir: stateDir))
         #expect(first.exit == 0, "first authorized run completes: \(first.stderr)")
         // Run 2: no flag → blocked AGAIN on the same historical hold.
         let second = try Self.run(
-            ["run", "--config", config, "--prompt", "second", "--alias", "loop"],
+            ["run", "--config", config, "--prompt", "second", "--alias", "loop",
+             "--workspace", workspace.path],
             env: Self.environment(stateDir: stateDir))
         #expect(second.exit == 3, "the prior acknowledgment exempts nothing, got \(second.exit)")
         #expect(second.stderr.contains("s-prior"))

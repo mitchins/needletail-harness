@@ -238,9 +238,13 @@ final class BoundedStreamDelegate: HTTPClientResponseDelegate, @unchecked Sendab
 }
 
 /// Builds the exact request body (sorted keys, verbatim option values).
-/// Reserved harness-owned keys can never appear: options passed validation
-/// at config load (unknown non-reserved keys ride along inertly).
-public func chatRequestBody(modelID: String, messages: [ChatMessage], maxTokens: Int, options: [String: JSONValue]) throws -> Data {
+/// Reserved harness-owned keys can never appear via options: they were
+/// rejected at config load (unknown non-reserved keys ride along inertly).
+/// `tools`/`toolChoice` are HARNESS-OWNED (B5-C): the transport derives
+/// them from effective capabilities via `ToolAdvertisement`, never from
+/// operator configuration or model output. exec, consult and diff are
+/// never advertised under any capabilities.
+public func chatRequestBody(modelID: String, messages: [ChatMessage], maxTokens: Int, options: [String: JSONValue], tools: [[String: Any]]? = nil, toolChoice: String? = nil) throws -> Data {
     var body: [String: Any] = [
         "model": modelID,
         "stream": true,
@@ -251,11 +255,26 @@ public func chatRequestBody(modelID: String, messages: [ChatMessage], maxTokens:
     for (key, value) in options {
         body[key] = jsonValueToAny(value)
     }
+    if let tools, !tools.isEmpty {
+        body["tools"] = tools
+        body["tool_choice"] = toolChoice ?? "auto"
+    }
     let data = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     guard data.count <= SSEBounds.maxRequestBytes else {
         throw ChatTransportError.requestTooLarge(bytes: data.count)
     }
     return data
+}
+
+/// Harness-owned OpenAI function-tool envelope for one advertised
+/// definition (B5-C): `{"type":"function","function":{...}}`. The inner
+/// object is the definition's canonical JSON (sorted keys).
+public func openAIToolEnvelopes(_ definitions: [ToolDefinition]) -> [[String: Any]] {
+    definitions.map { definition in
+        let inner = (try? JSONSerialization.jsonObject(
+            with: Data(definition.json().utf8), options: [])) as? [String: Any] ?? [:]
+        return ["type": "function", "function": inner]
+    }
 }
 
 private func messageJSON(_ message: ChatMessage) -> [String: Any] {
@@ -307,6 +326,12 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
     public var credentialProvider: @Sendable (CredentialReference, String) async throws -> String?
     public var snapshotProvider: @Sendable () -> ConfigSnapshot
     public var requestOverride: ChatRequestOverride?
+    /// Harness-owned advertisement source (B5-C): the RUN's effective tool
+    /// capabilities, set once at composition. Nil (the default for every
+    /// pre-B5-C construction site and test) advertises nothing — request
+    /// bodies are byte-identical to before. Sealed invocations suppress
+    /// advertisement regardless.
+    public var advertisedTools: ToolCapabilities?
     /// Incremental streaming sink (M1-D D4): called synchronously from the
     /// NIO delegate for each `content` delta before final assembly.
     /// Actor wires it to `UISink.emit(.delta)`; tests inject InMemory sink.
@@ -318,7 +343,8 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
         credentialProvider: @Sendable @escaping (CredentialReference, String) async throws -> String?,
         snapshotProvider: @Sendable @escaping () -> ConfigSnapshot,
         requestOverride: ChatRequestOverride? = nil,
-        deltaSink: (@Sendable (String) -> Void)? = nil
+        deltaSink: (@Sendable (String) -> Void)? = nil,
+        advertisedTools: ToolCapabilities? = nil
     ) {
         self.client = client
         self.messageProvider = messageProvider
@@ -326,6 +352,7 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
         self.snapshotProvider = snapshotProvider
         self.requestOverride = requestOverride
         self.deltaSink = deltaSink
+        self.advertisedTools = advertisedTools
     }
 
     public func invoke(_ invocation: ProviderInvocation, intake: BoundedChannelState<ProviderResponse>) async throws -> TransportResult {
@@ -366,10 +393,24 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
         }
         let body: Data
         do {
+            // B5-C harness-owned advertisement: tools + tool_choice derive
+            // SOLELY from the run's effective capabilities (sealed
+            // invocations advertise nothing). Operator configuration cannot
+            // carry these keys (reserved at config load) and model output
+            // never influences the schema — proposals are validated at
+            // dispatch regardless of what was advertised.
+            let definitions: [ToolDefinition]
+            if invocation.sealed {
+                definitions = []
+            } else {
+                definitions = advertisedTools.map { ToolAdvertisement.definitions(for: $0) } ?? []
+            }
             body = try chatRequestBody(
                 modelID: profile.modelID, messages: messages,
                 maxTokens: requestOverride?.maxTokens ?? profile.maxOutput,
-                options: requestOverride?.options ?? profile.requestOptions)
+                options: requestOverride?.options ?? profile.requestOptions,
+                tools: definitions.isEmpty ? nil : openAIToolEnvelopes(definitions),
+                toolChoice: definitions.isEmpty ? nil : "auto")
         } catch let chat as ChatTransportError {
             throw TransportFailure(phase: .preSend, message: chat.description)
         }

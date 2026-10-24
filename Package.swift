@@ -103,6 +103,8 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                // B5-C: WorkspaceResolver pins execution roots via FilePath.
+                .product(name: "SystemPackage", package: "swift-system"),
             ]
         ),
         .testTarget(
@@ -141,6 +143,7 @@ let package = Package(
             name: "NeedletailTerminalTests",
             dependencies: [
                 "NeedletailCore",
+                "NeedletailRuntime",
                 "NeedletailLineEditor",
                 "PTYShim",
             ]
