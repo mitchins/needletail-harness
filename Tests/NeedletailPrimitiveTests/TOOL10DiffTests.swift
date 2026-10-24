@@ -37,15 +37,15 @@ struct TOOL10DiffTests {
         p.executableURL = URL(fileURLWithPath: git)
         p.arguments = args
         p.currentDirectoryURL = cwd
-        // Fixture hermeticity: inherited repository-location variables
-        // (GIT_DIR/GIT_WORK_TREE/...) would redirect these fixture
+        // Fixture hermeticity: inherited GIT_* variables (GIT_DIR,
+        // GIT_WORK_TREE, GIT_COMMON_DIR, ...) would redirect these fixture
         // commands at the caller's repository instead of the temp
-        // fixture, so they are stripped before test overrides apply.
-        // (The B5-C binary legs poison GIT_* deliberately through their
-        // own env parameter — that path is the behavior under test, and
-        // unaffected by this scrub.)
+        // fixture, so every inherited GIT_* entry is stripped before
+        // test overrides apply. (The B5-C binary legs poison GIT_* deliberately
+        // through their own env parameter — that path is the behavior
+        // under test, and unaffected by this scrub.)
         var e = ProcessInfo.processInfo.environment
-        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE"] {
+        for key in e.keys.filter({ $0.hasPrefix("GIT_") }) {
             e.removeValue(forKey: key)
         }
         if let env {
