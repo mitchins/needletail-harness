@@ -135,4 +135,48 @@ struct ActorApprovalTests {
         try await ActorFixtures.awaitPhase(tActor, { $0.phase == .executing }, "trustedExec executing")
         #expect(trustedApprovals.requests.isEmpty, "no approval asked in trustedExec")
     }
+
+    @Test("HEAD-03 approval precedence: ask-gated exec with unshaped args still asks")
+    func approvalPrecedenceAskGatedExec() async throws {
+        // FINAL-03: the strict validator runs before the approval check.
+        // An ask-policy exec proposal whose shape the validator rejects
+        // must still reach the operator (headless: approval-required),
+        // not synthesize a provider continuation past the gate. Silent
+        // gateway parks at authorising for stable observation.
+        let approvals = ScriptedApprovals()
+        let (actor, transport, _, _) = try await Self.authorisingActor(
+            approvals: approvals,
+            batch: [ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: "{\"command\":\"pytest\"}")])
+        try await ActorFixtures.awaitPhase(actor, { $0.phase == .authorising }, "authorising despite unshaped args")
+        for _ in 0..<100_000 where approvals.requests.count < 1 {
+            await Task.yield()
+        }
+        #expect(approvals.requests.count == 1, "exactly one approval request emitted")
+        #expect(transport.invocations.count == 1, "no provider continuation past the gate")
+        let pending = await actor.currentState()
+        #expect(pending.pendingApproval != nil, "approval request is pending")
+    }
+
+    @Test("HEAD-03 precedence control: non-gated invalid batch still continues")
+    func approvalPrecedenceControl() async throws {
+        // A validation failure for a batch that needs NO approval keeps
+        // the legacy behavior: deterministic provider continuation, no
+        // approval request. (read with both artifact aliases is invalid
+        // and never approval-gated.)
+        let approvals = ScriptedApprovals()
+        approvals.script = [.deny("must never be asked")]
+        let transport = ScriptedTransport()
+        let (actor, _) = try ActorFixtures.makeActor(mode: .workspace, permissive: true, transport: transport, approvals: approvals)
+        transport.script = [ProviderResponse(
+            requestID: RequestID("s"), generation: Revision(0),
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"artifactId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"artifact_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"),
+            ], isFinal: false))]
+        await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
+        for _ in 0..<100_000 where transport.invocations.count < 2 {
+            await Task.yield()
+        }
+        #expect(transport.invocations.count == 2, "invalid non-gated batch synthesizes a provider continuation")
+        #expect(approvals.requests.isEmpty, "no approval asked for a non-gated batch")
+    }
 }

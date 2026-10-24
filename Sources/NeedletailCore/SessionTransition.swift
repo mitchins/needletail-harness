@@ -1291,6 +1291,39 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
     do {
         validated = try ToolValidator.validateBatchArguments(batch: batch)
     } catch let ToolFailure.preDispatch(status, summary) {
+        // FINAL-03 approval precedence: an approval-gated batch is decided
+        // by the operator, not by arg shape. B5-C's strict validator runs
+        // before the approval check, so an ask-policy proposal whose shape
+        // the validator rejects (HEAD-03: exec under exec=ask) died here
+        // and the run continued to another provider request instead of
+        // stopping at approval-required. If every proposal is
+        // capability-granted (denied tools still deny — never approve)
+        // and the batch needs approval, ask now, mirroring the normal
+        // approval path (no turn consumed, no validated paths: the shape
+        // is unknown). Arg shape is still enforced before any dispatch:
+        // the executor parses strictly per tool, and exec/consult have no
+        // backend at all, so no unshaped proposal can ever reach
+        // execution.
+        let tools = batch.proposals.map(\.tool)
+        let granted = tools.allSatisfy { toolAllowed($0, caps: state.epoch.effectiveCaps.tools) }
+        let needsApproval = batchNeedsApproval(
+            toolNames: tools,
+            execPolicy: state.epoch.effectiveCaps.tools.exec,
+            mode: state.trustMode,
+            sealed: state.activeRun?.sealed ?? false)
+        if granted && needsApproval {
+            guard let run = state.activeRun else {
+                return failRun(state, failure: .providerError("approval without run"), hold: true, atMillis: atMillis, ids: &ids)
+            }
+            let request = ApprovalRequest(
+                requestID: run.requestID, runID: run.runID, generation: run.revision,
+                operation: "tool batch: \(tools.joined(separator: ", "))",
+                requiredGrant: "explicit approval",
+                protectedPaths: [])
+            let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("approval", run.requestID.raw), ids: &ids)
+            let next = s1.replacing(phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch))
+            return Transition(state: next, effects: [.requestApproval(request)], records: prefix)
+        }
         // Deterministic per-call done receipts preserving SPEC status, no FS touch
         // Synthesize a provider continuation with per-call operationResults
         let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("preDispatch", status), ids: &ids)
