@@ -113,7 +113,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bound == 0, listen(fd, 16) == 0 else {
+        guard bound == 0, listen(fd, 128) == 0 else {
             close(fd)
             throw LoopbackError.bindFailed
         }
