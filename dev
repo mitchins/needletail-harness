@@ -146,10 +146,49 @@ test)
     shift || true
     case "$sub" in
     quick)
-        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests"
+        # FINAL-02 A: TransportCancellationTests carries the NET-04
+        # promptness bounds, which are scheduler-sensitive (sleep-polling
+        # on the cooperative pool while hundreds of sibling tests run
+        # inflates wall-clock observation without any deadline being
+        # missed — see the serialized `timing` lane below). It runs there
+        # instead, with identical assertions and thresholds.
+        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests" --skip TransportCancellationTests
         ;;
     native)
-        run_swift_test native --filter "$FILTER_PRIMITIVE"
+        # FINAL-02 A: see `quick` — NET-04 promptness runs in `timing`.
+        run_swift_test native --filter "$FILTER_PRIMITIVE" --skip TransportCancellationTests
+        ;;
+    timing)
+        # FINAL-02 A: serialized, bounded NET-04 promptness certification.
+        # The three elapsed assertions (stalled-request, silent-server,
+        # idle-listener) measure ~1 s deadlines with 4-5 s of slack, but
+        # the full parallel bulk starved the polling tasks by ~5.4 s on
+        # the 4-vCPU CI runner (even zero-work synchronous tests took
+        # 6.6 s) while every functional assertion — timeout outcome,
+        # readiness-false, thread exit, resource release — passed. The
+        # operations never exceeded their deadlines; observation was
+        # delayed. This lane runs the suite alone in its own process
+        # with parallel execution disabled, so no sibling test can
+        # deschedule the polling loops. Thresholds are NOT raised: the
+        # same < 5 s / < 6 s bounds apply under bounded conditions.
+        _timing_log="$root_dir/.needletail-dev/logs/dev-timing.log"
+        mkdir -p "$root_dir/.needletail-dev/logs"
+        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --filter TransportCancellationTests > "$_timing_log" 2>&1; then
+            _timing_rc=0
+        else
+            _timing_rc=$?
+        fi
+        cat "$_timing_log"
+        if [ "$_timing_rc" -ne 0 ]; then
+            echo "FAIL [timing]: test runner exited $_timing_rc (evidence: $_timing_log). Not a pass."
+            exit "$_timing_rc"
+        fi
+        require_test_result "$_timing_log" timing
+        _timing_ran=$(grep -o "Test run with [0-9]* tests\?" "$_timing_log" | grep -o "[0-9]*" | awk '{s+=$1} END {print s+0}' || true)
+        if [ "${_timing_ran:-0}" = "0" ]; then
+            echo "FAIL: no TransportCancellationTests matched the timing filter (evidence: $_timing_log). A zero-match run is not a pass."
+            exit 1
+        fi
         ;;
     feasibility)
         # M0-C: the ONE bounded Linux PTY feasibility scenario over the
@@ -249,6 +288,8 @@ test)
         "$0" test quick
         echo "== offline aggregate: native =="
         "$0" test native
+        echo "== offline aggregate: timing (serialized NET-04 promptness) =="
+        "$0" test timing
         echo "== offline aggregate: feasibility =="
         "$0" test feasibility
         echo "== offline aggregate: coverage =="
