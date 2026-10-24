@@ -209,7 +209,15 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             guard fds[0].revents & Int16(POLLIN) != 0 else { continue }
             let client = accept(listenFD, nil, nil)
             guard client >= 0 else { continue }
-            var timeout = timeval(tv_sec: 1, tv_usec: 0)
+            // FINAL-03: generous client-head timeout. The spawned CLI
+            // binary can take seconds to write its request head on a
+            // saturated runner (cold page cache, descheduled startup);
+            // the old 1 s timeout closed such connections, surfacing as
+            // persistent ECONNREFUSED/ECONNRESET across the product's
+            // full pre-send retry budget. 30 s still bounds a dead
+            // client (test-level deadlines and stop() bound the suite);
+            // no certified timeout is changed.
+            var timeout = timeval(tv_sec: 30, tv_usec: 0)
             _ = setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
             handleClient(client)
         }
