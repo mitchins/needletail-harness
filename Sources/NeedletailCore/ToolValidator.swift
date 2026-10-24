@@ -31,7 +31,14 @@ public enum ProtectedClassification: Sendable, Equatable {
 public enum ToolValidator {
     private static let maxPathLength = 4096
     private static let maxStringLength = 8 * 1024
-    private static let maxTotalArgumentsSize = 64 * 1024
+    /// Intake bound for one proposal's argument JSON. Sized to admit the
+    /// largest reachable payload — provider-assembled arguments cap at
+    /// 256 KiB (SSEBounds.maxArgumentsBytes), so the total MUST exceed
+    /// that (plus JSON overhead) or legitimate model traffic is refused
+    /// while larger per-tool limits stay unreachable. Direct callers
+    /// remain bounded; per-tool limits (e.g. write's 32 MiB, enforced
+    /// against streamed executor I/O) still apply inside validation.
+    private static let maxTotalArgumentsSize = 512 * 1024
 
     public static func validateBatchArguments(batch: ToolBatch) throws -> [ValidatedToolCall] {
         // Check total batch size

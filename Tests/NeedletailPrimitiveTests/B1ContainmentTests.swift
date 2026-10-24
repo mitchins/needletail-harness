@@ -266,6 +266,25 @@ struct B1ContainmentTests {
         #expect(ok.count == 1)
     }
 
+    @Test("B1_totalArgumentsBoundAdmitsReachablePayloads")
+    func b1TotalArgumentsBoundAdmitsReachablePayloads() throws {
+        // The intake bound must admit the largest reachable payload:
+        // provider assembly allows 256 KiB arguments, so a 200 KiB write
+        // validates here (per-tool 32 MiB still applies inside).
+        let big = String(repeating: "a", count: 200_000)
+        let ok = try ToolValidator.validateBatchArguments(batch: ToolBatch([ToolProposal(
+            callID: "c1", tool: "write", argumentsDigest: "d",
+            arguments: "{\"path\":\"f\",\"content\":\"\(big)\"}")]))
+        #expect(ok.count == 1)
+        // Beyond the bound: still refused, with the total-cap verdict.
+        let huge = String(repeating: "a", count: 600_000)
+        #expect(throws: ToolFailure.preDispatch(status: "invalid-arguments", summary: "arguments too large")) {
+            _ = try ToolValidator.validateBatchArguments(batch: ToolBatch([ToolProposal(
+                callID: "c1", tool: "write", argumentsDigest: "d",
+                arguments: "{\"path\":\"f\",\"content\":\"\(huge)\"}")]))
+        }
+    }
+
     @Test("B1_approvalGrant")
     func b1ApprovalGrant() throws {
         // Batch with grantable .git should populate ApprovalRequest.protectedPaths
