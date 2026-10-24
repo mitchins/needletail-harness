@@ -2,16 +2,21 @@ import Foundation
 
 /// B5 harness-owned tool advertisement (REV25 §5/B5, discovery-only).
 ///
-/// The harness — never the model, never config — owns the strict JSON
-/// Schema definitions for the four file tools. `definitions(for:)`
+/// The harness — never the model, never config — owns the JSON Schema
+/// definitions for the four file tools. `definitions(for:)`
 /// intersects the ALREADY-folded effective capabilities: a tool is
 /// advertised iff its capability bit is on. `exec`, `consult` and `diff`
 /// are NEVER advertised under any capabilities (denied in M2-B, tested).
 ///
-/// Advertisement is discovery-only: execution still validates every
-/// argument through `ToolValidator.validateBatchArguments` (strict
-/// Codable/hand validators). A schema-conformant proposal can still be
-/// rejected at dispatch (stale hashes, protected paths, quotas); a
+/// Interop note: the emitted envelopes advertise `"strict": false`
+/// EXPLICITLY. OpenAI strict mode requires every property in `required`,
+/// which these contracts cannot satisfy (read: all-optional with a
+/// path/artifactId XOR; edit/write: alias pairs and a conditional
+/// expectedHash) — and must not be "fixed" by weakening the contracts.
+/// Provider-side generation is therefore best-effort: the schema guides
+/// the model, while `ToolValidator.validateBatchArguments` remains the
+/// strict authority at dispatch. A schema-conformant proposal can still
+/// be rejected (stale hashes, protected paths, quotas); a
 /// schema-violating proposal never reaches the executor. The exact-schema
 /// tests pin the wire shape; the round-trip test proves an advertised
 /// proposal reaches the executor through the real actor loop.
@@ -29,12 +34,17 @@ public struct ToolDefinition: Sendable, Equatable {
     }
 
     /// Canonical full definition JSON (sorted keys), as carried on the wire.
+    /// `strict` is false (see the interop note above): the schemas carry
+    /// optional and alternative (XOR/alias) properties that strict mode
+    /// cannot express, so the flag must never be flipped to true without
+    /// also making every property required — which would misrepresent
+    /// the dispatch contracts.
     public func json() -> String {
         let obj: [String: Any] = [
             "description": description,
             "name": name,
             "parameters": (try? JSONSerialization.jsonObject(with: Data(parametersJSON.utf8), options: [])) ?? [:],
-            "strict": true,
+            "strict": false,
         ]
         let data = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data()
         return String(data: data, encoding: .utf8) ?? ""

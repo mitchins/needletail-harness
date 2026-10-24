@@ -268,7 +268,10 @@ public func chatRequestBody(modelID: String, messages: [ChatMessage], maxTokens:
 
 /// Harness-owned OpenAI function-tool envelope for one advertised
 /// definition (B5-C): `{"type":"function","function":{...}}`. The inner
-/// object is the definition's canonical JSON (sorted keys).
+/// object is the definition's canonical JSON (sorted keys), including its
+/// explicit `"strict": false` (see `ToolDefinition`: optional/XOR
+/// contracts are not strict-expressible; generation is best-effort while
+/// dispatch validation stays strict).
 public func openAIToolEnvelopes(_ definitions: [ToolDefinition]) -> [[String: Any]] {
     definitions.map { definition in
         let inner = (try? JSONSerialization.jsonObject(
