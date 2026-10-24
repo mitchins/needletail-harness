@@ -495,6 +495,79 @@ release-bundle)
 help|-h|--help)
     usage
     ;;
+coverage-sonar)
+    # FINAL-03: genuine Swift coverage for SonarCloud (generic format).
+    # Instruments everything (test binaries AND the spawned product
+    # binary), runs the full evidence (every test target; M1-D/binary
+    # legs execute the instrumented product through a NEEDLETAIL_BIN
+    # wrapper that routes each child process to a unique profraw),
+    # merges all profiles, exports per-module llvm-cov data, and
+    # converts llvm-cov's own line verdicts to Sonar generic XML at
+    # the repo root (see sonar.coverageReportPaths).
+    # Assertion failures do NOT fail this lane: coverage derives from
+    # executed tests, and partial execution can only understate
+    # coverage (fail-visible via the Sonar number), never invent it.
+    # The offline gate (./dev test offline) remains the assertion gate.
+    # After this lane, .github/workflows/sonar.yml runs the scanner in
+    # the same job so the report is imported by the same analysis.
+    _covdir="$root_dir/.needletail-dev/coverage"
+    _covchild="$_covdir/child"
+    mkdir -p "$_covdir" "$_covchild"
+    rm -f "$_covdir"/*.profraw "$_covchild"/*.profraw "$root_dir/coverage-generic.xml"
+    _swiftbin=$(command -v "$NEEDLETAIL_SWIFT")
+    _swiftreal=$(readlink -f "$_swiftbin" 2>/dev/null || printf '%s' "$_swiftbin")
+    _llvmdir=$(dirname "$_swiftreal")
+    if [ ! -x "$_llvmdir/llvm-profdata" ] || [ ! -x "$_llvmdir/llvm-cov" ]; then
+        echo "FAIL [coverage-sonar]: llvm-profdata/llvm-cov not beside $NEEDLETAIL_SWIFT (resolved $_llvmdir)."
+        exit 1
+    fi
+    echo "== coverage-sonar: instrumented product build =="
+    "$NEEDLETAIL_SWIFT" build --enable-code-coverage --disable-automatic-resolution --product needletail || exit 1
+    _realbin="$root_dir/.build/debug/needletail"
+    _wrap="$_covdir/needletail-cov"
+    {
+        echo '#!/bin/sh'
+        echo "# Coverage wrapper (FINAL-03): route each spawned child to a"
+        echo "# unique profraw (pid-keyed); the instrumented binary records"
+        echo "# real execution. Generated at lane start; never committed."
+        echo "export LLVM_PROFILE_FILE=\"$_covchild/child-\$\$.profraw\""
+        echo "exec \"$_realbin\" \"\$@\""
+    } > "$_wrap"
+    chmod +x "$_wrap"
+    echo "== coverage-sonar: full instrumented test run (assertions non-blocking) =="
+    _sonar_log="$root_dir/.needletail-dev/logs/dev-coverage-sonar.log"
+    if NEEDLETAIL_BIN="$_wrap" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution > "$_sonar_log" 2>&1; then
+        _sonar_rc=0
+    else
+        _sonar_rc=$?
+    fi
+    cat "$_sonar_log"
+    echo "NOTE [coverage-sonar]: test runner exited $_sonar_rc; assertion failures do not invalidate executed coverage (see lane comment)."
+    echo "== coverage-sonar: merge profiles =="
+    if ! "$_llvmdir/llvm-profdata" merge -sparse "$root_dir/.build/debug/codecov/"*.profraw "$_covchild"/*.profraw -o "$_covdir/merged.profdata" 2>"$_covdir/merge.err"; then
+        cat "$_covdir/merge.err"
+        echo "FAIL [coverage-sonar]: profile merge failed."
+        exit 1
+    fi
+    [ -s "$_covdir/merged.profdata" ] || { echo "FAIL [coverage-sonar]: empty merged profile."; exit 1; }
+    echo "== coverage-sonar: export per-module coverage =="
+    _prodout="$root_dir/.build/out/Products/Debug-linux-x86_64"
+    _showlist=""
+    for _m in Core Runtime Providers Presentation; do
+        (cd "$_covdir" && ar x "$_prodout/libNeedletail$_m.a" "Needletail$_m.o") || { echo "FAIL [coverage-sonar]: cannot extract Needletail$_m.o."; exit 1; }
+        "$_llvmdir/llvm-cov" show -object "$_covdir/Needletail$_m.o" -instr-profile "$_covdir/merged.profdata" > "$_covdir/show-$_m.txt" 2>"$_covdir/show-$_m.err" || { cat "$_covdir/show-$_m.err"; echo "FAIL [coverage-sonar]: show Needletail$_m.o failed."; exit 1; }
+        _showlist="$_showlist $_covdir/show-$_m.txt"
+    done
+    if [ -f "$_prodout/NeedletailLineEditor.o" ]; then
+        "$_llvmdir/llvm-cov" show -object "$_prodout/NeedletailLineEditor.o" -instr-profile "$_covdir/merged.profdata" > "$_covdir/show-LineEditor.txt" 2>"$_covdir/show-LineEditor.err" || { cat "$_covdir/show-LineEditor.err"; echo "FAIL [coverage-sonar]: show LineEditor failed."; exit 1; }
+        _showlist="$_showlist $_covdir/show-LineEditor.txt"
+    fi
+    "$_llvmdir/llvm-cov" show -object "$_realbin" -instr-profile "$_covdir/merged.profdata" > "$_covdir/show-CLI.txt" 2>"$_covdir/show-CLI.err" || { cat "$_covdir/show-CLI.err"; echo "FAIL [coverage-sonar]: show needletail binary failed."; exit 1; }
+    _showlist="$_showlist $_covdir/show-CLI.txt"
+    echo "== coverage-sonar: convert to Sonar generic XML =="
+    /usr/bin/python3 "$root_dir/.github/scripts/show2sonar.py" "$root_dir" "$root_dir/coverage-generic.xml" $_showlist || exit 1
+    echo "COVERAGE-SONAR OK: genuine instrumented report at $root_dir/coverage-generic.xml"
+    ;;
 *)
     usage
     exit 2
