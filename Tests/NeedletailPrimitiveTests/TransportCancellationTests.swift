@@ -258,6 +258,13 @@ private func awaitRequestHead(_ server: SyntheticLoopbackServer, deadlineSeconds
     return outcome == "ready"
 }
 
+/// The promptness bounds below are scheduler-sensitive (sleep-polling on
+/// the cooperative pool while hundreds of sibling tests run inflates
+/// wall-clock observation). The suite runs serialized in the dedicated
+/// `./dev test timing` lane (own process); the trait below additionally
+/// serializes the tests within any process so the lane's "serialized"
+/// claim holds even if a future bulk run includes the suite.
+@Suite(.serialized)
 struct TransportCancellationTests {
 
     @Test("NET-04 cancelling an in-flight request completes bounded with no resend")

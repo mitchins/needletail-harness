@@ -137,7 +137,7 @@ struct ActorApprovalTests {
     }
 
     @Test("HEAD-03 approval precedence: ask-gated exec with unshaped args still asks")
-    func approvalPrecedenceAskGatedExec() async throws {
+    func HEAD_03_approvalPrecedenceAskGatedExec() async throws {
         // FINAL-03: the strict validator runs before the approval check.
         // An ask-policy exec proposal whose shape the validator rejects
         // must still reach the operator (headless: approval-required),
@@ -157,7 +157,7 @@ struct ActorApprovalTests {
         #expect(pending.pendingApproval != nil, "approval request is pending")
     }
 
-    @Test("HEAD-03 precedence control: non-gated invalid batch still continues")
+    @Test("Precedence control: non-gated invalid batch still continues")
     func approvalPrecedenceControl() async throws {
         // A validation failure for a batch that needs NO approval keeps
         // the legacy behavior: deterministic provider continuation, no

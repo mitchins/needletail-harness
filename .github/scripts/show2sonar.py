@@ -31,6 +31,25 @@ PROD_ROOTS = (
 LINE_RE = re.compile(r"^\s*(\d+)\|\s*([^|]*)\|")
 
 
+def parse_count(raw):
+    """llvm-cov show execution counts: plain ints, comma-grouped ints,
+    or abbreviated thousands/millions (1.25k, 3.4M). Abbreviated forms
+    are always nonzero (llvm prints a bare 0 for zero), so they mark
+    covered lines; only the zero/nonzero distinction matters here."""
+    s = raw.strip().replace(",", "")
+    if not s or s.startswith("-"):
+        return None
+    if s[-1] in "kM":
+        try:
+            return int(float(s[:-1]) * (1000 if s[-1] == "k" else 1000000))
+        except ValueError:
+            return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
 def in_scope(repo_root, filename):
     if not filename.startswith(repo_root):
         return False
@@ -69,12 +88,8 @@ def main():
                 if not in_scope(repo_root, cur):
                     continue
                 lineno = int(m.group(1))
-                count = m.group(2).strip().replace(",", "")
-                if count == "" or count.startswith("-"):
-                    continue
-                try:
-                    c = int(count)
-                except ValueError:
+                c = parse_count(m.group(2))
+                if c is None:
                     continue
                 executable.setdefault(cur, set()).add(lineno)
                 if c > 0:
