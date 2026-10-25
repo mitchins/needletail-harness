@@ -98,6 +98,16 @@ public final class LoopbackSSEServer: @unchecked Sendable {
     public var requests: [CapturedRequest] { lock.withLock { captured } }
     public var threadExited: Bool { lock.withLock { _exited } }
 
+    /// Readiness latch for the shutdown regression test: signalled when
+    /// the server enters readHead for an accepted client. Lets a test
+    /// wait (bounded) until a blocked read is actually in progress
+    /// before calling stop(), so the test cannot pass vacuously by
+    /// stopping before accept.
+    private let headSignal = DispatchSemaphore(value: 0)
+    public func waitUntilReadingHead(timeout: TimeInterval) -> Bool {
+        headSignal.wait(timeout: .now() + timeout) == .success
+    }
+
     public init() throws {
 #if os(Linux)
         let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
@@ -270,6 +280,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
         // 30 s receive stall; the overall deadline still tolerates slow
         // children on saturated runners. Returns nil on shutdown, error,
         // oversize input, or deadline expiry.
+        headSignal.signal()
         var buffer: [UInt8] = []
         buffer.reserveCapacity(4096)
         let deadline = Date().addingTimeInterval(30)

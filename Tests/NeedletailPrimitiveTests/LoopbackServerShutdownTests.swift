@@ -6,6 +6,10 @@ import NeedletailTestSupport
 /// client that connects without completing a request head must not pin
 /// the server thread past stop(). stop() returns promptly and the
 /// thread exits; the bounded join is real, not notional.
+///
+/// Linux-only fixture coverage (LoopbackSSEServer refuses non-Linux at
+/// init); the file contributes no tests elsewhere.
+#if os(Linux)
 struct LoopbackServerShutdownTests {
 
     @Test("silent client does not pin the server thread past stop")
@@ -27,6 +31,19 @@ struct LoopbackServerShutdownTests {
             }
         }
         try #require(connected == 0, "test client could not connect to the loopback server")
+        // Wait until the server is actually blocked inside readHead:
+        // connect() alone can complete while the client sits in the
+        // backlog, which would let stop() win before the blocked read
+        // starts and pass vacuously.
+        let reading = server.waitUntilReadingHead(timeout: 5)
+        try #require(reading, "server never entered readHead for the silent client")
+        // Control: without stop(), the thread must stay blocked in the
+        // 30 s slow-start tolerance (it must NOT return spuriously).
+        // The client socket stays open for the whole test, so an early
+        // return here would mean a spurious readHead exit; every other
+        // loopback test independently proves heads are consumed.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        #expect(!server.threadExited, "server thread must stay blocked in readHead without stop")
         // Shutdown with a silent client connected: the accept/read path
         // must notice promptly (100 ms poll slices), not wait out the
         // 30 s slow-start tolerance.
@@ -40,3 +57,4 @@ struct LoopbackServerShutdownTests {
         #expect(Date().timeIntervalSince(stopStart) < 5.0, "stop() must return promptly")
     }
 }
+#endif
