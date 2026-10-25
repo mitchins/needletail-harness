@@ -205,6 +205,14 @@ final class SQLiteProbeStore: SessionStore, @unchecked Sendable {
             }
         }
     }
+
+    /// B5-B enumeration: sessions with rows, sorted (same SQL shape as GRDB).
+    func sessions() throws -> [SessionID] {
+        let raws = try queue.read { db in
+            try String.fetchAll(db, sql: "SELECT DISTINCT session FROM records ORDER BY session")
+        }
+        return raws.map(SessionID.init)
+    }
 }
 
 /// Global writer slot + STORE-07/09 over a real SQLite file (variant

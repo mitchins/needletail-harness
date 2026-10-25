@@ -1,5 +1,6 @@
 import ArgumentParser
 import Foundation
+import SystemPackage
 import NeedletailCore
 import NeedletailProviders
 import NeedletailRuntime
@@ -49,12 +50,87 @@ struct RunCommand: ParsableCommand {
     @Flag(name: .long, help: "Trusted execution fixture: allow all tools without approval (demo only, not the default).")
     var trusted: Bool = false
 
+    @Option(name: .long, help: "Workspace root (must exist) for mutating file tools.")
+    var workspace: String?
+
+    @Option(name: .customLong("acknowledge-unresolved-outcomes"),
+            help: "Explicit operator decision for the B5-B cross-run gate: 'operator-accepted-risk' or 'manually-reconciled:<note>'. Records a durable acknowledgment in the new session; required when the store holds unresolved mutating outcomes, never persisted, never exempts future runs.")
+    var acknowledgeUnresolvedOutcomes: String?
+
+    @Option(name: .customLong("read-root"), help: "Read-only root for read/search (may be repeated).")
+    var readRoot: [String] = []
+
     mutating func run() throws {
         let isJSONL = format?.lowercased() == "jsonl"
         if let format, !["json", "human", "jsonl"].contains(format.lowercased()) {
             eprint("error $.cli.--format: must be 'jsonl', 'human', or 'json'.")
             throw ExitCode(2)
         }
+        // B1 workspace/read-root + sealed/trusted conflict validations (exit 2)
+        if workspace != nil && trusted {
+            eprint("error: --workspace and --trusted are mutually exclusive")
+            throw ExitCode(2)
+        }
+        if workspace != nil && sealed {
+            eprint("error: --workspace and --sealed are mutually exclusive")
+            throw ExitCode(2)
+        }
+        if !readRoot.isEmpty && sealed {
+            eprint("error: --read-root and --sealed are mutually exclusive")
+            throw ExitCode(2)
+        }
+        // B5-C + CodeRabbit final review: --trusted is the scripted demo
+        // fixture (caps allAllowed, no roots consulted); combining it with
+        // any real-root grant is contradictory operator intent and fails
+        // closed like every other backend conflict.
+        if !readRoot.isEmpty && trusted {
+            eprint("error: --read-root and --trusted are mutually exclusive")
+            throw ExitCode(2)
+        }
+        // B5-C: script entries drive the scripted backend only; native
+        // execution (--workspace/--read-root) never consumes them — a
+        // silently ignored tool script would be a dispatch ambiguity.
+        if tools != nil && (workspace != nil || !readRoot.isEmpty) {
+            eprint("error: --tools and --workspace/--read-root are mutually exclusive (script entries require the scripted backend)")
+            throw ExitCode(2)
+        }
+        if let ws = workspace {
+            if ws.utf8.contains(0) {
+                eprint("error: --workspace contains NUL")
+                throw ExitCode(2)
+            }
+            let fd = ws.withCString { cstr in open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard fd >= 0 else {
+                eprint("error: --workspace must exist and be a directory (not symlink): \(terminalSafe(ws)): \(String(cString: strerror(errno)))")
+                throw ExitCode(2)
+            }
+            close(fd)
+        }
+        for rr in readRoot {
+            if rr.utf8.contains(0) {
+                eprint("error: --read-root contains NUL")
+                throw ExitCode(2)
+            }
+            let fd = rr.withCString { cstr in open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard fd >= 0 else {
+                eprint("error: --read-root must exist and be a directory (not symlink): \(terminalSafe(rr)): \(String(cString: strerror(errno)))")
+                throw ExitCode(2)
+            }
+            close(fd)
+        }
+        if let ack = acknowledgeUnresolvedOutcomes {
+            guard ack == "operator-accepted-risk"
+                    || (ack.hasPrefix("manually-reconciled:") && ack.dropFirst("manually-reconciled:".count).count > 0),
+                  !ack.utf8.contains(0) else {
+                eprint("error $.cli.--acknowledge-unresolved-outcomes: must be 'operator-accepted-risk' or 'manually-reconciled:<note>'.")
+                throw ExitCode(2)
+            }
+        }
+        // B5-C: whether an interactive approval decision is possible.
+        // Computed once, up front, on the process standards the gateway
+        // itself consults: a TTY here means the gateway will prompt and
+        // the run loop must await the decision instead of exiting 3.
+        let interactiveApprovalTTY = isatty(STDIN_FILENO) != 0 && isatty(STDERR_FILENO) != 0
         // Capture values for Sendable closure (mutating self cannot be captured)
         let promptCopy = prompt
         let configCopy = config
@@ -63,6 +139,9 @@ struct RunCommand: ParsableCommand {
         let toolsCopy = tools
         let aliasCopy = alias
         let maxTurnsCopy = maxTurns
+        let workspaceCopy = workspace
+        let readRootCopy = readRoot
+        let acknowledgedDetermination = acknowledgeUnresolvedOutcomes
         final class Box: @unchecked Sendable {
             var exitCode: Int32 = 0
             var error: Error?
@@ -82,7 +161,7 @@ struct RunCommand: ParsableCommand {
                 try await RunCommand.executeStatic(
                     prompt: promptCopy, config: configCopy, trace: traceCopy,
                     format: formatCopy, tools: toolsCopy, alias: aliasCopy,
-                    maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy, isJSONL: isJSONL)
+                    maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy, workspace: workspaceCopy, readRoot: readRootCopy,                     acknowledgedDetermination: acknowledgedDetermination, interactiveApproval: interactiveApprovalTTY, isJSONL: isJSONL)
             } catch let error as ExitCode {
                 box.lock.withLock { box.exitCode = error.rawValue }
             } catch {
@@ -108,7 +187,7 @@ struct RunCommand: ParsableCommand {
     // A5-2 owns export; there is deliberately no promotion path here.
     final class EphemeralStore: SessionStore, @unchecked Sendable {        private let lock = NSLock()
         private var log: [SequencedRecord] = []
-        private var sessions: [String] = []
+        private var sessionRows: [String] = []
         private var sequence: UInt64 = 0
         private var claims: [String: String] = [:]
         func append(_ record: DurableRecord, as identity: WriterIdentity) throws {
@@ -119,7 +198,7 @@ struct RunCommand: ParsableCommand {
                 guard log.count < 10_000 else { throw StoreError.quotaExceeded(limit: 10_000) }
                 sequence += 1
                 log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
-                sessions.append(identity.session.raw)
+                sessionRows.append(identity.session.raw)
             }
         }
         /// A3-1 atomic override: the whole transition group is quota/fencing
@@ -134,7 +213,7 @@ struct RunCommand: ParsableCommand {
                 for record in records {
                     sequence += 1
                     log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: record))
-                    sessions.append(identity.session.raw)
+                    sessionRows.append(identity.session.raw)
                 }
             }
         }
@@ -144,7 +223,7 @@ struct RunCommand: ParsableCommand {
             }
             return try lock.withLock {
                 let window = log.enumerated().filter {
-                    $0.element.sequence.value > since && sessions[$0.offset] == session.raw
+                    $0.element.sequence.value > since && sessionRows[$0.offset] == session.raw
                 }.prefix(limit).map { $0.element }
                 let next: UInt64? = window.count < limit ? nil : window.last?.sequence.value
                 return (window, next)
@@ -167,6 +246,12 @@ struct RunCommand: ParsableCommand {
                     throw StoreError.alreadyOwned(session: session.raw, writer: current)
                 }
                 claims[session.raw] = writer
+            }
+        }
+        /// B5-B session enumeration: sessions with appended records.
+        func sessions() throws -> [SessionID] {
+            lock.withLock {
+                Array(Set(sessionRows)).sorted().map(SessionID.init)
             }
         }
         func releaseWriterOwnership(session: SessionID, writer: String) throws {
@@ -216,6 +301,22 @@ struct RunCommand: ParsableCommand {
         }
     }
 
+    /// PATH-based provisioned-executable lookup (same semantics as
+    /// `doctor`): no execution, no secret-bearing environment, just an
+    /// absolute path for the executor's FD-qualification. Nil (absent)
+    /// denies the dependent tool at dispatch — never a synthetic
+    /// substitute, never a fallback.
+    static func locateExecutable(_ name: String) -> String? {
+        guard let path = ProcessInfo.processInfo.environment["PATH"] else { return nil }
+        for directory in path.split(separator: ":") {
+            let candidate = "\(directory)/\(name)"
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
     /// Opens (never creates-over) the production store at the resolved
     /// state directory. The directory is created private (0700, repaired
     /// when pre-existing); the database file itself is enforced 0600.
@@ -252,7 +353,7 @@ struct RunCommand: ParsableCommand {
         return store
     }
 
-    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, isJSONL: Bool) async throws {
+    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, workspace: String?, readRoot: [String], acknowledgedDetermination: String?, interactiveApproval: Bool, isJSONL: Bool) async throws {
         // Unused format param kept for future envelope versioning
         _ = format
         // Private-by-default file creation for EVERYTHING this process
@@ -305,8 +406,18 @@ struct RunCommand: ParsableCommand {
         // 3. Effective caps and epoch — default is fail-closed
         // (workspace deny-all, mode workspace) per §10/ARCH. The demo
         // fixture explicitly opts into trustedExec via --trusted.
+        // B1: workspace/read-root grants resolve the blanket allDenied.
         let mode: TrustMode = trusted ? .trustedExec : .workspace
-        let workspaceGrant: ToolCapabilities = trusted ? .allAllowed : .allDenied
+        let workspaceGrant: ToolCapabilities
+        if trusted {
+            workspaceGrant = .allAllowed
+        } else if workspace != nil {
+            workspaceGrant = ToolCapabilities(read: true, search: true, edit: true, write: true, exec: .denied, consult: false)
+        } else if !readRoot.isEmpty {
+            workspaceGrant = ToolCapabilities(read: true, search: true, edit: false, write: false, exec: .denied, consult: false)
+        } else {
+            workspaceGrant = .allDenied
+        }
         let effective = effectiveCapabilities(
             build: .allAllowed, userConfig: snapshot.tools,
             workspaceGrant: workspaceGrant, invocationMask: .allAllowed,
@@ -378,10 +489,41 @@ struct RunCommand: ParsableCommand {
                 }
             }
 
+            /// B5-B enumeration forwarding (mechanical, like every other seam).
+            func sessions() throws -> [SessionID] {
+                switch self {
+                case .ephemeral(let s): try s.sessions()
+                case .durable(let s): try s.sessions()
+                }
+            }
+
             func releaseWriterOwnership(session: SessionID, writer: String) throws {
                 switch self {
                 case .ephemeral(let s): try s.releaseWriterOwnership(session: session, writer: writer)
                 case .durable(let s): try s.releaseWriterOwnership(session: session, writer: writer)
+                }
+            }
+        }
+
+        /// B5-C backend dispatch (REV25 §5/B5 selection matrix): one
+        /// forwarding method per seam, no behavior of its own. Exactly one
+        /// backend is constructed per run — a failed native initialization
+        /// fails the run closed, never falls back to scripted execution.
+        enum CLIExecutor: ToolExecutor {
+            case scripted(ScriptedToolBackend)
+            case native(NativeToolExecutor)
+
+            func describe(batch: ToolBatch) -> String {
+                switch self {
+                case .scripted(let b): b.describe(batch: batch)
+                case .native(let b): b.describe(batch: batch)
+                }
+            }
+
+            func execute(batch: ToolBatch, reservation: EffectReservation) async throws -> ExecutorResult {
+                switch self {
+                case .scripted(let b): try await b.execute(batch: batch, reservation: reservation)
+                case .native(let b): try await b.execute(batch: batch, reservation: reservation)
                 }
             }
         }
@@ -472,7 +614,11 @@ struct RunCommand: ParsableCommand {
         } else {
             scriptEntries = []
         }
-        let backend = ScriptedToolBackend(script: scriptEntries, caps: effective.tools)
+        // NOTE (B5-C): the executor is composed AFTER the durable session
+        // is claimed (section 5 below) — the native backend binds
+        // session/store/writer/resolver, so it cannot exist before the
+        // claim. Scripted entries are parsed here; the backend choice
+        // lands after the gate.
 
         // 5. Run identities BEFORE any network client exists. The explicit
         // claim fences this writer; the actor re-claims the same identity
@@ -482,6 +628,8 @@ struct RunCommand: ParsableCommand {
         // happens before the client is constructed, so there is nothing
         // to leak (an un-shut-down client fatals the process on deinit).
         let writerID = UUID().uuidString
+        // B5-C: set iff the native backend composes below (always durable).
+        var nativeExecutor: NativeToolExecutor?
         if let production = grdb {
             let runIdentity = WriterIdentity(session: state.sessionID, writer: writerID)
             do {
@@ -516,6 +664,109 @@ struct RunCommand: ParsableCommand {
                 eprint("store error: cannot persist run identities: \(terminalSafe(String(describing: error)))")
                 throw ExitCode(6)
             }
+            // B5-B(i): settle the byte ledger under the existing artifact
+            // lock BEFORE the gate reads history. Reuses B3's
+            // reconcileByteUsage — no second accounting mechanism. A
+            // byte-reconciliation failure fails the run closed (exit 6)
+            // with no provider traffic and no filesystem mutation past
+            // this point.
+            do {
+                _ = try production.reconcileByteUsage()
+            } catch let error as ExitCode {
+                throw error
+            } catch {
+                eprint("store error: byte reconciliation failed: \(terminalSafe(String(describing: error)))")
+                throw ExitCode(6)
+            }
+            // B5-B(ii): read-only cross-session operation reconciliation.
+            // The gate performs NO writes and runs BEFORE any provider or
+            // tool dispatch (transport is constructed in step 6 below).
+            // An unreadable session ledger fails closed here (exit 6) —
+            // never treated as clean, and no acknowledgment can cure it.
+            let holds: [CrossSessionHold]
+            do {
+                holds = try CrossRunGate.unresolvedHolds(store: production)
+            } catch let error as ExitCode {
+                throw error
+            } catch {
+                eprint("store error: cross-run gate cannot verify history: \(terminalSafe(String(describing: error)))")
+                throw ExitCode(6)
+            }
+            if !holds.isEmpty {
+                let namedSessions = holds.map(\.session.raw).sorted().map { terminalSafe($0) }.joined(separator: ", ")
+                let heldOpCount = holds.reduce(0) { $0 + $1.operationIDs.count }
+                // B5-C read-only carve-out: the gate protects MUTATING
+                // execution. A run that cannot mutate (read/search/consult
+                // only, exec denied — enforced by caps at admission AND by
+                // the executor) needs no risk acknowledgment for unrelated
+                // historical writes; the holds stand for future mutating
+                // runs. Only a mutating-capable run trips the gate below.
+                let runMayMutate = effective.tools.edit || effective.tools.write
+                    || effective.tools.exec != .denied
+                if !runMayMutate {
+                    eprint("note: proceeding read-only with \(heldOpCount) unresolved operation(s) in session(s) \(namedSessions) (history preserved for future mutating runs)")
+                } else if let determination = acknowledgedDetermination {
+                    // The RECORD is the decision — the flag alone authorizes
+                    // nothing. Append under this run's fenced writer
+                    // identity AFTER claim + sessionOpened, verify
+                    // persistence, and only then permit dispatch. Original
+                    // unresolved markers are preserved untouched.
+                    let acknowledgment = Acknowledgment(
+                        subjectSessions: holds.map(\.session),
+                        operationIDs: holds.flatMap(\.operationIDs),
+                        determination: determination,
+                        atMillis: SystemClock().nowMillis())
+                    do {
+                        try CrossRunGate.appendAcknowledgment(
+                            store: production, as: runIdentity,
+                            acknowledgment: acknowledgment)
+                    } catch let error as ExitCode {
+                        throw error
+                    } catch {
+                        eprint("store error: cannot record acknowledgment: \(terminalSafe(String(describing: error)))")
+                        throw ExitCode(6)
+                    }
+                    eprint("acknowledged \(heldOpCount) unresolved operation(s) in session(s) \(namedSessions) as '\(terminalSafe(determination))' (recorded in session \(state.sessionID.raw); history preserved)")
+                } else {
+                    // This gate IS a non-interactive approval check (same
+                    // code as approval-required): the invocation is
+                    // well-formed and no TTY interaction can satisfy it —
+                    // only the explicit flag. NOT exit 4 (no run/ambiguous
+                    // delivery occurred) and NOT exit 6 (the ledgers are
+                    // readable; their outcomes are unknown, not corrupt).
+                    eprint("blocked: unresolved mutating outcomes in session(s) \(namedSessions) (\(heldOpCount) operation(s)) — an explicit operator decision is required before mutating work. Inspect with `needletail session export SESSION --output FILE`, then re-run with --acknowledge-unresolved-outcomes 'operator-accepted-risk' (or 'manually-reconciled:<note>').")
+                    throw ExitCode(3)
+                }
+            }
+            // B5-C backend composition (REV25 §5/B5 selection matrix). The
+            // native executor is constructed ONLY here — after the durable
+            // session has been claimed — binding session, store, writer
+            // identity and pinned execution roots. There is no fallback: a
+            // failed native initialization fails the run closed (exit 6),
+            // never silently backslides to scripted execution.
+            if !sealed && !trusted && (workspace != nil || !readRoot.isEmpty) {
+                let resolver: WorkspaceResolver
+                do {
+                    resolver = try WorkspaceResolver(
+                        workspace: workspace.map { FilePath($0) },
+                        readRoots: readRoot.map { FilePath($0) })
+                } catch {
+                    eprint("store error: cannot pin execution roots: \(terminalSafe(String(describing: error)))")
+                    throw ExitCode(6)
+                }
+                nativeExecutor = NativeToolExecutor(
+                    resolver: resolver, store: production,
+                    sessionID: state.sessionID, writer: runIdentity,
+                    rgPath: Self.locateExecutable("rg"), gitPath: nil)
+            }
+        }
+        // Exactly one backend per run: native when composed above (always
+        // durable), scripted otherwise (sealed/trusted/denied-caps demos).
+        let executor: CLIExecutor
+        if let native = nativeExecutor {
+            executor = .native(native)
+        } else {
+            executor = .scripted(ScriptedToolBackend(script: scriptEntries, caps: effective.tools))
         }
 
         // 6. Transport with transcript-based messageProvider
@@ -540,7 +791,8 @@ struct RunCommand: ParsableCommand {
             client: httpClient,
             messageProvider: messageProvider,
             credentialProvider: { ref, op in try credentialStore.resolve(ref, for: op) },
-            snapshotProvider: { snapshot })
+            snapshotProvider: { snapshot },
+            advertisedTools: effective.tools)
 
         // 7. Actor
         // The fencing claim above already established this writer identity;
@@ -549,15 +801,17 @@ struct RunCommand: ParsableCommand {
         // Actor init is the last throwing call before provider work: on the
         // (near-impossible) failure path the client is shut down first, so
         // a store fault can never strand it into a deinit fatalError.
+        // B5-C: the interactive gateway decides on a real TTY and behaves
+        // headless (.unavailable → exit 3, no mutation) otherwise.
         let actor: SessionActor<
-            ChatCompletionsTransport, ScriptedToolBackend, CLIStore,
-            HeadlessApprovals, SystemClock, DeterministicIDSource
+            ChatCompletionsTransport, CLIExecutor, CLIStore,
+            TerminalApprovalGateway, SystemClock, DeterministicIDSource
         >
         do {
             actor = try SessionActor(
                 state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
-                transport: transport, executor: backend, store: store,
-                approvals: HeadlessApprovals(), sink: sink, writer: writerID)
+                transport: transport, executor: executor, store: store,
+                approvals: TerminalApprovalGateway(), sink: sink, writer: writerID)
         } catch {
             try? await httpClient.shutdown().get()
             throw error
@@ -592,6 +846,17 @@ struct RunCommand: ParsableCommand {
                 finalState = current
                 break
             case .authorising where current.pendingApproval != nil:
+                if interactiveApproval {
+                    // An interactive decision is in flight on the
+                    // operator's terminal: wait for the grant/deny
+                    // instead of mistaking the prompt for a headless
+                    // verdict. (Pre-buffered test input resolves on the
+                    // first poll; a human answers whenever ready.) The
+                    // wall deadline below still bounds the wait; headless
+                    // runs resolve immediately via .unavailable.
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    continue
+                }
                 // Headless approval never blocks forever (POLICY-04, SPEC
                 // §12.2 exit 3): capture the structured request and return.
                 approvalRequest = current.pendingApproval

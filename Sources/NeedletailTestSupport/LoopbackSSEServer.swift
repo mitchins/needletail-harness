@@ -98,6 +98,16 @@ public final class LoopbackSSEServer: @unchecked Sendable {
     public var requests: [CapturedRequest] { lock.withLock { captured } }
     public var threadExited: Bool { lock.withLock { _exited } }
 
+    /// Readiness latch for the shutdown regression test: signalled when
+    /// the server enters readHead for an accepted client. Lets a test
+    /// wait (bounded) until a blocked read is actually in progress
+    /// before calling stop(), so the test cannot pass vacuously by
+    /// stopping before accept.
+    private let headSignal = DispatchSemaphore(value: 0)
+    public func waitUntilReadingHead(timeout: TimeInterval) -> Bool {
+        headSignal.wait(timeout: .now() + timeout) == .success
+    }
+
     public init() throws {
 #if os(Linux)
         let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
@@ -113,7 +123,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bound == 0, listen(fd, 16) == 0 else {
+        guard bound == 0, listen(fd, 128) == 0 else {
             close(fd)
             throw LoopbackError.bindFailed
         }
@@ -152,6 +162,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
         let listenFD = self.listenFD
         let wakeRead = self.wakeRead
         Thread.detachNewThread { [weak self] in
+            SIGPIPEGuard.install()
             self?.serveLoop(listenFD: listenFD, wakeRead: wakeRead)
         }
     }
@@ -209,7 +220,15 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             guard fds[0].revents & Int16(POLLIN) != 0 else { continue }
             let client = accept(listenFD, nil, nil)
             guard client >= 0 else { continue }
-            var timeout = timeval(tv_sec: 1, tv_usec: 0)
+            // FINAL-03: generous client-head timeout. The spawned CLI
+            // binary can take seconds to write its request head on a
+            // saturated runner (cold page cache, descheduled startup);
+            // the old 1 s timeout closed such connections, surfacing as
+            // persistent ECONNREFUSED/ECONNRESET across the product's
+            // full pre-send retry budget. 30 s still bounds a dead
+            // client (test-level deadlines and stop() bound the suite);
+            // no certified timeout is changed.
+            var timeout = timeval(tv_sec: 30, tv_usec: 0)
             _ = setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
             handleClient(client)
         }
@@ -231,6 +250,12 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             response += "Content-Length: \(total)\r\n"
         }
         response += "Connection: close\r\n\r\n"
+        // SIGPIPE-tolerant: SIGPIPEGuard is installed process-wide at
+        // runner load (see SIGPIPEGuard); a write to a peer that died
+        // mid-stream (notably the SIGKILLed child in the A5-1 kill test)
+        // fails with EPIPE here — "the peer went away", ending this
+        // scripted response. No disposition toggling: process-wide
+        // signal() restore raced across concurrently running suites.
         _ = response.withCString { pointer in
             write(client, pointer, strlen(pointer))
         }
@@ -238,7 +263,9 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             if let abort = script.abortAfterChunks, index >= abort {
                 return // Abrupt close: no end, no Content-Length framing.
             }
-            if lock.withLock({ stopped }) { return }
+            if lock.withLock({ stopped }) {
+                return
+            }
             if chunk.delayMillis > 0 {
                 usleep(useconds_t(min(chunk.delayMillis, 60_000) * 1_000))
             }
@@ -257,10 +284,22 @@ public final class LoopbackSSEServer: @unchecked Sendable {
     }
 
     private func readHead(_ client: Int32) -> Head? {
+        // Bounded slow-start tolerance with prompt shutdown (FINAL-03):
+        // poll the client in 100 ms slices so stop() never waits out a
+        // 30 s receive stall; the overall deadline still tolerates slow
+        // children on saturated runners. Returns nil on shutdown, error,
+        // oversize input, or deadline expiry.
+        headSignal.signal()
         var buffer: [UInt8] = []
         buffer.reserveCapacity(4096)
-        var chunk = [UInt8](repeating: 0, count: 4096)
-        while true {
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            switch pollReadable(client) {
+            case .failure: return nil
+            case .success(false): continue
+            case .success(true): break
+            }
+            var chunk = [UInt8](repeating: 0, count: 4096)
             let count = chunk.withUnsafeMutableBytes { pointer in
                 recv(client, pointer.baseAddress, pointer.count, 0)
             }
@@ -268,12 +307,55 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             buffer.append(contentsOf: chunk.prefix(count))
             guard buffer.count <= Self.maxRequestHeadBytes + Self.maxRequestBodyBytes else { return nil }
             if let end = findHeaderEnd(buffer) {
-                return parseHead(Array(buffer[..<end]), rest: Array(buffer[end...]), client: client)
+                return parseHead(Array(buffer[..<end]), rest: Array(buffer[end...]), client: client, deadline: deadline)
             }
             if buffer.count > Self.maxRequestHeadBytes, findHeaderEnd(buffer) == nil {
                 return nil
             }
         }
+        return nil
+    }
+
+    /// Client readability within one 100 ms poll slice: `.success(true)`
+    /// means bytes are ready, `.success(false)` means the slice elapsed
+    /// (caller re-checks its own deadline), `.failure` means shutdown was
+    /// requested or the fd errored — stop waiting.
+    private func pollReadable(_ fd: Int32) -> Result<Bool, Error> {
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        while true {
+            if lock.withLock({ stopped }) { return .failure(LoopbackError.pipeFailed) }
+            let ready = poll(&pfd, 1, 100)
+            if ready > 0 { return .success(true) }
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return .failure(LoopbackError.pipeFailed)
+            }
+            return .success(false)
+        }
+    }
+
+    private func readBody(_ client: Int32, initial: [UInt8], need: Int, deadline: Date) -> [UInt8]? {
+        // Matches the original break-on-EOF semantics: a client that
+        // closes mid-body yields what arrived (unrecorded oversize still
+        // fails); only shutdown, error, or deadline expiry drops the
+        // request.
+        var body = initial
+        while body.count < need {
+            if Date() >= deadline { return nil }
+            switch pollReadable(client) {
+            case .failure: return nil
+            case .success(false): continue
+            case .success(true): break
+            }
+            var chunk = [UInt8](repeating: 0, count: 4096)
+            let count = chunk.withUnsafeMutableBytes { pointer in
+                recv(client, pointer.baseAddress, pointer.count, 0)
+            }
+            guard count > 0 else { break }
+            body.append(contentsOf: chunk.prefix(count))
+            guard body.count <= Self.maxRequestBodyBytes else { return nil }
+        }
+        return body
     }
 
     private func findHeaderEnd(_ buffer: [UInt8]) -> Int? {
@@ -286,7 +368,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
         return nil
     }
 
-    private func parseHead(_ head: [UInt8], rest: [UInt8], client: Int32) -> Head? {
+    private func parseHead(_ head: [UInt8], rest: [UInt8], client: Int32, deadline: Date) -> Head? {
         guard let text = String(bytes: head, encoding: .utf8) else { return nil }
         let lines = text.split(separator: "\r\n", omittingEmptySubsequences: false).map(String.init)
         guard let requestLine = lines.first else { return nil }
@@ -304,16 +386,8 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             }
         }
         guard contentLength <= Self.maxRequestBodyBytes else { return nil }
-        var body = rest
-        while body.count < contentLength {
-            var chunk = [UInt8](repeating: 0, count: 4096)
-            let count = chunk.withUnsafeMutableBytes { pointer in
-                recv(client, pointer.baseAddress, pointer.count, 0)
-            }
-            guard count > 0 else { break }
-            body.append(contentsOf: chunk.prefix(count))
-            guard body.count <= Self.maxRequestBodyBytes else { return nil }
-        }
+        guard rest.count <= Self.maxRequestBodyBytes else { return nil }
+        guard let body = readBody(client, initial: rest, need: contentLength, deadline: deadline) else { return nil }
         return Head(method: String(parts[0]), path: String(parts[1]), headers: headers, body: Array(body.prefix(contentLength)))
     }
 

@@ -208,13 +208,15 @@ public struct ApprovalRequest: Sendable, Equatable {
     /// Rendered, redacted operation description (terminalSafe at construction).
     public let operation: String
     public let requiredGrant: String
+    public let protectedPaths: [String]
 
-    public init(requestID: RequestID, runID: RunID, generation: Revision, operation: String, requiredGrant: String) {
+    public init(requestID: RequestID, runID: RunID, generation: Revision, operation: String, requiredGrant: String, protectedPaths: [String] = []) {
         self.requestID = requestID
         self.runID = runID
         self.generation = generation
         self.operation = terminalSafe(operation)
         self.requiredGrant = requiredGrant
+        self.protectedPaths = protectedPaths
     }
 }
 
@@ -285,7 +287,8 @@ extension SessionState {
         preSendRetries: Int? = nil, invalidTracker: InvalidTracker? = nil,
         pendingApproval: ApprovalRequest?? = nil, pendingBatch: ToolBatch?? = nil,
         retryDeadlineMillis: UInt64?? = nil,
-        liveReservations: [EffectReservation]? = nil, generation: UInt64? = nil,
+        liveReservations: [EffectReservation]? = nil,
+        cancelledPendingReservations: [EffectReservation]? = nil, generation: UInt64? = nil,
         unresolvedOperations: [OperationRef]? = nil,
         droppedStaleCount: Int? = nil, lastSequence: UInt64? = nil
     ) -> SessionState {
@@ -306,6 +309,7 @@ extension SessionState {
             pendingBatch: pendingBatch ?? self.pendingBatch,
             retryDeadlineMillis: retryDeadlineMillis ?? self.retryDeadlineMillis,
             liveReservations: liveReservations ?? self.liveReservations,
+            cancelledPendingReservations: cancelledPendingReservations ?? self.cancelledPendingReservations,
             generation: generation ?? self.generation,
             unresolvedOperations: unresolvedOperations ?? self.unresolvedOperations,
             droppedStaleCount: droppedStaleCount ?? self.droppedStaleCount,
@@ -391,6 +395,9 @@ public struct SessionState: Sendable, Equatable {
     /// pairing). Cancel retention (C3) and consumption checks read this —
     /// never actor-side memory alone.
     public let liveReservations: [EffectReservation]
+    /// Cancelled-pending executor reservations retained for late-report
+    /// supersession (REV25: state-side truth for kill-switch path).
+    public let cancelledPendingReservations: [EffectReservation]
     /// Current generation. Bumped on every new run admission and every
     /// cancel; completions must match it (I21).
     public let generation: UInt64
@@ -410,6 +417,7 @@ public struct SessionState: Sendable, Equatable {
         pendingApproval: ApprovalRequest? = nil, pendingBatch: ToolBatch? = nil,
         retryDeadlineMillis: UInt64? = nil,
         liveReservations: [EffectReservation] = [],
+        cancelledPendingReservations: [EffectReservation] = [],
         generation: UInt64 = 0, unresolvedOperations: [OperationRef] = [],
         droppedStaleCount: Int = 0, lastSequence: UInt64 = 0
     ) {
@@ -433,6 +441,7 @@ public struct SessionState: Sendable, Equatable {
         self.pendingBatch = pendingBatch
         self.retryDeadlineMillis = retryDeadlineMillis
         self.liveReservations = liveReservations
+        self.cancelledPendingReservations = cancelledPendingReservations
         self.generation = generation
         self.unresolvedOperations = unresolvedOperations
         self.droppedStaleCount = droppedStaleCount

@@ -152,6 +152,24 @@ struct XUnitIngestionTests {
         "PORT-04": ["PORT_04_sqliteNativeKillReopenLegMustExecute": "NeedletailPrimitiveTests"],
         "STORE-03": ["STORE_03_sqliteRenamedArtifactWithoutReferenceIsReportedOrphan": "NeedletailPrimitiveTests"],
         "STORE-04": ["STORE_04_sqliteReferenceToAbsentArtifactFailsTypedIntegrity": "NeedletailPrimitiveTests"],
+        // B5-C: every TOOL family and PORT-03 is satisfied by executed
+        // native-process binary evidence (M2-B closing gate). One certifying
+        // binary variant each (TOOL-09's partial batch and TOOL-04's
+        // occurrence legs cover their multi-leg scenarios in one function);
+        // module-pinned so an in-memory rename fails loudly.
+        "TOOL-01": ["TOOL_01_binaryReadBudgetAndBinary": "NeedletailPrimitiveTests"],
+        "TOOL-02": ["TOOL_02_binarySearchMetacharacters": "NeedletailPrimitiveTests"],
+        "TOOL-03": ["TOOL_03_binarySearchIgnoresForeignConfig": "NeedletailPrimitiveTests"],
+        "TOOL-04": ["TOOL_04_binaryEditOccurrences": "NeedletailPrimitiveTests"],
+        "TOOL-05": ["TOOL_05_binaryEditStaleHash": "NeedletailPrimitiveTests"],
+        "TOOL-06": ["TOOL_06_binaryWriteExactBytes": "NeedletailPrimitiveTests"],
+        "TOOL-07": ["TOOL_07_binarySymlinkEscapeDenied": "NeedletailPrimitiveTests"],
+        "TOOL-08": ["TOOL_08_binaryCreateNewExistsRefused": "NeedletailPrimitiveTests"],
+        "TOOL-09": ["TOOL_09_binaryPartialBatchSecondFails": "NeedletailPrimitiveTests"],
+        "TOOL-10": ["TOOL_10_binaryDiffDirtyTree": "NeedletailPrimitiveTests"],
+        "TOOL-11": ["TOOL_11_binaryCrossSessionArtifactDenied": "NeedletailPrimitiveTests"],
+        "TOOL-12": ["TOOL_12_binaryTerminalBytesSanitized": "NeedletailPrimitiveTests"],
+        "PORT-03": ["PORT_03_binaryCaseAndUnicodeDistinct": "NeedletailPrimitiveTests"],
     ]
 
     private static var requiredVariants: [String: Set<String>] {
@@ -286,6 +304,23 @@ struct XUnitIngestionTests {
             "STORE_08_sqliteRedactedExportOmitsConfidentialContent": "NeedletailPrimitiveTests",
             "STORE_08_sqliteContentExportPermitsOnlyDocumentedContent": "NeedletailPrimitiveTests",
         ], "STORE-08 must require the native export variants")
+        // B5-C maps pin: all 12 TOOL families plus PORT-03 present, each
+        // with at least one binary variant pinned to the native-process
+        // module. Deleting or re-pointing an entry fails loudly here.
+        for number in ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"] {
+            let caseID = "TOOL-\(number)"
+            let variants = Self.requiredEvidence[caseID] ?? [:]
+            #expect(!variants.isEmpty, "\(caseID) must require certifying evidence")
+            for (variant, module) in variants {
+                #expect(variant.hasPrefix("TOOL_\(number)_binary"),
+                        "\(caseID) variant \(variant) must be a binary leg")
+                #expect(module == "NeedletailPrimitiveTests",
+                        "\(caseID)/\(variant) must execute in the native-process module")
+            }
+        }
+        let port03 = Self.requiredEvidence["PORT-03"] ?? [:]
+        #expect(port03["PORT_03_binaryCaseAndUnicodeDistinct"] == "NeedletailPrimitiveTests",
+                "PORT-03 must require the binary case/unicode variant")
     }
 
     @Test("PORT-04 gating body performs a native kill")

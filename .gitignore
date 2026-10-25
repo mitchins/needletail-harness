@@ -2,6 +2,10 @@
 .build/
 DerivedData/
 
+# Generated Sonar coverage report (FINAL-03: produced by
+# ./dev coverage-sonar in CI, never committed)
+coverage-generic.xml
+
 # Release bundle outputs (rebuilt by ./dev release-bundle)
 release/bundle/
 

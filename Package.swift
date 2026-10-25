@@ -68,7 +68,13 @@ let package = Package(
         ),
         .target(
             name: "NeedletailTestSupport",
-            dependencies: ["NeedletailCore"]
+            dependencies: [
+                "NeedletailCore",
+                // B3-A: InMemorySessionStore.publishArtifact needs SHA-256
+                // (same swift-crypto edge as production targets; no new
+                // resolved package).
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
         ),
         .target(
             name: "NeedletailPresentation",
@@ -97,6 +103,8 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                // B5-C: WorkspaceResolver pins execution roots via FilePath.
+                .product(name: "SystemPackage", package: "swift-system"),
             ]
         ),
         .testTarget(
@@ -135,6 +143,7 @@ let package = Package(
             name: "NeedletailTerminalTests",
             dependencies: [
                 "NeedletailCore",
+                "NeedletailRuntime",
                 "NeedletailLineEditor",
                 "PTYShim",
             ]

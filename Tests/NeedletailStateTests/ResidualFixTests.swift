@@ -13,7 +13,7 @@ struct ResidualFixTests {
         var live = state.liveReservations
         live.append(EffectReservation(
             effectID: EffectID("eff-mut"), runID: run.runID, requestID: run.requestID,
-            generation: run.revision, revision: run.revision, mutating: true))
+            generation: run.revision, revision: run.revision, mutating: true, kind: .executor))
         return state.replacing(liveReservations: live)
     }
 
@@ -114,7 +114,7 @@ struct ResidualFixTests {
         var live = state.liveReservations
         live.append(EffectReservation(
             effectID: effectID, runID: run.runID, requestID: run.requestID,
-            generation: run.revision, revision: run.revision, mutating: false))
+            generation: run.revision, revision: run.revision, mutating: false, kind: .provider))
         let marker = OperationRef(operationID: OperationID("op-u"), state: .unknown, mutating: true)
         state = state.replacing(phase: .executing, liveReservations: live, unresolvedOperations: [marker])
         let held = transition(state, .effectCompleted(

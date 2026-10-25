@@ -50,7 +50,7 @@ public final class ScriptedToolBackend: ToolExecutor, @unchecked Sendable {
         // Grants first: denied tools never reach matching (fail closed).
         for proposal in batch.proposals {
             guard toolAllowed(proposal.tool, caps: caps) else {
-                throw ScriptedBackendError.capabilityDenied(tool: proposal.tool)
+                throw ToolFailure.preDispatch(status: "denied", summary: "capabilityDenied: \(proposal.tool)")
             }
         }
         // Defense in depth: execution receives the VERBATIM native
@@ -59,31 +59,71 @@ public final class ScriptedToolBackend: ToolExecutor, @unchecked Sendable {
             let arguments = proposal.arguments ?? ""
             guard let parsed = try? JSONSerialization.jsonObject(with: Data(arguments.utf8), options: [.fragmentsAllowed]),
                   parsed is [String: Any] else {
-                throw ScriptedBackendError.argumentsNotObject(tool: proposal.tool)
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argumentsNotObject: \(proposal.tool)")
             }
         }
         // Ordered exact matching: every proposal consumes the script head.
+        // Pre-dispatch failures (before any success) throw; post-dispatch failures return partial.
+        var outcomes: [ToolCallOutcome] = []
         var summaries: [String] = []
         var firstCallID = ""
+        var halted = false
+        var haltAfter: String? = nil
+        var hadSuccess = false
         try lock.withLock {
             for proposal in batch.proposals {
+                if halted {
+                    outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "cancelled", summary: "unstarted: halted after \(haltAfter ?? "")", data: "", started: false))
+                    continue
+                }
                 guard !script.isEmpty else {
-                    throw ScriptedBackendError.scriptExhausted
+                    if hadSuccess {
+                        let err = ScriptedBackendError.scriptExhausted
+                        outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "failed", summary: "\(err)", data: "", error: "\(err)", started: true))
+                        summaries.append("\(err)")
+                        if firstCallID.isEmpty { firstCallID = proposal.callID }
+                        halted = true
+                        haltAfter = proposal.callID
+                    } else {
+                        throw ScriptedBackendError.scriptExhausted
+                    }
+                    continue
                 }
                 let head = script.removeFirst()
                 guard head.tool == proposal.tool,
                       jsonEqual(head.arguments, proposal.arguments ?? "")
                 else {
-                    throw ScriptedBackendError.scriptMismatch(
-                        expected: "\(head.tool) \(head.arguments)",
-                        got: "\(proposal.tool) \(proposal.arguments ?? "")")
+                    let err = ScriptedBackendError.scriptMismatch(expected: "\(head.tool) \(head.arguments)", got: "\(proposal.tool) \(proposal.arguments ?? "")")
+                    if hadSuccess {
+                        outcomes.append(ToolCallOutcome(callID: proposal.callID, status: "failed", summary: "\(err)", data: "", error: "\(err)", started: true))
+                        summaries.append("\(err)")
+                        if firstCallID.isEmpty { firstCallID = proposal.callID }
+                        halted = true
+                        haltAfter = proposal.callID
+                    } else {
+                        // No prior success: pre-dispatch throw
+                        // Restore head for accurate error reporting
+                        script.insert(head, at: 0)
+                        throw err
+                    }
+                    continue
                 }
                 if firstCallID.isEmpty { firstCallID = proposal.callID }
                 summaries.append(head.result)
+                let status = head.result.hasPrefix("tool-failure:") ? "failed" : "success"
+                outcomes.append(ToolCallOutcome(callID: proposal.callID, status: status, summary: head.result, data: head.result, started: true))
+                hadSuccess = true
+                if status != "success" {
+                    halted = true
+                    haltAfter = proposal.callID
+                }
             }
         }
+        if outcomes.isEmpty {
+            throw ScriptedBackendError.scriptExhausted
+        }
         return ExecutorResult(receipt: ExecutorReceipt(
-            callID: firstCallID, status: "ok", summary: summaries.joined(separator: "\n")))
+            callID: firstCallID, status: "ok", summary: summaries.joined(separator: "\n")), calls: outcomes)
     }
 
     /// Parsed-JSON content equality (order-insensitive); unparseable sides
