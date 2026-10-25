@@ -48,6 +48,11 @@ FILTER_CONFIG_PURE="NeedletailConfigTests"
 FILTER_STATE_PURE="NeedletailStateTests"
 FILTER_PRESENTATION_PURE="NeedletailPresentationTests"
 
+# Suites owned by the serialized lanes (FINAL-02 timing, FINAL-03 e2e):
+# every bulk swift-test invocation skips them; the lanes certify them
+# in isolation with identical assertions and thresholds.
+BULK_SKIP="--skip TransportCancellationTests --skip B5CEndToEndTests --skip TOOL10DiffTests --skip ProductionCLIWiringTests --skip ProductionExportCLIWiringTests --skip CrossRunGateCLITests --skip B1ContainmentTests --skip CrashMatrixTests --skip TOOL09OrderedBatchTests --skip SessionExportTests"
+
 swift_test() {
     # One test worker at a time: loopback suites share process/OS
     # resources, and multi-worker Swift Testing showed cross-suite
@@ -152,11 +157,16 @@ test)
         # inflates wall-clock observation without any deadline being
         # missed — see the serialized `timing` lane below). It runs there
         # instead, with identical assertions and thresholds.
-        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests" --skip TransportCancellationTests
+        # FINAL-03: the OS-heavy E2E suites (loopback servers, spawned
+        # binaries, GRDB files) likewise run in their own serialized
+        # `e2e` lane; bulk contention starved them into infra-shaped
+        # flakes (refused loopback, store locks) with no product defect.
+        run_swift_test quick --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests" $BULK_SKIP
         ;;
     native)
         # FINAL-02 A: see `quick` — NET-04 promptness runs in `timing`.
-        run_swift_test native --filter "$FILTER_PRIMITIVE" --skip TransportCancellationTests
+        # FINAL-03: E2E suites run in `e2e`.
+        run_swift_test native --filter "$FILTER_PRIMITIVE" $BULK_SKIP
         ;;
     timing)
         # FINAL-02 A: serialized, bounded NET-04 promptness certification.
@@ -196,6 +206,43 @@ test)
         fi
         if [ ! -f "$_timing_xunit_actual" ]; then
             echo "FAIL [timing]: runner wrote no xunit output at $_timing_xunit_actual. Not a pass."
+            exit 1
+        fi
+        ;;
+    e2e)
+        # FINAL-03: serialized, bounded OS-heavy certification. The
+        # suites below spawn real binaries, bind loopback servers, and
+        # hold GRDB files; the full parallel bulk starved them into
+        # infra-shaped flakes (refused loopback connections, store
+        # locks, wedged children) with no product defect behind any of
+        # them. This lane runs them alone in their own process with
+        # parallel execution disabled (every suite also carries
+        # @Suite(.serialized)), so no sibling test can deschedule the
+        # fixtures. Assertions and thresholds are unchanged; the lane
+        # emits xunit that INGEST merges (see `coverage`).
+        _e2e_log="$root_dir/.needletail-dev/logs/dev-e2e.log"
+        _e2e_xunit_base="$root_dir/.needletail-dev/xunit/results-e2e.xml"
+        _e2e_xunit_actual="${_e2e_xunit_base%.xml}-swift-testing.xml"
+        mkdir -p "$root_dir/.needletail-dev/logs" "$root_dir/.needletail-dev/xunit"
+        rm -f "$_e2e_xunit_base" "$_e2e_xunit_actual"
+        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --xunit-output "$_e2e_xunit_base" > "$_e2e_log" 2>&1; then
+            _e2e_rc=0
+        else
+            _e2e_rc=$?
+        fi
+        cat "$_e2e_log"
+        if [ "$_e2e_rc" -ne 0 ]; then
+            echo "FAIL [e2e]: test runner exited $_e2e_rc (evidence: $_e2e_log). Not a pass."
+            exit "$_e2e_rc"
+        fi
+        require_test_result "$_e2e_log" e2e
+        _e2e_ran=$(grep -o "Test run with [0-9]* tests\?" "$_e2e_log" | grep -o "[0-9]*" | awk '{s+=$1} END {print s+0}' || true)
+        if [ "${_e2e_ran:-0}" = "0" ]; then
+            echo "FAIL: no E2E suites matched the e2e filters (evidence: $_e2e_log). A zero-match run is not a pass."
+            exit 1
+        fi
+        if [ ! -f "$_e2e_xunit_actual" ]; then
+            echo "FAIL [e2e]: runner wrote no xunit output at $_e2e_xunit_actual. Not a pass."
             exit 1
         fi
         ;;
@@ -299,6 +346,8 @@ test)
         "$0" test native
         echo "== offline aggregate: timing (serialized NET-04 promptness) =="
         "$0" test timing
+        echo "== offline aggregate: e2e (serialized OS-heavy suites) =="
+        "$0" test e2e
         echo "== offline aggregate: feasibility =="
         "$0" test feasibility
         echo "== offline aggregate: coverage =="
@@ -345,6 +394,7 @@ coverage)
     # former, delete both first so a stale report can never pass.
     _xunit_actual="${_xunit_base%.xml}-swift-testing.xml"
     _timing_xunit_actual="$root_dir/.needletail-dev/xunit/results-timing-swift-testing.xml"
+    _e2e_xunit_actual="$root_dir/.needletail-dev/xunit/results-e2e-swift-testing.xml"
     _xunit_merged="$root_dir/.needletail-dev/xunit/results-merged-swift-testing.xml"
     mkdir -p "$(dirname "$_xunit_base")"
     rm -f "$_xunit_base" "$_xunit_actual" "$_xunit_merged"
@@ -352,18 +402,23 @@ coverage)
     # FINAL-02 A (CodeRabbit confirmation review): the NET-04 promptness
     # suite is certified in the isolated `timing` lane, not rerun here —
     # the bulk run would reintroduce the scheduler contention the lane
-    # removes. Its 8 tests remain INGEST evidence: the lane emits xunit
-    # (fresh here, so a stale report can never pass) and merge-xunit.py
-    # joins the union for reconciliation — disjointness and counts are
-    # asserted, a missing timing report fails closed.
+    # removes. FINAL-03: the OS-heavy E2E suites likewise run only in
+    # the isolated `e2e` lane (bulk contention starved them into
+    # infra-shaped flakes). Both lanes' tests remain INGEST evidence:
+    # each lane emits xunit (fresh here, so a stale report can never
+    # pass) and merge-xunit.py joins the union for reconciliation —
+    # disjointness and counts are asserted, a missing lane report fails
+    # closed.
     echo "== coverage: isolated NET-04 timing evidence =="
     "$0" test timing
-    run_swift_test coverage-evidence --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_STATE_PURE" --skip TransportCancellationTests --xunit-output "$_xunit_base"
+    echo "== coverage: isolated E2E evidence =="
+    "$0" test e2e
+    run_swift_test coverage-evidence --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_STATE_PURE" $BULK_SKIP --xunit-output "$_xunit_base"
     if [ ! -f "$_xunit_actual" ]; then
         echo "FAIL [coverage]: runner wrote no xunit output at $_xunit_actual. Not a pass."
         exit 1
     fi
-    if ! /usr/bin/python3 "$root_dir/.github/scripts/merge-xunit.py" "$_xunit_actual" "$_timing_xunit_actual" "$_xunit_merged"; then
+    if ! /usr/bin/python3 "$root_dir/.github/scripts/merge-xunit.py" "$_xunit_merged" --bulk "$_xunit_actual" --timing "$_timing_xunit_actual" --e2e "$_e2e_xunit_actual"; then
         echo "FAIL [coverage]: xunit merge failed (evidence above). Not a pass."
         exit 1
     fi

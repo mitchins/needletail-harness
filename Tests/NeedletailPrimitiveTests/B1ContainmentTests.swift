@@ -13,6 +13,8 @@ import Darwin
 /// B1 containment, strict args, grants, lock — real filesystem, production resolver/validator.
 /// Covers TOOL_07, PORT_03, protected-path, arg-shape, root replacement, special files, lock, CLI grants.
 /// Includes RED/GREEN counterfactuals for string-prefix, realpath-once, Unicode normalization, unknown field, final symlink.
+/// FINAL-03: serialized, matching the sibling OS-heavy suites (spawns subprocess locks and real binaries; serialized with the E2E lane).
+@Suite(.serialized)
 struct B1ContainmentTests {
 
     private static func tempRoot() throws -> (URL, FilePath) {

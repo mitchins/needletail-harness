@@ -18,6 +18,8 @@ import Darwin
 /// discharge, intent/result ordering, reconcile-after-reopen, and the
 /// counterfactuals (aggregate receipts, false holds, auto-retry,
 /// reordering, post-dispatch throws, lost successes).
+/// FINAL-03: serialized, matching the sibling OS-heavy suites (GRDB-backed ordered batches; serialized with the E2E lane).
+@Suite(.serialized)
 struct TOOL09OrderedBatchTests {
 
     // MARK: - Local seams (minimal; ActorTests owns the shared scripted seams)

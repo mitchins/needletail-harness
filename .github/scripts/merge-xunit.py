@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
-"""Merge two SwiftPM swift-testing xunit reports for INGEST reconciliation.
+"""Merge SwiftPM swift-testing xunit reports for INGEST reconciliation.
 
-FINAL-02 A: the NET-04 promptness suite runs in the isolated `timing` lane
-(own process, no parallel siblings) while the bulk coverage-evidence run
-skips it. Both reports are genuine executed evidence; INGEST reconciles
-their union. This script merges them deterministically and fails closed on
-any structural surprise:
+FINAL-02/03: the NET-04 promptness suite runs in the isolated `timing`
+lane and the OS-heavy suites run in the isolated `e2e` lane (own
+processes, serialized); the bulk coverage-evidence run skips all of
+them. Every lane's tests remain INGEST evidence: this script joins the
+union for reconciliation. It fails closed on any structural surprise:
 
-- both inputs must be <testsuites> roots (SwiftPM swift-testing schema);
+- every input must be a <testsuites> root (SwiftPM swift-testing schema);
 - the timing report must contain ONLY TransportCancellationTests cases
   (guard against merging the wrong file);
-- the two reports must be disjoint (the bulk run skips the timing suite);
+- the e2e report must contain ONLY the lane's E2E suites;
+- all reports must be pairwise disjoint (bulk skips must hold);
 - the merged testcase count must equal the sum of the inputs.
 
-Usage: merge-xunit.py <bulk.xml> <timing.xml> <merged-out.xml>
+Usage: merge-xunit.py <merged-out.xml> --bulk <bulk.xml> [--timing <timing.xml>] [--e2e <e2e.xml>]
+Absent lane inputs are simply not merged.
 """
 
 import sys
 import xml.etree.ElementTree as ET
+
+# Suites owned by the serialized e2e lane (must match `dev test e2e`).
+E2E_SUITES = {
+    "B5CEndToEndTests",
+    "TOOL10DiffTests",
+    "ProductionCLIWiringTests",
+    "ProductionExportCLIWiringTests",
+    "CrossRunGateCLITests",
+    "B1ContainmentTests",
+    "CrashMatrixTests",
+    "TOOL09OrderedBatchTests",
+    "SessionExportTests",
+}
 
 
 def load(path):
@@ -43,32 +58,57 @@ def cases(root):
 
 
 def main():
-    if len(sys.argv) != 4:
-        sys.stderr.write("usage: merge-xunit.py <bulk.xml> <timing.xml> <merged-out.xml>\n")
+    # usage: merge-xunit.py <merged-out.xml> --bulk <bulk.xml>
+    #          [--timing <timing.xml>] [--e2e <e2e.xml>]
+    args = sys.argv[1:]
+    if len(args) < 3 or args[1] != "--bulk":
+        sys.stderr.write(
+            "usage: merge-xunit.py <merged-out.xml> --bulk <bulk.xml> [--timing <timing.xml>] [--e2e <e2e.xml>]\n"
+        )
         sys.exit(1)
-    bulk_path, timing_path, out_path = sys.argv[1:4]
-    bulk = load(bulk_path)
-    timing = load(timing_path)
-
-    bulk_cases = cases(bulk)
-    timing_cases = cases(timing)
-    if not timing_cases:
-        sys.stderr.write(f"FAIL: timing report {timing_path} holds zero testcases\n")
+    out_path = args[0]
+    inputs = {}
+    i = 1
+    while i < len(args):
+        if args[i] in ("--bulk", "--timing", "--e2e") and i + 1 < len(args):
+            inputs[args[i][2:]] = args[i + 1]
+            i += 2
+        else:
+            sys.stderr.write(f"FAIL: bad merge arguments near {' '.join(args[i:])}\n")
+            sys.exit(1)
+    if "bulk" not in inputs:
+        sys.stderr.write("FAIL: bulk report is required\n")
         sys.exit(1)
-    for suite, name in timing_cases:
+    reports = {k: load(v) for k, v in inputs.items()}
+    report_cases = {k: cases(r) for k, r in reports.items()}
+    if not report_cases["bulk"]:
+        sys.stderr.write("FAIL: bulk report holds zero testcases\n")
+        sys.exit(1)
+    for suite, name in report_cases.get("timing", []):
         if "TransportCancellationTests" not in suite:
             sys.stderr.write(
                 f"FAIL: timing report holds non-timing case {suite}::{name}; refusing to merge\n"
             )
             sys.exit(1)
-    overlap = set(bulk_cases) & set(timing_cases)
-    if overlap:
-        sys.stderr.write(f"FAIL: {len(overlap)} cases in both reports (bulk skip broken): {sorted(overlap)[:5]}\n")
-        sys.exit(1)
+    for suite, name in report_cases.get("e2e", []):
+        if not any(s in suite for s in E2E_SUITES):
+            sys.stderr.write(
+                f"FAIL: e2e report holds non-e2e case {suite}::{name}; refusing to merge\n"
+            )
+            sys.exit(1)
+    seen: dict = {}
+    for kind, clist in report_cases.items():
+        for case in clist:
+            if case in seen:
+                sys.stderr.write(
+                    f"FAIL: case {case[0]}::{case[1]} in both {seen[case]} and {kind} (bulk skip broken)\n"
+                )
+                sys.exit(1)
+            seen[case] = kind
 
     merged = ET.Element("testsuites")
     total_tests = total_failures = total_errors = total_skipped = 0
-    for root in (bulk, timing):
+    for root in reports.values():
         for suite_el in root.findall("testsuite"):
             merged.append(suite_el)
     for tc in merged.iter("testcase"):
@@ -79,10 +119,9 @@ def main():
             total_errors += 1
         if tc.find("skipped") is not None:
             total_skipped += 1
-    if total_tests != len(bulk_cases) + len(timing_cases):
-        sys.stderr.write(
-            f"FAIL: merged {total_tests} != bulk {len(bulk_cases)} + timing {len(timing_cases)}\n"
-        )
+    expected = sum(len(v) for v in report_cases.values())
+    if total_tests != expected:
+        sys.stderr.write(f"FAIL: merged {total_tests} != sum of inputs {expected}\n")
         sys.exit(1)
     merged.set("tests", str(total_tests))
     merged.set("failures", str(total_failures))
@@ -94,7 +133,8 @@ def main():
     except Exception as exc:
         sys.stderr.write(f"FAIL: cannot write {out_path}: {exc}\n")
         sys.exit(1)
-    print(f"XUNIT MERGE OK: bulk={len(bulk_cases)} timing={len(timing_cases)} merged={total_tests} failures={total_failures} errors={total_errors}")
+    parts = " ".join(f"{k}={len(v)}" for k, v in report_cases.items())
+    print(f"XUNIT MERGE OK: {parts} merged={total_tests} failures={total_failures} errors={total_errors}")
 
 
 if __name__ == "__main__":

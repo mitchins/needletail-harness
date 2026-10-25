@@ -16,6 +16,8 @@ import Darwin
 /// git, large/binary output, dirty trees); binary legs spawn the real
 /// `needletail diff` CLI (poisoned env, missing git, bad workspace,
 /// truncation notes, driver neutralization through the binary).
+/// FINAL-03: serialized, matching the sibling OS-heavy suites (spawns the real binary against real git fixtures; serialized with the E2E lane).
+@Suite(.serialized)
 struct TOOL10DiffTests {
 
     // MARK: - Fixtures

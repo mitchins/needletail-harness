@@ -11,6 +11,8 @@ import NeedletailTestSupport
 /// snapshots, routes, capability maps and recovery rationale NEVER
 /// travel. Two interleaved sessions prove scoping; seeded sentinels
 /// prove redaction field-by-field.
+/// FINAL-03: serialized, matching the sibling OS-heavy suites (GRDB-backed export proofs; serialized with the E2E lane).
+@Suite(.serialized)
 struct SessionExportTests {
 
     // MARK: - Fixtures
