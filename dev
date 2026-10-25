@@ -592,7 +592,11 @@ coverage-sonar)
     chmod +x "$_wrap"
     echo "== coverage-sonar: full instrumented test run (assertions non-blocking) =="
     _cov_start=$(date +%s)
-    if NEEDLETAIL_BIN="$_wrap" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution > "$_sonar_log" 2>&1; then
+    # --no-parallel: coverage must be deterministic. A SIGPIPE-killed
+    # runner (observed on CI) silently dropped whole modules from the
+    # report and failed the gate on understated coverage; a serialized
+    # run removes that variable entirely.
+    if NEEDLETAIL_BIN="$_wrap" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution --no-parallel > "$_sonar_log" 2>&1; then
         _sonar_rc=0
     else
         _sonar_rc=$?

@@ -162,6 +162,7 @@ public final class LoopbackSSEServer: @unchecked Sendable {
         let listenFD = self.listenFD
         let wakeRead = self.wakeRead
         Thread.detachNewThread { [weak self] in
+            SIGPIPEGuard.install()
             self?.serveLoop(listenFD: listenFD, wakeRead: wakeRead)
         }
     }
@@ -249,22 +250,20 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             response += "Content-Length: \(total)\r\n"
         }
         response += "Connection: close\r\n\r\n"
-        // SIGPIPE-guarded: the child may die mid-stream (notably the
-        // SIGKILLed child in the A5-1 kill test); an unguarded write to
-        // the dead socket raises SIGPIPE, which kills the TEST RUNNER
-        // by default disposition. Ignore for the response, then
-        // restore; a failed write simply ends this scripted response.
-        signal(SIGPIPE, SIG_IGN)
+        // SIGPIPE-tolerant: SIGPIPEGuard is installed process-wide at
+        // runner load (see SIGPIPEGuard); a write to a peer that died
+        // mid-stream (notably the SIGKILLed child in the A5-1 kill test)
+        // fails with EPIPE here — "the peer went away", ending this
+        // scripted response. No disposition toggling: process-wide
+        // signal() restore raced across concurrently running suites.
         _ = response.withCString { pointer in
             write(client, pointer, strlen(pointer))
         }
         for (index, chunk) in script.chunks.enumerated() {
             if let abort = script.abortAfterChunks, index >= abort {
-                signal(SIGPIPE, SIG_DFL)
                 return // Abrupt close: no end, no Content-Length framing.
             }
             if lock.withLock({ stopped }) {
-                signal(SIGPIPE, SIG_DFL)
                 return
             }
             if chunk.delayMillis > 0 {
@@ -275,7 +274,6 @@ public final class LoopbackSSEServer: @unchecked Sendable {
                 _ = write(client, base, pointer.count)
             }
         }
-        signal(SIGPIPE, SIG_DFL)
     }
 
     private struct Head {

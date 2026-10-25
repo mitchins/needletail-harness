@@ -435,10 +435,9 @@ struct ProductionCLIWiringTests {
         // The loopback server writes paced chunks on its own thread; when
         // the child dies mid-stream the next write would raise SIGPIPE and
         // kill THIS test process by default disposition — exactly why the
-        // CLI itself ignores SIGPIPE (RunCommand). Ignore it for the kill
-        // window only, then restore.
-        signal(SIGPIPE, SIG_IGN)
-        defer { signal(SIGPIPE, SIG_DFL) }
+        // CLI itself ignores SIGPIPE (RunCommand). The process-wide guard
+        // is installed at runner load; no per-write toggling.
+        SIGPIPEGuard.install()
         let server = try LoopbackSSEServer()
         // Slow drip keeps the run alive for the kill window.
         var paced: [ScriptChunk] = []

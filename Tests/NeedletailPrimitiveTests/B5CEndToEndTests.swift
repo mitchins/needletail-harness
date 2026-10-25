@@ -233,16 +233,15 @@ struct B5CEndToEndTests {
             #expect(process.isRunning, "still awaiting the decision after a beat")
         }
         // Decision input (pre-buffered, or post-prompt in delayed mode).
-        // SIGPIPE-guarded: the child may have exited already (instant
-        // failure, crashed binary); an unguarded write to the closed PTY
-        // raises SIGPIPE and kills the TEST RUNNER by default disposition
-        // (observed as an illegal-instruction runner crash). Ignore for
-        // the write, then restore — same pattern as the kill-window test.
+        // SIGPIPE-tolerant: the child may have exited already (instant
+        // failure, crashed binary); with SIGPIPEGuard installed at runner
+        // load, a write to the closed PTY fails with EPIPE instead of
+        // killing the TEST RUNNER by default disposition (observed as an
+        // illegal-instruction runner crash). No per-write toggling.
         let inputBytes = Array(input.utf8)
         _ = inputBytes.withUnsafeBufferPointer { buf in
-            signal(SIGPIPE, SIG_IGN)
+            SIGPIPEGuard.install()
             let written = write(masterFD, buf.baseAddress, buf.count)
-            signal(SIGPIPE, SIG_DFL)
             _ = written
         }
         let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
