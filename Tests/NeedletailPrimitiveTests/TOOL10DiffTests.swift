@@ -66,17 +66,28 @@ struct TOOL10DiffTests {
         return (p.terminationStatus, out, err)
     }
 
+    private static func runGitChecked(_ git: String, args: [String], cwd: URL, step: String) throws {
+        // Fixture setup must not silently proceed past a failed git
+        // command (e.g. an inherited commit-signing config failing the
+        // commit would leave an uncommitted repo and the diff tests
+        // would certify the wrong fixture state).
+        let (status, out, err) = try Self.runGit(git, args: args, cwd: cwd)
+        try #require(status == 0, "git setup '\(step)' failed (\(status)): \(err.prefix(300)) \(out.prefix(100))")
+    }
+
     private static func makeRepo(files: [String: String] = ["f.txt": "hello\n"]) throws -> (URL, String) {
         let git = try #require(Self.locateGit(), "git required for TOOL-10 evidence; silent skip is not evidence")
         let dir = try Self.tempDir(prefix: "tool10-repo")
-        _ = try Self.runGit(git, args: ["init", "-q"], cwd: dir)
-        _ = try Self.runGit(git, args: ["config", "user.email", "t@t"], cwd: dir)
-        _ = try Self.runGit(git, args: ["config", "user.name", "t"], cwd: dir)
+        try Self.runGitChecked(git, args: ["init", "-q"], cwd: dir, step: "init")
+        try Self.runGitChecked(git, args: ["config", "user.email", "t@t"], cwd: dir, step: "config email")
+        try Self.runGitChecked(git, args: ["config", "user.name", "t"], cwd: dir, step: "config name")
         for (name, content) in files {
             try content.write(to: dir.appendingPathComponent(name), atomically: true, encoding: .utf8)
         }
-        _ = try Self.runGit(git, args: ["add", "-A"], cwd: dir)
-        _ = try Self.runGit(git, args: ["commit", "-qm", "init"], cwd: dir)
+        try Self.runGitChecked(git, args: ["add", "-A"], cwd: dir, step: "add")
+        // Never honor ambient commit-signing config in fixtures: an
+        // inherited gpgsign would fail (or sign) the fixture commit.
+        try Self.runGitChecked(git, args: ["-c", "commit.gpgsign=false", "commit", "-qm", "init"], cwd: dir, step: "commit")
         return (dir, git)
     }
 

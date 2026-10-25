@@ -188,7 +188,7 @@ test)
         _timing_xunit_actual="${_timing_xunit_base%.xml}-swift-testing.xml"
         mkdir -p "$root_dir/.needletail-dev/logs" "$root_dir/.needletail-dev/xunit"
         rm -f "$_timing_xunit_base" "$_timing_xunit_actual"
-        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --filter TransportCancellationTests --xunit-output "$_timing_xunit_base" > "$_timing_log" 2>&1; then
+        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter TransportCancellationTests --xunit-output "$_timing_xunit_base" > "$_timing_log" 2>&1; then
             _timing_rc=0
         else
             _timing_rc=$?
@@ -225,7 +225,7 @@ test)
         _e2e_xunit_actual="${_e2e_xunit_base%.xml}-swift-testing.xml"
         mkdir -p "$root_dir/.needletail-dev/logs" "$root_dir/.needletail-dev/xunit"
         rm -f "$_e2e_xunit_base" "$_e2e_xunit_actual"
-        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --xunit-output "$_e2e_xunit_base" > "$_e2e_log" 2>&1; then
+        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --xunit-output "$_e2e_xunit_base" > "$_e2e_log" 2>&1; then
             _e2e_rc=0
         else
             _e2e_rc=$?
@@ -569,7 +569,7 @@ coverage-sonar)
     _covchild="$_covdir/child"
     _sonar_log="$root_dir/.needletail-dev/logs/dev-coverage-sonar.log"
     mkdir -p "$_covdir" "$_covchild" "$(dirname "$_sonar_log")"
-    rm -f "$_covdir"/*.profraw "$_covchild"/*.profraw "$root_dir/coverage-generic.xml"
+    rm -f "$_covdir"/*.profraw "$_covchild"/*.profraw "$root_dir/coverage-generic.xml" "$root_dir/.build/debug/codecov/"*.profraw
     _swiftbin=$(command -v "$NEEDLETAIL_SWIFT")
     _swiftreal=$(readlink -f "$_swiftbin" 2>/dev/null || printf '%s' "$_swiftbin")
     _llvmdir=$(dirname "$_swiftreal")
@@ -591,6 +591,7 @@ coverage-sonar)
     } > "$_wrap"
     chmod +x "$_wrap"
     echo "== coverage-sonar: full instrumented test run (assertions non-blocking) =="
+    _cov_start=$(date +%s)
     if NEEDLETAIL_BIN="$_wrap" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution > "$_sonar_log" 2>&1; then
         _sonar_rc=0
     else
@@ -598,6 +599,17 @@ coverage-sonar)
     fi
     cat "$_sonar_log"
     echo "NOTE [coverage-sonar]: test runner exited $_sonar_rc; assertion failures do not invalidate executed coverage (see lane comment)."
+    # Stale-profile guard (FINAL-03 review): everything merged below must
+    # have been produced by THIS run. The profraw trees were cleared at
+    # lane start, so require at least one fresh profile and reject any
+    # file older than the run — never silently merge leftovers.
+    _stale=0
+    for _f in "$root_dir/.build/debug/codecov/"*.profraw "$_covchild"/*.profraw; do
+        [ -e "$_f" ] || continue
+        [ "$(stat -c %Y "$_f" 2>/dev/null || echo 0)" -ge "$_cov_start" ] || { echo "FAIL [coverage-sonar]: stale profile $_f predates this run."; _stale=1; }
+    done
+    [ "$_stale" -eq 0 ] || exit 1
+    [ -n "$(ls -A "$root_dir/.build/debug/codecov" 2>/dev/null)" ] || { echo "FAIL [coverage-sonar]: no fresh profraw profiles produced by this run."; exit 1; }
     echo "== coverage-sonar: merge profiles =="
     if ! "$_llvmdir/llvm-profdata" merge -sparse "$root_dir/.build/debug/codecov/"*.profraw "$_covchild"/*.profraw -o "$_covdir/merged.profdata" 2>"$_covdir/merge.err"; then
         cat "$_covdir/merge.err"

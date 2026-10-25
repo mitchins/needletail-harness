@@ -76,7 +76,7 @@ struct TOOL09OrderedBatchTests {
         func describe(batch: ToolBatch) -> String { "shuffled" }
         func execute(batch: ToolBatch, reservation: EffectReservation) async throws -> ExecutorResult {
             let calls = batch.proposals.reversed().map {
-                ToolCallOutcome(callID: $0.callID, status: "success", summary: "ok", data: "ok", started: true)
+                ToolCallOutcome(callID: $0.callID, status: "success", summary: "ok-\($0.callID)", data: "data-\($0.callID)", started: true)
             }
             return ExecutorResult(receipt: ExecutorReceipt(callID: "shuf", status: "ok", summary: "ok"), calls: Array(calls))
         }
@@ -185,6 +185,10 @@ struct TOOL09OrderedBatchTests {
 
     private static func toolResponses(_ log: [DurableRecord]) -> [String] {
         log.compactMap { if case .transcriptAppended(.toolResponse(let id, _)) = $0 { return id } else { return nil } }
+    }
+
+    private static func transcriptTexts(_ log: [DurableRecord]) -> [(String, String)] {
+        log.compactMap { if case .transcriptAppended(.toolResponse(let id, let text)) = $0 { return (id, text) } else { return nil } }
     }
 
     /// Small predicates keeping #expect macro bodies trivially checkable
@@ -685,6 +689,15 @@ struct TOOL09OrderedBatchTests {
         let log = try Self.allRecords(run.store, run.session)
         #expect(Self.toolResponses(log) == ["c1", "c2"], "transcript follows proposal order, got \(Self.toolResponses(log))")
         #expect(Self.results(log).map(\.0.callID) == ["c1", "c2"], "results follow proposal order")
+        // Distinct per-call payloads: pairing by callID (not position) is
+        // observable — c1 must carry c1's outcome even though c2 reported
+        // first. Durable results carry the summary; transcript carries data.
+        let byID = Dictionary(Self.results(log).map { ($0.0.callID, $0.1) }, uniquingKeysWith: { a, _ in a })
+        #expect(byID["c1"] == "ok-c1", "c1 durable result carries c1's distinct summary, got \(byID["c1"] ?? "nil")")
+        #expect(byID["c2"] == "ok-c2", "c2 durable result carries c2's distinct summary, got \(byID["c2"] ?? "nil")")
+        let transcriptByID = Dictionary(Self.transcriptTexts(log), uniquingKeysWith: { a, _ in a })
+        #expect(transcriptByID["c1"] == "data-c1", "c1 transcript carries c1's distinct data, got \(transcriptByID["c1"] ?? "nil")")
+        #expect(transcriptByID["c2"] == "data-c2", "c2 transcript carries c2's distinct data, got \(transcriptByID["c2"] ?? "nil")")
     }
 
     @Test("TOOL_09_searchTimeoutTranscriptOnlyThroughActor")
