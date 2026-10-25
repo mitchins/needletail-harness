@@ -1,4 +1,8 @@
+#if canImport(Glibc)
 import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 /// FINAL-03: SIG_IGN for SIGPIPE, installed once per test-runner process.
 ///

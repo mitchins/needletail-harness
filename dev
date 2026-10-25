@@ -603,6 +603,10 @@ coverage-sonar)
     fi
     cat "$_sonar_log"
     echo "NOTE [coverage-sonar]: test runner exited $_sonar_rc; assertion failures do not invalidate executed coverage (see lane comment)."
+    # Signal/interruption deaths are NOT assertion failures: a runner
+    # killed mid-run (128+N) leaves whole modules unmeasured, so the
+    # merged report would understate coverage — refuse, do not certify.
+    [ "$_sonar_rc" -lt 128 ] || { echo "FAIL [coverage-sonar]: test runner died by signal/timeout (exit $_sonar_rc); refusing to certify coverage from an interrupted run."; exit 1; }
     # Stale-profile guard (FINAL-03 review): everything merged below must
     # have been produced by THIS run. The profraw trees were cleared at
     # lane start, so require at least one fresh profile and reject any
