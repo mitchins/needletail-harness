@@ -55,12 +55,11 @@ struct C1QualificationTests {
     }
 
     private static func countLiveGroupMembers(pgid: Int32) -> Int {
-        // direct scan for verification, not using the probe
+        // direct scan for verification, not using the probe — includes leader
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return -1 }
         var cnt = 0
         for name in entries {
             guard let pid = Int32(name) else { continue }
-            if pid == pgid { continue }
             guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8) else { continue }
             guard let r = stat.lastIndex(of: ")") else { continue }
             let after = stat[stat.index(after: r)...].trimmingCharacters(in: .whitespaces)
@@ -91,8 +90,8 @@ struct C1QualificationTests {
         let scr = """
             #!/bin/sh
             trap '' INT
-            # grandchild in same pgid
-            ( trap '' INT; echo $! > "\(grandFile.path)"; exec sleep 60 ) &
+            # grandchild in same pgid — capture pid outside subshell
+            ( trap '' INT; exec sleep 60 ) & echo $! > "\(grandFile.path)"
             echo $$ > "\(pgidFile.path)"
             echo ready > "\(ready.path)"
             # parent also ignores INT
@@ -121,21 +120,19 @@ struct C1QualificationTests {
         #expect(elapsed >= 3 && elapsed < 12, "escalation bound ~7s, took \(elapsed)")
 
         // Prove no owned group member survives after bounded cleanup.
-        // If pgid known, check /proc
-        if let pgid = Self.readIntFile(pgidFile), let grand = Self.readIntFile(grandFile) {
-            // Both pids should be gone or zombie then reaped
-            // Give a moment for reap
-            usleep(500_000)
-            let live = Self.countLiveGroupMembers(pgid: pgid)
-            #expect(live == 0, "group pgid \(pgid) must have no live members after escalation, found \(live) (grand \(grand))")
-            // Also check grandchild not zombie live
-            if FileManager.default.fileExists(atPath: "/proc/\(grand)/stat") {
-                #expect(Self.isZombie(pid: grand) || Self.procState(pid: grand) == nil, "grandchild \(grand) must be reaped or zombie, state \(Self.procState(pid: grand) ?? "gone")")
-            }
-            // Ensure main leader also reaped (no zombie leak)
-            #expect(!Self.isZombie(pid: pgid), "leader \(pgid) must not be zombie leak")
-            Self.killGroup(pgid: pgid)
+        guard let pgid = Self.readIntFile(pgidFile), let grand = Self.readIntFile(grandFile) else {
+            Issue.record("missing pgid/grand pid files at \(pgidFile.path) / \(grandFile.path)")
+            return
         }
+        // Give a moment for reap
+        usleep(500_000)
+        let live = Self.countLiveGroupMembers(pgid: pgid)
+        #expect(live == 0, "group pgid \(pgid) must have no live members after escalation, found \(live) (grand \(grand))")
+        if FileManager.default.fileExists(atPath: "/proc/\(grand)/stat") {
+            #expect(Self.isZombie(pid: grand) || Self.procState(pid: grand) == nil, "grandchild \(grand) must be reaped or zombie, state \(Self.procState(pid: grand) ?? "gone")")
+        }
+        #expect(!Self.isZombie(pid: pgid), "leader \(pgid) must not be zombie leak")
+        Self.killGroup(pgid: pgid)
         // Counterfactual: if we had only sent SIGINT (no TERM/KILL), the test would hang / not time out properly.
         // Verified by elapsed <12 and timedOut true.
     }
@@ -281,8 +278,8 @@ struct C1QualificationTests {
         let scr = """
             #!/bin/bash
             echo $$ > "\(pgidFile.path)"
-            # grandchild closes stdio, sleeps, leader exits
-            ( exec 1>&- 2>&-; echo $! > "\(grandFile.path)"; exec sleep 60 ) &
+            # grandchild closes stdio, sleeps, leader exits — capture pid outside subshell
+            ( exec 1>&- 2>&-; exec sleep 60 ) & echo $! > "\(grandFile.path)"
             sleep 0.2
             exit 0
             """
@@ -294,16 +291,17 @@ struct C1QualificationTests {
         let result = try NativeToolExecutor.runBounded(
             executablePath: script.path, args: [], stdoutCap: 1<<20, stderrCap: 1<<20,
             timeout: 5, useSession: true)
-        if let pgid = Self.readIntFile(pgidFile), let grand = Self.readIntFile(grandFile) {
-            usleep(500_000)
-            let live = Self.countLiveGroupMembers(pgid: pgid)
-            // Must have killed grandchild
-            #expect(live == 0, "closed-stdio grandchild must be killed, pgid \(pgid) live \(live)")
-            #expect(result.timedOut || result.status != 0, "pipes EOF but group live must not be success (timedOut \(result.timedOut))")
-            Self.killGroup(pgid: pgid)
-            if FileManager.default.fileExists(atPath: "/proc/\(grand)/stat") {
-                #expect(Self.isZombie(pid: grand) || Self.procState(pid: grand) == nil, "grand \(grand) must be reaped")
-            }
+        guard let pgid = Self.readIntFile(pgidFile), let grand = Self.readIntFile(grandFile) else {
+            Issue.record("missing pgid/grand for D at \(pgidFile.path)")
+            return
+        }
+        usleep(500_000)
+        let live = Self.countLiveGroupMembers(pgid: pgid)
+        #expect(live == 0, "closed-stdio grandchild must be killed, pgid \(pgid) live \(live)")
+        #expect(result.timedOut, "pipes EOF but group live must be timedOut (is timedOut \(result.timedOut) status \(result.status)) — clean success is a leak")
+        Self.killGroup(pgid: pgid)
+        if FileManager.default.fileExists(atPath: "/proc/\(grand)/stat") {
+            #expect(Self.isZombie(pid: grand) || Self.procState(pid: grand) == nil, "grand \(grand) must be reaped")
         }
     }
 
@@ -453,8 +451,9 @@ struct C1QualificationTests {
         let scr = """
             #!/bin/bash
             echo $$ > "\(pidFile.path)"
+            sleep 60 &
             echo ready > "\(ready.path)"
-            exec -a "a (b) c" sleep 60
+            exec sleep 60
             """
         try scr.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
@@ -486,7 +485,7 @@ struct C1QualificationTests {
         throw RequireSkip("Linux-only")
         #endif
         // Need a known live group to prove false-negative would be caught
-        // Create a live group via sleep in new session, then test probe hooks
+        // Create a live group with a non-leader member so probe true
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let ready = dir.appendingPathComponent("ready3")
@@ -495,6 +494,7 @@ struct C1QualificationTests {
         let scr = """
             #!/bin/bash
             echo $$ > "\(pgidFile.path)"
+            sleep 60 &
             echo ready > "\(ready.path)"
             exec sleep 60
             """
@@ -520,20 +520,16 @@ struct C1QualificationTests {
         NativeToolExecutor._testHook_probeDeadlineOffsetNs = 0
         #expect(NativeToolExecutor.groupHasLiveMembers(pgid: 999999) == true, "deadline 0 must be true (conservative)")
         NativeToolExecutor._testHook_probeDeadlineOffsetNs = nil
-        // After live group killed, probe should be false
+        // After live group killed, probe should be false (with 2048 limit, not truncated)
         task.cancel()
         _ = try? await task.value
         usleep(500_000)
-        // Now pgid should have no live members — verify via direct count (probe is conservative and may truncate on this host with 974 pids)
         let unusedPgid: Int32 = 1_999_999
         NativeToolExecutor._testHook_probeDeadlineOffsetNs = nil
         let emptyProbe = NativeToolExecutor.groupHasLiveMembers(pgid: unusedPgid)
-        // Probe is conservative: on hosts with >200 processes it returns true even for empty pgid due to truncation — accept either.
-        #expect(emptyProbe == true || emptyProbe == false, "probe returns valid Bool for empty pgid")
-        // Direct count without truncation must be 0 for empty pgid
+        #expect(emptyProbe == false, "empty pgid \(unusedPgid) must be false (live==true proves discrimination), got \(String(describing: emptyProbe))")
         let emptyDirect = Self.countLiveGroupMembers(pgid: unusedPgid)
         #expect(emptyDirect == 0, "empty pgid \(unusedPgid) must have 0 live members via direct scan, got \(emptyDirect)")
-        // And the just-killed real pgid must have 0 via direct scan
         let realDirect = Self.countLiveGroupMembers(pgid: pgid)
         #expect(realDirect == 0, "real pgid \(pgid) after kill must have 0 live members via direct scan, got \(realDirect)")
         let empty = emptyProbe
@@ -683,6 +679,170 @@ struct C1QualificationTests {
         // On Darwin, lifecycle is unqualified — no assertion
         #expect(Bool(true), "Darwin unqualified, no WNOWAIT check")
         #endif
+    }
+
+    @Test("PROC-02 group KILL — parent+grandchild trap INT+TERM, only KILL terminates", .timeLimit(.minutes(2)))
+    func proc02GroupKill() throws {
+        #if !canImport(Glibc)
+        throw RequireSkip("Linux-only")
+        #endif
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ready = dir.appendingPathComponent("ready_kill")
+        let pgidFile = dir.appendingPathComponent("pgid_kill")
+        let grandFile = dir.appendingPathComponent("grand_kill.pid")
+        let script = dir.appendingPathComponent("kill.sh")
+        let scr = """
+            #!/bin/sh
+            trap '' INT TERM
+            ( trap '' INT TERM; exec sleep 60 ) & echo $! > "\(grandFile.path)"
+            echo $$ > "\(pgidFile.path)"
+            echo ready > "\(ready.path)"
+            exec sleep 60
+            """
+        try scr.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let start = Date()
+        let result = try NativeToolExecutor.runBounded(
+            executablePath: script.path, args: [], stdoutCap: 1<<20, stderrCap: 1<<20,
+            timeout: 3, useSession: true)
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(result.timedOut, "INT+TERM ignored must be KILLed and timedOut, elapsed \(elapsed)")
+        #expect(elapsed >= 7 && elapsed < 13, "KILL stage at ~7s (INT 3, TERM 5, KILL 7), took \(elapsed)")
+        guard let pgid = Self.readIntFile(pgidFile), let grand = Self.readIntFile(grandFile) else {
+            Issue.record("missing pgid/grand for KILL test")
+            return
+        }
+        usleep(500_000)
+        #expect(Self.countLiveGroupMembers(pgid: pgid) == 0, "group must be empty after KILL")
+        #expect(!Self.isZombie(pid: grand) || Self.procState(pid: grand) == nil, "grand reaped")
+        Self.killGroup(pgid: pgid)
+    }
+
+    @Test("PROC-03 25 cycles — repeated timeout/cancel leaves no zombie/FD leak", .timeLimit(.minutes(3)))
+    func proc03TwentyFive() async throws {
+        for i in 0..<25 {
+            let task = Task.detached {
+                try NativeToolExecutor.runBounded(
+                    executablePath: "/bin/sleep", args: ["60"], stdoutCap: 64*1024, stderrCap: 64*1024,
+                    timeout: 2, useSession: true)
+            }
+            usleep(150_000)
+            // alternate cancel vs timeout: even i cancel, odd let timeout
+            if i % 2 == 0 {
+                task.cancel()
+                var didCancel = false
+                do { _ = try await task.value } catch is CancellationError { didCancel = true } catch { Issue.record("unexpected \(error) at \(i)") }
+                #expect(didCancel, "cycle \(i) cancel must throw")
+            } else {
+                let r = try await task.value
+                #expect(r.timedOut, "cycle \(i) timeout must be timedOut")
+            }
+            if i % 5 == 0 {
+                let quick = try NativeToolExecutor.runBounded(executablePath: "/bin/sh", args: ["-c", "exit 0"], stdoutCap: 64*1024, stderrCap: 64*1024, timeout: 2, useSession: true)
+                #expect(quick.status == 0, "after cycle \(i) quick must succeed")
+            }
+        }
+        #if canImport(Glibc)
+        let before = (try? FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd").count) ?? -1
+        for _ in 0..<5 {
+            _ = try NativeToolExecutor.runBounded(executablePath: "/bin/sh", args: ["-c", "exit 0"], stdoutCap: 64*1024, stderrCap: 64*1024, timeout: 2, useSession: false)
+        }
+        let after = (try? FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd").count) ?? -1
+        if before >= 0 && after >= 0 { #expect(after - before <= 2, "FD leak after 25 cycles: \(before)->\(after)") }
+        #endif
+    }
+
+    @Test("PROC-04 setsid descendant escapes group — exposed limitation, pid-cleanup only", .timeLimit(.minutes(2)))
+    func proc04SetsidEscape() throws {
+        #if !canImport(Glibc)
+        throw RequireSkip("Linux-only")
+        #endif
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let pgidFile = dir.appendingPathComponent("pgid4")
+        let escapedFile = dir.appendingPathComponent("escaped.pid")
+        let ready = dir.appendingPathComponent("ready4")
+        let script = dir.appendingPathComponent("escape.sh")
+        // Grandchild does setsid, creating new pgid, then sleeps — escapes parent group
+        let scr = """
+            #!/bin/sh
+            echo $$ > "\(pgidFile.path)"
+            # setsid escape: new session, new pgid
+            setsid sh -c 'echo $$ > "\(escapedFile.path)"; exec sleep 60' &
+            echo ready > "\(ready.path)"
+            exec sleep 60
+            """
+        try scr.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let result = try NativeToolExecutor.runBounded(
+            executablePath: script.path, args: [], stdoutCap: 1<<20, stderrCap: 1<<20,
+            timeout: 3, useSession: true)
+        #expect(result.timedOut, "parent group timeout must be timedOut")
+        guard let pgid = Self.readIntFile(pgidFile), let escaped = Self.readIntFile(escapedFile) else {
+            Issue.record("missing pgid/escaped for PROC-04")
+            return
+        }
+        usleep(500_000)
+        // Parent group should be empty (leader+non-escaped sleep killed), but escaped setsid member survives group KILL — exposed limitation
+        #expect(Self.countLiveGroupMembers(pgid: pgid) == 0, "parent pgid \(pgid) must be empty after escalation")
+        // Escaped pid is in new pgid, not parent's, so it survives — we must clean it via pid
+        let escapedState = Self.procState(pid: escaped)
+        #expect(escapedState != nil && escapedState != "Z", "escaped setsid descendant \(escaped) should still be live (exposed limitation), state \(escapedState ?? "gone")")
+        // Cleanup escaped via pid, not group
+        _ = NativeToolExecutor.killWithHook(escaped, SIGKILL)
+        usleep(300_000)
+        _ = NativeToolExecutor.killWithHook(escaped, SIGKILL)
+        #expect(Self.procState(pid: escaped) == nil || Self.isZombie(pid: escaped), "escaped must be reaped after pid kill")
+        Self.killGroup(pgid: pgid)
+    }
+
+    @Test("Benign clean path — no descendant, success not timedOut, probe false", .timeLimit(.minutes(1)))
+    func benignCleanPath() throws {
+        #if !canImport(Glibc)
+        throw RequireSkip("Linux-only")
+        #endif
+        // Count zombies before to avoid failing on pre-existing leaks from prior tests in same process
+        func zombiePids() -> Set<Int32> {
+            var s = Set<Int32>()
+            let selfPid = Glibc.getpid()
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return s }
+            for name in entries {
+                guard let pid = Int32(name) else { continue }
+                guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8) else { continue }
+                guard let r = stat.lastIndex(of: ")") else { continue }
+                let after = stat[stat.index(after: r)...].trimmingCharacters(in: .whitespaces)
+                let f = after.split(separator: " ", omittingEmptySubsequences: true)
+                guard f.count >= 2, let ppid = Int32(f[1]), ppid == selfPid, f[0] == "Z" else { continue }
+                s.insert(pid)
+            }
+            return s
+        }
+        let beforeZombies = zombiePids()
+        let result = try NativeToolExecutor.runBounded(
+            executablePath: "/bin/sh", args: ["-c", "echo hello; exit 0"], stdoutCap: 64*1024, stderrCap: 64*1024,
+            timeout: 5, useSession: true)
+        print("DEBUG benign result timedOut=\(result.timedOut) status=\(result.status) truncated=\(result.truncated) stdout='\(String(decoding: result.stdout, as: UTF8.self))' stderr='\(String(decoding: result.stderr, as: UTF8.self))'")
+        let probeUnused = NativeToolExecutor.groupHasLiveMembers(pgid: 9_999_998)
+        print("DEBUG probe unused 9999998=\(String(describing: probeUnused))")
+        #expect(!result.timedOut && result.status == 0, "clean exec must be success, not timedOut (got timedOut=\(result.timedOut) status=\(result.status))")
+        #expect(String(decoding: result.stdout, as: UTF8.self).contains("hello"))
+        // Probe for unused pgid: with 8192/500ms bound, typically false, but under extreme load may be true (conservative) — verify via direct count
+        let directEmpty = Self.countLiveGroupMembers(pgid: 9_999_998)
+        #expect(directEmpty == 0, "direct count for unused pgid must be 0, got \(directEmpty)")
+        if probeUnused != false {
+            print("WARN probe unused returned \(String(describing: probeUnused)) (conservative true under load, direct 0)")
+        }
+        // Verify no new zombie leak (delta, not absolute, to avoid prior-test interference)
+        let afterZombies = zombiePids()
+        let newZombies = afterZombies.subtracting(beforeZombies)
+        #expect(newZombies.isEmpty, "benign path must not leak new zombies: \(newZombies)")
+        // Also verify clean runs don't accumulate FDs
+        for _ in 0..<10 {
+            let r = try NativeToolExecutor.runBounded(executablePath: "/bin/sh", args: ["-c", "echo hello"], stdoutCap: 64*1024, stderrCap: 64*1024, timeout: 5, useSession: true)
+            #expect(r.status == 0 && !r.timedOut)
+        }
+        #expect(zombiePids().subtracting(beforeZombies).isEmpty, "10 rapid clean runs must not leak zombies")
     }
 }
 

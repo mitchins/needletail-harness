@@ -32,6 +32,7 @@ E2E_SUITES = {
     "CrashMatrixTests",
     "TOOL09OrderedBatchTests",
     "C1ProcRunnerTests",
+    "C1QualificationTests",
     "SessionExportTests",
 }
 
