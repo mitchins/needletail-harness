@@ -943,7 +943,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// already-validated open directory FD via fchdir (nil: inherit).
     /// Both are internal so GitDiff reuses this runner without duplicating
     /// the fork/exec/drain/escalation machinery.
-    static func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval, env: [String: String] = sanitizedSearchEnv, cwdFD: Int32? = nil) throws -> BoundedRunResult {
+    static func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval, env: [String: String] = sanitizedSearchEnv, cwdFD: Int32? = nil, execPath: String? = nil, useSession: Bool = false) throws -> BoundedRunResult {
         try Task.checkCancellation()
         Self.spawnLock.lock()
         let (outR, outW): (Int32, Int32)
@@ -1000,6 +1000,15 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             Self.spawnLock.unlock()
         }
         if pid == 0 {
+            // C1: dedicated process group/session where supported — the child
+            // becomes session and group leader; grandchildren inherit the group.
+            if useSession {
+#if canImport(Glibc)
+                _ = Glibc.setsid()
+#else
+                _ = Darwin.setsid()
+#endif
+            }
             // Child: wire pipes to stdio, drop pipe FDs, exec. The qualified
             // rg FD and search-root FDs are inheritable and survive into rg
             // for /proc/self/fd resolution. Guards avoid closing stdio itself
@@ -1020,15 +1029,20 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 if Darwin.fchdir(dir) != 0 { Darwin._exit(127) }
 #endif
             }
+            // C1: execPath split — the display argv[0] stays the resolved
+            // path, but the kernel executes the /proc/self/fd path.
+            let execvePath: UnsafeMutablePointer<CChar> = execPath != nil ? (strdup(execPath!) ?? pathC) : pathC
+            let needsFree = execPath != nil
             argv.withUnsafeMutableBufferPointer { abuf in
                 envp.withUnsafeMutableBufferPointer { ebuf in
 #if canImport(Glibc)
-                    _ = Glibc.execve(pathC, abuf.baseAddress!, ebuf.baseAddress!)
+                    _ = Glibc.execve(execvePath, abuf.baseAddress!, ebuf.baseAddress!)
 #else
-                    _ = Darwin.execve(pathC, abuf.baseAddress!, ebuf.baseAddress!)
+                    _ = Darwin.execve(execvePath, abuf.baseAddress!, ebuf.baseAddress!)
 #endif
                 }
             }
+            if needsFree { free(UnsafeMutablePointer(mutating: execvePath)) }
 #if canImport(Glibc)
             Glibc._exit(127)
 #else
@@ -1099,6 +1113,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         var hardStopped = false
         var termSent = false
         var killSent = false
+        var intSent = false
         var cancelled = false
         while true {
             var pfds: [pollfd] = []
@@ -1145,21 +1160,28 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 cancelled = true
                 break
             }
-            if !childDone && now >= deadlineNanos && !termSent {
+            if !childDone && now >= deadlineNanos && !intSent {
                 deadlineExceeded = true
-                termSent = true
+                intSent = true
 #if canImport(Glibc)
-                Glibc.kill(pid, SIGTERM)
+                if useSession { Glibc.kill(-pid, SIGINT) } else { Glibc.kill(pid, SIGINT) }
 #else
-                Darwin.kill(pid, SIGTERM)
+                if useSession { Darwin.kill(-pid, SIGINT) } else { Darwin.kill(pid, SIGINT) }
 #endif
                 killNanos = now + 2_000_000_000
-            }
-            if !childDone && termSent && !killSent && now >= killNanos {
+            } else if !childDone && intSent && !termSent && now >= killNanos {
+                termSent = true
 #if canImport(Glibc)
-                Glibc.kill(pid, SIGKILL)
+                if useSession { Glibc.kill(-pid, SIGTERM) } else { Glibc.kill(pid, SIGTERM) }
 #else
-                Darwin.kill(pid, SIGKILL)
+                if useSession { Darwin.kill(-pid, SIGTERM) } else { Darwin.kill(pid, SIGTERM) }
+#endif
+                killNanos = now + 2_000_000_000
+            } else if !childDone && termSent && !killSent && now >= killNanos {
+#if canImport(Glibc)
+                if useSession { Glibc.kill(-pid, SIGKILL) } else { Glibc.kill(pid, SIGKILL) }
+#else
+                if useSession { Darwin.kill(-pid, SIGKILL) } else { Darwin.kill(pid, SIGKILL) }
 #endif
                 killSent = true
                 killNanos = now + 2_000_000_000
