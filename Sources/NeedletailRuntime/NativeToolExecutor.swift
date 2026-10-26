@@ -938,28 +938,20 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         if monotonicNanos() > deadline { return true }
         var scanned = 0
         for name in entries {
-            if scanned >= 8192 || monotonicNanos() > deadline { return true }
+            if _testHook_probeForceTruncate || scanned >= 8192 || monotonicNanos() > deadline { return true }
             guard let pid = Int32(name), pid > 0 else { continue }
             scanned += 1
             // Skip leader itself — its own escalation already covers it.
             if pid == pgid { continue }
             guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8) else {
-                // Stale pid (exited between readdir and stat) => ENOENT, skip.
-                // Only EACCES/hidepid (file exists but unreadable) is conservative true.
-                if FileManager.default.fileExists(atPath: "/proc/\(pid)/stat") {
-                    return true
-                } else {
-                    continue
-                }
+                if _testHook_probeForceUnreadable || FileManager.default.fileExists(atPath: "/proc/\(pid)/stat") { return true } else { continue }
             }
-            // stat: "pid (comm) state ppid pgid ..."
-            guard let rParen = stat.lastIndex(of: ")") else { continue }
+            guard let rParen = stat.lastIndex(of: ")") else { return true }
             let after = stat[stat.index(after: rParen)...].trimmingCharacters(in: .whitespaces)
             let fields = after.split(separator: " ", omittingEmptySubsequences: true)
-            // fields[0] = state, fields[2] = pgid (since fields[0]=state,1=ppid,2=pgid)
-            guard fields.count >= 3 else { continue }
+            guard fields.count >= 3 else { return true }
             let state = fields[0]
-            guard let memberPGID = Int32(fields[2]) else { continue }
+            guard let memberPGID = Int32(fields[2]) else { return true }
             if memberPGID == pgid && state != "Z" {
                 return true
             }
@@ -1234,7 +1226,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             if _testHook_waitidECHILD {
                 errno = ECHILD
                 childDone = true
-                reaped = true
+                // Do not set reaped — leave real child for final reap to avoid leak
                 unsafeToSignal = true
             } else {
                 var info = siginfo_t()
@@ -1265,7 +1257,6 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             if _testHook_waitidECHILD {
                 errno = ECHILD
                 childDone = true
-                reaped = true
                 unsafeToSignal = true
             } else {
                 let wr = waitpid(pid, &st2, WNOHANG)
@@ -1391,8 +1382,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 if wrInt2 == pid { childDone = true } // Darwin: waitpid reaps but we keep reaped false until final
                 if wrInt2 < 0 && errno == ECHILD { childDone = true; reaped = true; unsafeToSignal = true; break }
 #endif
-                // Early exit if group empty and leader done
-                if childDone && (Self.groupHasLiveMembers(pgid: pid) == false || Self.groupHasLiveMembers(pgid: pid) == nil) { break }
+                if childDone { break }
                 usleep(100_000); intWaited += 1
             }
             if !reaped && !unsafeToSignal {
@@ -1420,7 +1410,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                     if wrT2 == pid { childDone = true }
                     if wrT2 < 0 && errno == ECHILD { childDone = true; reaped = true; unsafeToSignal = true; break }
 #endif
-                    if childDone && (Self.groupHasLiveMembers(pgid: pid) == false || Self.groupHasLiveMembers(pgid: pid) == nil) { break }
+                    if childDone { break }
                     usleep(100_000); termWaited += 1
                 }
             }

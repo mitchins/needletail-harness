@@ -217,8 +217,7 @@ struct C1QualificationTests {
             usleep(500_000)
             let live = Self.countLiveGroupMembers(pgid: pgid)
             #expect(live == 0, "grandchild must be killed after escalation, pgid \(pgid) live \(live)")
-            // Result should be timedOut because we escalated the group (even though leader exited 0)
-            #expect(result.timedOut || live == 0, "early-exit+live descendant must not be success without escalation (timedOut=\(result.timedOut) status=\(result.status))")
+            #expect(result.timedOut, "early-exit+live descendant must be timedOut (is timedOut=\(result.timedOut) status=\(result.status)) — probe must escalate, not success")
             if !Self.isZombie(pid: grand) {
                 // grand should be gone
                 #expect(!FileManager.default.fileExists(atPath: "/proc/\(grand)/stat") || Self.isZombie(pid: grand), "grandchild \(grand) reaped")
@@ -382,30 +381,28 @@ struct C1QualificationTests {
         #if !canImport(Glibc)
         throw RequireSkip("Linux-only")
         #endif
-        // Exercise the exact rg/git path: useSession false, waitid WNOWAIT left zombie but clean reap must handle
-        // Do 10 rapid runs and verify no zombie accumulation for self
-        for _ in 0..<10 {
-            let r = try NativeToolExecutor.runBounded(executablePath: "/bin/sh", args: ["-c", "echo hello"], stdoutCap: 64*1024, stderrCap: 64*1024, timeout: 5, useSession: false)
-            #expect(r.status == 0 && !r.timedOut)
-            #expect(String(decoding: r.stdout, as: UTF8.self).contains("hello"))
-        }
-        // Check no zombie children of this process
-        // Scan /proc/self/task or just ensure no child pid with ppid=self in Z
-        let selfPid = Glibc.getpid()
-        if let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") {
+        func zombies() -> Set<Int32> {
+            var s = Set<Int32>(); let selfPid = Glibc.getpid()
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return s }
             for name in entries {
                 guard let pid = Int32(name) else { continue }
                 guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8) else { continue }
                 guard let r = stat.lastIndex(of: ")") else { continue }
                 let after = stat[stat.index(after: r)...].trimmingCharacters(in: .whitespaces)
                 let f = after.split(separator: " ", omittingEmptySubsequences: true)
-                guard f.count >= 3 else { continue }
-                // f[1] is ppid
-                if let ppid = Int32(f[1]), ppid == selfPid {
-                    #expect(f[0] != "Z", "zombie child \(pid) of self \(selfPid) — leak! stat \(stat.prefix(80))")
-                }
+                guard f.count >= 3, let ppid = Int32(f[1]), ppid == selfPid, f[0] == "Z" else { continue }
+                s.insert(pid)
             }
+            return s
         }
+        let before = zombies()
+        for _ in 0..<10 {
+            let r = try NativeToolExecutor.runBounded(executablePath: "/bin/sh", args: ["-c", "echo hello"], stdoutCap: 64*1024, stderrCap: 64*1024, timeout: 5, useSession: false)
+            #expect(r.status == 0 && !r.timedOut)
+            #expect(String(decoding: r.stdout, as: UTF8.self).contains("hello"))
+        }
+        let after = zombies()
+        #expect(after.subtracting(before).isEmpty, "ordinary path must not leak new zombies: \(after.subtracting(before))")
     }
 
     // MARK: - 3 /proc and parser
@@ -613,11 +610,10 @@ struct C1QualificationTests {
 
     @Test("Kill failed but no fabricated success — ECHILD and EPERM are timedOut, not success", .timeLimit(.minutes(1)))
     func noFabricatedSuccess() throws {
-        // Ensure that neither fault can be mis-reported as success with status 0
         NativeToolExecutor._testHook_waitidECHILD = true
+        defer { NativeToolExecutor._testHook_waitidECHILD = false }
         let r1 = try NativeToolExecutor.runBounded(executablePath: "/bin/sh", args: ["-c", "exit 0"], stdoutCap: 64*1024, stderrCap: 64*1024, timeout: 5, useSession: true)
-        NativeToolExecutor._testHook_waitidECHILD = false
-        #expect(r1.timedOut && r1.status != 0 || r1.timedOut, "ECHILD must not be success 0")
+        #expect(r1.timedOut, "ECHILD must be timedOut (is \(r1.timedOut) status \(r1.status))")
         // EPERM case already proved timedOut above; no additional check needed
     }
 
@@ -822,9 +818,7 @@ struct C1QualificationTests {
         let result = try NativeToolExecutor.runBounded(
             executablePath: "/bin/sh", args: ["-c", "echo hello; exit 0"], stdoutCap: 64*1024, stderrCap: 64*1024,
             timeout: 5, useSession: true)
-        print("DEBUG benign result timedOut=\(result.timedOut) status=\(result.status) truncated=\(result.truncated) stdout='\(String(decoding: result.stdout, as: UTF8.self))' stderr='\(String(decoding: result.stderr, as: UTF8.self))'")
         let probeUnused = NativeToolExecutor.groupHasLiveMembers(pgid: 9_999_998)
-        print("DEBUG probe unused 9999998=\(String(describing: probeUnused))")
         #expect(!result.timedOut && result.status == 0, "clean exec must be success, not timedOut (got timedOut=\(result.timedOut) status=\(result.status))")
         #expect(String(decoding: result.stdout, as: UTF8.self).contains("hello"))
         // Probe for unused pgid: with 8192/500ms bound, typically false, but under extreme load may be true (conservative) — verify via direct count
