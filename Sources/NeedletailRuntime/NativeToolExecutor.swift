@@ -1114,7 +1114,9 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         var termSent = false
         var killSent = false
         var intSent = false
+        var reaped = false
         var cancelled = false
+        var unsafeToSignal = false
         while true {
             var pfds: [pollfd] = []
             if !outEOF { pfds.append(pollfd(fd: outR, events: Int16(POLLIN), revents: 0)) }
@@ -1138,6 +1140,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             let wr = waitpid(pid, &st, WNOHANG)
             if wr == pid {
                 childDone = true
+                reaped = true
                 if (st & 0x7F) == 0 {
                     exitStatus = (st >> 8) & 0xFF
                 } else {
@@ -1147,6 +1150,8 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 // Reaped elsewhere: no zombie can remain, but the status is
                 // unknown and the pid must never be signalled (reuse risk).
                 childDone = true
+                reaped = true
+                unsafeToSignal = true
             }
             let now = Self.monotonicNanos()
             // Deadline expiry is sticky and independent of child state: it is
@@ -1197,14 +1202,23 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         }
         if cancelled || (!childDone) {
             // Escalate and reap; cancellation always terminates the child.
-            // Never signal a reaped pid (reuse risk): waitpid ECHILD marks
-            // childDone above, and every kill below is guarded by !childDone.
-            if !childDone {
+            // When useSession, target the group; also handle the setsid race
+            // by sending both pid and -pgid in the first stage if useSession.
+            // Never signal a reaped pid (reuse risk) or when unsafeToSignal.
+            if !childDone && !unsafeToSignal {
+                if useSession {
 #if canImport(Glibc)
-                Glibc.kill(pid, SIGTERM)
+                    Glibc.kill(pid, SIGINT); Glibc.kill(-pid, SIGINT)
 #else
-                Darwin.kill(pid, SIGTERM)
+                    Darwin.kill(pid, SIGINT); Darwin.kill(-pid, SIGINT)
 #endif
+                } else {
+#if canImport(Glibc)
+                    Glibc.kill(pid, SIGINT)
+#else
+                    Darwin.kill(pid, SIGINT)
+#endif
+                }
             }
             var st: Int32 = 0
             var waited = 0
@@ -1228,9 +1242,9 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             }
             if !childDone {
 #if canImport(Glibc)
-                Glibc.kill(pid, SIGKILL)
+                if useSession { Glibc.kill(-pid, SIGKILL) } else { Glibc.kill(pid, SIGKILL) }
 #else
-                Darwin.kill(pid, SIGKILL)
+                if useSession { Darwin.kill(-pid, SIGKILL) } else { Darwin.kill(pid, SIGKILL) }
 #endif
                 var waited2 = 0
                 while !childDone && waited2 < 20 {
