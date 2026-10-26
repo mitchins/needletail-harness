@@ -51,7 +51,7 @@ FILTER_PRESENTATION_PURE="NeedletailPresentationTests"
 # Suites owned by the serialized lanes (FINAL-02 timing, FINAL-03 e2e):
 # every bulk swift-test invocation skips them; the lanes certify them
 # in isolation with identical assertions and thresholds.
-BULK_SKIP="--skip TransportCancellationTests --skip B5CEndToEndTests --skip TOOL10DiffTests --skip ProductionCLIWiringTests --skip ProductionExportCLIWiringTests --skip CrossRunGateCLITests --skip B1ContainmentTests --skip CrashMatrixTests --skip TOOL09OrderedBatchTests --skip SessionExportTests"
+BULK_SKIP="--skip TransportCancellationTests --skip B5CEndToEndTests --skip TOOL10DiffTests --skip ProductionCLIWiringTests --skip ProductionExportCLIWiringTests --skip CrossRunGateCLITests --skip B1ContainmentTests --skip CrashMatrixTests --skip TOOL09OrderedBatchTests --skip SessionExportTests --skip C1ProcRunnerTests"
 
 swift_test() {
     # One test worker at a time: loopback suites share process/OS

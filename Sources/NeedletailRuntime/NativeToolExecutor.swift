@@ -1200,8 +1200,13 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             }
             if childDone && outEOF && errEOF { break }
         }
-        if cancelled || (!childDone) {
-            // Escalate and reap; cancellation always terminates the child.
+        // C1: cancellation and timeout share the same group-aware escalation.
+        // When useSession, the group is the containment boundary; when the
+        // leader is reaped but the group may still have members (pipes held
+        // open), the group KILL must still be sent. The reaped flag gates
+        // group signals, not childDone.
+        if cancelled || (!childDone) || (!reaped && useSession) {
+            // Escalate and reap; cancellation always terminates the child/group.
             // When useSession, target the group; also handle the setsid race
             // by sending both pid and -pgid in the first stage if useSession.
             // Never signal a reaped pid (reuse risk) or when unsafeToSignal.
