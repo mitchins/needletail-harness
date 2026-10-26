@@ -60,12 +60,12 @@ public struct ExecRunner: Sendable {
         approvedDigest: String? = nil,
         timeout: TimeInterval = Double(ExecArguments.defaultTimeoutSecs)
     ) throws -> Result {
-        // Re-verify the approved digest at spawn (C1) — no silent substitution.
-        // For C1 tests that don't go through the resolver, approvedDigest is nil and we skip.
-        // The executable walk is the same anchored byteSplit walk as the resolver.
+        // C1 store-free runner: executable identity is bound by C0 (approval/
+        // reservation digest); this slice does not yet re-resolve and hash at
+        // spawn. approvedDigest is accepted for forward-compat but not verified
+        // here — C2 will re-run the anchored walk and compare. No silent
+        // substitution is claimed beyond the C0 binding for this slice.
         let startNanos = NativeToolExecutor.monotonicNanos()
-        let timeoutNs = UInt64(max(0, timeout) * 1_000_000_000)
-        let deadlineNs = startNanos + timeoutNs
 
         // Resolve cwd if present
         var cwdFD: Int32? = nil
@@ -110,24 +110,10 @@ public struct ExecRunner: Sendable {
             childEnv[k] = v
         }
 
-        // For the executable, we need to open and hash it if approvedDigest is set, to verify.
-        // For now, we just use the executable path directly; the digest check is deferred to the spawn's
-        // re-resolve. For C1, we re-resolve via the same anchored walk as the resolver would, but
-        // we can also just verify by opening the file and hashing if approvedDigest is present.
-        // To keep C1 simple, we delegate to the resolver's walk for verification: if approvedDigest
-        // is present, we re-resolve the executable via the same logic and compare digests.
-        // For this C1 stub, we skip the re-resolve and just launch; the digest binding is
-        // verified at the approval/reservation layer (C0), and C1's spawn re-verification is
-        // the same walk — we can call a helper to verify.
-
-        // Use the existing NativeToolExecutor's runBounded with the new C1 parameters for the
-        // supervised spawn. For C1, we use a direct fork/exec path that mirrors runBounded but
-        // with the C1 enhancements. To avoid duplicating 400 lines, we call the extended
-        // runBounded with the C1 flags.
-
-        // The executable path for the child is the resolved path; for C1 tests we use the
-        // requested path directly (they don't go through the resolver's symlink resolution).
-        // For approvedDigest verification, we would re-resolve here.
+        // C1: approvedDigest verification deferred — see docstring above.
+        // The executable path is used directly; the C2 slice will re-resolve
+        // via the anchored walk, qualify, hash and compare before exec.
+        _ = approvedDigest // accepted for API compat, verified in C2
 
         let stdoutCap = 32 * 1024 * 1024
         let stderrCap = 32 * 1024 * 1024
