@@ -1167,11 +1167,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 cancelled = true
                 break
             }
-            if !childDone && now >= deadlineNanos && !intSent {
+            if (!childDone || (!reaped && useSession)) && now >= deadlineNanos && !intSent {
                 deadlineExceeded = true
                 intSent = true
 #if canImport(Glibc)
-                if useSession { Glibc.kill(-pid, SIGINT) } else { Glibc.kill(pid, SIGINT) }
+                if useSession && !reaped { Glibc.kill(-pid, SIGINT) } else if !childDone { Glibc.kill(pid, SIGINT) }
 #else
                 if useSession { Darwin.kill(-pid, SIGINT) } else { Darwin.kill(pid, SIGINT) }
 #endif
