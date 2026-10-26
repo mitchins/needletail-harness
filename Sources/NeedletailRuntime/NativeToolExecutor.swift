@@ -885,20 +885,59 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// concurrently via poll() with in-loop caps (never buffered unboundedly);
     /// wall-clock timeout escalates SIGTERM -> SIGKILL; the child is always
     /// reaped via waitpid; Task cancellation terminates and throws.
+    // MARK: - C1 qualification test hooks (internal, test-only)
+    // Fault-injection seams for ECHILD/EPERM/probe counterfactuals. Never set
+    // in production; tests set/clear them and must reset after.
+    nonisolated(unsafe) static var _testHook_waitidECHILD = false
+    nonisolated(unsafe) static var _testHook_killFailPID: pid_t? = nil // when set, kill(pid,_) and kill(-pid,_) return -1/EPERM
+    nonisolated(unsafe) static var _testHook_probeForceTruncate = false
+    nonisolated(unsafe) static var _testHook_probeForceUnreadable = false
+    nonisolated(unsafe) static var _testHook_probeDeadlineOffsetNs: UInt64? = nil // if set, probe deadline = now + offset (0 => immediate)
+
+    /// Exposed for qualification tests: parse a /proc/<pid>/stat string into
+    /// (state, pgid) using the same last-')' logic as the probe. Returns nil
+    /// on malformed input. Handles parenthesized comm with spaces/parens.
+    static func parseProcStatForTest(_ stat: String) -> (state: String, pgid: Int32)? {
+        guard let rParen = stat.lastIndex(of: ")") else { return nil }
+        let after = stat[stat.index(after: rParen)...].trimmingCharacters(in: .whitespaces)
+        let fields = after.split(separator: " ", omittingEmptySubsequences: true)
+        guard fields.count >= 3 else { return nil }
+        guard let pgid = Int32(fields[2]) else { return nil }
+        return (String(fields[0]), pgid)
+    }
+
+    /// Test-visible kill wrapper that honors _testHook_killFailPID.
+    @discardableResult
+    static func killWithHook(_ pid: pid_t, _ sig: Int32) -> Int32 {
+        if let fail = _testHook_killFailPID {
+            if pid == fail || pid == -fail { errno = EPERM; return -1 }
+        }
+#if canImport(Glibc)
+        return Glibc.kill(pid, sig)
+#else
+        return Darwin.kill(pid, sig)
+#endif
+    }
+
     /// Linux /proc group liveness probe (REV12 §3.5 Change 2/3): enumerate
     /// /proc/<pid>/stat and match pgrp (fields[2] after final ')', state at
-    /// fields[0]) with state != 'Z' (live). Bounded: ≤200 entries, ≤20 ms wall
+    /// fields[0]) with state != 'Z' (live). Bounded: ≤2048 entries, ≤50 ms wall
     /// including the directory read; on enumeration error or truncated/uncertain
     /// scan conservatively returns true (escalate). Non-Linux: nil (unqualified).
-    private static func groupHasLiveMembers(pgid: pid_t) -> Bool? {
+    /// Bound raised from 200/20ms to avoid host-specific false positives on
+    /// builders with ~1000 pids while remaining bounded per REV12.
+    static func groupHasLiveMembers(pgid: pid_t) -> Bool? {
 #if canImport(Glibc)
-        let deadline = monotonicNanos() + 20_000_000
+        if _testHook_probeForceTruncate { return true }
+        if _testHook_probeForceUnreadable { return true }
+        let deadlineOffset: UInt64 = _testHook_probeDeadlineOffsetNs ?? 50_000_000
+        let deadline = monotonicNanos() + deadlineOffset
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(atPath: "/proc") else { return true }
         if monotonicNanos() > deadline { return true }
         var scanned = 0
         for name in entries {
-            if scanned >= 200 || monotonicNanos() > deadline { return true }
+            if scanned >= 2048 || monotonicNanos() > deadline { return true }
             guard let pid = Int32(name), pid > 0 else { continue }
             scanned += 1
             // Skip leader itself — its own escalation already covers it.
@@ -1187,46 +1226,60 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             // siginfo_t field access via raw offsets (si_code@8, si_pid@16,
             // si_status@24) because Swift's Glibc overlay doesn't expose the
             // macro-mapped si_pid/si_status members.
-            var info = siginfo_t()
-            let wr = Glibc.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
-            if wr == 0 {
-                let siCode: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 8, as: Int32.self) }
-                let siPid: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 16, as: Int32.self) }
-                if siPid == pid {
-                    childDone = true
-                    // Do NOT set reaped — leader stays unreaped zombie until final reap.
-                    if siCode == CLD_EXITED {
-                        let siStatus: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 24, as: Int32.self) }
-                        exitStatus = siStatus
-                        st2 = siStatus
-                    } else {
-                        exitStatus = 128
-                        st2 = 128
-                    }
-                    st = st2
-                }
-            } else if wr != 0 && errno == ECHILD {
+            if _testHook_waitidECHILD {
+                errno = ECHILD
                 childDone = true
                 reaped = true
                 unsafeToSignal = true
+            } else {
+                var info = siginfo_t()
+                let wr = Glibc.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+                if wr == 0 {
+                    let siCode: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 8, as: Int32.self) }
+                    let siPid: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 16, as: Int32.self) }
+                    if siPid == pid {
+                        childDone = true
+                        // Do NOT set reaped — leader stays unreaped zombie until final reap.
+                        if siCode == CLD_EXITED {
+                            let siStatus: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 24, as: Int32.self) }
+                            exitStatus = siStatus
+                            st2 = siStatus
+                        } else {
+                            exitStatus = 128
+                            st2 = 128
+                        }
+                        st = st2
+                    }
+                } else if wr != 0 && errno == ECHILD {
+                    childDone = true
+                    reaped = true
+                    unsafeToSignal = true
+                }
             }
 #else
-            let wr = waitpid(pid, &st2, WNOHANG)
-            if wr == pid {
-                childDone = true
-                // Darwin fallback: waitpid reaps; pgid recycle risk unqualified.
-                // Set reaped here on Darwin so group signals stop (safe fallback).
-                reaped = true
-                if (st2 & 0x7F) == 0 {
-                    exitStatus = (st2 >> 8) & 0xFF
-                } else {
-                    exitStatus = 128
-                }
-                st = st2
-            } else if wr < 0 && errno == ECHILD {
+            if _testHook_waitidECHILD {
+                errno = ECHILD
                 childDone = true
                 reaped = true
                 unsafeToSignal = true
+            } else {
+                let wr = waitpid(pid, &st2, WNOHANG)
+                if wr == pid {
+                    childDone = true
+                    // Darwin fallback: waitpid reaps; pgid recycle risk unqualified.
+                    // Set reaped here on Darwin so group signals stop (safe fallback).
+                    reaped = true
+                    if (st2 & 0x7F) == 0 {
+                        exitStatus = (st2 >> 8) & 0xFF
+                    } else {
+                        exitStatus = 128
+                    }
+                    st = st2
+                } else if wr < 0 && errno == ECHILD {
+                    childDone = true
+                    reaped = true
+                    unsafeToSignal = true
+                }
             }
 #endif
             let now = Self.monotonicNanos()
@@ -1245,30 +1298,30 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 deadlineExceeded = true
                 intSent = true
 #if canImport(Glibc)
-                if !childDone && !unsafeToSignal { Glibc.kill(pid, SIGINT) }
-                if useSession && !reaped && !unsafeToSignal { Glibc.kill(-pid, SIGINT) }
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGINT) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGINT) }
 #else
-                if !childDone && !unsafeToSignal { Darwin.kill(pid, SIGINT) }
-                if useSession && !reaped && !unsafeToSignal { Darwin.kill(-pid, SIGINT) }
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGINT) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGINT) }
 #endif
                 killNanos = now + 2_000_000_000
             } else if (!childDone || (!reaped && useSession)) && intSent && !termSent && now >= killNanos {
                 termSent = true
 #if canImport(Glibc)
-                if !childDone && !unsafeToSignal { Glibc.kill(pid, SIGTERM) }
-                if useSession && !reaped && !unsafeToSignal { Glibc.kill(-pid, SIGTERM) }
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGTERM) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGTERM) }
 #else
-                if !childDone && !unsafeToSignal { Darwin.kill(pid, SIGTERM) }
-                if useSession && !reaped && !unsafeToSignal { Darwin.kill(-pid, SIGTERM) }
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGTERM) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGTERM) }
 #endif
                 killNanos = now + 2_000_000_000
             } else if (!childDone || (!reaped && useSession)) && termSent && !killSent && now >= killNanos {
 #if canImport(Glibc)
-                if !childDone && !unsafeToSignal { Glibc.kill(pid, SIGKILL) }
-                if useSession && !reaped && !unsafeToSignal { Glibc.kill(-pid, SIGKILL) }
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGKILL) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGKILL) }
 #else
-                if !childDone && !unsafeToSignal { Darwin.kill(pid, SIGKILL) }
-                if useSession && !reaped && !unsafeToSignal { Darwin.kill(-pid, SIGKILL) }
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGKILL) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGKILL) }
 #endif
                 killSent = true
                 killNanos = now + 2_000_000_000
@@ -1302,23 +1355,23 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             if !unsafeToSignal {
                 if !childDone && useSession {
 #if canImport(Glibc)
-                    Glibc.kill(pid, SIGINT); Glibc.kill(-pid, SIGINT)
+                    Self.killWithHook(pid, SIGINT); Self.killWithHook(-pid, SIGINT)
 #else
-                    Darwin.kill(pid, SIGINT); Darwin.kill(-pid, SIGINT)
+                    Self.killWithHook(pid, SIGINT); Self.killWithHook(-pid, SIGINT)
 #endif
                 } else if !childDone {
 #if canImport(Glibc)
-                    Glibc.kill(pid, SIGINT)
+                    Self.killWithHook(pid, SIGINT)
 #else
-                    Darwin.kill(pid, SIGINT)
+                    Self.killWithHook(pid, SIGINT)
 #endif
                 } else if !reaped && useSession {
                     // Leader already exited (childDone) but zombie (!reaped) —
                     // descendant may hold pipes open. Signal group only.
 #if canImport(Glibc)
-                    Glibc.kill(-pid, SIGINT)
+                    Self.killWithHook(-pid, SIGINT)
 #else
-                    Darwin.kill(-pid, SIGINT)
+                    Self.killWithHook(-pid, SIGINT)
 #endif
                 }
             }
@@ -1349,9 +1402,9 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 // Full escalation: TERM grace before KILL (INT already sent).
                 // Covers cancellation and /proc-probe live-descendant paths.
 #if canImport(Glibc)
-                Glibc.kill(-pid, SIGTERM); if !childDone { Glibc.kill(pid, SIGTERM) }
+                Self.killWithHook(-pid, SIGTERM); if !childDone { Self.killWithHook(pid, SIGTERM) }
 #else
-                Darwin.kill(-pid, SIGTERM); if !childDone { Darwin.kill(pid, SIGTERM) }
+                Self.killWithHook(-pid, SIGTERM); if !childDone { Self.killWithHook(pid, SIGTERM) }
 #endif
                 var termWaited = 0
                 while !reaped && termWaited < 20 {
@@ -1364,11 +1417,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             if !reaped && !unsafeToSignal {
                 // Final KILL escalation for remaining group/leader (split predicate).
 #if canImport(Glibc)
-                if useSession { Glibc.kill(-pid, SIGKILL) }
-                if !childDone { Glibc.kill(pid, SIGKILL) }
+                if useSession { Self.killWithHook(-pid, SIGKILL) }
+                if !childDone { Self.killWithHook(pid, SIGKILL) }
 #else
-                if useSession { Darwin.kill(-pid, SIGKILL) }
-                if !childDone { Darwin.kill(pid, SIGKILL) }
+                if useSession { Self.killWithHook(-pid, SIGKILL) }
+                if !childDone { Self.killWithHook(pid, SIGKILL) }
 #endif
                 var waited2 = 0
                 while !reaped && waited2 < 20 {
