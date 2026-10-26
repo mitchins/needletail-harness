@@ -136,18 +136,21 @@ struct ActorApprovalTests {
         #expect(trustedApprovals.requests.isEmpty, "no approval asked in trustedExec")
     }
 
-    @Test("HEAD-03 approval precedence: ask-gated exec with unshaped args still asks")
+    @Test("HEAD-03 approval precedence: ask-gated schema-valid exec still asks")
     func HEAD_03_approvalPrecedenceAskGatedExec() async throws {
-        // FINAL-03: the strict validator runs before the approval check.
-        // An ask-policy exec proposal whose shape the validator rejects
-        // must still reach the operator (headless: approval-required),
-        // not synthesize a provider continuation past the gate. Silent
-        // gateway parks at authorising for stable observation.
+        // M2-C C0 (plan REV12 §3.2): HEAD-03's required OUTCOME is
+        // preserved through the main path — a SCHEMA-VALID exec proposal
+        // under an ask gate reaches the operator (authorising, one
+        // approval request, no provider continuation), not a synthesized
+        // continuation. The demo epoch (no resolver composed) approves
+        // through the single-hop path with an `unresolved (demo)` display;
+        // the two-phase resolved display is certified in C0ExecContractTests.
         let approvals = ScriptedApprovals()
         let (actor, transport, _, _) = try await Self.authorisingActor(
             approvals: approvals,
-            batch: [ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: "{\"command\":\"pytest\"}")])
-        try await ActorFixtures.awaitPhase(actor, { $0.phase == .authorising }, "authorising despite unshaped args")
+            batch: [ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d",
+                                 arguments: "{\"executable\":\"/usr/bin/pytest\",\"argv\":[\"/usr/bin/pytest\",\"-q\"]}")])
+        try await ActorFixtures.awaitPhase(actor, { $0.phase == .authorising }, "authorising for ask-gated exec")
         for _ in 0..<100_000 where approvals.requests.count < 1 {
             await Task.yield()
         }
@@ -155,6 +158,36 @@ struct ActorApprovalTests {
         #expect(transport.invocations.count == 1, "no provider continuation past the gate")
         let pending = await actor.currentState()
         #expect(pending.pendingApproval != nil, "approval request is pending")
+        #expect(pending.pendingApproval?.execIdentities.isEmpty == true, "demo path binds no identities (no resolver composed)")
+    }
+
+    @Test("HEAD-03 malformed exec is never approved (C0 counterfactual)")
+    func HEAD_03_malformedExecNeverApproved() async throws {
+        // MUST-FAIL PROBE (plan REV12 §3.2): reintroducing shape-blind
+        // approval (the retired compatibility branch) makes this fail — a
+        // malformed exec proposal must NEVER reach the operator, never
+        // resolve, and never dispatch. Deterministic invalid-arguments
+        // continuation only.
+        let approvals = ScriptedApprovals()
+        approvals.script = [.deny("must never be asked")]
+        let transport = ScriptedTransport()
+        let (actor, _) = try ActorFixtures.makeActor(mode: .workspace, permissive: true, transport: transport, approvals: approvals)
+        transport.script = [ProviderResponse(
+            requestID: RequestID("s"), generation: Revision(0),
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: "{\"command\":\"pytest\"}"),
+                ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d", arguments: "{}"),
+                ToolProposal(callID: "c3", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"pytest\",\"argv\":[\"pytest\"]}"),
+            ], isFinal: false))]
+        await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
+        for _ in 0..<100_000 where transport.invocations.count < 2 {
+            await Task.yield()
+        }
+        #expect(approvals.requests.isEmpty, "no approval for malformed exec — validation precedes approval")
+        #expect(transport.invocations.count == 2, "deterministic provider continuation after the typed rejection")
+        let final = await actor.currentState()
+        #expect(final.pendingApproval == nil, "no approval request pending")
+        #expect(final.pendingResolution == nil && final.pendingExecIdentities == nil, "no resolution state leaked")
     }
 
     @Test("Precedence control: non-gated invalid batch still continues")

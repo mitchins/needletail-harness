@@ -1,3 +1,4 @@
+import Foundation
 /// M1-B production transition function (SPEC §4.2, ARCH §§1–4).
 ///
 /// `transition(state:event:ids:)` is TOTAL over the (phase, event) table in
@@ -31,6 +32,8 @@ public enum Effect: Sendable, Equatable {
     case cancelInFlight(runID: RunID, reason: String)
     case requestApproval(ApprovalRequest)
     case reserveEffect(EffectReservation)
+    /// M2-C C0 phase 1 (plan REV12 §3.4b).
+    case resolveExecIdentities(resolutionID: String, batch: ToolBatch)
 }
 
 public struct ProviderInvocation: Sendable, Equatable {
@@ -73,8 +76,13 @@ public struct EffectReservation: Sendable, Equatable {
     public let batch: ToolBatch
     public let kind: Kind
     public let approvedPaths: [String]
+    /// M2-C C0 (plan REV12 §3.4b.7).
+    public let approvedExecDigests: [String: String]
+    /// M2-C C0 (plan REV12 §3.4): the resolved cwd identity bound alongside
+    /// the executable digest ("dev:ino" string). C1 re-verifies at spawn.
+    public let approvedCwdIdentities: [String: String]
 
-    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch(), kind: Kind, approvedPaths: [String] = []) {
+    public init(effectID: EffectID, runID: RunID, requestID: RequestID? = nil, generation: Revision, revision: Revision, mutating: Bool, batch: ToolBatch = ToolBatch(), kind: Kind, approvedPaths: [String] = [], approvedExecDigests: [String: String] = [:], approvedCwdIdentities: [String: String] = [:]) {
         self.effectID = effectID
         self.runID = runID
         self.requestID = requestID
@@ -84,6 +92,8 @@ public struct EffectReservation: Sendable, Equatable {
         self.batch = batch
         self.kind = kind
         self.approvedPaths = approvedPaths
+        self.approvedExecDigests = approvedExecDigests
+        self.approvedCwdIdentities = approvedCwdIdentities
     }
 }
 
@@ -259,7 +269,8 @@ private func integrityStop<I: IDSource>(_ state: SessionState, ids: inout I) -> 
     let (s1, prefix) = sequenced(state, kind: "integrity-stopped", digest: "marker-bound", ids: &ids)
     let next = s1.replacing(
         phase: .failed(.integrityStopped("unresolved marker bound (\(maxUnresolvedOperations)) exceeded")),
-        queueHeld: true, heldReason: .error("integrity stop"))
+        queueHeld: true, heldReason: .error("integrity stop"),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(nil))
     return Transition(
         state: next,
         effects: [.emitUI(.denied(cause: "integrity stop: recovery ledger overflowed; explicit operator reset required"))],
@@ -340,6 +351,10 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return denyApproval(state, ids: &ids)
     case (.authorising, .approvalUnavailable(let requestID, _, let reason, let at)):
         return holdForApproval(state, requestID: requestID, reason: reason, atMillis: at, ids: &ids)
+    case (.authorising, .execIdentitiesResolved(let resolutionID, _, _, let identities, _)):
+        return execIdentitiesResolved(state, resolutionID: resolutionID, identities: identities, ids: &ids)
+    case (.authorising, .execResolutionFailed(let resolutionID, _, _, let status, let summary, _)):
+        return execResolutionFailed(state, resolutionID: resolutionID, status: status, summary: summary, ids: &ids)
     case (.authorising, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.authorising, .cancelRequested(let at)):
@@ -517,6 +532,15 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
     case .requestDispatched(let requestID, _):
         guard state.phase == .admitting,
               let run = state.activeRun, run.requestID == requestID
+        else {
+            return drop(state)
+        }
+        return nil
+    case .execIdentitiesResolved(let resolutionID, let runID, let generation, _, _),
+         .execResolutionFailed(let resolutionID, let runID, let generation, _, _, _):
+        guard let run = state.activeRun,
+              run.runID == runID, run.revision == generation,
+              state.pendingResolution?.resolutionID == resolutionID
         else {
             return drop(state)
         }
@@ -897,7 +921,8 @@ private func switchModel<I: IDSource>(_ state: SessionState, alias: String, atMi
     let epoch = EpochDescriptor(
         epochID: ids.nextEpochID(), parentEpochID: state.epoch.epochID,
         configSnapshot: state.epoch.configSnapshot, profile: state.epoch.configSnapshot.profiles[alias]!,
-        effectiveCaps: state.epoch.effectiveCaps, route: .allowed(endpoint: endpointURL(for: state.epoch.configSnapshot.profiles[alias]!), alias: alias))
+        effectiveCaps: state.epoch.effectiveCaps, route: .allowed(endpoint: endpointURL(for: state.epoch.configSnapshot.profiles[alias]!), alias: alias),
+        execComposed: state.epoch.execComposed)
     var queue = state.queue
     for i in queue.indices where queue[i].targetEpochID != epoch.epochID && (queue[i].state == .queued) {
         let entry = queue[i]
@@ -1061,7 +1086,8 @@ private func finishRunWithQueue<I: IDSource>(
         let (s1, prefix) = sequenced(state, kind: "completed-held", digest: eventDigest("completed", run.runID.raw), ids: &ids)
         let next = s1.replacing(
             phase: .completed(receiptValue), activeRun: .some(nil), activeRequest: .some(nil),
-            pendingApproval: .some(nil), pendingBatch: .some(nil), liveReservations: [])
+            pendingApproval: .some(nil), pendingBatch: .some(nil),
+            pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
         return Transition(
             state: next,
             effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished; queue held"))],
@@ -1081,7 +1107,8 @@ private func finishRunWithQueue<I: IDSource>(
             queue[position] = dispatched
             let mid = state.replacing(
                 phase: .completed(receiptValue), activeRun: .some(nil), activeRequest: .some(nil),
-                queue: queue, pendingApproval: .some(nil), pendingBatch: .some(nil), liveReservations: [])
+                queue: queue, pendingApproval: .some(nil), pendingBatch: .some(nil),
+                pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
             let (s1, prefix) = sequenced(mid, kind: "completed-dispatched", digest: eventDigest("completed", run.runID.raw), ids: &ids)
             // New run, same text: reserve inline (generation+1, counters reset).
             let next = admitReservedRun(s1, entry: dispatched, atMillis: atMillis, ids: &ids)
@@ -1094,7 +1121,8 @@ private func finishRunWithQueue<I: IDSource>(
     let (s1, prefix) = sequenced(state, kind: "completed", digest: eventDigest("completed", run.runID.raw), ids: &ids)
     let next = s1.replacing(
         phase: .completed(receiptValue), activeRun: .some(nil), activeRequest: .some(nil),
-        pendingApproval: .some(nil), pendingBatch: .some(nil), liveReservations: [])
+        pendingApproval: .some(nil), pendingBatch: .some(nil),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
     return Transition(
         state: next,
         effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished"))],
@@ -1159,6 +1187,7 @@ private func failRun<I: IDSource>(
         queueHeld: hold ? true : s1.queueHeld,
         heldReason: hold ? .error("run failed") : s1.heldReason,
         pendingApproval: .some(nil), pendingBatch: .some(nil),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(nil),
         retryDeadlineMillis: .some(nil), liveReservations: [])
     return Transition(
         state: next,
@@ -1172,6 +1201,7 @@ private func interruptRun<I: IDSource>(_ state: SessionState, note: String, atMi
     let next = s1.replacing(
         phase: .interrupted, activeRun: .some(nil), activeRequest: .some(nil),
         pendingApproval: .some(nil), pendingBatch: .some(nil),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(nil),
         retryDeadlineMillis: .some(nil), liveReservations: [])
     return Transition(
         state: next,
@@ -1278,6 +1308,42 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
     if state.activeRun?.sealed == true, !batch.proposals.isEmpty {
         return failRun(state, failure: .providerError("sealed response proposed tools; sealed requests are tool-free"), hold: true, atMillis: atMillis, ids: &ids)
     }
+    // C0 reducer-side credential register (plan REV12 §3.3 / NC-10): the env
+    // overlay must not carry a registered credential name.
+    for proposal in batch.proposals where proposal.tool == "exec" {
+        if let raw = proposal.arguments, let bytes = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: bytes, options: []) as? [String: Any],
+           let env = obj["env"] as? [String: Any] {
+            let credentialNames = credentialEnvNames(in: state.epoch)
+            for key in env.keys where credentialNames.contains(key) {
+                guard state.turnsUsed < state.turnLimit else {
+                    return failRun(state, failure: .budgetExhausted("turn budget exhausted after credential check"), hold: true, atMillis: atMillis, ids: &ids)
+                }
+                // Typed invalid-arguments receipt (deterministic per-call
+                // intent+result + continuation) — a model-authorable input
+                // rejection, never a terminal held run.
+                let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("credential-overlay", key), ids: &ids)
+                var records: [DurableRecord] = []
+                var transcripts: [DurableRecord] = []
+                for prop in batch.proposals {
+                    let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+                    let opID = ids.nextOperationID()
+                    records.append(.operationIntent(OperationRef(operationID: opID, callID: prop.callID, state: .intent, mutating: isMut)))
+                    records.append(.operationResult(OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut),
+                                                    outcome: "tool-failure: credential overlay carries \(terminalSafe(key)) (invalid-arguments)"))
+                    transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "preDispatch invalid-arguments: credential overlay carries \(terminalSafe(key))")))
+                }
+                let nextEffectID = ids.nextEffectID()
+                let seq = ids.nextSequence()
+                let reservation = EffectReservation(effectID: nextEffectID, runID: s1.activeRun!.runID, requestID: s1.activeRun!.requestID, generation: s1.activeRun!.revision, revision: s1.activeRun!.revision, mutating: false, kind: .provider)
+                let invocation = ProviderInvocation(effectID: nextEffectID, requestID: s1.activeRun!.requestID, runID: s1.activeRun!.runID, generation: s1.activeRun!.revision, alias: s1.epoch.profile.alias, epochID: s1.epoch.epochID, sealed: s1.activeRun!.sealed, turnsLeft: s1.turnLimit - s1.turnsUsed, deadlineMillis: s1.runDeadlineMillis, historyDigest: fnv1aHex("\(s1.sessionID.raw):\(seq.value):credential"))
+                let next = s1.replacing(phase: .requesting, turnsUsed: s1.turnsUsed + 1, liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+                return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
+                                  records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
+            }
+        }
+    }
+
     // Structural shape check first: non-empty callIDs, non-empty tools, no
     // duplicate callIDs. Malformed batches fail closed (WIRE-05 spirit).
     var seenCalls: Set<String> = []
@@ -1291,39 +1357,9 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
     do {
         validated = try ToolValidator.validateBatchArguments(batch: batch)
     } catch let ToolFailure.preDispatch(status, summary) {
-        // FINAL-03 approval precedence: an approval-gated batch is decided
-        // by the operator, not by arg shape. B5-C's strict validator runs
-        // before the approval check, so an ask-policy proposal whose shape
-        // the validator rejects (HEAD-03: exec under exec=ask) died here
-        // and the run continued to another provider request instead of
-        // stopping at approval-required. If every proposal is
-        // capability-granted (denied tools still deny — never approve)
-        // and the batch needs approval, ask now, mirroring the normal
-        // approval path (no turn consumed, no validated paths: the shape
-        // is unknown). Arg shape is still enforced before any dispatch:
-        // the executor parses strictly per tool, and exec/consult have no
-        // backend at all, so no unshaped proposal can ever reach
-        // execution.
-        let tools = batch.proposals.map(\.tool)
-        let granted = tools.allSatisfy { toolAllowed($0, caps: state.epoch.effectiveCaps.tools) }
-        let needsApproval = batchNeedsApproval(
-            toolNames: tools,
-            execPolicy: state.epoch.effectiveCaps.tools.exec,
-            mode: state.trustMode,
-            sealed: state.activeRun?.sealed ?? false)
-        if granted && needsApproval {
-            guard let run = state.activeRun else {
-                return failRun(state, failure: .providerError("approval without run"), hold: true, atMillis: atMillis, ids: &ids)
-            }
-            let request = ApprovalRequest(
-                requestID: run.requestID, runID: run.runID, generation: run.revision,
-                operation: "tool batch: \(tools.joined(separator: ", "))",
-                requiredGrant: "explicit approval",
-                protectedPaths: [])
-            let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("approval", run.requestID.raw), ids: &ids)
-            let next = s1.replacing(phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch))
-            return Transition(state: next, effects: [.requestApproval(request)], records: prefix)
-        }
+        // M2-C C0 (plan REV12 §3.2): the FINAL-03/HEAD-03 compatibility
+        // branch is RETIRED. Validation failure ⇒ the legacy deterministic
+        // per-call `invalid-arguments` receipts + provider continuation.
         // Deterministic per-call done receipts preserving SPEC status, no FS touch
         // Synthesize a provider continuation with per-call operationResults
         let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("preDispatch", status), ids: &ids)
@@ -1453,9 +1489,44 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
     guard let run = state.activeRun else {
         return failRun(state, failure: .providerError("authorising without a run"), hold: true, atMillis: atMillis, ids: &ids)
     }
+    let hasExec = names.contains("exec")
+    if hasExec && state.epoch.execComposed {
+        let resolutionID = ids.nextEffectID().raw
+        let seed = ExecResolutionSeed(
+            resolutionID: resolutionID, runID: run.runID, generation: run.revision,
+            batchDigest: fnv1aHex(batch.proposals.map { "\($0.callID):\($0.tool):\($0.arguments ?? "")" }.joined(separator: "\n")),
+            grantablePaths: grantablePaths)
+        let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("resolve", resolutionID), ids: &ids)
+        let next = s1.replacing(
+            phase: .authorising, pendingApproval: .some(nil), pendingBatch: .some(batch),
+            pendingResolution: .some(seed))
+        return Transition(state: next, effects: [.resolveExecIdentities(resolutionID: resolutionID, batch: batch)], records: prefix)
+    }
+    var operation = "tool batch: \(names.joined(separator: ", "))"
+    if hasExec {
+        var demoLines: [String] = []
+        for prop in batch.proposals {
+            if prop.tool != "exec" {
+                demoLines.append("\(prop.tool) \(prop.callID)")
+                continue
+            }
+            if let raw = prop.arguments,
+               let data = raw.data(using: .utf8),
+               let json = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any],
+               let args = try? ToolValidator.parseExecArguments(callID: prop.callID, json: json),
+               let rendered = renderExecApprovalDisplay(args) {
+                demoLines.append(rendered)
+            } else {
+                demoLines.append("exec \(prop.callID)")
+            }
+        }
+        if !demoLines.isEmpty {
+            operation = (demoLines + ["[unresolved (demo)]"]).joined(separator: "; ")
+        }
+    }
     let request = ApprovalRequest(
         requestID: run.requestID, runID: run.runID, generation: run.revision,
-        operation: "tool batch: \(names.joined(separator: ", "))",
+        operation: operation,
         requiredGrant: "explicit approval",
         protectedPaths: grantablePaths.sorted())
     let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("approval", run.requestID.raw), ids: &ids)
@@ -1464,6 +1535,86 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         state: next,
         effects: [.requestApproval(request)],
         records: prefix)
+}
+
+// MARK: - M2-C C0 two-phase resolution (plan REV12 §3.4b)
+
+private func execIdentitiesResolved<I: IDSource>(
+    _ state: SessionState, resolutionID: String, identities: [ResolvedExecIdentity], ids: inout I
+) -> Transition {
+    guard let seed = state.pendingResolution, let batch = state.pendingBatch, let run = state.activeRun else {
+        return drop(state)
+    }
+    _ = seed
+    let bound = identities.map {
+        ExecCommandIdentity(callID: $0.callID, requestedPath: $0.requestedPath, resolvedPath: $0.resolvedPath, contentDigest: $0.contentDigest, cwdDevice: $0.cwdDevice, cwdInode: $0.cwdInode)
+    }
+    var lines: [String] = []
+    for prop in batch.proposals {
+        if prop.tool == "exec" {
+            guard let args = try? ToolValidator.execArguments(fromRaw: prop.arguments ?? ""),
+                  let rendered = renderExecApprovalDisplay(args) else {
+                lines.append("exec \(prop.callID): <unrenderable>")
+                continue
+            }
+            if let id = identities.first(where: { $0.callID == prop.callID }) {
+                lines.append("\(rendered) → resolved \(id.resolvedPath) digest=\(id.contentDigest.prefix(16))…")
+            } else {
+                lines.append(rendered)
+            }
+        } else {
+            let summary = prop.arguments?.prefix(120) ?? ""
+            lines.append("\(prop.tool) \(prop.callID): \(summary)")
+        }
+    }
+    var operation = lines.joined(separator: "; ")
+    if operation.utf8.count > 8 * 1024 {
+        operation = String(operation.prefix(8 * 1024)) + "…[elided]"
+    }
+    let request = ApprovalRequest(
+        requestID: run.requestID, runID: run.runID, generation: run.revision,
+        operation: operation, requiredGrant: "explicit approval",
+        protectedPaths: seed.grantablePaths.sorted(), execIdentities: bound)
+    let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("resolved", resolutionID), ids: &ids)
+    let next = s1.replacing(
+        phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(bound))
+    return Transition(state: next, effects: [.requestApproval(request)], records: prefix)
+}
+
+private func execResolutionFailed<I: IDSource>(
+    _ state: SessionState, resolutionID: String, status: String, summary: String, ids: inout I
+) -> Transition {
+    guard state.pendingResolution != nil, let batch = state.pendingBatch, let run = state.activeRun else {
+        return drop(state)
+    }
+    guard state.turnsUsed < state.turnLimit else {
+        return failRun(state, failure: .budgetExhausted("turn budget exhausted after resolution"), hold: true, atMillis: 0, ids: &ids)
+    }
+    let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("execResolution", status), ids: &ids)
+    var records: [DurableRecord] = []
+    var transcripts: [DurableRecord] = []
+    for prop in batch.proposals {
+        let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
+        let opID = ids.nextOperationID()
+        let intentRef = OperationRef(operationID: opID, callID: prop.callID, state: .intent, mutating: isMut)
+        let resultRef = OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut)
+        records.append(.operationIntent(intentRef))
+        records.append(.operationResult(resultRef, outcome: "tool-failure: \(summary) (\(status))"))
+        transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "preDispatch \(status): \(summary)")))
+    }
+    let nextEffectID = ids.nextEffectID()
+    let seq = ids.nextSequence()
+    let reservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+    let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed, turnsLeft: state.turnLimit - (state.turnsUsed + 1), deadlineMillis: state.runDeadlineMillis, historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):execResolution"))
+    let next = s1.replacing(
+        phase: .requesting, turnsUsed: state.turnsUsed + 1,
+        pendingBatch: .some(nil), pendingResolution: .some(nil), pendingExecIdentities: .some(nil),
+        liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+    return Transition(
+        state: next,
+        effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
+        records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
 }
 
 /// A3-1 stable operation identity (SPEC §9.1): every externally
@@ -1477,7 +1628,7 @@ private func operationID(effectID: EffectID, callID: String) -> OperationID {
     OperationID("\(effectID.raw)/\(callID)")
 }
 
-private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: ToolBatch, approvedPaths: [String] = [], ids: inout I) -> Transition {
+private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: ToolBatch, approvedPaths: [String] = [], approvedExecDigests: [String: String] = [:], approvedCwdIdentities: [String: String] = [:], ids: inout I) -> Transition {
     guard let run = state.activeRun else {
         let (s1, prefix) = sequenced(state, kind: "failed", digest: "no-run", ids: &ids)
         return Transition(state: s1.replacing(phase: .failed(.providerError("trusted dispatch without a run"))), effects: [], records: prefix)
@@ -1496,10 +1647,12 @@ private func dispatchTrustedBatch<I: IDSource>(_ state: SessionState, batch: Too
     let mutating = batch.proposals.contains { $0.tool != "read" && $0.tool != "search" && $0.tool != "consult" }
     let reservation = EffectReservation(
         effectID: effectID, runID: run.runID, requestID: run.requestID,
-        generation: run.revision, revision: run.revision, mutating: mutating, batch: batch, kind: .executor, approvedPaths: approvedPaths)
+        generation: run.revision, revision: run.revision, mutating: mutating, batch: batch, kind: .executor,
+        approvedPaths: approvedPaths, approvedExecDigests: approvedExecDigests, approvedCwdIdentities: approvedCwdIdentities)
     let (s1, prefix) = sequenced(state, kind: "executing", digest: eventDigest("exec", run.requestID.raw), ids: &ids)
     let next = s1.replacing(
         phase: .executing, pendingApproval: .some(nil), pendingBatch: .some(nil),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(nil),
         liveReservations: state.liveReservations + [reservation])
     // Every dispatchable operation commits its durable intent in the SAME
     // record group as the dispatch: the actor persists this whole group
@@ -1524,7 +1677,15 @@ private func grantApproval<I: IDSource>(_ state: SessionState, requestID: Reques
         return Transition(state: s1, effects: [], records: prefix)
     }
     let approved = state.pendingApproval?.protectedPaths ?? []
-    return dispatchTrustedBatch(state, batch: batch, approvedPaths: approved, ids: &ids)
+    // C0 (plan REV12 §3.4b.9): bind the approved identities into the
+    // reservation — the spawn re-verifies digests against THIS map.
+    let digests = Dictionary(
+        (state.pendingExecIdentities ?? []).map { ($0.callID, $0.contentDigest) },
+        uniquingKeysWith: { a, _ in a })
+    let cwdIds = Dictionary(
+        (state.pendingExecIdentities ?? []).map { ($0.callID, "\($0.cwdDevice):\($0.cwdInode)") },
+        uniquingKeysWith: { a, _ in a })
+    return dispatchTrustedBatch(state, batch: batch, approvedPaths: approved, approvedExecDigests: digests, approvedCwdIdentities: cwdIds, ids: &ids)
 }
 
 private func denyApproval<I: IDSource>(_ state: SessionState, ids: inout I) -> Transition {
@@ -2090,6 +2251,7 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
         queueHeld: true, heldReason: .cancelled(sinceMillis: atMillis),
         consumedEffects: consumed,
         pendingApproval: .some(nil), pendingBatch: .some(nil),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(nil),
         retryDeadlineMillis: .some(nil), liveReservations: live,
         cancelledPendingReservations: pending,
         generation: state.generation + 1,

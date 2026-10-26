@@ -8,13 +8,30 @@ import Glibc
 import Darwin
 #endif
 
+private func byteSplit(_ path: String) -> [String] {
+    var parts: [String] = []
+    var piece: [UInt8] = []
+    piece.reserveCapacity(64)
+    for b in path.utf8 {
+        if b == 0x2F { parts.append(String(decoding: piece, as: UTF8.self)); piece.removeAll(keepingCapacity: true) }
+        else { piece.append(b) }
+    }
+    parts.append(String(decoding: piece, as: UTF8.self))
+    return parts
+}
+
 /// B1 NativeToolExecutor: descriptor-relative via WorkspaceResolver, strict validation pre-side-effect,
 /// protected-path enforcement, and per-mutating-batch nonblocking lock.
 /// B4: ordered partial batches with per-call halt, injectable per-tool
 /// deadlines (local I/O 30 s, search 120 s), and per-call mutating
 /// attestation on every outcome.
-public struct NativeToolExecutor: ToolExecutor, Sendable {
+public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     public let resolver: WorkspaceResolver
+    /// M2-C C0 (plan REV12 §3.8): whether THIS executor instance carries the
+    /// native exec grant (composed via `--allow-exec` + config). Defense in
+    /// depth: the authoriser gates before dispatch AND the executor refuses
+    /// exec here, so a wiring mistake fails closed at the execution site.
+    public let execGrant: Bool
     public let store: any SessionStore
     public let sessionID: SessionID
     public let writer: WriterIdentity
@@ -36,7 +53,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     public let preCallSuspension: (@Sendable (ToolProposal) async throws -> Void)?
     public let postCommitSuspension: (@Sendable () async throws -> Void)?
 
-    public init(resolver: WorkspaceResolver, store: any SessionStore, sessionID: SessionID, writer: WriterIdentity, rgPath: String? = nil, gitPath: String? = nil, deadlines: ToolDeadlines = ToolDeadlines(), preCallSuspension: (@Sendable (ToolProposal) async throws -> Void)? = nil, postCommitSuspension: (@Sendable () async throws -> Void)? = nil) {
+    public init(resolver: WorkspaceResolver, store: any SessionStore, sessionID: SessionID, writer: WriterIdentity, rgPath: String? = nil, gitPath: String? = nil, deadlines: ToolDeadlines = ToolDeadlines(), preCallSuspension: (@Sendable (ToolProposal) async throws -> Void)? = nil, postCommitSuspension: (@Sendable () async throws -> Void)? = nil, execGrant: Bool = false) {
         self.resolver = resolver
         self.store = store
         self.sessionID = sessionID
@@ -46,11 +63,356 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         self.deadlines = deadlines
         self.preCallSuspension = preCallSuspension
         self.postCommitSuspension = postCommitSuspension
+        self.execGrant = execGrant
     }
 
     /// Internal: a fired per-tool deadline. Never thrown past the loop —
     /// mapped to a `timeout` outcome (unknown+hold for mutating).
     private struct DeadlineExceeded: Error {}
+
+    // MARK: - M2-C C0 exec identity resolution (plan REV12 §3.4)
+
+    /// ExecIdentityResolver (plan REV12 §3.4b.2): resolve → qualify →
+    /// content-hash every exec proposal in the batch. Synchronous,
+    /// filesystem-touching, bounded (NC-15: ≤8 calls/batch enforced by the
+    /// validator; ≤64 MiB per executable, ≤128 MiB aggregate here). The
+    /// executable walk anchors at "/" and RESOLVES symlinks (≤40 hops,
+    /// NC-4) so `/usr/bin/python3` and Conda env binaries qualify; the
+    /// final component opens O_NOFOLLOW and must be a regular file. The
+    /// cwd walk is anchored at the pinned workspace root with per-component
+    /// O_NOFOLLOW — containment by construction; a C0 deviation (fail-
+    /// closed): symlinked cwd components are typed `.cwd` failures rather
+    /// than resolved (C1 completes the resolving containment walk per plan
+    /// §3.4).
+    public func resolveIdentities(batch: ToolBatch) throws -> [ResolvedExecIdentity] {
+        // DEBUG-C0: surface resolver errors for the diagnosis
+        var out: [ResolvedExecIdentity] = []
+        var aggregateBytes: UInt64 = 0
+        var cache: [String: (dev: UInt64, ino: UInt64, size: UInt64, digest: String, resolved: String)] = [:]
+        for proposal in batch.proposals where proposal.tool == "exec" {
+            let args = try ToolValidator.execArguments(fromRaw: proposal.arguments ?? "")
+            let id = try resolveOne(callID: proposal.callID, args: args, cache: &cache, aggregateBytes: &aggregateBytes)
+            out.append(id)
+        }
+        return out
+    }
+
+    private struct ResolutionFailure: Error { let error: ExecResolutionError }
+
+    private func resolveOne(
+        callID: String, args: ExecArguments,
+        cache: inout [String: (dev: UInt64, ino: UInt64, size: UInt64, digest: String, resolved: String)],
+        aggregateBytes: inout UInt64
+    ) throws -> ResolvedExecIdentity {
+        // Executable: anchored walk from "/" resolving symlinks (NC-4).
+        let digestKey = args.executable
+        if let hit = cache[digestKey] {
+            let cwdID = try cwdIdentity(callID: callID, args: args)
+            return ResolvedExecIdentity(
+                callID: callID, requestedPath: args.executable, resolvedPath: hit.resolved,
+                device: hit.dev, inode: hit.ino, size: hit.size, contentDigest: hit.digest,
+                cwdDevice: cwdID.0, cwdInode: cwdID.1)
+        }
+        var stack: [String] = []
+        var dirFD: Int32 = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard dirFD >= 0 else {
+            throw ExecResolutionError.notFound("root unavailable: \(String(cString: strerror(errno)))")
+        }
+        var hops = 0
+        var resolvedPath = ""
+        var finalFD: Int32 = -1
+        defer {
+            if dirFD >= 0 { close(dirFD) }
+            if finalFD >= 0 { close(finalFD) }
+        }
+        var components = byteSplit(args.executable).filter { !$0.isEmpty }
+        var i = 0
+        while i < components.count {
+            let comp = components[i]
+            // Canonical stack: ".." pops the stack and moves dirFD to its parent.
+            if comp == ".." {
+                guard stack.popLast() != nil else {
+                    throw ExecResolutionError.qualification("symlink target escapes the root anchor for exec \(callID)")
+                }
+                let parent = openat(dirFD, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                guard parent >= 0 else {
+                    throw ExecResolutionError.qualification("symlink target escape failed for exec \(callID)")
+                }
+                close(dirFD)
+                dirFD = parent
+                i += 1
+                continue
+            }
+            if comp == "." || comp.isEmpty { i += 1; continue }
+            // Final: the file itself — may itself be a symlink, so probe
+            // symlinks here too (the final-component symlink case, M1) with
+            // the same readlinkat resolution as intermediates. Use
+            // O_NONBLOCK so a FIFO does not block the inline resolver (M6 —
+            // FIFO is never a regular file, so it is rejected without
+            // blocking; the signal is resolved in C1 with O_PATH probing).
+            if i == components.count - 1 {
+                let fd = comp.withCString { c in openat(dirFD, c, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) }
+                if fd >= 0 {
+                    finalFD = fd
+                    stack.append(comp)
+                    resolvedPath = "/" + stack.joined(separator: "/")
+                    break
+                }
+                // Either ELOOP (symlink) or another failure: probe as symlink.
+                var target = [CChar](repeating: 0, count: 4097)
+                let n = comp.withCString { c in readlinkat(dirFD, c, &target, 4096) }
+                if n > 0 {
+                    hops += 1
+                    if hops > 40 {
+                        throw ExecResolutionError.qualification("symlink hop budget exceeded for exec \(callID)")
+                    }
+                    target[n] = 0
+                    let linkTarget = String(cString: target)
+                    if linkTarget.utf8.first == 0x2F {
+                        close(dirFD)
+                        dirFD = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                        guard dirFD >= 0 else {
+                            throw ExecResolutionError.notFound("root unavailable")
+                        }
+                        stack.removeAll(keepingCapacity: true)
+                        resolvedPath = ""
+                        components = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(components[(i + 1)...])
+                        i = 0
+                    } else {
+                        var tail = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(components[(i + 1)...])
+                        var newStack = stack
+                        // Relative symlink target may contain leading ".."
+                        // that pops above the anchor — move dirFD to the
+                        // parent directory for each pop (the B2 dirFD/stack
+                        // desynchronization fix).
+                        while let first = tail.first, first == ".." {
+                            guard newStack.popLast() != nil else {
+                                throw ExecResolutionError.qualification("symlink target escapes the root anchor for exec \(callID)")
+                            }
+                            let parent = openat(dirFD, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                            guard parent >= 0 else {
+                                throw ExecResolutionError.qualification("symlink target escape failed for exec \(callID)")
+                            }
+                            close(dirFD)
+                            dirFD = parent
+                            tail.removeFirst()
+                        }
+                        components = tail
+                        stack = newStack
+                        resolvedPath = "/" + stack.joined(separator: "/")
+                        if components.isEmpty {
+                            throw ExecResolutionError.qualification("symlink target resolves to a directory for exec \(callID)")
+                        }
+                        i = 0
+                    }
+                    continue
+                }
+                throw ExecResolutionError.notFound("executable open failed: \(String(cString: strerror(errno)))")
+            }
+            let nextFD = comp.withCString { c in openat(dirFD, c, O_RDONLY | O_NOFOLLOW | O_DIRECTORY) }
+            if nextFD >= 0 {
+                close(dirFD)
+                dirFD = nextFD
+                stack.append(comp)
+                resolvedPath = "/" + stack.joined(separator: "/")
+                i += 1
+                continue
+            }
+            // Not a directory (or ELOOP): probe as symlink.
+            var target = [CChar](repeating: 0, count: 4097)
+            let n = comp.withCString { c in readlinkat(dirFD, c, &target, 4096) }
+            guard n > 0 else {
+                throw ExecResolutionError.notFound("\(comp): \(String(cString: strerror(errno)))")
+            }
+            hops += 1
+            if hops > 40 {
+                throw ExecResolutionError.qualification("symlink hop budget exceeded for exec \(callID)")
+            }
+            target[n] = 0
+            let linkTarget = String(cString: target)
+            // Interior ".."/".": C0 fail-closed (C1 completes per plan REV12 §3.4).
+            do {
+                let comps = linkTarget.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+                var depth = 0
+                for c in comps {
+                    if c == ".." {
+                        if depth == 0 { throw ExecResolutionError.qualification("symlink target escapes for exec \(callID)") }
+                        depth -= 1
+                    } else if c != "." && !c.isEmpty { depth += 1 }
+                }
+                // If any interior ".." would have popped past non-leading depth, it would have been caught.
+                // For C0, reject any target where a ".." appears after a normal component within the target itself.
+                var seenNormal = false
+                for c in comps {
+                    if c == ".." || c == "." {
+                        if seenNormal && c == ".." {
+                            throw ExecResolutionError.qualification("symlink target contains interior dot for exec \(callID)")
+                        }
+                    } else { seenNormal = true }
+                }
+            }
+            if linkTarget.utf8.first == 0x2F {
+                // Absolute target: restart from "/" with the target's
+                // components prepended to the remaining walk.
+                close(dirFD)
+                dirFD = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                guard dirFD >= 0 else {
+                    throw ExecResolutionError.notFound("root unavailable")
+                }
+                stack.removeAll(keepingCapacity: true)
+                resolvedPath = ""
+                components = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(components[(i + 1)...])
+                i = 0
+            } else {
+                // Relative target: replace the current component with the
+                // target's components (openat-plus-stack-pop; a pop past
+                // the root anchor ⇒ qualification failure) and move dirFD
+                // to the parent for each popped "..".
+                var tail = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(components[(i + 1)...])
+                var newStack = stack
+                while let first = tail.first, first == ".." {
+                    guard newStack.popLast() != nil else {
+                        throw ExecResolutionError.qualification("symlink target escapes the root anchor for exec \(callID)")
+                    }
+                    let parent = openat(dirFD, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                    guard parent >= 0 else {
+                        throw ExecResolutionError.qualification("symlink target escape failed for exec \(callID)")
+                    }
+                    close(dirFD)
+                    dirFD = parent
+                    tail.removeFirst()
+                }
+                // Interior ".." inside the symlink target itself is normalized
+                // by the same stack-pop + parent-fd discipline that leading
+                // ".." uses: walk the concatenated tail, applying pops for
+                // every ".." encountered (not only leading ones) against
+                // newStack/dirFD.
+                components = tail
+                stack = newStack
+                resolvedPath = "/" + stack.joined(separator: "/")
+                i = 0
+            }
+        }
+        // Qualify the resolved final (regular file, exec bit, no
+        // group/world-write, root-or-owner) — the qualifiedRgFD checks on
+        // the resolved target.
+        var st = stat()
+        guard fstat(finalFD, &st) == 0 else {
+            throw ExecResolutionError.qualification("executable fstat failed for exec \(callID)")
+        }
+        guard (st.st_mode & S_IFMT) == S_IFREG else {
+            throw ExecResolutionError.qualification("resolved executable is not a regular file for exec \(callID)")
+        }
+        if (st.st_mode & 0o002) != 0 {
+            throw ExecResolutionError.qualification("resolved executable is world-writable for exec \(callID)")
+        }
+        if (st.st_mode & 0o020) != 0 {
+            throw ExecResolutionError.qualification("resolved executable is group-writable for exec \(callID)")
+        }
+        let uid = getuid()
+        guard st.st_uid == 0 || st.st_uid == uid else {
+            throw ExecResolutionError.qualification("resolved executable not owned by root or current user for exec \(callID)")
+        }
+        guard (st.st_mode & 0o111) != 0 else {
+            throw ExecResolutionError.qualification("resolved executable is not executable for exec \(callID)")
+        }
+        let size = UInt64(st.st_size)
+        guard size <= 64 * 1024 * 1024 else {
+            throw ExecResolutionError.qualification("executable exceeds the 64 MiB hash bound for exec \(callID)")
+        }
+        aggregateBytes &+= size
+        guard aggregateBytes <= 128 * 1024 * 1024 else {
+            throw ExecResolutionError.budgetExceeded("resolution budget exceeded (128 MiB aggregate) for exec \(callID)")
+        }
+        // Content hash over the held fd's bytes (the fd the spawn will use).
+        let contentSHA = try Self.sha256Hex(fd: finalFD)
+        let dev = UInt64(st.st_dev), ino = UInt64(st.st_ino)
+        let resolved = resolvedPath + (resolvedPath.isEmpty ? "" : "") 
+        let commandDigest = Self.sha256Hex(of: "\(resolved)\n\(dev)\n\(ino)\n\(size)\n\(contentSHA)")
+        cache[digestKey] = (dev, ino, size, commandDigest, resolved)
+        let cwdID = try cwdIdentity(callID: callID, args: args)
+        return ResolvedExecIdentity(
+            callID: callID, requestedPath: args.executable, resolvedPath: resolved,
+            device: dev, inode: ino, size: size, contentDigest: commandDigest,
+            cwdDevice: cwdID.0, cwdInode: cwdID.1)
+    }
+
+    /// cwd identity: anchored at the pinned workspace root, per-component
+    /// O_NOFOLLOW (containment by construction). C0 deviation (fail-closed,
+    /// documented in the slice receipt): symlinked cwd components are typed
+    /// `.cwd` failures; C1 completes the resolving containment walk.
+    private func cwdIdentity(callID: String, args: ExecArguments) throws -> (UInt64, UInt64) {
+        guard let root = resolver.workspaceRoot else {
+            throw ExecResolutionError.cwd("no workspace root for exec \(callID)")
+        }
+        let rootPath = root.path.string
+        let rootFD = rootPath.withCString { cstr in
+            open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard rootFD >= 0 else {
+            throw ExecResolutionError.cwd("workspace root unavailable for exec \(callID)")
+        }
+        defer { close(rootFD) }
+        var st = stat()
+        guard fstat(rootFD, &st) == 0 else {
+            throw ExecResolutionError.cwd("workspace root fstat failed for exec \(callID)")
+        }
+        let rootDev = UInt64(st.st_dev), rootIno = UInt64(st.st_ino)
+        guard rootDev == root.device && rootIno == root.inode else {
+            throw ExecResolutionError.cwd("workspace root replaced for exec \(callID)")
+        }
+        guard let rel = args.cwd else {
+            return (rootDev, rootIno)
+        }
+        var dirFD = rootFD
+        defer { if dirFD != rootFD { close(dirFD) } }
+        // M2: defer BEFORE the loop so a failed component does not leak dirFD.
+        for comp in byteSplit(rel).filter({ !$0.isEmpty }) {
+            if comp == "." { continue }
+            if comp == ".." {
+                throw ExecResolutionError.cwd("parent component in cwd for exec \(callID)")
+            }
+            let next = comp.withCString { c in openat(dirFD, c, O_RDONLY | O_NOFOLLOW | O_DIRECTORY) }
+            guard next >= 0 else {
+                throw ExecResolutionError.cwd("cwd component \(comp): \(String(cString: strerror(errno)))")
+            }
+            if dirFD != rootFD { close(dirFD) }
+            dirFD = next
+        }
+        var cst = stat()
+        guard fstat(dirFD, &cst) == 0 else {
+            throw ExecResolutionError.cwd("cwd fstat failed for exec \(callID)")
+        }
+        return (UInt64(cst.st_dev), UInt64(cst.st_ino))
+    }
+
+    /// Streaming SHA-256 over an opened fd (reading from the CURRENT file
+    /// offset; callers pass a fresh fd or rewind first).
+    static func sha256Hex(fd: Int32) throws -> String {
+        var sha = SHA256()
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 64 * 1024)
+        defer { buf.deallocate() }
+        lseek(fd, 0, SEEK_SET)
+        while true {
+#if canImport(Glibc)
+            let n = Glibc.read(fd, buf, 64 * 1024)
+#else
+            let n = Darwin.read(fd, buf, 64 * 1024)
+#endif
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw ExecResolutionError.qualification("read failed: \(String(cString: strerror(errno)))")
+            }
+            if n == 0 { break }
+            sha.update(data: Data(bytes: buf, count: n))
+        }
+        let digest = sha.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func sha256Hex(of text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
 
     /// B4: applies the B1 mutating classifier at the execution site, so the
     /// per-call result carries the executor's attestation (the reducer
@@ -210,6 +572,14 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             return try edit(callID: proposal.callID, json: json)
         case "write":
             return try write(callID: proposal.callID, json: json)
+        case "exec":
+            // M2-C C0 (plan REV12 §7-C0): the native process runner is NOT
+            // implemented in this slice — the shape has been validated (so
+            // malformed exec dies earlier as invalid-arguments), and this
+            // arm refuses any EXEC-granted proposal loudly and typed. A
+            // wiring mistake (exec dispatched without the C1 runner) can
+            // never spawn: fail closed at the execution site.
+            throw ToolFailure.preDispatch(status: "denied", summary: "native exec backend not composed (C0: contract and authorization only)")
         default:
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown tool")
         }

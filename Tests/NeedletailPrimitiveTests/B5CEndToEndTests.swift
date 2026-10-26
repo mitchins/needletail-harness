@@ -67,7 +67,7 @@ struct B5CEndToEndTests {
         return env
     }
 
-    private static func writeConfig(_ directory: URL, port: Int) throws -> String {
+    private static func writeConfig(_ directory: URL, port: Int, execPolicy: Any = "ask") throws -> String {
         let url = directory.appendingPathComponent("config.json")
         let config: [String: Any] = [
             "version": 1,
@@ -89,7 +89,7 @@ struct B5CEndToEndTests {
             ]],
             "tools": [
                 "read": true, "search": true, "edit": true, "write": true,
-                "exec": "ask", "consult": true,
+                "exec": execPolicy, "consult": true,
             ],
         ]
         try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
@@ -1172,7 +1172,7 @@ struct B5CEndToEndTests {
         let server = try LoopbackSSEServer()
         server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(
             Self.toolCallChunk(callID: "c1", tool: "exec",
-                               arguments: "{\"command\":\"touch MARKER\"}").utf8))]))
+                               arguments: "{\"executable\":\"/usr/bin/touch\",\"argv\":[\"/usr/bin/touch\",\"MARKER\"]}").utf8))]))
         server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("done").utf8))]))
         server.start()
         defer { server.stop() }
@@ -1191,16 +1191,111 @@ struct B5CEndToEndTests {
         let firstBody = try Self.jsonBody(Data(server.requests[0].body))
         #expect(Self.toolNames(in: firstBody)?.sorted() == ["edit", "read", "search", "write"])
         #expect(firstBody["tool_choice"] as? String == "auto")
-        // Nothing executes: no marker file, and the denial (not a
-        // success) is the durable outcome. The intent IS committed
-        // (intent-before-effect); the denial result proves no effect ran.
+        // Nothing executes: no marker file, and the denial (not a success)
+        // is the durable outcome. M2-C C0 (plan REV12 §7-C0): a
+        // capability-denied batch takes the callID-less denial arm — ZERO
+        // tool intents (nothing was ever authorized) and ONE callID-less
+        // done result (denialIDs-exempt, never a held orphan).
         #expect(!FileManager.default.fileExists(atPath: workspace.appendingPathComponent("MARKER").path))
         let sessions = try Self.storeSessions(at: stateDir)
         let (intents, results) = Self.intentsAndResults(
             try Self.sessionRecords(at: stateDir, session: sessions[0]))
-        #expect(intents.count == 1)
-            #expect(results.count == 1)
-            #expect(!results.contains(where: { Self.isMutatingSuccess($0.1) }), "caps-denied exec records denial, never success")
+        #expect(intents.count == 0, "capability denial commits no tool intent, got \(intents.count)")
+        #expect(results.count == 1, "exactly one callID-less denial result, got \(results.count)")
+        #expect(results.first?.0.callID == nil, "the denial result is callID-less")
+        #expect(!results.contains(where: { Self.isMutatingSuccess($0.1) }), "caps-denied exec records denial, never success")
+    }
+
+    // MARK: - M2-C C0 binary legs (plan REV12 §7-C0)
+
+    @Test("C0 --allow-exec flag matrix conflicts fail closed (exit 2)")
+    func c0AllowExecFlagMatrix() throws {
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Self.writeConfig(directory, port: 0)
+        // Requires --workspace.
+        let noWorkspace = try Self.runWithPTY(
+            ["run", "--config", config, "--prompt", "p", "--format", "jsonl", "--alias", "loop", "--allow-exec"],
+            env: Self.environment(stateDir: try Self.freshState(in: directory)), input: "")
+        #expect(noWorkspace.exit == 2, "--allow-exec without --workspace is exit 2: \(noWorkspace.ptyOutput.prefix(200))")
+        // Conflicts with --trusted (both with and without --workspace —
+        // the conflict is independent of the workspace requirement).
+        let ws = try Self.freshDirectory().appendingPathComponent("ws2").path
+        try FileManager.default.createDirectory(atPath: ws, withIntermediateDirectories: true)
+        let withTrusted = try Self.runWithPTY(
+            ["run", "--config", config, "--prompt", "p", "--format", "jsonl", "--alias", "loop",
+             "--workspace", ws, "--trusted", "--allow-exec"],
+            env: Self.environment(stateDir: try Self.freshState(in: directory)), input: "")
+        #expect(withTrusted.exit == 2, "--allow-exec + --trusted is exit 2: \(withTrusted.ptyOutput.prefix(200))")
+        // Conflicts with --sealed.
+        let withSealed = try Self.runWithPTY(
+            ["run", "--config", config, "--prompt", "p", "--format", "jsonl", "--alias", "loop",
+             "--workspace", ws, "--sealed", "--allow-exec"],
+            env: Self.environment(stateDir: try Self.freshState(in: directory)), input: "")
+        #expect(withSealed.exit == 2, "--allow-exec + --sealed is exit 2: \(withSealed.ptyOutput.prefix(200))")
+    }
+
+    @Test("C0 config-only denial: --allow-exec cannot beat a config denial (invariant 2)")
+    func c0ConfigDenialBeatsFlag() throws {
+        let server = try LoopbackSSEServer()
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(
+            Self.toolCallChunk(callID: "c1", tool: "exec",
+                               arguments: "{\"executable\":\"/usr/bin/touch\",\"argv\":[\"/usr/bin/touch\",\"MARKER2\"]}").utf8))]))
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("done").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Config exec DENIED: the flag cannot re-enable it (I06/§10.1).
+        let config = try Self.writeConfig(directory, port: Int(server.port), execPolicy: false)
+        let stateDir = try Self.freshState(in: directory)
+        let workspace = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let result = try Self.runWithPTY(
+            ["run", "--config", config, "--prompt", "run it", "--format", "jsonl", "--alias", "loop",
+             "--workspace", workspace.path, "--allow-exec"],
+            env: Self.environment(stateDir: stateDir), input: "y\n")
+        #expect(result.exit == 0, "denial receipt continues the run: \(result.ptyOutput.prefix(200))")
+        let firstBody = try Self.jsonBody(Data(server.requests[0].body))
+        #expect(Self.toolNames(in: firstBody)?.contains("exec") != true, "config-denied exec is never advertised even with --allow-exec")
+        #expect(!FileManager.default.fileExists(atPath: workspace.appendingPathComponent("MARKER2").path), "nothing executed")
+    }
+
+    @Test("C0 native exec composes: advertised, resolved, approval-bound, headless exit 3")
+    func c0NativeExecComposedHeadless() throws {
+        let server = try LoopbackSSEServer()
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(
+            Self.toolCallChunk(callID: "c1", tool: "exec",
+                               arguments: "{\"executable\":\"/usr/bin/touch\",\"argv\":[\"/usr/bin/touch\",\"MARKER3\"]}").utf8))]))
+        server.start()
+        defer { server.stop() }
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Self.writeConfig(directory, port: Int(server.port))
+        let stateDir = try Self.freshState(in: directory)
+        let workspace = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        // Headless (piped stdin: no PTY): approval-required WITHOUT
+        // dispatch — the resolution runs pre-approval through the REAL
+        // executor resolver, and the gateway is unavailable (exit 3).
+        let result = try Self.run(
+            ["run", "--config", config, "--prompt", "run it", "--format", "jsonl", "--alias", "loop",
+             "--workspace", workspace.path, "--allow-exec"],
+            env: Self.environment(stateDir: stateDir))
+        #expect(result.exit == 3, "headless native exec is approval-required exit 3: \(result.stderr.prefix(500))")
+        #expect(result.stderr.contains("approval required") || result.stderr.contains("approval_required"),
+                "structured approval request surfaced on stderr (POLICY-04): \(result.stderr.prefix(500))")
+        // The approval display includes the command (bounded rendering of
+        // the resolved path is in the terminal request surfaced above).
+        let firstBody = try Self.jsonBody(Data(server.requests[0].body))
+        #expect(Self.toolNames(in: firstBody)?.sorted() == ["edit", "exec", "read", "search", "write"], "exec advertised when granted AND composed")
+        #expect(!FileManager.default.fileExists(atPath: workspace.appendingPathComponent("MARKER3").path), "nothing launched pre-approval")
+        // The store binds no digest yet: pendingExecIdentities only enters
+        // the reservation after grant.
+        let sessions = try Self.storeSessions(at: stateDir)
+        let recs = try Self.sessionRecords(at: stateDir, session: sessions[0])
+        let (_, results) = Self.intentsAndResults(recs)
+        #expect(results.isEmpty, "approval-required: no result bound yet, got \(results)")
     }
 
     // MARK: - Support: trusted demo cannot mutate real files

@@ -46,14 +46,34 @@ struct ToolAdvertisementTests {
     @Test("advertisement capability gating: exec consult diff never advertised")
     func gating() throws {
         #expect(Self.defs(.allDenied).isEmpty, "denied caps advertise nothing")
+        // Default composition (false): exec is NEVER advertised — the M2-B
+        // invariant holds for the demo/scripted backend (plan REV12 §3.8).
         let full = Self.defs(.allAllowed).map(\.name)
-        #expect(full == ["read", "search", "edit", "write"], "full caps advertise exactly the four file tools, got \(full)")
-        #expect(!full.contains("exec") && !full.contains("consult") && !full.contains("diff"), "exec/consult/diff never advertised")
+        #expect(full == ["read", "search", "edit", "write"], "uncomposed caps advertise exactly the four file tools, got \(full)")
+        #expect(!full.contains("exec") && !full.contains("consult") && !full.contains("diff"), "exec/consult/diff never advertised when not composed")
         let readOnly = ToolCapabilities(read: true, search: true, edit: false, write: false, exec: .denied, consult: false)
         #expect(ToolAdvertisement.names(for: readOnly) == ["read", "search"], "read-only caps advertise read+search only")
         let execAsk = ToolCapabilities(read: true, search: true, edit: true, write: true, exec: .ask, consult: true)
         let execNames = ToolAdvertisement.names(for: execAsk)
-        #expect(!execNames.contains("exec") && !execNames.contains("consult"), "ask/exec caps still advertise no exec/consult, got \(execNames)")
+        #expect(!execNames.contains("exec") && !execNames.contains("consult"), "ask/exec caps still advertise no exec/consult when not composed, got \(execNames)")
+    }
+
+    @Test("advertisement exec gating: granted AND native-composed (NC-7)")
+    func execGating() throws {
+        // Positive pin (plan REV12 §3.8): exec appears only when granted
+        // AND natively composed; consult/diff never.
+        let execAsk = ToolCapabilities(read: true, search: true, edit: true, write: true, exec: .ask, consult: true)
+        let composed = ToolAdvertisement.names(for: execAsk, nativeExecComposed: true)
+        #expect(composed == ["read", "search", "edit", "write", "exec"], "composed + granted advertises exactly five tools, got \(composed)")
+        let composedDenied = ToolAdvertisement.names(
+            for: ToolCapabilities(read: true, search: true, edit: true, write: true, exec: .denied, consult: false),
+            nativeExecComposed: true)
+        #expect(!composedDenied.contains("exec"), "composition without an exec grant still hides exec")
+        let def = ToolAdvertisement.definitions(for: execAsk, nativeExecComposed: true).first(where: { $0.name == "exec" })
+        let got = try #require(def).json()
+        #expect(got.contains("\"name\":\"exec\""), "exec definition present")
+        #expect(got.contains("absolute path"), "exec schema requires an absolute executable")
+        #expect(got.contains("\"argv\""), "exec schema requires argv")
     }
 
     // MARK: - Schema/validator agreement (advertisement is discovery-only;

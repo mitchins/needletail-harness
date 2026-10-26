@@ -335,6 +335,12 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
     /// bodies are byte-identical to before. Sealed invocations suppress
     /// advertisement regardless.
     public var advertisedTools: ToolCapabilities?
+    /// M2-C C0 (plan REV12 §3.8): whether the native exec executor is
+    /// composed for this run. Single source of truth is the epoch's
+    /// `execComposed`, threaded by RunCommand — never an independent flag.
+    /// Exec is advertised iff `advertisedTools.exec != .denied` AND this is
+    /// true (NC-7: the demo/scripted backend never advertises exec).
+    public var nativeExecComposed: Bool
     /// Incremental streaming sink (M1-D D4): called synchronously from the
     /// NIO delegate for each `content` delta before final assembly.
     /// Actor wires it to `UISink.emit(.delta)`; tests inject InMemory sink.
@@ -347,7 +353,8 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
         snapshotProvider: @Sendable @escaping () -> ConfigSnapshot,
         requestOverride: ChatRequestOverride? = nil,
         deltaSink: (@Sendable (String) -> Void)? = nil,
-        advertisedTools: ToolCapabilities? = nil
+        advertisedTools: ToolCapabilities? = nil,
+        nativeExecComposed: Bool = false
     ) {
         self.client = client
         self.messageProvider = messageProvider
@@ -356,6 +363,7 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
         self.requestOverride = requestOverride
         self.deltaSink = deltaSink
         self.advertisedTools = advertisedTools
+        self.nativeExecComposed = nativeExecComposed
     }
 
     public func invoke(_ invocation: ProviderInvocation, intake: BoundedChannelState<ProviderResponse>) async throws -> TransportResult {
@@ -406,7 +414,7 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
             if invocation.sealed {
                 definitions = []
             } else {
-                definitions = advertisedTools.map { ToolAdvertisement.definitions(for: $0) } ?? []
+                definitions = advertisedTools.map { ToolAdvertisement.definitions(for: $0, nativeExecComposed: nativeExecComposed) } ?? []
             }
             body = try chatRequestBody(
                 modelID: profile.modelID, messages: messages,
