@@ -22,10 +22,14 @@ private func byteSplit(_ path: String) -> [String] {
 
 /// C1 supervised exec runner — plan REV12 §3.5/§3.6 (spawn-level, no actor
 /// integration). Wraps the qualified bounded process mechanism with
-/// process-group semantics, three-stage escalation, exec-error pipe,
-/// argv0/execPath split, cwd/env policy, output bounds and artifact
-/// preparation. Store integration (spill leases) is C2; this slice is
-/// store-free and focuses on the process lifecycle that PROC-01..06 certify.
+/// process-group semantics (setsid), three-stage escalation (INT→TERM→KILL
+/// with group signaling when useSession), concurrent draining, and bounded
+/// caps. Store integration (spill leases, per-inode cache, boot identity)
+/// and the full deferred mechanisms (§3.4 symlink interior, §3.5 /proc
+/// probe, ECHILD/EPERM, exec-error pipe, argv0/execPath split, artifact
+/// preparation) are C1/C2 refinements explicitly noted as next steps; this
+/// slice focuses on the core process lifecycle that PROC-01/06 certify
+/// store-free.
 
 public struct ExecRunner: Sendable {
     public struct Result: Sendable {
