@@ -1137,18 +1137,20 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 usleep(10_000)
             }
             var st: Int32 = 0
-            let wr = waitpid(pid, &st, WNOHANG)
+            var st2: Int32 = 0
+            let wr = waitpid(pid, &st2, WNOHANG)
             if wr == pid {
                 childDone = true
-                reaped = true
-                if (st & 0x7F) == 0 {
-                    exitStatus = (st >> 8) & 0xFF
+                // Do NOT set reaped here — the leader stays an unreaped zombie
+                // so its pgid cannot be recycled and group signals remain safe.
+                // Only the final bounded reap sets reaped.
+                if (st2 & 0x7F) == 0 {
+                    exitStatus = (st2 >> 8) & 0xFF
                 } else {
                     exitStatus = 128
                 }
+                st = st2
             } else if wr < 0 && errno == ECHILD {
-                // Reaped elsewhere: no zombie can remain, but the status is
-                // unknown and the pid must never be signalled (reuse risk).
                 childDone = true
                 reaped = true
                 unsafeToSignal = true
@@ -1174,17 +1176,17 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 if useSession { Darwin.kill(-pid, SIGINT) } else { Darwin.kill(pid, SIGINT) }
 #endif
                 killNanos = now + 2_000_000_000
-            } else if !childDone && intSent && !termSent && now >= killNanos {
+            } else if (!childDone || (!reaped && useSession)) && intSent && !termSent && now >= killNanos {
                 termSent = true
 #if canImport(Glibc)
-                if useSession { Glibc.kill(-pid, SIGTERM) } else { Glibc.kill(pid, SIGTERM) }
+                if useSession && !reaped { Glibc.kill(-pid, SIGTERM) } else if !childDone { Glibc.kill(pid, SIGTERM) }
 #else
                 if useSession { Darwin.kill(-pid, SIGTERM) } else { Darwin.kill(pid, SIGTERM) }
 #endif
                 killNanos = now + 2_000_000_000
-            } else if !childDone && termSent && !killSent && now >= killNanos {
+            } else if (!childDone || (!reaped && useSession)) && termSent && !killSent && now >= killNanos {
 #if canImport(Glibc)
-                if useSession { Glibc.kill(-pid, SIGKILL) } else { Glibc.kill(pid, SIGKILL) }
+                if useSession && !reaped { Glibc.kill(-pid, SIGKILL) } else if !childDone { Glibc.kill(pid, SIGKILL) }
 #else
                 if useSession { Darwin.kill(-pid, SIGKILL) } else { Darwin.kill(pid, SIGKILL) }
 #endif
