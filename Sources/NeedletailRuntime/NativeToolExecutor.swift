@@ -1343,6 +1343,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             return false // non-Linux unqualified or empty -> no group escalation on clean success
         }()
         let probeEscalated = needsGroupProbe
+        let enteredChildDone = childDone
         if cancelled || (!childDone) || needsGroupProbe {
             // Escalate before the single final reap (REV12). The leader stays
             // zombie (waitid WNOWAIT) until the final bounded waitpid below,
@@ -1382,7 +1383,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 if wrInt2 == pid { childDone = true } // Darwin: waitpid reaps but we keep reaped false until final
                 if wrInt2 < 0 && errno == ECHILD { childDone = true; reaped = true; unsafeToSignal = true; break }
 #endif
-                if childDone { break }
+                if childDone && !enteredChildDone { break }
                 usleep(100_000); intWaited += 1
             }
             if !reaped && !unsafeToSignal {
@@ -1410,7 +1411,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                     if wrT2 == pid { childDone = true }
                     if wrT2 < 0 && errno == ECHILD { childDone = true; reaped = true; unsafeToSignal = true; break }
 #endif
-                    if childDone { break }
+                    if childDone && !enteredChildDone { break }
                     usleep(100_000); termWaited += 1
                 }
             }
@@ -1428,7 +1429,10 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         // Clean-completion reap: leader is zombie (!reaped) but group empty
         // (probe false) — still must reap before return. Also covers rg/git
         // when waitid WNOWAIT left zombie (Linux). Bounded, no signals.
-        if !reaped && !unsafeToSignal {
+        // Not gated on unsafeToSignal — the ECHILD hook leaves a real child
+        // unreaped (reaped false, unsafe true) that must still be reaped; real
+        // ECHILD (no child) will return ECHILD and set reaped.
+        if !reaped {
             var st: Int32 = 0
             var waited = 0
             while !reaped && waited < 20 {

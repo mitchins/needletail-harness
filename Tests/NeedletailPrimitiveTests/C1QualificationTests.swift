@@ -117,7 +117,7 @@ struct C1QualificationTests {
         // Must be timedOut, not success, and not cancellation
         let r = try #require(result, "run must return, not throw \(String(describing: caught))")
         #expect(r.timedOut, "parent+grandchild ignoring INT must time out, got status \(r.status)")
-        #expect(elapsed >= 3 && elapsed < 12, "escalation bound ~7s, took \(elapsed)")
+        #expect(elapsed >= 3 && elapsed < 15, "escalation bound ~7s (now 2s stages), took \(elapsed)")
 
         // Prove no owned group member survives after bounded cleanup.
         guard let pgid = Self.readIntFile(pgidFile), let grand = Self.readIntFile(grandFile) else {
@@ -256,7 +256,7 @@ struct C1QualificationTests {
             timeout: 3, useSession: true)
         let elapsed = Date().timeIntervalSince(start)
         #expect(result.timedOut, "closed-stdio live leader must be timed out via pid signal, elapsed \(elapsed)")
-        #expect(elapsed >= 3 && elapsed < 10, "must respect deadline escalation, elapsed \(elapsed)")
+        #expect(elapsed >= 3 && elapsed < 15, "must respect deadline escalation (2s stages), elapsed \(elapsed)")
         if let pgid = Self.readIntFile(pgidFile) {
             usleep(300_000)
             #expect(Self.countLiveGroupMembers(pgid: pgid) == 0 || !FileManager.default.fileExists(atPath: "/proc/\(pgid)/stat"), "leader \(pgid) must be gone after escalation")

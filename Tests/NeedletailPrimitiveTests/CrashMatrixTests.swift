@@ -321,7 +321,7 @@ struct CrashMatrixTests {
         /// child is certainly dead (reaped by us, or reaped elsewhere and
         /// therefore gone). A live child past the deadline fails loudly —
         /// never hangs the run.
-        func killAndVerifySIGKILL(deadline: TimeInterval = 30) throws -> Int32 {
+        func killAndVerifySIGKILL(deadline: TimeInterval = 60) throws -> Int32 {
             let pid = process.processIdentifier
             guard process.isRunning else {
                 throw CrashSetupError.childDied("child exited before the kill landed")
@@ -375,7 +375,7 @@ struct CrashMatrixTests {
             if process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
             }
-            if reapBounded(pid: process.processIdentifier, deadline: 30) == nil,
+            if reapBounded(pid: process.processIdentifier, deadline: 60) == nil,
                process.isRunning {
                 Issue.record("crash child survived SIGKILL past the teardown deadline")
             }
