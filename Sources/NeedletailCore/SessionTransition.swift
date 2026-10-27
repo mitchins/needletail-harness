@@ -128,6 +128,11 @@ public struct ToolCallOutcome: Sendable, Equatable, Codable {
     public let summary: String
     public let data: String
     public let artifactID: String?
+    /// M2-C C3 (NC-9): additional durable artifact digests beyond the
+    /// primary `artifactID` (exec: the stderr stream artifact). Carried in
+    /// the receipt and transcript alongside the primary reference so no
+    /// preserved stream is invisible.
+    public let secondaryArtifactIDs: [String]
     public let truncated: Bool
     public let warnings: [String]
     public let error: String?
@@ -144,12 +149,13 @@ public struct ToolCallOutcome: Sendable, Equatable, Codable {
     /// requires done results to agree with their intent on this flag.
     public let mutating: Bool?
 
-    public init(callID: String, status: String, summary: String, data: String, artifactID: String? = nil, truncated: Bool = false, warnings: [String] = [], error: String? = nil, path: String? = nil, mode: String? = nil, beforeHash: String? = nil, afterHash: String? = nil, started: Bool? = nil, mutating: Bool? = nil) {
+    public init(callID: String, status: String, summary: String, data: String, artifactID: String? = nil, secondaryArtifactIDs: [String] = [], truncated: Bool = false, warnings: [String] = [], error: String? = nil, path: String? = nil, mode: String? = nil, beforeHash: String? = nil, afterHash: String? = nil, started: Bool? = nil, mutating: Bool? = nil) {
         self.callID = callID
         self.status = status
         self.summary = summary
         self.data = data
         self.artifactID = artifactID
+        self.secondaryArtifactIDs = secondaryArtifactIDs
         self.truncated = truncated
         self.warnings = warnings
         self.error = error
@@ -1325,20 +1331,27 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
                 let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("credential-overlay", key), ids: &ids)
                 var records: [DurableRecord] = []
                 var transcripts: [DurableRecord] = []
+                var uiEffects: [Effect] = []
                 for prop in batch.proposals {
                     let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
                     let opID = ids.nextOperationID()
                     records.append(.operationIntent(OperationRef(operationID: opID, callID: prop.callID, state: .intent, mutating: isMut)))
                     records.append(.operationResult(OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut),
                                                     outcome: "tool-failure: credential overlay carries \(terminalSafe(key)) (invalid-arguments)"))
-                    transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "preDispatch invalid-arguments: credential overlay carries \(terminalSafe(key))")))
+                    var credText = "preDispatch invalid-arguments: credential overlay carries \(terminalSafe(key))"
+                    if prop.tool == "exec" {
+                        let receipt = execReceiptText(callID: prop.callID, op: opID, status: "invalid-arguments", started: false, artifact: nil, truncated: false, summary: "credential overlay carries \(key)")
+                        credText += "\n[\(receipt)]"
+                        uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+                    }
+                    transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: credText)))
                 }
                 let nextEffectID = ids.nextEffectID()
                 let seq = ids.nextSequence()
                 let reservation = EffectReservation(effectID: nextEffectID, runID: s1.activeRun!.runID, requestID: s1.activeRun!.requestID, generation: s1.activeRun!.revision, revision: s1.activeRun!.revision, mutating: false, kind: .provider)
                 let invocation = ProviderInvocation(effectID: nextEffectID, requestID: s1.activeRun!.requestID, runID: s1.activeRun!.runID, generation: s1.activeRun!.revision, alias: s1.epoch.profile.alias, epochID: s1.epoch.epochID, sealed: s1.activeRun!.sealed, turnsLeft: s1.turnLimit - s1.turnsUsed, deadlineMillis: s1.runDeadlineMillis, historyDigest: fnv1aHex("\(s1.sessionID.raw):\(seq.value):credential"))
                 let next = s1.replacing(phase: .requesting, turnsUsed: s1.turnsUsed + 1, liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
-                return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
+                return Transition(state: next, effects: uiEffects + [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
                                   records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
             }
         }
@@ -1383,7 +1396,7 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
             records.append(.operationResult(resultRef, outcome: "tool-failure: \(summary) (\(status))"))
             var text = "preDispatch \(status): \(summary)"
             if prop.tool == "exec" {
-                let receipt = "exec \(prop.callID) \(status) op=\(opID.raw) started=false artifact=- truncated=false :: \(summary)"
+                let receipt = execReceiptText(callID: prop.callID, op: opID, status: status, started: false, artifact: nil, truncated: false, summary: summary)
                 text += "\n[\(receipt)]"
                 uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
             }
@@ -1464,10 +1477,18 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
             liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
         // The denial joins the transcript as tool responses: without it the
         // model re-proposes the same tools forever. Never executed, never
-        // silently dropped (I05).
+        // silently dropped (I05). Exec denials also carry the NC-9 receipt.
         let denial = "tools denied by effective capabilities: \(denied.joined(separator: ", "))"
-        let responses = batch.proposals.map {
-            DurableRecord.transcriptAppended(.toolResponse(callID: $0.callID, text: "denied: \(denial)"))
+        var uiExecEffects: [Effect] = []
+        let responses = batch.proposals.map { prop -> DurableRecord in
+            var text = "denied: \(denial)"
+            if prop.tool == "exec" {
+                let opID = ids.nextOperationID()
+                let receipt = execReceiptText(callID: prop.callID, op: opID, status: "denied", started: false, artifact: nil, truncated: false, summary: denial)
+                text += "\n[\(receipt)]"
+                uiExecEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+            }
+            return .transcriptAppended(.toolResponse(callID: prop.callID, text: text))
         }
         return Transition(
             state: next,
@@ -1475,7 +1496,7 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
                 .reserveEffect(reservation),
                 .requestProvider(invocation: invocation),
                 .emitUI(.denied(cause: denial)),
-            ],
+            ] + uiExecEffects,
             records: prefix + [.operationResult(ref, outcome: "denied")] + responses)
     }
     if batch.proposals.isEmpty {
@@ -1612,7 +1633,7 @@ private func execResolutionFailed<I: IDSource>(
         // NC-9: resolution-phase exec refusals also carry the receipt.
         var text = "preDispatch \(status): \(summary)"
         if prop.tool == "exec" {
-            let receipt = "exec \(prop.callID) \(status) op=\(opID.raw) started=false artifact=- truncated=false :: \(summary)"
+            let receipt = execReceiptText(callID: prop.callID, op: opID, status: status, started: false, artifact: nil, truncated: false, summary: summary)
             text += "\n[\(receipt)]"
             uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
         }
@@ -1630,6 +1651,25 @@ private func execResolutionFailed<I: IDSource>(
         state: next,
         effects: uiEffects + [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
         records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
+}
+
+/// M2-C C3 (NC-9): one-line operator-visible exec receipt. Carries the
+/// call identity, stable operation ID, verdict, start certitude, artifact
+/// pointer and truncation flag, plus the executor's summary (exit code,
+/// byte counts, discarded-byte counts). Bounded by construction (fixed
+/// labels, numbers, digests, short statuses — never child output);
+/// terminalSafe is applied by the runUpdate constructor at each call site.
+/// Used on EVERY exec path (success, failure, timeout, unknown, refused,
+/// cancelled, duplicate, halted) so no exec outcome is silent.
+private func execReceiptText(callID: String, op: OperationID, status: String, started: Bool?, artifact: String?, secondary: [String] = [], truncated: Bool, summary: String) -> String {
+    let startedStr: String
+    switch started {
+    case .some(true): startedStr = "started"
+    case .some(false): startedStr = "unstarted"
+    case .none: startedStr = "uncertain"
+    }
+    let secondaryStr = secondary.isEmpty ? "-" : secondary.joined(separator: ",")
+    return "exec \(callID) \(status) op=\(op.raw) \(startedStr) artifact=\(artifact ?? "-") secondary=\(secondaryStr) truncated=\(truncated) :: \(summary)"
 }
 
 /// A3-1 stable operation identity (SPEC §9.1): every externally
@@ -1904,7 +1944,14 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             }
         }
         if !transcript.contains(where: { if case .transcriptAppended(.toolResponse(let id, _)) = $0 { return id == dupID } else { return false } }) {
-            transcript.append(.transcriptAppended(.toolResponse(callID: dupID, text: "duplicate callID: \(dupID)")))
+            var dupText = "duplicate callID: \(dupID)"
+            if proposal.tool == "exec" {
+                let dupRef = OperationRef(operationID: operationID(effectID: effectID, callID: dupID), callID: dupID, state: .unknown, mutating: true)
+                let receipt = execReceiptText(callID: dupID, op: dupRef.operationID, status: "unknown", started: nil, artifact: nil, truncated: false, summary: "duplicate callID")
+                dupText += "\n[\(receipt)]"
+                uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+            }
+            transcript.append(.transcriptAppended(.toolResponse(callID: dupID, text: dupText)))
         }
     }
     // Build map from callID to outcome (first wins, but tainted IDs will be handled as unknown above and skipped below)
@@ -1956,6 +2003,12 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
                 unresolved = markers
                 if overflow { return integrityStop(state, ids: &ids) }
                 records.append(.operationResult(ref, outcome: "unknown"))
+                if proposal.tool == "exec" {
+                    let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: "unknown", started: nil, artifact: nil, truncated: false, summary: "no executor outcome")
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "no-entry: \(proposal.callID)\n[\(receipt)]")))
+                    uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+                    continue
+                }
             }
             transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "no-entry: \(proposal.callID)")))
             continue
@@ -1974,7 +2027,13 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             unresolved = markers
             if overflow { return integrityStop(state, ids: &ids) }
             records.append(.operationResult(ref, outcome: "unknown: mutating mismatch (intent \(isMutating) vs result \(reported)) for \(proposal.callID)"))
-            transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+            var mismatchText = outcome.data
+            if proposal.tool == "exec" {
+                let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: "unknown", started: outcome.started, artifact: outcome.artifactID, secondary: outcome.secondaryArtifactIDs, truncated: outcome.truncated, summary: "mutating mismatch intent=\(isMutating) result=\(reported)")
+                mismatchText += "\n[\(receipt)]"
+                uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+            }
+            transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: mismatchText)))
             continue
         }
         let status = outcome.status
@@ -1992,7 +2051,13 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
                     unresolved = markers
                     if overflow { return integrityStop(state, ids: &ids) }
                     records.append(.operationResult(ref, outcome: "unknown: halt violation \(proposal.callID)"))
-                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "halt violation: \(proposal.callID)")))
+                    var haltText = "halt violation: \(proposal.callID)"
+                    if proposal.tool == "exec" {
+                        let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: "unknown", started: started, artifact: outcome.artifactID, secondary: outcome.secondaryArtifactIDs, truncated: outcome.truncated, summary: "halt violation after \(String(describing: firstHalt))")
+                        haltText += "\n[\(receipt)]"
+                        uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+                    }
+                    transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: haltText)))
                 } else {
                     transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: "halt violation: \(proposal.callID)")))
                 }
@@ -2068,13 +2133,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         // construction (numbers, digests, fixed literals, strerror text).
         let toolText: String
         if proposal.tool == "exec" {
-            let startedFlag: String
-            switch outcome.started {
-            case .some(true): startedFlag = "started"
-            case .some(false): startedFlag = "unstarted"
-            case .none: startedFlag = "uncertain"
-            }
-            let receipt = "exec \(proposal.callID) \(outcome.status) op=\(ref.operationID.raw) \(startedFlag) artifact=\(outcome.artifactID ?? "-") truncated=\(outcome.truncated) :: \(outcome.summary)"
+            let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: outcome.status, started: outcome.started, artifact: outcome.artifactID, secondary: outcome.secondaryArtifactIDs, truncated: outcome.truncated, summary: outcome.summary)
             toolText = outcome.data.isEmpty ? "[\(receipt)]" : "\(outcome.data)\n[\(receipt)]"
             uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
         } else {
@@ -2146,6 +2205,7 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
     consumed.insert(effectID)
     var unresolved = state.unresolvedOperations
     var records: [DurableRecord] = []
+    var uiEffects: [Effect] = []
 
     switch outcome {
     case .preDispatchFailure:
@@ -2156,6 +2216,10 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
             let ref = OperationRef(operationID: operationID(effectID: effectID, callID: prop.callID), callID: prop.callID, state: .done, mutating: true)
             records.append(.operationResult(ref, outcome: "cancelled: unstarted"))
             unresolved.removeAll(where: { $0.operationID == ref.operationID })
+            if prop.tool == "exec" {
+                let receipt = execReceiptText(callID: prop.callID, op: ref.operationID, status: "cancelled", started: false, artifact: nil, truncated: false, summary: "unstarted")
+                uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+            }
         }
         break
     case .success, .failureReceipt:
@@ -2182,15 +2246,25 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
                 records.append(.operationResult(ref, outcome: "cancelled: unstarted"))
                 // Remove the pending marker from unresolved if present (supersession)
                 unresolved.removeAll(where: { $0.operationID == ref.operationID })
+                if prop.tool == "exec" {
+                    let receipt = execReceiptText(callID: call.callID, op: ref.operationID, status: call.status, started: false, artifact: call.artifactID, secondary: call.secondaryArtifactIDs, truncated: call.truncated, summary: "unstarted")
+                    uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+                }
             } else {
-                // Started or unknown: keep marker, no new record (hold remains)
+                // Started or unknown: keep marker, no new record (hold remains).
+                // The operator still sees what is held and why.
+                if prop.tool == "exec" {
+                    let holdRef = OperationRef(operationID: operationID(effectID: effectID, callID: call.callID), callID: call.callID, state: .unknown, mutating: true)
+                    let receipt = execReceiptText(callID: call.callID, op: holdRef.operationID, status: call.status, started: call.started, artifact: call.artifactID, secondary: call.secondaryArtifactIDs, truncated: call.truncated, summary: "uncertain completion withheld")
+                    uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+                }
                 continue
             }
         }
     }
 
     let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending, unresolvedOperations: unresolved)
-    return Transition(state: next, effects: [], records: records)
+    return Transition(state: next, effects: uiEffects, records: records)
 }
 
 private func completeCancelledPendingFailed<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, atMillis: UInt64, ids: inout I) -> Transition {
@@ -2202,7 +2276,14 @@ private func completeCancelledPendingFailed<I: IDSource>(_ state: SessionState, 
     consumed.insert(effectID)
     let errRecord = CancelledPendingError(effectID: effectID, operationIDs: reservation.batch.proposals.map { operationID(effectID: effectID, callID: $0.callID) }, error: error, atMillis: atMillis)
     let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending)
-    return Transition(state: next, effects: [], records: [.cancelledPendingError(errRecord)])
+    // NC-9: the failure carries no per-call outcome, but exec calls still
+    // get an operator-visible receipt (identity + failure, never started).
+    let uiEffects: [Effect] = reservation.batch.proposals.compactMap { prop in
+        guard prop.tool == "exec" else { return nil }
+        let receipt = execReceiptText(callID: prop.callID, op: operationID(effectID: effectID, callID: prop.callID), status: "failed", started: false, artifact: nil, truncated: false, summary: error)
+        return .emitUI(.runUpdate(phase: "tool-exec", detail: receipt))
+    }
+    return Transition(state: next, effects: uiEffects, records: [.cancelledPendingError(errRecord)])
 }
 
 private func handleCancelledPendingRemoved<I: IDSource>(_ state: SessionState, effectID: EffectID, atMillis: UInt64, ids: inout I) -> Transition {
@@ -2211,6 +2292,7 @@ private func handleCancelledPendingRemoved<I: IDSource>(_ state: SessionState, e
     consumed.insert(effectID)
     var unresolved = state.unresolvedOperations
     var records: [DurableRecord] = []
+    var uiEffects: [Effect] = []
     // Promote pending markers to unknown for still-pending operationIDs — always, even if marker already in unresolved (supersession)
     if let reservation = state.cancelledPendingReservations.first(where: { $0.effectID == effectID }) {
         for prop in reservation.batch.proposals {
@@ -2223,10 +2305,14 @@ private func handleCancelledPendingRemoved<I: IDSource>(_ state: SessionState, e
             unresolved = markers
             if overflow { return integrityStop(state, ids: &ids) }
             records.append(.operationResult(ref, outcome: "unknown: cancelled pending terminated"))
+            if prop.tool == "exec" {
+                let receipt = execReceiptText(callID: prop.callID, op: ref.operationID, status: "unknown", started: nil, artifact: nil, truncated: false, summary: "cancelled pending terminated")
+                uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+            }
         }
     }
     let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending, unresolvedOperations: unresolved)
-    return Transition(state: next, effects: [], records: records)
+    return Transition(state: next, effects: uiEffects, records: records)
 }
 
 private func failEffect<I: IDSource>(_ state: SessionState, effectID: EffectID, error: String, ids: inout I) -> Transition {

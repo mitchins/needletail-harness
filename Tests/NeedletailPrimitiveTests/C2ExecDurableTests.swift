@@ -1438,6 +1438,40 @@ struct C2ExecDurableTests {
         #expect(try Self.leaseRows(store, atPath: dbPath) == 0)
     }
 
+    @Test("C2 exec: cancellation during spill grant propagates, never converts to failure")
+    func execCancelDuringGrantPropagates() async throws {
+        defer { Self.resetHooks() }
+        let (wsURL, wsFP) = try Self.makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: wsURL) }
+        let (dir, store, session, writer) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let dbPath = dir.appendingPathComponent("store.sqlite").path
+        // Hold the artifact lock externally: the 10s grant cannot proceed.
+        let lockPath = dbPath + "-artifacts.lock"
+        let holderFD: Int32 = lockPath.withCString { open($0, O_RDWR | O_CREAT | O_CLOEXEC, mode_t(0o600)) }
+        #expect(holderFD >= 0)
+        #expect(flock(holderFD, LOCK_EX) == 0, "holder takes the lock")
+        defer { close(holderFD) }
+        let resolver = try WorkspaceResolver(workspace: wsFP, readRoots: [])
+        let exec = Self.makeExecutor(resolver: resolver, store: store, session: session, identity: writer)
+        let batch = Self.execBatch("{\"executable\":\"/bin/echo\",\"argv\":[\"/bin/echo\",\"x\"],\"timeoutSecs\":30}")
+        let (digests, cwdIds) = try Self.approve(executor: exec, batch: batch)
+        let reservation = Self.makeReservation(batch: batch, digests: digests, cwdIds: cwdIds)
+        let task = Task { try await exec.execute(batch: batch, reservation: reservation) }
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        task.cancel()
+        let start = Date()
+        do {
+            _ = try await task.value
+            Issue.record("cancelled grant must throw, not return an outcome")
+        } catch is CancellationError {
+            #expect(Date().timeIntervalSince(start) < 8, "cancellation cuts through the 10s grant bound")
+        } catch {
+            Issue.record("cancellation must propagate, not convert: \(error)")
+        }
+        #expect(try Self.leaseRows(store, atPath: dbPath) == 0, "cancelled grant leaves no lease")
+    }
+
     @Test("C2 exec: stderr-only output publishes stderr, releases stdout")
     func execStderrOnlyPublishesStderr() async throws {
         defer { Self.resetHooks() }
@@ -1458,6 +1492,7 @@ struct C2ExecDurableTests {
         }
         defer { f.cleanup() }
         #expect(out.artifactID == nil, "empty stdout publishes no artifact")
+        #expect(out.secondaryArtifactIDs.count == 1, "stderr artifact carried as secondary, got \(out.secondaryArtifactIDs)")
         #expect(out.summary.contains("stderr-artifact="), "stderr digest recorded, got \(out.summary)")
         let stderrDigest = out.summary.split(separator: ";").map({ $0.trimmingCharacters(in: .whitespaces) }).first(where: { $0.hasPrefix("stderr-artifact=") }).map { String($0.dropFirst("stderr-artifact=".count)) }
         let digest = try #require(stderrDigest)

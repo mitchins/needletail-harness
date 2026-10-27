@@ -479,7 +479,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// per-call result carries the executor's attestation (the reducer
     /// verifies agreement with the dispatch-time intent).
     private func stamped(_ outcome: ToolCallOutcome, isMutating: Bool) -> ToolCallOutcome {
-        ToolCallOutcome(callID: outcome.callID, status: outcome.status, summary: outcome.summary, data: outcome.data, artifactID: outcome.artifactID, truncated: outcome.truncated, warnings: outcome.warnings, error: outcome.error, path: outcome.path, mode: outcome.mode, beforeHash: outcome.beforeHash, afterHash: outcome.afterHash, started: outcome.started, mutating: isMutating)
+        ToolCallOutcome(callID: outcome.callID, status: outcome.status, summary: outcome.summary, data: outcome.data, artifactID: outcome.artifactID, secondaryArtifactIDs: outcome.secondaryArtifactIDs, truncated: outcome.truncated, warnings: outcome.warnings, error: outcome.error, path: outcome.path, mode: outcome.mode, beforeHash: outcome.beforeHash, afterHash: outcome.afterHash, started: outcome.started, mutating: isMutating)
     }
 
     public func describe(batch: ToolBatch) -> String {
@@ -666,19 +666,26 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             // provider may re-propose. Deterministic `failed`, started nil:
             // nothing executed, continuation proceeds (no hold).
             let spillKind = "exec-output"
-            let stdoutHandle: SpillHandle
-            do {
-                stdoutHandle = try store.openArtifactSpill(session: sessionID, as: writer, kind: spillKind, stream: "stdout", requestedBytes: 32*1024*1024)
-            } catch {
-                throw ToolFailure.preDispatch(status: "failed", summary: "spill lease failed: \(error)")
-            }
-            let stderrHandle: SpillHandle
-            do {
-                stderrHandle = try store.openArtifactSpill(session: sessionID, as: writer, kind: spillKind, stream: "stderr", requestedBytes: 32*1024*1024)
-            } catch {
-                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
-                throw ToolFailure.preDispatch(status: "failed", summary: "spill lease failed: \(error)")
-            }
+        let stdoutHandle: SpillHandle
+        do {
+            stdoutHandle = try store.openArtifactSpill(session: sessionID, as: writer, kind: spillKind, stream: "stdout", requestedBytes: 32*1024*1024)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ToolFailure.preDispatch(status: "failed", summary: "spill lease failed: \(error)")
+        }
+        let stderrHandle: SpillHandle
+        do {
+            stderrHandle = try store.openArtifactSpill(session: sessionID, as: writer, kind: spillKind, stream: "stderr", requestedBytes: 32*1024*1024)
+        } catch is CancellationError {
+            // A cancelled second grant still releases the first lease
+            // synchronously (no partial-leak state), then propagates.
+            try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+            throw CancellationError()
+        } catch {
+            try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+            throw ToolFailure.preDispatch(status: "failed", summary: "spill lease failed: \(error)")
+        }
             // Launch via ExecRunner with revalidation (FD binding, execPath, cwd)
             let runner = ExecRunner(resolver: resolver)
             let execResult: ExecRunner.Result
@@ -762,8 +769,8 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             if let ref = stderrRef {
                 summaryParts.append("stderr-artifact=\(ref.digest)")
             }
-            let preview = String(decoding: execResult.stdout.prefix(16*1024), as: UTF8.self)
-            return ToolCallOutcome(callID: proposal.callID, status: status, summary: summaryParts.joined(separator: "; "), data: preview, artifactID: stdoutRef?.digest, truncated: execResult.truncated, started: true)
+        let preview = String(decoding: execResult.stdout.prefix(16*1024), as: UTF8.self)
+        return ToolCallOutcome(callID: proposal.callID, status: status, summary: summaryParts.joined(separator: "; "), data: preview, artifactID: stdoutRef?.digest, secondaryArtifactIDs: stderrRef.map { [$0.digest] } ?? [], truncated: execResult.truncated, started: true)
         default:
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown tool")
         }
@@ -1337,6 +1344,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// the fork/exec/drain/escalation machinery.
     static func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval, env: [String: String] = sanitizedSearchEnv, cwdFD: Int32? = nil, execPath: String? = nil, useSession: Bool = false) throws -> BoundedRunResult {
         try Task.checkCancellation()
+        // Snapshot test hooks into locals BEFORE fork: the child below must
+        // never touch Swift globals (async-signal-safety; no once-token,
+        // no cross-test contamination through shared mutable state).
+        let hookKillAfterMarker = Self._testHook_killAfterMarker
+        let hookStopAfterMarker = Self._testHook_stopAfterMarker
         Self.spawnLock.lock()
         let (outR, outW): (Int32, Int32)
         do {
@@ -1533,14 +1545,14 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             // stopAfterMarker: SIGSTOP after the marker — the parent
             // observes [0x01] with no EOF; the run deadline decides
             // (timeout/unknown+hold), never a fabricated success.
-            if Self._testHook_killAfterMarker {
+            if hookKillAfterMarker {
 #if canImport(Glibc)
                 Glibc.raise(SIGKILL)
 #else
                 Darwin.raise(SIGKILL)
 #endif
             }
-            if Self._testHook_stopAfterMarker {
+            if hookStopAfterMarker {
 #if canImport(Glibc)
                 Glibc.raise(SIGSTOP)
 #else
@@ -1627,6 +1639,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             let readDeadline = deadlineNanos
             var eof = false
             while errBytes.count < 8 && !eof && NativeToolExecutor.monotonicNanos() < readDeadline {
+                // Cooperative cancellation: a stopped-after-marker child
+                // holds the pipe open, so the wait is deadline-bounded —
+                // but an explicit cancel must still cut through promptly
+                // rather than burn the whole run budget.
+                if Task.isCancelled { throw CancellationError() }
                 var pfd = pollfd(fd: errPipeRead, events: Int16(POLLIN), revents: 0)
                 let pr = poll(&pfd, 1, 100)
                 // POLLHUP/POLLERR without POLLIN (all writers gone, no data
