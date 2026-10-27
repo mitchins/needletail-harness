@@ -209,7 +209,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
-    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle) throws -> ArtifactRef {
+    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle, operationID: OperationID? = nil) throws -> ArtifactRef {
         try lock.withLock {
             guard session == identity.session && session == spill.session else { throw StoreError.integrity("publish session mismatch") }
             guard kind == spill.kind else { throw StoreError.integrity("publish kind mismatch") }
@@ -220,7 +220,7 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             if artifactBytes[digest] == nil { artifactBytes[digest] = data }
             sequence += 1
-            let ref = ArtifactRef(digest: digest, size: data.count, kind: kind, operationID: nil)
+            let ref = ArtifactRef(digest: digest, size: data.count, kind: kind, operationID: operationID)
             log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: .artifactPublished(ref)))
             sessionRows.append(identity.session.raw)
             spillLeases.removeValue(forKey: spill.leaseID.uuidString)

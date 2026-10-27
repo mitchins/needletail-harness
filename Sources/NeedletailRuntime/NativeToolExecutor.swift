@@ -702,7 +702,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                     throw error
                 }
                 do {
-                    return try store.publishArtifactFromFile(session: sessionID, as: writer, kind: spillKind, spill: handle)
+                    // The stable operation identity binds this artifact to
+                    // its call for recovery tracing (same derivation as the
+                    // intent's operationID in SessionTransition).
+                    let opID = OperationID("\(reservation.effectID.raw)/\(proposal.callID)")
+                    return try store.publishArtifactFromFile(session: sessionID, as: writer, kind: spillKind, spill: handle, operationID: opID)
                 } catch {
                     try? store.releaseArtifactSpill(as: writer, handle: handle)
                     throw error
@@ -726,7 +730,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             else { status = "failed" }
             var summaryParts: [String] = []
             if execResult.timedOut {
-                summaryParts.append("exec timed out after \(args.timeoutSecs)s (exit \(execResult.exitStatus))")
+                summaryParts.append("exec timed out after \(Int(effective))s (exit \(execResult.exitStatus))")
             } else if execResult.exitStatus == 0 {
                 summaryParts.append("exec succeeded (exit 0)")
             } else {
@@ -1333,6 +1337,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         defer { for p in envp { if let p { free(p) } } }
         guard let pathC = strdup(executablePath) else {
             close(outR); close(errR); close(outW); close(errW)
+            close(errPipeRead); close(errPipeWrite)
             Self.spawnLock.unlock()
             throw ToolFailure.preDispatch(status: "failed", summary: "rg launch failed: alloc")
         }
@@ -1346,6 +1351,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         if pid < 0 {
             let e = errno
             close(outR); close(errR); close(outW); close(errW)
+            close(errPipeRead); close(errPipeWrite)
             Self.spawnLock.unlock()
             throw ToolFailure.preDispatch(status: "failed", summary: "rg fork failed: \(String(cString: strerror(e)))")
         }
@@ -1357,19 +1363,76 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         if pid == 0 {
             // C1: dedicated process group/session where supported — the child
             // becomes session and group leader; grandchildren inherit the group.
+            // A setsid failure is reported (never silently uncontained).
             if useSession {
 #if canImport(Glibc)
-                _ = Glibc.setsid()
+                if Glibc.setsid() < 0 {
+                    var e = errno
+                    var code: UInt8 = 0x02
+                    _ = Glibc.write(errPipeWrite, &code, 1)
+                    _ = Glibc.write(errPipeWrite, &e, 4)
+                    Glibc._exit(127)
+                }
 #else
-                _ = Darwin.setsid()
+                if Darwin.setsid() < 0 {
+                    var e = errno
+                    var code: UInt8 = 0x02
+                    _ = Darwin.write(errPipeWrite, &code, 1)
+                    _ = Darwin.write(errPipeWrite, &e, 4)
+                    Darwin._exit(127)
+                }
 #endif
             }
+            // Reset signal dispositions the parent may ignore (notably the
+            // production CLI's SIG_IGN for INT/PIPE): escalation signals
+            // must terminate the child, and EPIPE must surface as an error,
+            // never silent survival. signal() is async-signal-safe.
+#if canImport(Glibc)
+            _ = Glibc.signal(SIGINT, SIG_DFL)
+            _ = Glibc.signal(SIGTERM, SIG_DFL)
+            _ = Glibc.signal(SIGPIPE, SIG_DFL)
+#else
+            _ = Darwin.signal(SIGINT, SIG_DFL)
+            _ = Darwin.signal(SIGTERM, SIG_DFL)
+            _ = Darwin.signal(SIGPIPE, SIG_DFL)
+#endif
             // Child: wire pipes to stdio, drop pipe FDs, exec. The qualified
             // rg FD and search-root FDs are inheritable and survive into rg
             // for /proc/self/fd resolution. Guards avoid closing stdio itself
             // if a pipe FD ever lands on 0/1/2. No Swift runtime interaction.
-            _ = dup2(outW, STDOUT_FILENO)
-            _ = dup2(errW, STDERR_FILENO)
+            // dup2 failures are reported via the error pipe, never run on
+            // with broken stdio.
+#if canImport(Glibc)
+            if Glibc.dup2(outW, STDOUT_FILENO) < 0 {
+                var e = errno
+                var code: UInt8 = 0x02
+                _ = Glibc.write(errPipeWrite, &code, 1)
+                _ = Glibc.write(errPipeWrite, &e, 4)
+                Glibc._exit(127)
+            }
+            if Glibc.dup2(errW, STDERR_FILENO) < 0 {
+                var e = errno
+                var code: UInt8 = 0x02
+                _ = Glibc.write(errPipeWrite, &code, 1)
+                _ = Glibc.write(errPipeWrite, &e, 4)
+                Glibc._exit(127)
+            }
+#else
+            if Darwin.dup2(outW, STDOUT_FILENO) < 0 {
+                var e = errno
+                var code: UInt8 = 0x02
+                _ = Darwin.write(errPipeWrite, &code, 1)
+                _ = Darwin.write(errPipeWrite, &e, 4)
+                Darwin._exit(127)
+            }
+            if Darwin.dup2(errW, STDERR_FILENO) < 0 {
+                var e = errno
+                var code: UInt8 = 0x02
+                _ = Darwin.write(errPipeWrite, &code, 1)
+                _ = Darwin.write(errPipeWrite, &e, 4)
+                Darwin._exit(127)
+            }
+#endif
             if outR != STDIN_FILENO && outR != STDOUT_FILENO && outR != STDERR_FILENO { close(outR) }
             if errR != STDIN_FILENO && errR != STDOUT_FILENO && errR != STDERR_FILENO { close(errR) }
             if outW != STDOUT_FILENO { close(outW) }
@@ -1398,10 +1461,12 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 }
 #endif
             }
-            // C2 exec-error pipe: close read end, write 0x01 marker before execve
+            // C2 exec-error pipe: close read end, write 0x01 marker before execve.
+            // A failed marker write aborts (REV8: a command that ran must
+            // never classify pre-dispatch). EINTR retries; any other failure
+            // means the parent is gone, so _exit (EOF-no-marker ⇒ the
+            // parent classifies pre-exec death, fail-safe).
             close(errPipeRead)
-            // Child's dup2 wiring already closed outR/errR, but keep errPipeWrite
-            // Write 0x01 with EINTR retry; EPIPE means parent closed, still exec
             do {
                 var m: UInt8 = 0x01
                 var written = 0
@@ -1413,13 +1478,30 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
 #endif
                     if n == 1 { written = 1; break }
                     if n < 0 && errno == EINTR { continue }
-                    break // EPIPE or other, still try exec
+#if canImport(Glibc)
+                    Glibc._exit(127)
+#else
+                    Darwin._exit(127)
+#endif
                 }
             }
             // C1: execPath split — the display argv[0] stays the resolved
-            // path, but the kernel executes the /proc/self/fd path.
-            let execvePath: UnsafeMutablePointer<CChar> = execPath != nil ? (strdup(execPath!) ?? pathC) : pathC
-            let needsFree = execPath != nil
+            // path, but the kernel executes the /proc/self/fd path. An
+            // OOM here aborts (never fall back to the display path — that
+            // would reopen the TOCTOU the fd binding closes).
+            let execvePath: UnsafeMutablePointer<CChar>
+            if let execPath {
+                guard let p = strdup(execPath) else {
+#if canImport(Glibc)
+                    Glibc._exit(127)
+#else
+                    Darwin._exit(127)
+#endif
+                }
+                execvePath = p
+            } else {
+                execvePath = pathC
+            }
             argv.withUnsafeMutableBufferPointer { abuf in
                 envp.withUnsafeMutableBufferPointer { ebuf in
 #if canImport(Glibc)
@@ -1429,7 +1511,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
 #endif
                 }
             }
-            if needsFree { free(UnsafeMutablePointer(mutating: execvePath)) }
+            if execPath != nil { free(UnsafeMutablePointer(mutating: execvePath)) }
             // execve failed: write 0x02 + errno. Capture errno before the
             // marker write clobbers it.
             do {
@@ -1451,6 +1533,12 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         close(errPipeWrite)
         close(outW)
         close(errW)
+        // Monotonic clock: wall-clock changes must not extend/truncate the
+        // timeout. Hard stop is deadline+6 s; cleanup loops can add ~4 s, so
+        // the real bound is ~timeout+10 s.
+        let startNanos = Self.monotonicNanos()
+        let deadlineNanos = startNanos + UInt64(timeout * 1_000_000_000)
+        let hardNanos = deadlineNanos + 6_000_000_000
         var execStarted = false
         var execError: (code: UInt8, errno: Int32)? = nil
         // C2 exec-error pipe: the write end is CLOEXEC, so a successful
@@ -1463,14 +1551,21 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         //   [0x02 e0..e3]     → pre-exec failure with errno (fchdir path)
         //   [0x01 0x02 e0..e3]→ execve failed after the marker (never started)
         // Any observed 0x02 ⇒ no image ever executed ⇒ pre-dispatch
-        // `failed`. EOF terminates every case (execve-CLOEXEC or _exit);
-        // the 2 s deadline is a backstop only — an inconclusive wait (no
-        // bytes, no EOF) leaves both flags clear and lets the main
-        // deadline/reap machinery decide instead of fabricating a verdict.
+        // `failed`. EOF terminates every case (execve-CLOEXEC or _exit).
+        // The wait is bounded by the RUN deadline (never a fixed short
+        // window): the child always terminates promptly (exec or _exit), so
+        // only scheduling delay can stretch the read — and that delay is
+        // charged to the run budget the caller already approved. A fixed
+        // short deadline here would manufacture "started" from a
+        // descheduled child under load. If the run deadline expires first
+        // with a partial 0x02 frame, the failure is still reported (errno
+        // possibly zeroed); a bare [0x01] or no bytes at all stays
+        // inconclusive and the main deadline/reap machinery decides
+        // (timeout ⇒ unknown+hold, never a fabricated success).
         do {
             var errBytes: [UInt8] = []
             errBytes.reserveCapacity(8)
-            let readDeadline = NativeToolExecutor.monotonicNanos() + 2_000_000_000
+            let readDeadline = deadlineNanos
             var eof = false
             while errBytes.count < 8 && !eof && NativeToolExecutor.monotonicNanos() < readDeadline {
                 var pfd = pollfd(fd: errPipeRead, events: Int16(POLLIN), revents: 0)
@@ -1582,12 +1677,10 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         var errDiscarded: Int64 = 0
         var exitStatus: Int32 = -1
         var childDone = false
-        // Monotonic clock: wall-clock changes must not extend/truncate the
-        // timeout. Hard stop is deadline+6 s; cleanup loops can add ~4 s, so
-        // the real bound is ~timeout+10 s.
-        let startNanos = Self.monotonicNanos()
-        let deadlineNanos = startNanos + UInt64(timeout * 1_000_000_000)
-        let hardNanos = deadlineNanos + 6_000_000_000
+        // deadlineNanos/hardNanos/startNanos are computed BEFORE the
+        // exec-error classification above: the classification wait is
+        // charged to the run budget (a fixed short window there would
+        // manufacture "started" from a descheduled child under load).
         var killNanos = UInt64.max
         var deadlineExceeded = false
         var hardStopped = false

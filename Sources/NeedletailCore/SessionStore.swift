@@ -292,7 +292,7 @@ public protocol SessionStore: Sendable {
     /// Publish a previously opened spill file to a durable artifact. The
     /// artifact is fsync'd and the reference is inserted in the same
     /// transaction as the lease deletion — never a reference to a missing file.
-    func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle) throws -> ArtifactRef
+    func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle, operationID: OperationID?) throws -> ArtifactRef
     /// Release a spill lease and unlink its staging file (synchronous, fenced).
     func releaseArtifactSpill(as identity: WriterIdentity, handle: SpillHandle) throws
 }
@@ -349,8 +349,8 @@ extension SessionStore {
         throw StoreError.integrity("spill lease not supported by this store")
     }
 
-    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle) throws -> ArtifactRef {
-        _ = session; _ = identity; _ = kind; _ = spill
+    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle, operationID: OperationID? = nil) throws -> ArtifactRef {
+        _ = session; _ = identity; _ = kind; _ = spill; _ = operationID
         throw StoreError.integrity("spill publish not supported by this store")
     }
 

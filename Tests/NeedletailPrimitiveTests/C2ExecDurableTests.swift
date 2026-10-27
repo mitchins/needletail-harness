@@ -846,6 +846,7 @@ struct C2ExecDurableTests {
     private final class C2FailingStore: SessionStore, @unchecked Sendable {
         private let inner: GRDBSessionStore
         var failResults = false
+        var failIntents = false
         init(inner: GRDBSessionStore) { self.inner = inner }
         func claimWriterOwnership(session: SessionID, writer: String) throws { try inner.claimWriterOwnership(session: session, writer: writer) }
         func sessions() throws -> [SessionID] { try inner.sessions() }
@@ -854,6 +855,11 @@ struct C2ExecDurableTests {
         func appendBatch(_ records: [DurableRecord], as identity: WriterIdentity) throws {
             if failResults && records.contains(where: { if case .operationResult = $0 { return true } else { return false } }) {
                 throw StoreError.integrity("injected completion-store failure")
+            }
+            if failIntents && records.contains(where: {
+                if case .operationIntent(let ref) = $0, ref.callID != nil { return true } else { return false }
+            }) {
+                throw StoreError.integrity("injected intent-store failure")
             }
             try inner.appendBatch(records, as: identity)
         }
@@ -1112,5 +1118,186 @@ struct C2ExecDurableTests {
         let final = await actor.currentState()
         #expect(final.unresolvedOperations.count == 1, "one held operation")
         #expect(final.unresolvedOperations.first?.state == .unknown, "completion-fail is unknown, never done")
+    }
+    @Test("C2 exec: omitted cwd pins the workspace root (never inherits process cwd)")
+    func execOmittedCwdPinsRoot() async throws {
+        defer { Self.resetHooks() }
+        var win: (ExecAttempt, ToolCallOutcome)? = nil
+        for _ in 0..<3 {
+            let f = try Self.makeAttempt()
+            // /bin/pwd prints the child's working directory: it must be
+            // the workspace root even though no cwd was approved.
+            let batch = Self.execBatch("{\"executable\":\"/bin/pwd\",\"argv\":[\"/bin/pwd\"],\"timeoutSecs\":30}")
+            let (digests, cwdIds) = try Self.approve(executor: f.executor, batch: batch)
+            let result = try await f.executor.execute(batch: batch, reservation: Self.makeReservation(batch: batch, digests: digests, cwdIds: cwdIds))
+            guard let out = result.calls.first else { f.cleanup(); Issue.record("no outcome"); return }
+            if out.status == "success" { win = (f, out); break }
+            f.cleanup()
+            guard Self.isProbeFlake(out) else { Issue.record("non-flake failure, no retry: \(out)"); return }
+        }
+        guard let (f, out) = win else {
+            Issue.record("safe-direction flake persisted across attempts")
+            return
+        }
+        defer { f.cleanup() }
+        #expect(out.data.trimmingCharacters(in: .whitespacesAndNewlines) == f.wsURL.path,
+                "omitted cwd runs in the workspace root, got \(out.data)")
+        // Counterfactual: a different process cwd must not leak in.
+        #expect(out.data.trimmingCharacters(in: .whitespacesAndNewlines) != FileManager.default.currentDirectoryPath,
+                "child cwd is pinned, not inherited")
+    }
+
+    @Test("C2 store: forged spill handles are rejected, never publish or delete")
+    func spillForgedHandlesRejected() throws {
+        defer { Self.resetHooks() }
+        let (dir, store, session, writer) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let dbPath = dir.appendingPathComponent("store.sqlite").path
+        let h = try store.openArtifactSpill(session: session, as: writer, kind: "exec-output", stream: "stdout", requestedBytes: 64)
+        try Data("real\n".utf8).write(to: URL(fileURLWithPath: h.path))
+        // Unknown lease: rejected, nothing published.
+        let forged = SpillHandle(leaseID: UUID(), session: session, stream: "stdout", kind: "exec-output", path: h.path, bytes: 64)
+        do {
+            _ = try store.publishArtifactFromFile(session: session, as: writer, kind: "exec-output", spill: forged)
+            Issue.record("unknown-lease publish must fail")
+        } catch is StoreError { }
+        // Cross-lease path: lease row of h but another handle's path.
+        let h2 = try store.openArtifactSpill(session: session, as: writer, kind: "exec-output", stream: "stderr", requestedBytes: 64)
+        let crossed = SpillHandle(leaseID: h.leaseID, session: session, stream: "stdout", kind: "exec-output", path: h2.path, bytes: 64)
+        do {
+            _ = try store.publishArtifactFromFile(session: session, as: writer, kind: "exec-output", spill: crossed)
+            Issue.record("cross-lease publish must fail")
+        } catch is StoreError { }
+        // Escape path: lease row of h but /tmp path.
+        let escape = SpillHandle(leaseID: h.leaseID, session: session, stream: "stdout", kind: "exec-output", path: "/tmp/c2-escape-x", bytes: 64)
+        do {
+            _ = try store.publishArtifactFromFile(session: session, as: writer, kind: "exec-output", spill: escape)
+            Issue.record("escape publish must fail")
+        } catch is StoreError { }
+        // Kind mismatch: row says exec-output, handle claims other.
+        let wrongKind = SpillHandle(leaseID: h.leaseID, session: session, stream: "stdout", kind: "other", path: h.path, bytes: 64)
+        do {
+            _ = try store.publishArtifactFromFile(session: session, as: writer, kind: "other", spill: wrongKind)
+            Issue.record("kind-mismatch publish must fail")
+        } catch is StoreError { }
+        // Release with a forged path must not delete arbitrary files.
+        let victim = dir.appendingPathComponent("victim").path
+        try Data("precious".utf8).write(to: URL(fileURLWithPath: victim))
+        let evilRelease = SpillHandle(leaseID: h.leaseID, session: session, stream: "stdout", kind: "exec-output", path: victim, bytes: 64)
+        do {
+            try store.releaseArtifactSpill(as: writer, handle: evilRelease)
+            Issue.record("forged release must fail")
+        } catch is StoreError { }
+        #expect(FileManager.default.fileExists(atPath: victim), "forged release deletes nothing")
+        // Stream with a separator is refused at grant.
+        do {
+            _ = try store.openArtifactSpill(session: session, as: writer, kind: "exec-output", stream: "a/b", requestedBytes: 64)
+            Issue.record("separator stream must be refused")
+        } catch is StoreError { }
+        // The genuine handle still publishes after the forgery attempts.
+        let ref = try store.publishArtifactFromFile(session: session, as: writer, kind: "exec-output", spill: h)
+        #expect(try store.readArtifact(ref) == Data("real\n".utf8))
+        try store.releaseArtifactSpill(as: writer, handle: h2)
+        #expect(try Self.leaseRows(store, atPath: dbPath) == 0)
+    }
+
+    @Test("C2 exec: stderr-only output publishes stderr, releases stdout")
+    func execStderrOnlyPublishesStderr() async throws {
+        defer { Self.resetHooks() }
+        var win: (ExecAttempt, ToolCallOutcome)? = nil
+        for _ in 0..<3 {
+            let f = try Self.makeAttempt()
+            let batch = Self.execBatch("{\"executable\":\"/bin/sh\",\"argv\":[\"/bin/sh\",\"-c\",\"echo only-err 1>&2\"],\"timeoutSecs\":30}")
+            let (digests, cwdIds) = try Self.approve(executor: f.executor, batch: batch)
+            let result = try await f.executor.execute(batch: batch, reservation: Self.makeReservation(batch: batch, digests: digests, cwdIds: cwdIds))
+            guard let out = result.calls.first else { f.cleanup(); Issue.record("no outcome"); return }
+            if out.status == "success" { win = (f, out); break }
+            f.cleanup()
+            guard Self.isProbeFlake(out) else { Issue.record("non-flake failure, no retry: \(out)"); return }
+        }
+        guard let (f, out) = win else {
+            Issue.record("safe-direction flake persisted across attempts")
+            return
+        }
+        defer { f.cleanup() }
+        #expect(out.artifactID == nil, "empty stdout publishes no artifact")
+        #expect(out.summary.contains("stderr-artifact="), "stderr digest recorded, got \(out.summary)")
+        let stderrDigest = out.summary.split(separator: ";").map({ $0.trimmingCharacters(in: .whitespaces) }).first(where: { $0.hasPrefix("stderr-artifact=") }).map { String($0.dropFirst("stderr-artifact=".count)) }
+        let digest = try #require(stderrDigest)
+        let bytes = try f.store.readArtifact(ArtifactRef(digest: digest, size: 9, kind: "exec-output", operationID: nil))
+        #expect(bytes == Data("only-err\n".utf8), "stderr bytes durable, got \(String(decoding: bytes, as: UTF8.self))")
+        #expect(try Self.leaseRows(f.store, atPath: f.dbPath) == 0, "both leases settled")
+        #expect(try Self.stagingFiles(f.store, dbPath: f.dbPath).isEmpty)
+    }
+
+    @Test("C2 exec: cancellation propagates and releases spill leases")
+    func execCancelPropagatesAndReleases() async throws {
+        defer { Self.resetHooks() }
+        let f = try Self.makeAttempt()
+        defer { f.cleanup() }
+        let batch = Self.execBatch("{\"executable\":\"/bin/sleep\",\"argv\":[\"/bin/sleep\",\"30\"],\"timeoutSecs\":120}")
+        let (digests, cwdIds) = try Self.approve(executor: f.executor, batch: batch)
+        let reservation = Self.makeReservation(batch: batch, digests: digests, cwdIds: cwdIds)
+        let task = Task { try await f.executor.execute(batch: batch, reservation: reservation) }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        task.cancel()
+        do {
+            _ = try await task.value
+            Issue.record("cancelled exec must throw CancellationError, not an outcome")
+        } catch is CancellationError {
+            // Expected: cancellation is delivery, never converted.
+        } catch {
+            Issue.record("wrong error on cancel: \(error)")
+        }
+        // No zombie, no lease leak, no staging leak after cancellation.
+        #expect(try Self.leaseRows(f.store, atPath: f.dbPath) == 0, "cancel releases both leases")
+        #expect(try Self.stagingFiles(f.store, dbPath: f.dbPath).isEmpty)
+    }
+
+    @Test("C2 actor: intent store-fail prevents spawn (failed, unstarted)")
+    func actorIntentStoreFailPreventsSpawn() async throws {
+        defer { Self.resetHooks() }
+        let (wsURL, wsFP) = try Self.makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: wsURL) }
+        let dir = try Self.tempDir(prefix: "c2-actor-intent")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbPath = dir.appendingPathComponent("store.sqlite").path
+        let inner = try GRDBSessionStore(path: dbPath)
+        defer { try? inner.close() }
+        let session = SessionID("s-c2a")
+        try inner.claimWriterOwnership(session: session, writer: "c2a-writer")
+        let store = C2FailingStore(inner: inner)
+        store.failIntents = true
+        let identity = WriterIdentity(session: session, writer: "c2a-writer")
+        let script = wsURL.appendingPathComponent("never2.sh")
+        try "#!/bin/sh\ntouch \(wsURL.path)/SENTINEL6\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let resolver = try WorkspaceResolver(workspace: wsFP, readRoots: [])
+        let executor = Self.makeExecutor(resolver: resolver, store: store, session: session, identity: identity)
+        let transport = C2Transport()
+        transport.script = [
+            ProviderResponse(
+                requestID: RequestID("s"), generation: Revision(0),
+                outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                    ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d",
+                                arguments: "{\"executable\":\"\(script.path)\",\"argv\":[\"\(script.path)\"],\"timeoutSecs\":30}"),
+                ], isFinal: false)),
+        ]
+        let approvals = C2Approvals()
+        approvals.script = [.approve]
+        let actor = try SessionActor(
+            state: try Self.actorEpoch(), ids: DeterministicIDSource(prefix: "c2i"),
+            clock: VirtualClock(now: 1_000_000),
+            transport: transport, executor: executor, store: store,
+            approvals: approvals, writer: "c2a-writer", execResolver: executor)
+        await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
+        // The intent cannot commit: the run fails before any dispatch.
+        try await Self.awaitCondition("intent failure stops the run") {
+            let st = await actor.currentState()
+            if case .failed = st.phase { return true }
+            return false
+        }
+        #expect(transport.invocations == 1, "no continuation past the unpersisted intent")
+        #expect(!FileManager.default.fileExists(atPath: wsURL.appendingPathComponent("SENTINEL6").path), "intent failure prevents spawn")
     }
 }

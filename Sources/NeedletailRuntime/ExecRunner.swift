@@ -217,29 +217,36 @@ public struct ExecRunner: Sendable {
                     close(resolvedCwdFD)
                     resolvedCwdFD = fcntl(rootFD2, F_DUPFD, 3)
                     if resolvedCwdFD < 0 { failed = true; break }
-                    // Check re-entry: walk the absolute target and ensure it stays within root
-                    // For C2, fail if absolute target does not re-enter root prefix (dev/ino check)
-                    // Simplified: require absolute target to have root prefix string
-                    if !linkTarget.hasPrefix(rootPath) { failed = true; break }
-                    let tailPart = String(linkTarget.dropFirst(rootPath.count))
+                    // Containment by boundary-exact prefix: the target must
+                    // be the root itself or stay beneath it (a plain
+                    // hasPrefix would admit "/a/bc" for root "/a/b"). The
+                    // tail is then walked relatively from the root FD, so
+                    // containment holds structurally; the dev/ino check
+                    // below still closes any residual mismatch.
+                    guard linkTarget == rootPath || linkTarget.hasPrefix(rootPath + "/") else { failed = true; break }
+                    let tailPart = linkTarget == rootPath ? "" : String(linkTarget.dropFirst(rootPath.count + 1))
                     cwdStack.removeAll()
                     cwdComps = byteSplit(tailPart).filter({ !$0.isEmpty }) + Array(cwdComps[(j+1)...]); j = 0
                     cwdHops += 1; if cwdHops > 40 { failed = true; break }
                 } else {
                     var tail = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(cwdComps[(j+1)...])
                     var newStack = cwdStack
-                    var newFD = resolvedCwdFD
+                    // Walk leading ".." with single ownership: cur starts
+                    // aliased to resolvedCwdFD (unowned); each successful
+                    // pop closes the previous fd exactly once.
+                    var cur: Int32 = resolvedCwdFD
+                    var curOwned = false
                     var popFailed = false
                     while let first = tail.first, first == ".." {
                         guard newStack.popLast() != nil else { popFailed = true; break }
-                        let parent = openat(newFD, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                        let parent = openat(cur, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
                         if parent < 0 { popFailed = true; break }
-                        if newFD != resolvedCwdFD { close(newFD) } else { close(resolvedCwdFD) }
-                        newFD = parent; tail.removeFirst()
+                        if curOwned { close(cur) } else { close(resolvedCwdFD) }
+                        cur = parent; curOwned = true; tail.removeFirst()
                     }
-                    if popFailed { failed = true; if newFD != resolvedCwdFD { close(newFD) }; break }
+                    if popFailed { if curOwned { close(cur) }; failed = true; break }
                     cwdComps = tail; cwdStack = newStack
-                    if newFD != resolvedCwdFD { close(resolvedCwdFD); resolvedCwdFD = newFD }
+                    if curOwned { resolvedCwdFD = cur }
                     j = 0
                 }
             }
@@ -258,11 +265,26 @@ public struct ExecRunner: Sendable {
             // Actually cwdFD should be inheritable? For fchdir, it needs to be open in child, but not necessarily CLOEXEC cleared? We clear for consistency.
             cwdFD = held
         } else if let expected = expectedCwd {
-            // No cwd in args but expected has identity (workspace root) — verify root
+            // No cwd in args: the workspace root IS the cwd (plan: omitted
+            // ⇒ root, the only way to name it). Verify its identity AND pin
+            // it — the child must not inherit an arbitrary process cwd.
             guard let root = resolver.workspaceRoot else { close(lifted); throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity mismatch (cwd)") }
             if root.device != expected.device || root.inode != expected.inode {
                 close(lifted); throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity mismatch (cwd root mismatch)")
             }
+            let rootPath = root.path.string
+            let pinned: Int32 = rootPath.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard pinned >= 0 else { close(lifted); throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity mismatch (cwd root unavailable)") }
+            var rst = stat()
+            guard fstat(pinned, &rst) == 0, UInt64(rst.st_dev) == expected.device, UInt64(rst.st_ino) == expected.inode else {
+                close(pinned); close(lifted); throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity mismatch (cwd root changed)")
+            }
+            let heldRoot = fcntl(pinned, F_DUPFD, 3)
+            close(pinned)
+            guard heldRoot >= 0 else { close(lifted); throw ToolFailure.preDispatch(status: "failed", summary: "cwd fd lift failed") }
+            let rflags = fcntl(heldRoot, F_GETFD)
+            if rflags >= 0 { _ = fcntl(heldRoot, F_SETFD, rflags & ~FD_CLOEXEC) }
+            cwdFD = heldRoot
         }
 
         return Verified(fd: lifted, execPath: execPath, cwdFD: cwdFD, resolvedPath: resolvedPath)

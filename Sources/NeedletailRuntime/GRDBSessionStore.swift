@@ -1074,8 +1074,22 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     }
 
     public func openArtifactSpill(session: SessionID, as identity: WriterIdentity, kind: String, stream: String, requestedBytes: Int64) throws -> SpillHandle {
+        do {
+            return try openArtifactSpillImpl(session: session, as: identity, kind: kind, stream: stream, requestedBytes: requestedBytes)
+        } catch { throw Self.translate(error) }
+    }
+
+    private func openArtifactSpillImpl(session: SessionID, as identity: WriterIdentity, kind: String, stream: String, requestedBytes: Int64) throws -> SpillHandle {
         guard session == identity.session else { throw StoreError.integrity("spill session/identity mismatch") }
         guard !kind.isEmpty, !stream.isEmpty else { throw StoreError.integrity("spill kind/stream empty") }
+        // Handle-confinement: the stream becomes a filename component, so it
+        // must be a bare name (no separators, dot-segments, or NUL). The
+        // executor only ever passes "stdout"/"stderr"; anything else that
+        // reaches the store fails closed here, before any filesystem touch.
+        guard stream.utf8.allSatisfy({ $0 != 0x2F && $0 != 0x00 }),
+              stream != ".", stream != "..",
+              !stream.contains("..") else { throw StoreError.integrity("spill stream is not a bare name") }
+        guard !kind.contains("/") && !kind.contains("\0") else { throw StoreError.integrity("spill kind invalid") }
         guard requestedBytes >= 0 && requestedBytes <= 32*1024*1024 else { throw StoreError.quotaExceeded(limit: 32*1024*1024) }
         return try withArtifactLock {
             gate.lock(); defer { gate.unlock() }
@@ -1182,7 +1196,13 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
-    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle) throws -> ArtifactRef {
+    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle, operationID: OperationID? = nil) throws -> ArtifactRef {
+        do {
+            return try publishArtifactFromFileImpl(session: session, as: identity, kind: kind, spill: spill, operationID: operationID)
+        } catch { throw Self.translate(error) }
+    }
+
+    private func publishArtifactFromFileImpl(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle, operationID: OperationID? = nil) throws -> ArtifactRef {
         guard session == identity.session && session == spill.session else { throw StoreError.integrity("publish session mismatch") }
         guard kind == spill.kind else { throw StoreError.integrity("publish kind mismatch") }
         return try withArtifactLock {
@@ -1192,17 +1212,26 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             // still be ours before any filesystem work.
             let holder: String? = try queue.read { db in try String.fetchOne(db, sql: "SELECT writer FROM writer WHERE session = ?", arguments: [identity.session.raw]) }
             guard holder == identity.writer else { throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer) }
-            // The staging file must live directly in OUR artifact root: a
-            // forged handle pointing elsewhere fails here, never publishes.
+            // The staging file must live directly in OUR artifact root AND be
+            // exactly this lease's file: a forged handle pointing elsewhere
+            // — or at another lease's staging file — fails here and never
+            // publishes, renames, or deletes foreign bytes.
             let root = artifactsRoot
             let spillDir = (spill.path as NSString).deletingLastPathComponent
             guard spillDir == root else { throw StoreError.integrity("spill path escapes artifact root") }
             let stagingBase = (spill.path as NSString).lastPathComponent
-            guard !stagingBase.isEmpty, !stagingBase.contains("/") else { throw StoreError.integrity("spill name invalid") }
-            let leaseRow: Bool = try queue.read { db in
-                (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spill_leases WHERE leaseID = ? AND session = ? AND writer = ?", arguments: [spill.leaseID.uuidString, session.raw, identity.writer]) ?? 0) > 0
+            let boundName = ".tmp-lease-\(spill.leaseID.uuidString)-\(spill.stream)"
+            guard stagingBase == boundName else { throw StoreError.integrity("spill handle does not bind its lease file") }
+            guard spill.bytes >= 0 else { throw StoreError.integrity("spill size invalid") }
+            let leaseRow: (stream: String, kind: String, bytes: Int64)? = try queue.read { db in
+                try Row.fetchOne(db, sql: "SELECT stream, kind, bytes FROM spill_leases WHERE leaseID = ? AND session = ? AND writer = ?", arguments: [spill.leaseID.uuidString, session.raw, identity.writer]).map { row in
+                    ((row["stream"] as String?) ?? "", (row["kind"] as String?) ?? "", (row["bytes"] as Int64?) ?? -1)
+                }
             }
-            guard leaseRow else { throw StoreError.integrity("lease not found or reclaimed") }
+            guard let leaseRow, leaseRow.stream == spill.stream, leaseRow.kind == spill.kind, leaseRow.bytes == spill.bytes,
+                  leaseRow.kind == kind else {
+                throw StoreError.integrity("lease not found, reclaimed, or mismatched")
+            }
             // A publish commits one artifactPublished row: record-count
             // quotas are enforced before touching the filesystem.
             let global = try queue.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records") } ?? 0
@@ -1239,6 +1268,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 throw StoreError.integrity("spill staging read failed: \(error)")
             }
             guard staged.count <= artifactByteLimit else { throw StoreError.quotaExceeded(limit: artifactByteLimit) }
+            // The lease reserves staging headroom: drained output can never
+            // exceed the grant (caps are equal by construction, but the
+            // store enforces its own bound rather than trusting the caller).
+            guard Int64(staged.count) <= spill.bytes else { throw StoreError.integrity("spill staging exceeds its lease") }
             // Zero-byte rule (plan §3.6): no empty artifacts — an empty
             // staging file releases its lease via releaseArtifactSpill and
             // never publishes. A direct publish call on empty staging fails
@@ -1246,7 +1279,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             guard !staged.isEmpty else { throw StoreError.integrity("spill staging is empty") }
             let digest = artifactSHA256Hex(staged)
             guard !digest.isEmpty else { throw StoreError.integrity("spill digest failed") }
-            let ref = ArtifactRef(digest: digest, size: staged.count, kind: kind, operationID: nil)
+            let ref = ArtifactRef(digest: digest, size: staged.count, kind: kind, operationID: operationID)
             let payload = try RecordCodec.encode(DurableRecord.artifactPublished(ref))
             let finalPath = try resolveArtifactPath(root: root, name: digest)
             var didRename = false
@@ -1350,6 +1383,12 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     }
 
     public func releaseArtifactSpill(as identity: WriterIdentity, handle: SpillHandle) throws {
+        do {
+            try releaseArtifactSpillImpl(as: identity, handle: handle)
+        } catch { throw Self.translate(error) }
+    }
+
+    private func releaseArtifactSpillImpl(as identity: WriterIdentity, handle: SpillHandle) throws {
         try withArtifactLock {
             gate.lock(); defer { gate.unlock() }
             try assertOpenLocked()
@@ -1359,21 +1398,22 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             }
             let root = artifactsRoot
             let rootFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            // Bound to the lease's own staging name (reconstructed, never
+            // trusted from the handle path): a forged handle can neither
+            // delete an arbitrary path nor escape the root. No
+            // FileManager fallback — fd-relative or nothing.
+            let boundName = ".tmp-lease-\(handle.leaseID.uuidString)-\(handle.stream)"
+            guard (handle.path as NSString).deletingLastPathComponent == root,
+                  (handle.path as NSString).lastPathComponent == boundName else {
+                throw StoreError.integrity("spill handle does not bind its lease file")
+            }
             try queue.write { db in
                 try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ? AND writer = ?", arguments: [handle.leaseID.uuidString, identity.writer])
             }
-            // Unlink fd-relative when the handle still points inside our
-            // root; otherwise fall back to the path (a forged handle can
-            // only delete a path, never escape the lease table fence above).
             if rootFD >= 0 {
                 defer { closeArtifactFD(rootFD) }
-                let base = (handle.path as NSString).lastPathComponent
-                if (handle.path as NSString).deletingLastPathComponent == root, !base.isEmpty, !base.contains("/") {
-                    _ = base.withCString { unlinkat(rootFD, $0, 0) }
-                    return
-                }
+                _ = boundName.withCString { unlinkat(rootFD, $0, 0) }
             }
-            try? FileManager.default.removeItem(atPath: handle.path)
         }
     }
 
@@ -1393,6 +1433,12 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// for that run (conservative leak, documented — never reclaim live
     /// leases on an unsound time base).
     func sweepSpillLeases() throws {
+        do {
+            try sweepSpillLeasesImpl()
+        } catch { throw Self.translate(error) }
+    }
+
+    private func sweepSpillLeasesImpl() throws {
         try withArtifactLock {
             gate.lock(); defer { gate.unlock() }
             try assertOpenLocked()
