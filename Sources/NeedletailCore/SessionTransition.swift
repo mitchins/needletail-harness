@@ -1846,6 +1846,10 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
     let proposals = reservation.batch.proposals
     var records: [DurableRecord] = []
     var transcript: [DurableRecord] = []
+    // M2-C C3 (NC-9): operator-visible exec receipts, emitted to the
+    // terminal/JSONL sink as they complete. Collected here and appended
+    // at every return below.
+    var uiEffects: [Effect] = []
     var consumed = state.consumedEffects
     consumed.insert(effectID)
     var live = state.liveReservations.filter { $0.effectID != effectID }
@@ -2028,7 +2032,31 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         } else {
             records.append(.operationResult(ref, outcome: outcomeText))
         }
-        transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
+        // M2-C C3 (NC-9): exec calls carry an operator-visible receipt into
+        // the provider continuation AND the terminal/JSONL sink: command
+        // identity (call ID + operation ID), status, start certitude,
+        // artifact reference, truncation flag, and the executor's outcome
+        // summary (exit code, byte counts, truncation/discarded counts,
+        // artifact digests). Stdout/stderr evidence stays distinct (the
+        // data preview is stdout only; stderr has its own artifact); the
+        // preview is unchanged for non-exec tools. Terminal safety is
+        // enforced by runUpdate at construction; the fields are bounded by
+        // construction (numbers, digests, fixed literals, strerror text).
+        let toolText: String
+        if proposal.tool == "exec" {
+            let startedFlag: String
+            switch outcome.started {
+            case .some(true): startedFlag = "started"
+            case .some(false): startedFlag = "unstarted"
+            case .none: startedFlag = "uncertain"
+            }
+            let receipt = "exec \(proposal.callID) \(outcome.status) op=\(ref.operationID.raw) \(startedFlag) artifact=\(outcome.artifactID ?? "-") truncated=\(outcome.truncated) :: \(outcome.summary)"
+            toolText = outcome.data.isEmpty ? "[\(receipt)]" : "\(outcome.data)\n[\(receipt)]"
+            uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+        } else {
+            toolText = outcome.data
+        }
+        transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: toolText)))
         // Artifact handling: if outcome has artifactID, publish reference already done by executor; here we just record
     }
 
@@ -2041,7 +2069,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         if !fallbackState.unresolvedOperations.isEmpty {
             let (s1, prefix) = sequenced(fallbackState, kind: "continuation-blocked", digest: "markers", ids: &ids)
             let next = s1.replacing(queueHeld: true, heldReason: .error("unresolved operations block continuation"))
-            return Transition(state: next, effects: [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + newRecords)
+            return Transition(state: next, effects: uiEffects + [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + newRecords)
         }
         guard fallbackState.turnsUsed < fallbackState.turnLimit else {
             return failRun(fallbackState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
@@ -2057,7 +2085,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         nextLive.removeAll(where: { $0.effectID == effectID })
         let (s1, prefix) = sequenced(fallbackState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
         let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: fallbackState.turnsUsed + 1, liveReservations: nextLive, lastSequence: seq.value)
-        return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + newRecords)
+        return Transition(state: next, effects: uiEffects + [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + newRecords)
     }
 
     let allRecords = records + transcript
@@ -2066,15 +2094,15 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
     if !unresolved.isEmpty {
         let (s1, prefix) = sequenced(interimState, kind: "continuation-blocked", digest: "markers", ids: &ids)
         let next = s1.replacing(queueHeld: true, heldReason: .error("unresolved operations block continuation"))
-        return Transition(state: next, effects: [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + allRecords)
+        return Transition(state: next, effects: uiEffects + [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + allRecords)
     }
     guard interimState.turnsUsed < interimState.turnLimit else {
         let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
-        return Transition(state: failed.state, effects: failed.effects, records: allRecords + failed.records)
+        return Transition(state: failed.state, effects: uiEffects + failed.effects, records: allRecords + failed.records)
     }
     guard let run = interimState.activeRun else {
         let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
-        return Transition(state: failed.state, effects: failed.effects, records: allRecords + failed.records)
+        return Transition(state: failed.state, effects: uiEffects + failed.effects, records: allRecords + failed.records)
     }
     let nextEffectID = ids.nextEffectID()
     let seq = ids.nextSequence()
@@ -2082,7 +2110,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
     let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: interimState.epoch.profile.alias, epochID: interimState.epoch.epochID, sealed: run.sealed, turnsLeft: interimState.turnLimit - interimState.turnsUsed, deadlineMillis: interimState.runDeadlineMillis, historyDigest: fnv1aHex("\(interimState.sessionID.raw):\(seq.value):continue"))
     let (s1, prefix) = sequenced(interimState, kind: "requesting", digest: eventDigest("continue", run.requestID.raw), ids: &ids)
     let next = s1.replacing(phase: .requesting, consumedEffects: consumed, turnsUsed: interimState.turnsUsed + 1, liveReservations: live, lastSequence: seq.value)
-    return Transition(state: next, effects: [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + allRecords)
+    return Transition(state: next, effects: uiEffects + [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + allRecords)
 }
 
 private func completeCancelledPending<I: IDSource>(_ state: SessionState, effectID: EffectID, outcome: EffectOutcome, ids: inout I) -> Transition {

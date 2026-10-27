@@ -1091,7 +1091,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
               !stream.contains("..") else { throw StoreError.integrity("spill stream is not a bare name") }
         guard !kind.contains("/") && !kind.contains("\0") else { throw StoreError.integrity("spill kind invalid") }
         guard requestedBytes >= 0 && requestedBytes <= 32*1024*1024 else { throw StoreError.quotaExceeded(limit: 32*1024*1024) }
-        return try withArtifactLock {
+        return try withArtifactLock(timeout: 10) {
             gate.lock(); defer { gate.unlock() }
             try assertOpenLocked()
             let holder: String? = try queue.read { db in try String.fetchOne(db, sql: "SELECT writer FROM writer WHERE session = ?", arguments: [identity.session.raw]) }
@@ -1389,7 +1389,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     }
 
     private func releaseArtifactSpillImpl(as identity: WriterIdentity, handle: SpillHandle) throws {
-        try withArtifactLock {
+        try withArtifactLock(timeout: 10) {
             gate.lock(); defer { gate.unlock() }
             try assertOpenLocked()
             let holder: String? = try queue.read { db in try String.fetchOne(db, sql: "SELECT writer FROM writer WHERE session = ?", arguments: [handle.session.raw]) }
@@ -1446,10 +1446,23 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             let now = Self.currentMonotonic()
             let ttlNanos = UInt64(Self.spillTTL * 1_000_000_000)
             let root = artifactsRoot
-            var stalePaths: [String] = []
+            var staleNames: [String] = []
             try queue.write { db in
                 for row in try Row.fetchAll(db, sql: "SELECT leaseID, session, stream, grantedBootID, grantedMonotonic FROM spill_leases") {
                     guard let id: String = row["leaseID"], let stream: String = row["stream"] else { continue }
+                    // Sweep-time confinement: only bare-name streams are
+                    // ever unlinked, and only by fd-relative basename.
+                    // A tampered row (separator, dot-segment, NUL) is
+                    // deleted from the table but its file is left for the
+                    // row-less sweep below (which applies the same name
+                    // gate plus a TTL), never unlinked by a raw path.
+                    guard !stream.isEmpty,
+                          stream.utf8.allSatisfy({ $0 != 0x2F && $0 != 0x00 }),
+                          stream != ".", stream != "..", !stream.contains(".."),
+                          UUID(uuidString: id) != nil else {
+                        try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ?", arguments: [id])
+                        continue
+                    }
                     let gBoot: String? = row["grantedBootID"]
                     let gMono: Int64? = row["grantedMonotonic"]
                     var stale = false
@@ -1463,25 +1476,43 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                     }
                     if stale {
                         try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ?", arguments: [id])
-                        stalePaths.append((root as NSString).appendingPathComponent(".tmp-lease-\(id)-\(stream)"))
+                        staleNames.append(".tmp-lease-\(id)-\(stream)")
                     }
                 }
             }
-            for p in stalePaths { try? FileManager.default.removeItem(atPath: p) }
+            // Fd-relative unlink against the held root FD (no path
+            // traversal: basenames only, O_NOFOLLOW not needed for unlinkat
+            // with a validated bare name, and the root FD pins the
+            // directory — a swapped root fails at open).
+            let rootFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            if rootFD >= 0 {
+                defer { closeArtifactFD(rootFD) }
+                for name in staleNames {
+                    _ = name.withCString { unlinkat(rootFD, $0, 0) }
+                }
+            }
             // Row-less sweep: staging names whose lease row is gone and whose
             // mtime is older than the TTL. File age uses wall-clock mtime
             // (approximate, documented direction notes above).
             guard FileManager.default.fileExists(atPath: root) else { return }
+            let sweepFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard sweepFD >= 0 else { return }
+            defer { closeArtifactFD(sweepFD) }
             let entries = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
             let ttlSecs = Self.spillTTL
             let wallNow = Date().timeIntervalSince1970
             for entry in entries where entry.hasPrefix(".tmp-lease-") {
                 let rest = String(entry.dropFirst(".tmp-lease-".count))
-                // Format: <36-char UUID>-<stream>. Streams never contain a
-                // second UUID, so the leaseID is the first 36 characters.
+                // Format: <36-char UUID>-<stream>, with a bare-name stream
+                // (same gate as grant time). Anything else is not ours:
+                // left alone here (never unlinked by an unvalidated name).
                 guard rest.count > 37, rest[rest.index(rest.startIndex, offsetBy: 36)] == "-" else { continue }
                 let idPart = String(rest.prefix(36))
                 guard UUID(uuidString: idPart) != nil else { continue }
+                let streamPart = String(rest.dropFirst(37))
+                guard !streamPart.isEmpty,
+                      streamPart.utf8.allSatisfy({ $0 != 0x2F && $0 != 0x00 }),
+                      streamPart != ".", streamPart != "..", !streamPart.contains("..") else { continue }
                 let liveRow: Bool = (try? queue.read { db in
                     (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spill_leases WHERE leaseID = ?", arguments: [idPart]) ?? 0) > 0
                 }) ?? true
@@ -1489,7 +1520,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 let full = (root as NSString).appendingPathComponent(entry)
                 let age: TimeInterval? = (try? FileManager.default.attributesOfItem(atPath: full)[.modificationDate] as? Date).map { wallNow - $0.timeIntervalSince1970 }
                 if let age, age > ttlSecs {
-                    try? FileManager.default.removeItem(atPath: full)
+                    _ = entry.withCString { unlinkat(sweepFD, $0, 0) }
                 }
             }
         }
@@ -1579,7 +1610,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         dbPath + "-artifacts.lock"
     }
 
-    private func withArtifactLock<T>(_ body: () throws -> T) throws -> T {
+    private func withArtifactLock<T>(timeout: TimeInterval = 60, _ body: () throws -> T) throws -> T {
         let lockPath = Self.artifactLockPath(for: path)
         let fd: Int32 = lockPath.withCString { cstr in
             open(cstr, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
@@ -1592,15 +1623,27 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         guard fstat(fd, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFREG else {
             throw StoreError.integrity("artifact lock is not a regular file")
         }
-        var tries = 0
+        // M2-C C3 bounded acquisition: nonblocking attempts against a
+        // monotonic deadline (default 60 s per the plan's publish bound;
+        // callers pass shorter budgets for pre-spawn gates). A wedged
+        // holder can never hang publication, grant, sweep, or the calling
+        // task indefinitely: expiry surfaces typed `.contention` (the
+        // honest classification — the operation could not proceed), and
+        // task cancellation aborts the wait promptly. EINTR retries inside
+        // the budget; any other flock error fails closed immediately.
+        let waitDeadline = Self.currentMonotonic() + UInt64(max(timeout, 0) * 1_000_000_000)
         while true {
-            if flock(fd, LOCK_EX) == 0 { break }
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 { break }
             let e = errno
-            if e == EINTR, tries < 5 {
-                tries += 1
-                continue
+            if e == EINTR { continue }
+            guard e == EWOULDBLOCK else {
+                throw StoreError.integrity("artifact lock failed: \(String(cString: strerror(e)))")
             }
-            throw StoreError.integrity("artifact lock failed: \(String(cString: strerror(e)))")
+            if Task.isCancelled { throw CancellationError() }
+            if Self.currentMonotonic() >= waitDeadline {
+                throw StoreError.contention("artifact lock unavailable within budget")
+            }
+            usleep(10_000)
         }
         defer { flock(fd, LOCK_UN) }
         return try body()

@@ -78,8 +78,16 @@ struct C2ExecDurableTests {
         return ExecAttempt(wsURL: wsURL, dir: dir, dbPath: dbPath, store: store, session: session, identity: identity, resolver: resolver, executor: executor)
     }
 
-    /// The safe-direction probe flake signature: a clean exit-0 observed as
-    /// a timeout (conservative, never a false success). Only this signature
+    /// Retry budget, disabled with NEEDLETAIL_C2_NO_RETRY=1 for
+    /// first-attempt flake measurement (mission §7: a retry may aid
+    /// diagnosis but never turns a failed first attempt into a pass —
+    /// measurement runs set the knob and report raw outcomes).
+    private static var retryAttempts: Int {
+        ProcessInfo.processInfo.environment["NEEDLETAIL_C2_NO_RETRY"] != nil ? 1 : 3
+    }
+
+    /// The safe-direction probe flake signature: a clean exit-0 observed as a
+    /// timeout (conservative, never a false success). Only this signature
     /// retries; every other verdict fails the test immediately.
     private static func isProbeFlake(_ out: ToolCallOutcome) -> Bool {
         out.status == "timeout" && out.summary.contains("(exit 0)")
@@ -346,6 +354,160 @@ struct C2ExecDurableTests {
         #expect(try Self.leaseRows(store, atPath: dbPath) == 0)
     }
 
+    @Test("C2 store: external lock holder cannot hang publication (bounded contention)")
+    func spillLockBoundedUnderExternalHolder() throws {
+        defer { Self.resetHooks() }
+        let (dir, store, session, writer) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let dbPath = dir.appendingPathComponent("store.sqlite").path
+        let lockPath = dbPath + "-artifacts.lock"
+        // A second open description holds LOCK_EX (the kernel mediates
+        // flock identically within and across processes): every spill path
+        // must fail bounded with typed contention, never hang.
+        final class HolderBox: @unchecked Sendable { var fd: Int32 = -1 }
+        let box = HolderBox()
+        let acquired = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let holder = Thread {
+            let fd: Int32 = lockPath.withCString { open($0, O_RDWR | O_CREAT | O_CLOEXEC, mode_t(0o600)) }
+            guard fd >= 0, flock(fd, LOCK_EX) == 0 else { return }
+            box.fd = fd
+            acquired.signal()
+            _ = release.wait(timeout: DispatchTime.now() + 30)
+            close(fd)
+        }
+        holder.start()
+        #expect(acquired.wait(timeout: DispatchTime.now() + 30) == .success, "holder takes the lock")
+        let t0 = Date()
+        do {
+            _ = try store.openArtifactSpill(session: session, as: writer, kind: "exec-output", stream: "stdout", requestedBytes: 64)
+            Issue.record("contended grant must fail, not hang or succeed")
+        } catch let e as StoreError {
+            guard case .contention = e else {
+                Issue.record("contended grant must be typed contention, got \(e)")
+                release.signal()
+                return
+            }
+        }
+        let dt = Date().timeIntervalSince(t0)
+        #expect(dt < 15, "grant bounded by its 10s budget (took \(dt)s), never indefinite")
+        release.signal()
+    }
+
+    @Test("C2 store: killed lock holder never wedges the store")
+    func spillLockSurvivesKilledHolder() throws {
+        defer { Self.resetHooks() }
+        let (dir, store, session, writer) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let dbPath = dir.appendingPathComponent("store.sqlite").path
+        let lockPath = dbPath + "-artifacts.lock"
+        // A holder that vanishes releases the lock with its last fd — the
+        // kernel closes open descriptions on process (or thread) exit, so
+        // closing the fd here models SIGKILL of a holder exactly.
+        let fd: Int32 = lockPath.withCString { open($0, O_RDWR | O_CREAT | O_CLOEXEC, mode_t(0o600)) }
+        #expect(fd >= 0)
+        #expect(flock(fd, LOCK_EX) == 0)
+        close(fd)
+        let h = try store.openArtifactSpill(session: session, as: writer, kind: "exec-output", stream: "stdout", requestedBytes: 64)
+        try store.releaseArtifactSpill(as: writer, handle: h)
+    }
+
+    @Test("C2 store: crash leaves lease row+staging; reopen reclaims by TTL")
+    func spillCrashRecoveryAcrossHandles() throws {
+        defer { Self.resetHooks() }
+        let dir = try Self.tempDir(prefix: "c2-crash-lease")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbPath = dir.appendingPathComponent("store.sqlite").path
+        GRDBSessionStore._testHook_monotonicOverride = 5_000_000_000
+        GRDBSessionStore._testHook_bootIDOverride = "boot-X"
+        do {
+            let store = try GRDBSessionStore(path: dbPath)
+            let session = SessionID("s-crash-lease")
+            try store.claimWriterOwnership(session: session, writer: "w")
+            let writer = WriterIdentity(session: session, writer: "w")
+            let h = try store.openArtifactSpill(session: session, as: writer, kind: "exec-output", stream: "stdout", requestedBytes: 64)
+            try Data("partial\n".utf8).write(to: URL(fileURLWithPath: h.path))
+            // Simulate a crash: close WITHOUT releasing. Row + staging persist.
+            try store.close()
+        }
+        let root = GRDBSessionStore.artifactsRoot(for: dbPath)
+        let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
+        #expect(leftovers.contains(where: { $0.hasPrefix(".tmp-lease-") }), "crash leaves the staging file")
+        // Reopen far past the TTL on the same boot: the sweep reclaims.
+        GRDBSessionStore._testHook_monotonicOverride = 5_000_000_000 + UInt64(2400 + 60) * 1_000_000_000
+        let reopened = try GRDBSessionStore(path: dbPath)
+        defer { try? reopened.close() }
+        #expect(try Self.leaseRows(reopened, atPath: dbPath) == 0, "crashed lease reclaimed")
+        #expect(try Self.stagingFiles(reopened, dbPath: dbPath).isEmpty, "crashed staging reclaimed")
+        // The store remains fully usable after recovery.
+        let session = SessionID("s-crash-lease")
+        let writer = WriterIdentity(session: session, writer: "w")
+        let h2 = try reopened.openArtifactSpill(session: session, as: writer, kind: "exec-output", stream: "stdout", requestedBytes: 64)
+        try Data("fresh\n".utf8).write(to: URL(fileURLWithPath: h2.path))
+        let ref = try reopened.publishArtifactFromFile(session: session, as: writer, kind: "exec-output", spill: h2)
+        #expect(try reopened.readArtifact(ref) == Data("fresh\n".utf8))
+    }
+
+    @Test("C2 store: genuine v3 database with records migrates to v4 intact")
+    func spillGenuineV3Migration() throws {
+        defer { Self.resetHooks() }
+        let dir = try Self.tempDir(prefix: "c2-store-genuine-v3")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbPath = dir.appendingPathComponent("store.sqlite").path
+        let session = SessionID("s-v3")
+        // Craft a genuine v3 store: v3 tables at user_version 3, with
+        // committed records (intent + done result), an artifact reference,
+        // the artifact file itself, and byte accounting.
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        let root = GRDBSessionStore.artifactsRoot(for: dbPath)
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try Data("abc".utf8).write(to: URL(fileURLWithPath: (root as NSString).appendingPathComponent(digest)))
+        let raw = try DatabaseQueue(path: dbPath)
+        let opID = "eff-9/c9"
+        let intentPayload = try RecordCodec.encode(DurableRecord.operationIntent(OperationRef(operationID: OperationID(opID), callID: "c9", state: .intent, mutating: true)))
+        let resultPayload = try RecordCodec.encode(DurableRecord.operationResult(OperationRef(operationID: OperationID(opID), callID: "c9", state: .done, mutating: true), outcome: "tool-failure: done"))
+        let artPayload = try RecordCodec.encode(DurableRecord.artifactPublished(ArtifactRef(digest: digest, size: 3, kind: "exec-output", operationID: nil)))
+        try raw.write { db in
+            try db.execute(sql: "CREATE TABLE records(seq INTEGER PRIMARY KEY, session TEXT NOT NULL, payload TEXT NOT NULL)")
+            try db.execute(sql: "CREATE TABLE writer(session TEXT PRIMARY KEY, writer TEXT NOT NULL)")
+            try db.execute(sql: "CREATE TABLE byte_usage(session TEXT PRIMARY KEY, bytes INTEGER NOT NULL CHECK (bytes >= 0))")
+            try db.execute(sql: "CREATE TABLE artifact_physical(digest TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK (size >= 0))")
+            try db.execute(sql: "INSERT INTO records(seq, session, payload) VALUES (1, ?, ?)", arguments: [session.raw, String(decoding: intentPayload, as: UTF8.self)])
+            try db.execute(sql: "INSERT INTO records(seq, session, payload) VALUES (2, ?, ?)", arguments: [session.raw, String(decoding: resultPayload, as: UTF8.self)])
+            try db.execute(sql: "INSERT INTO records(seq, session, payload) VALUES (3, ?, ?)", arguments: [session.raw, String(decoding: artPayload, as: UTF8.self)])
+            try db.execute(sql: "INSERT INTO writer(session, writer) VALUES (?, 'w-v3')", arguments: [session.raw])
+            try db.execute(sql: "INSERT INTO byte_usage(session, bytes) VALUES (?, ?)", arguments: [session.raw, 1000])
+            try db.execute(sql: "INSERT INTO artifact_physical(digest, size) VALUES (?, 3)", arguments: [digest])
+            try db.execute(sql: "CREATE INDEX records_session ON records(session, seq)")
+            try db.execute(sql: "PRAGMA user_version = 3")
+        }
+        // Open: forward migration to v4 must preserve everything.
+        let store = try GRDBSessionStore(path: dbPath)
+        defer { try? store.close() }
+        let version = try raw.read { db in try Int32.fetchOne(db, sql: "PRAGMA user_version") }
+        #expect(version == 4, "migration stamps v4, got \(String(describing: version))")
+        let tables = try raw.read { db in try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='table'")) }
+        #expect(tables.contains("spill_leases"), "migration creates spill_leases")
+        let indexes = try raw.read { db in try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='index'")) }
+        #expect(indexes.contains("records_session"), "session index survives migration")
+        #expect(indexes.contains("spill_leases_session"), "migration creates the lease index")
+        // Operation records intact and reconcile clean.
+        let (page, _) = try store.records(session: session, since: 0, limit: 100)
+        #expect(page.count == 3, "all v3 records survive, got \(page.count)")
+        let rec = try store.reconcile(session: session)
+        #expect(rec.completed.count == 1, "intent+done reconciles completed: \(rec)")
+        #expect(rec.heldOperations.isEmpty, "no holds from the migrated past")
+        // Referenced artifact bytes intact and quota-accounted.
+        let v3bytes = try store.readArtifact(ArtifactRef(digest: digest, size: 3, kind: "exec-output", operationID: nil))
+        #expect(v3bytes == Data("abc".utf8))
+        // The migrated store grants and publishes spill leases.
+        let writer = WriterIdentity(session: session, writer: "w-v3")
+        let h = try store.openArtifactSpill(session: session, as: writer, kind: "exec-output", stream: "stdout", requestedBytes: 64)
+        try Data("new\n".utf8).write(to: URL(fileURLWithPath: h.path))
+        let ref = try store.publishArtifactFromFile(session: session, as: writer, kind: "exec-output", spill: h)
+        #expect(try store.readArtifact(ref) == Data("new\n".utf8))
+    }
+
     @Test("C2 store: v3 file migrates to v4 with the spill table")
     func spillV4Migration() throws {
         let dir = try Self.tempDir(prefix: "c2-store-v3")
@@ -380,7 +542,7 @@ struct C2ExecDurableTests {
         // attempt so the winning attempt's agreement assertions are exact.
         var win: ExecAttempt? = nil
         var last: ToolCallOutcome? = nil
-        for _ in 0..<3 {
+        for _ in 0..<Self.retryAttempts {
             let f = try Self.makeAttempt()
             let batch = Self.execBatch("{\"executable\":\"/bin/echo\",\"argv\":[\"/bin/echo\",\"hello\",\"durable\"],\"timeoutSecs\":30}")
             let (digests, cwdIds) = try Self.approve(executor: f.executor, batch: batch)
@@ -651,7 +813,7 @@ struct C2ExecDurableTests {
     func execShebangArgv0() async throws {
         defer { Self.resetHooks() }
         var win: (ExecAttempt, ToolCallOutcome)? = nil
-        for _ in 0..<3 {
+        for _ in 0..<Self.retryAttempts {
             let f = try Self.makeAttempt()
             let script = f.wsURL.appendingPathComponent("argv0.sh")
             try "#!/bin/sh\necho \"argv0=$0\"\n".write(to: script, atomically: true, encoding: .utf8)
@@ -751,6 +913,41 @@ struct C2ExecDurableTests {
             #expect(status == "failed")
             #expect(summary.contains("invalid executable format"), "got \(summary)")
         }
+    }
+
+    @Test("C2 spawn: death after the marker is started-signal-terminated, never success")
+    func spawnDeathAfterMarker() throws {
+        defer {
+            NativeToolExecutor._testHook_killAfterMarker = false
+            Self.resetHooks()
+        }
+        // SIGKILL between 0x01 and execve: the image never runs, but the
+        // spawn sequence verifiably started. Classification must be a
+        // started failure (exit 128) — never success, never pre-dispatch.
+        NativeToolExecutor._testHook_killAfterMarker = true
+        let run = try NativeToolExecutor.runBounded(
+            executablePath: "/bin/echo", args: ["hi"], stdoutCap: 4096, stderrCap: 4096,
+            timeout: 10, cwdFD: nil, execPath: nil, useSession: false)
+        #expect(run.status == 128, "signalled child reports 128, got \(run.status)")
+        #expect(!run.timedOut, "prompt SIGKILL is a determined failure, not a timeout")
+        #expect(run.stdout.isEmpty, "image never executed: no output")
+    }
+
+    @Test("C2 spawn: hang after the marker times out unknown, never success")
+    func spawnHangAfterMarker() throws {
+        defer {
+            NativeToolExecutor._testHook_stopAfterMarker = false
+            Self.resetHooks()
+        }
+        // SIGSTOP between 0x01 and execve: [0x01] observed, EOF never
+        // arrives. The run deadline decides — timeout/unknown+hold, never
+        // a fabricated successful launch.
+        NativeToolExecutor._testHook_stopAfterMarker = true
+        let run = try NativeToolExecutor.runBounded(
+            executablePath: "/bin/echo", args: ["hi"], stdoutCap: 4096, stderrCap: 4096,
+            timeout: 3, cwdFD: nil, execPath: nil, useSession: false)
+        #expect(run.timedOut, "stalled launch must time out, got \(run)")
+        #expect(run.stdout.isEmpty, "no output from a never-executed image")
     }
 
     @Test("C2 spawn: bad cwd descriptor classifies pre-dispatch")
@@ -1049,7 +1246,7 @@ struct C2ExecDurableTests {
     @Test("C2 actor: approved exec runs once through the real loop with durable agreement")
     func actorApprovedExecRunsOnceDurable() async throws {
         defer { Self.resetHooks() }
-        for attempt in 1...3 {
+        for attempt in 1...Self.retryAttempts {
             switch try await Self.runActorSuccessOnce() {
             case .success: return
             case .flaky(let note):
@@ -1123,7 +1320,7 @@ struct C2ExecDurableTests {
     func execOmittedCwdPinsRoot() async throws {
         defer { Self.resetHooks() }
         var win: (ExecAttempt, ToolCallOutcome)? = nil
-        for _ in 0..<3 {
+        for _ in 0..<Self.retryAttempts {
             let f = try Self.makeAttempt()
             // /bin/pwd prints the child's working directory: it must be
             // the workspace root even though no cwd was approved.
@@ -1205,7 +1402,7 @@ struct C2ExecDurableTests {
     func execStderrOnlyPublishesStderr() async throws {
         defer { Self.resetHooks() }
         var win: (ExecAttempt, ToolCallOutcome)? = nil
-        for _ in 0..<3 {
+        for _ in 0..<Self.retryAttempts {
             let f = try Self.makeAttempt()
             let batch = Self.execBatch("{\"executable\":\"/bin/sh\",\"argv\":[\"/bin/sh\",\"-c\",\"echo only-err 1>&2\"],\"timeoutSecs\":30}")
             let (digests, cwdIds) = try Self.approve(executor: f.executor, batch: batch)

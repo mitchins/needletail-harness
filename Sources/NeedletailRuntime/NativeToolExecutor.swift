@@ -426,8 +426,23 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// Writes drained child output directly to the leased staging path
     /// (O_WRONLY|O_TRUNC|O_NOFOLLOW, loop write, fsync). Never `.atomic`:
     /// the lease binds the staging inode the sweep attributes by name.
+    /// The handle is re-bound here (basename reconstructed from the lease
+    /// identity, root-pinned open): a forged handle fails closed before
+    /// any byte is written.
     private func writeSpillFile(_ handle: SpillHandle, data: Data) throws {
-        let fd: Int32 = handle.path.withCString { open($0, O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC) }
+        let boundName = ".tmp-lease-\(handle.leaseID.uuidString)-\(handle.stream)"
+        guard (handle.path as NSString).lastPathComponent == boundName,
+              !handle.stream.isEmpty,
+              handle.stream.utf8.allSatisfy({ $0 != 0x2F && $0 != 0x00 }) else {
+            throw ExecPostSpawnError(summary: "spill handle does not bind its lease file")
+        }
+        let dir = (handle.path as NSString).deletingLastPathComponent
+        let dirFD: Int32 = dir.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        guard dirFD >= 0 else {
+            throw ExecPostSpawnError(summary: "spill root unavailable: \(String(cString: strerror(errno)))")
+        }
+        defer { close(dirFD) }
+        let fd: Int32 = boundName.withCString { openat(dirFD, $0, O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC) }
         guard fd >= 0 else {
             throw ExecPostSpawnError(summary: "spill write open failed: \(String(cString: strerror(errno)))")
         }
@@ -1051,6 +1066,45 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         var timedOut: Bool
     }
 
+    /// Child-side exec-error report (async-signal-safe: only write loops
+    /// and _exit — no allocation, no locks, no Swift runtime traffic).
+    /// Writes 0x02 + errno (native LE int32), EINTR-retried; any other
+    /// failure still returns (the caller _exits — the parent classifies a
+    /// missing/truncated frame fail-safe, never as success).
+    private static func reportExecError(fd: Int32, errnoValue: Int32) {
+        var code: UInt8 = 0x02
+        var e = errnoValue
+        var tries = 0
+        while tries < 3 {
+            tries += 1
+#if canImport(Glibc)
+            let a = Glibc.write(fd, &code, 1)
+#else
+            let a = Darwin.write(fd, &code, 1)
+#endif
+            if a == 1 {
+                var off = 0
+                while off < 4 {
+#if canImport(Glibc)
+                    let n = withUnsafeBytes(of: &e) { raw in
+                        Glibc.write(fd, raw.baseAddress!.advanced(by: off), 4 - off)
+                    }
+#else
+                    let n = withUnsafeBytes(of: &e) { raw in
+                        Darwin.write(fd, raw.baseAddress!.advanced(by: off), 4 - off)
+                    }
+#endif
+                    if n > 0 { off += n; continue }
+                    if n < 0 && errno == EINTR { continue }
+                    break
+                }
+                break
+            }
+            if a < 0 && errno == EINTR { continue }
+            break
+        }
+    }
+
     /// Raw posix_spawn bounded runner. Foundation.Process closes inherited
     /// FDs in the child, which would break /proc/self/fd execution and
     /// directory-FD traversal; posix_spawn inherits exactly the FDs we leave
@@ -1067,6 +1121,10 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     nonisolated(unsafe) static var _testHook_probeForceTruncate = false
     nonisolated(unsafe) static var _testHook_probeForceUnreadable = false
     nonisolated(unsafe) static var _testHook_probeDeadlineOffsetNs: UInt64? = nil // if set, probe deadline = now + offset (0 => immediate)
+    /// C2 ambiguous-launch hooks (tests only, never production): stop/kill
+    /// the child after the 0x01 marker but before execve.
+    nonisolated(unsafe) static var _testHook_killAfterMarker = false
+    nonisolated(unsafe) static var _testHook_stopAfterMarker = false
 
     /// Exposed for qualification tests: parse a /proc/<pid>/stat string into
     /// (state, pgid) using the same last-')' logic as the probe. Returns nil
@@ -1367,18 +1425,14 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             if useSession {
 #if canImport(Glibc)
                 if Glibc.setsid() < 0 {
-                    var e = errno
-                    var code: UInt8 = 0x02
-                    _ = Glibc.write(errPipeWrite, &code, 1)
-                    _ = Glibc.write(errPipeWrite, &e, 4)
+                    let e = errno
+                    Self.reportExecError(fd: errPipeWrite, errnoValue: e)
                     Glibc._exit(127)
                 }
 #else
                 if Darwin.setsid() < 0 {
-                    var e = errno
-                    var code: UInt8 = 0x02
-                    _ = Darwin.write(errPipeWrite, &code, 1)
-                    _ = Darwin.write(errPipeWrite, &e, 4)
+                    let e = errno
+                    Self.reportExecError(fd: errPipeWrite, errnoValue: e)
                     Darwin._exit(127)
                 }
 #endif
@@ -1404,32 +1458,24 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             // with broken stdio.
 #if canImport(Glibc)
             if Glibc.dup2(outW, STDOUT_FILENO) < 0 {
-                var e = errno
-                var code: UInt8 = 0x02
-                _ = Glibc.write(errPipeWrite, &code, 1)
-                _ = Glibc.write(errPipeWrite, &e, 4)
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
                 Glibc._exit(127)
             }
             if Glibc.dup2(errW, STDERR_FILENO) < 0 {
-                var e = errno
-                var code: UInt8 = 0x02
-                _ = Glibc.write(errPipeWrite, &code, 1)
-                _ = Glibc.write(errPipeWrite, &e, 4)
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
                 Glibc._exit(127)
             }
 #else
             if Darwin.dup2(outW, STDOUT_FILENO) < 0 {
-                var e = errno
-                var code: UInt8 = 0x02
-                _ = Darwin.write(errPipeWrite, &code, 1)
-                _ = Darwin.write(errPipeWrite, &e, 4)
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
                 Darwin._exit(127)
             }
             if Darwin.dup2(errW, STDERR_FILENO) < 0 {
-                var e = errno
-                var code: UInt8 = 0x02
-                _ = Darwin.write(errPipeWrite, &code, 1)
-                _ = Darwin.write(errPipeWrite, &e, 4)
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
                 Darwin._exit(127)
             }
 #endif
@@ -1443,20 +1489,14 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             if let dir = cwdFD {
 #if canImport(Glibc)
                 if Glibc.fchdir(dir) != 0 {
-                    // Write exec-error 0x02 + errno before _exit. Capture
-                    // errno FIRST: the marker write itself may clobber it.
-                    var e = errno
-                    var code: UInt8 = 0x02
-                    _ = Glibc.write(errPipeWrite, &code, 1)
-                    _ = Glibc.write(errPipeWrite, &e, 4)
+                    let e = errno
+                    Self.reportExecError(fd: errPipeWrite, errnoValue: e)
                     Glibc._exit(127)
                 }
 #else
                 if Darwin.fchdir(dir) != 0 {
-                    var e = errno
-                    var code: UInt8 = 0x02
-                    _ = Darwin.write(errPipeWrite, &code, 1)
-                    _ = Darwin.write(errPipeWrite, &e, 4)
+                    let e = errno
+                    Self.reportExecError(fd: errPipeWrite, errnoValue: e)
                     Darwin._exit(127)
                 }
 #endif
@@ -1485,6 +1525,28 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
 #endif
                 }
             }
+            // C2 test hooks: simulate death/hang between the 0x01 marker and
+            // execve (the ambiguous launch window). Never set in production.
+            // killAfterMarker: SIGKILL after the marker — the parent must
+            // classify started-then-signalled (failed), never success and
+            // never pre-dispatch.
+            // stopAfterMarker: SIGSTOP after the marker — the parent
+            // observes [0x01] with no EOF; the run deadline decides
+            // (timeout/unknown+hold), never a fabricated success.
+            if Self._testHook_killAfterMarker {
+#if canImport(Glibc)
+                Glibc.raise(SIGKILL)
+#else
+                Darwin.raise(SIGKILL)
+#endif
+            }
+            if Self._testHook_stopAfterMarker {
+#if canImport(Glibc)
+                Glibc.raise(SIGSTOP)
+#else
+                Darwin.raise(SIGSTOP)
+#endif
+            }
             // C1: execPath split — the display argv[0] stays the resolved
             // path, but the kernel executes the /proc/self/fd path. An
             // OOM here aborts (never fall back to the display path — that
@@ -1512,18 +1574,15 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 }
             }
             if execPath != nil { free(UnsafeMutablePointer(mutating: execvePath)) }
-            // execve failed: write 0x02 + errno. Capture errno before the
-            // marker write clobbers it.
+            // execve failed: report errno (captured before the marker
+            // write could clobber it), then _exit. A missing/truncated
+            // frame classifies fail-safe upstream (pre-dispatch death).
             do {
-                var e = errno
-                var code: UInt8 = 0x02
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
 #if canImport(Glibc)
-                _ = Glibc.write(errPipeWrite, &code, 1)
-                _ = Glibc.write(errPipeWrite, &e, 4)
                 Glibc._exit(127)
 #else
-                _ = Darwin.write(errPipeWrite, &code, 1)
-                _ = Darwin.write(errPipeWrite, &e, 4)
                 Darwin._exit(127)
 #endif
             }
@@ -1570,7 +1629,10 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             while errBytes.count < 8 && !eof && NativeToolExecutor.monotonicNanos() < readDeadline {
                 var pfd = pollfd(fd: errPipeRead, events: Int16(POLLIN), revents: 0)
                 let pr = poll(&pfd, 1, 100)
-                if pr > 0 && (pfd.revents & Int16(POLLIN)) != 0 {
+                // POLLHUP/POLLERR without POLLIN (all writers gone, no data
+                // queued) still requires a drain attempt: the read observes
+                // EOF (n == 0) rather than hanging on a dead pipe.
+                if pr > 0 && (pfd.revents & (Int16(POLLIN) | Int16(POLLHUP) | Int16(POLLERR))) != 0 {
                     var tmp = [UInt8](repeating: 0, count: 8 - errBytes.count)
                     let n = tmp.withUnsafeMutableBytes { ptr in
 #if canImport(Glibc)

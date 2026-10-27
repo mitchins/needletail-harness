@@ -861,6 +861,15 @@ struct RunCommand: ParsableCommand {
             throw error
         }
 
+        // M2-C C3 §10.4: operator-visible composition banner. Emitted on
+        // stderr (stdout stays JSONL-pure) whenever the native executor is
+        // actually composed — host execution is NOT OS-isolated, and the
+        // /proc/self/fd execution path is Linux-only. No banner on
+        // scripted/sealed/demo runs (nothing executes on the host there).
+        if execComposed, nativeExecutor != nil {
+            eprint("needletail: native exec composed (host execution is not OS-isolated; Linux-only execution path)")
+        }
+
         // H2: catchable SIGINT drives production cancellation (not a default
         // termination), so JSONL runs can emit terminal run_finished and
         // return 130. Broken-pipe handling remains unchanged.

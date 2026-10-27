@@ -34,6 +34,7 @@ E2E_SUITES = {
     "C1ProcRunnerTests",
     "C1QualificationTests",
     "C2ExecDurableTests",
+    "C3ExecQualificationTests",
     "SessionExportTests",
 }
 

@@ -244,7 +244,15 @@ public struct ExecRunner: Sendable {
                         if curOwned { close(cur) } else { close(resolvedCwdFD) }
                         cur = parent; curOwned = true; tail.removeFirst()
                     }
-                    if popFailed { if curOwned { close(cur) }; failed = true; break }
+                    if popFailed {
+                        // Ownership rule: cur is live iff curOwned (the
+                        // original resolvedCwdFD was already closed on the
+                        // first pop). Invalidate the dead reference so the
+                        // shared failure epilogue below can never double-close
+                        // it (close(-1) is a harmless no-op).
+                        if curOwned { close(cur); resolvedCwdFD = -1 }
+                        failed = true; break
+                    }
                     cwdComps = tail; cwdStack = newStack
                     if curOwned { resolvedCwdFD = cur }
                     j = 0
@@ -296,6 +304,15 @@ public struct ExecRunner: Sendable {
         approvedCwdIdentity: (device: UInt64, inode: UInt64)? = nil,
         timeout: TimeInterval = Double(ExecArguments.defaultTimeoutSecs)
     ) throws -> Result {
+#if !canImport(Glibc)
+        // M2-C C3: the /proc/self/fd FD-binding path is Linux-only and
+        // qualified there. Refuse closed on other platforms rather than
+        // silently falling back to a pathname exec (no TOCTOU-safe spawn
+        // exists without /proc/self/fd or /dev/fd).
+        if approvedDigest != nil {
+            throw ToolFailure.preDispatch(status: "failed", summary: "exec requires Linux (/proc/self/fd unavailable)")
+        }
+#endif
         let startNanos = NativeToolExecutor.monotonicNanos()
         var execFD: Int32? = nil
         var execPathForSpawn: String? = nil
