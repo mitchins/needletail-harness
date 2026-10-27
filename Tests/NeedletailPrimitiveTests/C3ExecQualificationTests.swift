@@ -595,6 +595,15 @@ struct C3ExecQualificationTests {
             env: Self.environment(stateDir: stateDir))
         #expect(result.exit == 0, "malformed proposal fails the call, not the run: \(result.stderr.prefix(300))")
         #expect(!FileManager.default.fileExists(atPath: ws.appendingPathComponent("SENTINEL-SPOOF").path), "spoofed argv never spawns")
+        // NC-9: the pre-dispatch refusal is visible to the operator (JSONL)
+        // and to the provider (transcript receipt), with the call identity.
+        let envelopes = try Self.jsonLines(result.stdout)
+        let toolExecDetails = envelopes.compactMap { $0["payload"] as? String }
+            .filter { $0.contains("exec c1") }
+        #expect(!toolExecDetails.isEmpty, "refusal receipt emitted, kinds=\(envelopes.compactMap { $0["kind"] as? String })")
+        #expect(toolExecDetails.allSatisfy { !$0.contains("\u{1B}") }, "receipt sanitized")
+        let bodies2 = server.requests.map { String(decoding: $0.body, as: UTF8.self) }
+        #expect(bodies2.contains(where: { $0.contains("preDispatch invalid-arguments") }), "provider saw the deterministic refusal")
         let sessions = try Self.sessions(dbPath: Self.dbPath(in: stateDir))
         var sawInvalid = false
         for session in sessions {
@@ -805,8 +814,9 @@ struct C3ExecQualificationTests {
             env: Self.environment(stateDir: stateDir), input: "y\n")
         #expect(result.exit == 0, "capped drain runs to completion: \(result.stdout.prefix(300))")
         let envelopes = try Self.jsonLines(result.stdout)
-        let receipts = envelopes.compactMap { ($0["payload"] as? [String: Any]) }.filter { ($0["kind"] as? String) == nil }
-        _ = receipts
+        // The tool-exec receipt envelope is present and parseable JSON.
+        let toolExecKinds = envelopes.compactMap { $0["kind"] as? String }.filter { $0 == "run:tool-exec" }
+        #expect(!toolExecKinds.isEmpty, "run:tool-exec receipt emitted")
         // Durable receipt carries truncation + discarded counts.
         let sessions = try Self.sessions(dbPath: Self.dbPath(in: stateDir))
         var sawTruncation = false
@@ -856,8 +866,7 @@ struct C3ExecQualificationTests {
         #expect(!result.stdout.contains("\u{1B}"), "no raw escape bytes on stdout")
         // The exec receipt line in the JSONL stream is sanitized too.
         for envelope in envelopes {
-            if let payload = envelope["payload"] as? [String: Any],
-               let detail = payload["detail"] as? String {
+            if let detail = envelope["payload"] as? String, envelope["kind"] as? String == "run:tool-exec" {
                 #expect(!detail.contains("\u{1B}"), "receipt detail sanitized")
             }
         }

@@ -950,6 +950,46 @@ struct C2ExecDurableTests {
         #expect(run.stdout.isEmpty, "no output from a never-executed image")
     }
 
+    @Test("C2 exec: orphaned same-group grandchild blocks clean success (timeout, no zombie)")
+    func execOrphanedGrandchildNoCleanSuccess() async throws {
+        defer { Self.resetHooks() }
+        let (wsURL, wsFP) = try Self.makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: wsURL) }
+        let (dir, store, session, writer) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        // The leader execs echo (exits at once) but leaves a same-group
+        // background sleep behind. The post-completion group probe must
+        // refuse a clean verdict: timeout, never success — and the
+        // escalation must reap the descendant (no zombie leak).
+        let script = wsURL.appendingPathComponent("orphan.sh")
+        try "#!/bin/sh\nsleep 30 &\nexec /bin/echo done\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let resolver = try WorkspaceResolver(workspace: wsFP, readRoots: [])
+        let exec = Self.makeExecutor(resolver: resolver, store: store, session: session, identity: writer)
+        let batch = Self.execBatch("{\"executable\":\"\(script.path)\",\"argv\":[\"\(script.path)\"],\"timeoutSecs\":10}")
+        let (digests, cwdIds) = try Self.approve(executor: exec, batch: batch)
+        let result = try await exec.execute(batch: batch, reservation: Self.makeReservation(batch: batch, digests: digests, cwdIds: cwdIds))
+        let out = try #require(result.calls.first)
+        #expect(out.status == "timeout", "lingering same-group descendant forbids clean success, got \(out)")
+        #expect(out.started == true, "the leader verifiably started: hold, not done")
+    }
+
+    @Test("C2 exec: absolute cwd is invalid-arguments, never spawned")
+    func execAbsoluteCwdRejected() throws {
+        defer { Self.resetHooks() }
+        // Absolute cwd (e.g. a read root) is rejected at shape validation,
+        // before any identity resolution or spawn.
+        do {
+            _ = try ToolValidator.execArguments(fromRaw: "{\"executable\":\"/bin/echo\",\"argv\":[\"/bin/echo\"],\"cwd\":\"/tmp\",\"timeoutSecs\":30}")
+            Issue.record("absolute cwd must be rejected")
+        } catch let failure as ToolFailure {
+            guard case .preDispatch(let status, _) = failure, status == "invalid-arguments" else {
+                Issue.record("wrong refusal: \(failure)")
+                return
+            }
+        }
+    }
+
     @Test("C2 spawn: bad cwd descriptor classifies pre-dispatch")
     func spawnBadCwdDescriptor() throws {
         // An fd number that can never be open in this process: fchdir fails
