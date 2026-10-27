@@ -190,6 +190,53 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
         }
     }
 
+    // MARK: - M2-C C2 spill-lease (in-memory mirror)
+
+    private var spillLeases: [String: SpillHandle] = [:]
+
+    public func openArtifactSpill(session: SessionID, as identity: WriterIdentity, kind: String, stream: String, requestedBytes: Int64) throws -> SpillHandle {
+        try lock.withLock {
+            guard session == identity.session else { throw StoreError.integrity("spill session/identity mismatch") }
+            guard let owner = claims[identity.session.raw], owner == identity.writer else { throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer) }
+            guard !kind.isEmpty, !stream.isEmpty else { throw StoreError.integrity("spill kind/stream empty") }
+            guard requestedBytes >= 0 && requestedBytes <= 32*1024*1024 else { throw StoreError.quotaExceeded(limit: 32*1024*1024) }
+            let leaseID = UUID()
+            let path = NSTemporaryDirectory() + ".tmp-lease-\(leaseID.uuidString)-\(stream)"
+            FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
+            let handle = SpillHandle(leaseID: leaseID, session: session, stream: stream, kind: kind, path: path, bytes: requestedBytes)
+            spillLeases[leaseID.uuidString] = handle
+            return handle
+        }
+    }
+
+    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle) throws -> ArtifactRef {
+        try lock.withLock {
+            guard session == identity.session && session == spill.session else { throw StoreError.integrity("publish session mismatch") }
+            guard kind == spill.kind else { throw StoreError.integrity("publish kind mismatch") }
+            guard let owner = claims[identity.session.raw], owner == identity.writer else { throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer) }
+            guard spillLeases[spill.leaseID.uuidString] != nil else { throw StoreError.integrity("lease not found") }
+            let data = try Data(contentsOf: URL(fileURLWithPath: spill.path))
+            guard data.count <= Self.artifactByteLimit else { throw StoreError.quotaExceeded(limit: Self.artifactByteLimit) }
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            if artifactBytes[digest] == nil { artifactBytes[digest] = data }
+            sequence += 1
+            let ref = ArtifactRef(digest: digest, size: data.count, kind: kind, operationID: nil)
+            log.append(SequencedRecord(sequence: SequenceNumber(sequence), record: .artifactPublished(ref)))
+            sessionRows.append(identity.session.raw)
+            spillLeases.removeValue(forKey: spill.leaseID.uuidString)
+            try? FileManager.default.removeItem(atPath: spill.path)
+            return ref
+        }
+    }
+
+    public func releaseArtifactSpill(as identity: WriterIdentity, handle: SpillHandle) throws {
+        try lock.withLock {
+            guard let owner = claims[handle.session.raw], owner == identity.writer else { throw StoreError.notWriter(session: handle.session.raw, writer: identity.writer) }
+            spillLeases.removeValue(forKey: handle.leaseID.uuidString)
+            try? FileManager.default.removeItem(atPath: handle.path)
+        }
+    }
+
     /// B5-B read-only session enumeration: every session with at least
     /// one appended record, sorted for deterministic gate output.
     public func sessions() throws -> [SessionID] {

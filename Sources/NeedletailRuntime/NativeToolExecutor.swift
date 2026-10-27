@@ -414,6 +414,52 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// M2-C C2: post-spawn exec failure. Deliberately UNTYPED (never a
+    /// ToolFailure): thrown after the child may have executed, the batch
+    /// loop maps it to timeout/unknown+hold for mutating — an uncertain
+    /// shell side effect is never certified as a deterministic failure and
+    /// never returns success without durable artifacts.
+    private struct ExecPostSpawnError: Error {
+        let summary: String
+    }
+
+    /// Writes drained child output directly to the leased staging path
+    /// (O_WRONLY|O_TRUNC|O_NOFOLLOW, loop write, fsync). Never `.atomic`:
+    /// the lease binds the staging inode the sweep attributes by name.
+    private func writeSpillFile(_ handle: SpillHandle, data: Data) throws {
+        let fd: Int32 = handle.path.withCString { open($0, O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC) }
+        guard fd >= 0 else {
+            throw ExecPostSpawnError(summary: "spill write open failed: \(String(cString: strerror(errno)))")
+        }
+        defer { close(fd) }
+        var offset = 0
+        let total = data.count
+        while offset < total {
+            let n = data.withUnsafeBytes { raw -> Int in
+#if canImport(Glibc)
+                Glibc.write(fd, raw.baseAddress!.advanced(by: offset), total - offset)
+#else
+                Darwin.write(fd, raw.baseAddress!.advanced(by: offset), total - offset)
+#endif
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw ExecPostSpawnError(summary: "spill write failed: \(String(cString: strerror(errno)))")
+            }
+            if n == 0 { throw ExecPostSpawnError(summary: "spill short write") }
+            offset += n
+        }
+#if canImport(Glibc)
+        guard Glibc.fsync(fd) == 0 else {
+            throw ExecPostSpawnError(summary: "spill fsync failed: \(String(cString: strerror(errno)))")
+        }
+#else
+        guard Darwin.fsync(fd) == 0 else {
+            throw ExecPostSpawnError(summary: "spill fsync failed: \(String(cString: strerror(errno)))")
+        }
+#endif
+    }
+
     /// B4: applies the B1 mutating classifier at the execution site, so the
     /// per-call result carries the executor's attestation (the reducer
     /// verifies agreement with the dispatch-time intent).
@@ -573,13 +619,132 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         case "write":
             return try write(callID: proposal.callID, json: json)
         case "exec":
-            // M2-C C0 (plan REV12 §7-C0): the native process runner is NOT
-            // implemented in this slice — the shape has been validated (so
-            // malformed exec dies earlier as invalid-arguments), and this
-            // arm refuses any EXEC-granted proposal loudly and typed. A
-            // wiring mistake (exec dispatched without the C1 runner) can
-            // never spawn: fail closed at the execution site.
-            throw ToolFailure.preDispatch(status: "denied", summary: "native exec backend not composed (C0: contract and authorization only)")
+            // M2-C C2: full exec dispatch with identity revalidation, spill
+            // leases, and artifact publication. Defense in depth: the
+            // executor refuses exec without the composed grant (the
+            // authoriser gates first, so a wiring mistake fails closed here).
+            guard execGrant else {
+                throw ToolFailure.preDispatch(status: "denied", summary: "exec grant not composed (C2 requires --allow-exec)")
+            }
+            let args = try ToolValidator.execArguments(fromRaw: proposal.arguments ?? "")
+            // Timeout: min(requested, deadlines.exec, dispatch ceiling 1800)
+            let requested = TimeInterval(args.timeoutSecs)
+            var effective = min(requested, deadlines.exec)
+            effective = min(effective, 1800)
+            // Approved identities from reservation (C0 two-phase)
+            let approvedDigest = reservation.approvedExecDigests[proposal.callID]
+            let approvedCwdStr = reservation.approvedCwdIdentities[proposal.callID]
+            var approvedCwd: (device: UInt64, inode: UInt64)? = nil
+            if let s = approvedCwdStr {
+                let parts = s.split(separator: ":", omittingEmptySubsequences: false)
+                if parts.count == 2, let d = UInt64(parts[0]), let i = UInt64(parts[1]) {
+                    approvedCwd = (d, i)
+                }
+            }
+            // For C2, approvedDigest must be present (grant) — otherwise pre-dispatch conflict
+            guard let digest = approvedDigest else {
+                throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity not approved (no digest)")
+            }
+            // Spill leases before spawn, one per stream back-to-back (REV9).
+            // A second-stream refusal aborts the whole call: the first lease
+            // is released synchronously (no partial-leak state) and the
+            // provider may re-propose. Deterministic `failed`, started nil:
+            // nothing executed, continuation proceeds (no hold).
+            let spillKind = "exec-output"
+            let stdoutHandle: SpillHandle
+            do {
+                stdoutHandle = try store.openArtifactSpill(session: sessionID, as: writer, kind: spillKind, stream: "stdout", requestedBytes: 32*1024*1024)
+            } catch {
+                throw ToolFailure.preDispatch(status: "failed", summary: "spill lease failed: \(error)")
+            }
+            let stderrHandle: SpillHandle
+            do {
+                stderrHandle = try store.openArtifactSpill(session: sessionID, as: writer, kind: spillKind, stream: "stderr", requestedBytes: 32*1024*1024)
+            } catch {
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                throw ToolFailure.preDispatch(status: "failed", summary: "spill lease failed: \(error)")
+            }
+            // Launch via ExecRunner with revalidation (FD binding, execPath, cwd)
+            let runner = ExecRunner(resolver: resolver)
+            let execResult: ExecRunner.Result
+            do {
+                execResult = try runner.run(args: args, approvedDigest: digest, approvedCwdIdentity: approvedCwd.map { ($0.device, $0.inode) }, timeout: effective)
+            } catch is CancellationError {
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                try? store.releaseArtifactSpill(as: writer, handle: stderrHandle)
+                throw CancellationError()
+            } catch let err as ToolFailure {
+                // Pre-dispatch failures (conflict, invalid-arguments) — release leases
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                try? store.releaseArtifactSpill(as: writer, handle: stderrHandle)
+                throw err
+            } catch {
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                try? store.releaseArtifactSpill(as: writer, handle: stderrHandle)
+                throw ToolFailure.preDispatch(status: "failed", summary: "exec launch failed: \(error)")
+            }
+            // Post-spawn (the child may have executed): convert each stream
+            // into a durable artifact. From here on, failures throw UNTYPED
+            // (never ToolFailure): the batch loop maps them to
+            // timeout/unknown+hold for mutating. A non-empty stream NEVER
+            // returns success without its committed artifact reference; an
+            // empty stream releases its lease (zero-byte rule: counters and
+            // preview only, no empty artifact).
+            func publishExecStream(_ handle: SpillHandle, data: Data) throws -> ArtifactRef? {
+                if data.isEmpty {
+                    try? store.releaseArtifactSpill(as: writer, handle: handle)
+                    return nil
+                }
+                do {
+                    try writeSpillFile(handle, data: data)
+                } catch {
+                    try? store.releaseArtifactSpill(as: writer, handle: handle)
+                    throw error
+                }
+                do {
+                    return try store.publishArtifactFromFile(session: sessionID, as: writer, kind: spillKind, spill: handle)
+                } catch {
+                    try? store.releaseArtifactSpill(as: writer, handle: handle)
+                    throw error
+                }
+            }
+            let stdoutRef: ArtifactRef?
+            let stderrRef: ArtifactRef?
+            do {
+                stdoutRef = try publishExecStream(stdoutHandle, data: execResult.stdout)
+                stderrRef = try publishExecStream(stderrHandle, data: execResult.stderr)
+            } catch {
+                // Release any lease the failed publish left behind (publish
+                // deletes its lease on success; release is a no-op otherwise).
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                try? store.releaseArtifactSpill(as: writer, handle: stderrHandle)
+                throw error
+            }
+            let status: String
+            if execResult.timedOut { status = "timeout" }
+            else if execResult.exitStatus == 0 { status = "success" }
+            else { status = "failed" }
+            var summaryParts: [String] = []
+            if execResult.timedOut {
+                summaryParts.append("exec timed out after \(args.timeoutSecs)s (exit \(execResult.exitStatus))")
+            } else if execResult.exitStatus == 0 {
+                summaryParts.append("exec succeeded (exit 0)")
+            } else {
+                summaryParts.append("exec failed (exit \(execResult.exitStatus))")
+            }
+            summaryParts.append("stdout \(execResult.stdout.count)B")
+            summaryParts.append("stderr \(execResult.stderr.count)B")
+            if execResult.truncated {
+                summaryParts.append("truncated stdout-discarded=\(execResult.discardedStdoutBytes) stderr-discarded=\(execResult.discardedStderrBytes)")
+            }
+            if let ref = stdoutRef {
+                summaryParts.append("stdout-artifact=\(ref.digest)")
+            }
+            if let ref = stderrRef {
+                summaryParts.append("stderr-artifact=\(ref.digest)")
+            }
+            let preview = String(decoding: execResult.stdout.prefix(16*1024), as: UTF8.self)
+            return ToolCallOutcome(callID: proposal.callID, status: status, summary: summaryParts.joined(separator: "; "), data: preview, artifactID: stdoutRef?.digest, truncated: execResult.truncated, started: true)
         default:
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown tool")
         }
@@ -874,6 +1039,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         var status: Int32
         var truncated: Bool
         var stdoutTruncated: Bool
+        /// M2-C C2: exact discarded-byte counts (bytes read from the pipe
+        /// but dropped by the cap). The drain counts every dropped byte, so
+        /// truncation accounting is exact, not cap-minus-kept.
+        var stdoutDiscarded: Int64
+        var stderrDiscarded: Int64
         var timedOut: Bool
     }
 
@@ -921,42 +1091,125 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
 
     /// Linux /proc group liveness probe (REV12 §3.5 Change 2/3): enumerate
     /// /proc/<pid>/stat and match pgrp (fields[2] after final ')', state at
-    /// fields[0]) with state != 'Z' (live). Bounded: ≤8192 entries, ≤500 ms wall
-    /// including the directory read; on enumeration error or truncated/uncertain
-    /// scan conservatively returns true (escalate). Non-Linux: nil (unqualified).
+    /// fields[0]) with state != 'Z' (live). Bounded: ≤8192 entries, ≤2000 ms wall
+    /// per scan with ONE immediate rescan on genuine timeout/truncation
+    /// (M2-C C2: a saturated host can stall a single scan past any fixed
+    /// bound; squaring the observation keeps the fail-closed mapping while
+    /// making spurious escalation rare — two consecutive timeouts still
+    /// return conservative-true). Hook-forced truncate/unreadable/deadline-0
+    /// return true immediately (C1 RED pins); per-pid unreadable-with-present
+    /// file stays immediate-true. Non-Linux: nil (unqualified).
     /// Bound raised from 200/20ms to avoid host-specific false positives on
     /// builders with ~1000 pids while remaining bounded per REV12. ENOENT
     /// races (pid exited between readdir and stat) are skipped, not escalated.
-    static func groupHasLiveMembers(pgid: pid_t) -> Bool? {
-#if canImport(Glibc)
-        if _testHook_probeForceTruncate { return true }
-        if _testHook_probeForceUnreadable { return true }
-        let deadlineOffset: UInt64 = _testHook_probeDeadlineOffsetNs ?? 500_000_000
-        let deadline = monotonicNanos() + deadlineOffset
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(atPath: "/proc") else { return true }
-        if monotonicNanos() > deadline { return true }
+    /// Single-scan verdict: live member found (escalate), clean (no live
+    /// member), or inconclusive (scan timed out or truncated — rescan).
+    private enum ProbeScan {
+        case liveFound
+        case clean
+        case inconclusive
+    }
+
+    private static func scanGroupOnce(pgid: pid_t, entries: [String], deadline: UInt64) -> ProbeScan {
         var scanned = 0
         for name in entries {
-            if _testHook_probeForceTruncate || scanned >= 8192 || monotonicNanos() > deadline { return true }
+            if _testHook_probeForceTruncate { return .liveFound }
+            if scanned >= 8192 || monotonicNanos() > deadline { return .inconclusive }
             guard let pid = Int32(name), pid > 0 else { continue }
             scanned += 1
             // Skip leader itself — its own escalation already covers it.
             if pid == pgid { continue }
-            guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8) else {
-                if _testHook_probeForceUnreadable || FileManager.default.fileExists(atPath: "/proc/\(pid)/stat") { return true } else { continue }
+            // Fast stat read (M2-C C2): one open/read/close of ≤256 bytes.
+            // comm is ≤15 chars so the last ')' is always in-buffer; the
+            // parse needs only state + pgrp (fields 0 and 2 after ')').
+            // Semantically identical to the old full-file parse: any
+            // unreadable/unparsable stat with a present file is
+            // conservative-true; a vanished file (exited race) is skipped.
+            let statPath = "/proc/\(pid)/stat"
+            let sfd: Int32 = statPath.withCString { open($0, O_RDONLY | O_CLOEXEC) }
+            guard sfd >= 0 else {
+                if _testHook_probeForceUnreadable || FileManager.default.fileExists(atPath: statPath) { return .liveFound } else { continue }
             }
-            guard let rParen = stat.lastIndex(of: ")") else { return true }
-            let after = stat[stat.index(after: rParen)...].trimmingCharacters(in: .whitespaces)
-            let fields = after.split(separator: " ", omittingEmptySubsequences: true)
-            guard fields.count >= 3 else { return true }
-            let state = fields[0]
-            guard let memberPGID = Int32(fields[2]) else { return true }
-            if memberPGID == pgid && state != "Z" {
-                return true
+            var sbuf = [UInt8](repeating: 0, count: 256)
+            let sn = sbuf.withUnsafeMutableBytes { ptr in
+#if canImport(Glibc)
+                Glibc.read(sfd, ptr.baseAddress!, ptr.count)
+#else
+                Darwin.read(sfd, ptr.baseAddress!, ptr.count)
+#endif
+            }
+            close(sfd)
+            guard sn > 0 else {
+                if _testHook_probeForceUnreadable || FileManager.default.fileExists(atPath: statPath) { return .liveFound } else { continue }
+            }
+            var rparen = -1
+            var i = 0
+            while i < sn {
+                if sbuf[i] == 0x29 { rparen = i }
+                i += 1
+            }
+            guard rparen >= 0 else { return .liveFound }
+            // Tokens after ") ": state, ppid, pgrp (whitespace-separated).
+            var k = rparen + 1
+            func skipSpaces() {
+                while k < sn && (sbuf[k] == 0x20 || sbuf[k] == 0x09) { k += 1 }
+            }
+            func nextToken() -> [UInt8]? {
+                skipSpaces()
+                let start = k
+                while k < sn && sbuf[k] != 0x20 && sbuf[k] != 0x09 && sbuf[k] != 0x0A { k += 1 }
+                guard k > start else { return nil }
+                return Array(sbuf[start..<k])
+            }
+            guard let stateTok = nextToken(), !stateTok.isEmpty else { return .liveFound }
+            guard nextToken() != nil else { return .liveFound }
+            guard let pgrpTok = nextToken(), !pgrpTok.isEmpty else { return .liveFound }
+            var memberPGID: Int32 = 0
+            var neg = false
+            var digits = 0
+            for b in pgrpTok {
+                if b == 0x2D && digits == 0 && !neg { neg = true; continue }
+                guard b >= 0x30 && b <= 0x39 else { return .liveFound }
+                memberPGID = memberPGID &* 10 &+ Int32(b - 0x30)
+                digits += 1
+            }
+            guard digits > 0, !neg else { return .liveFound }
+            let isZombie = stateTok.count == 1 && stateTok[0] == 0x5A // 'Z'
+            if memberPGID == pgid && !isZombie {
+                return .liveFound
             }
         }
-        return false
+        return .clean
+    }
+
+    static func groupHasLiveMembers(pgid: pid_t) -> Bool? {
+#if canImport(Glibc)
+        if _testHook_probeForceTruncate { return true }
+        if _testHook_probeForceUnreadable { return true }
+        // M2-C C2: default scan bound raised 500 ms → 2000 ms, plus ONE
+        // immediate rescan on genuine timeout/truncation. Empirical
+        // ground: a ~1000-pid host scans in up to ~1000 ms with Foundation
+        // reads, so the old bound spuriously timed out (~15%) and marked
+        // clean fast exits timedOut via probe escalation; the faster
+        // per-pid read plus a squared observation makes that rare while
+        // the mapping stays fail-closed (two consecutive timeouts still
+        // return conservative-true — the C1 RED probes pin exactly that).
+        let deadlineOffset: UInt64 = _testHook_probeDeadlineOffsetNs ?? 2_000_000_000
+        let fm = FileManager.default
+        for _ in 0..<2 {
+            // Fresh listing per attempt: a member spawned during a timed-out
+            // first scan must be visible to the rescan (never decide on a
+            // stale snapshot).
+            guard let entries = try? fm.contentsOfDirectory(atPath: "/proc") else { return true }
+            let deadline = monotonicNanos() + deadlineOffset
+            if monotonicNanos() > deadline { continue }
+            switch scanGroupOnce(pgid: pgid, entries: entries, deadline: deadline) {
+            case .liveFound: return true
+            case .clean: return false
+            case .inconclusive: continue
+            }
+        }
+        return true
 #else
         return nil
 #endif
@@ -1040,6 +1293,31 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             throw error
         }
         let (errR, errW) = errPair
+        // C2 exec-error pipe: close-on-exec, parent closes write after fork
+        // so child write failures surface as EPIPE not silent success.
+        var errPipeRead: Int32 = -1
+        var errPipeWrite: Int32 = -1
+        do {
+            var fds = [Int32](repeating: 0, count: 2)
+            guard pipe(&fds) == 0 else { throw ToolFailure.preDispatch(status: "failed", summary: "exec pipe failed") }
+            // Lift above stdio and set CLOEXEC
+            for i in 0..<2 {
+                while fds[i] >= 0 && fds[i] <= 2 {
+                    let n = fcntl(fds[i], F_DUPFD, 3)
+                    guard n >= 0 else { close(fds[0]); close(fds[1]); throw ToolFailure.preDispatch(status: "failed", summary: "exec pipe dup failed") }
+                    close(fds[i]); fds[i] = n
+                }
+            }
+            for fd in fds {
+                let flags = fcntl(fd, F_GETFD)
+                _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)
+            }
+            errPipeRead = fds[0]; errPipeWrite = fds[1]
+        } catch {
+            close(outR); close(outW); close(errR); close(errW)
+            Self.spawnLock.unlock()
+            throw error
+        }
         // fork+exec (not posix_spawn): glibc posix_spawn fails scripts with
         // ENOEXEC, while version probes and race-test wrappers are #! scripts
         // launched via /proc/self/fd. fork+execve handles both ELF and
@@ -1101,10 +1379,42 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             // A failed pin aborts loudly (never diff the wrong directory).
             if let dir = cwdFD {
 #if canImport(Glibc)
-                if Glibc.fchdir(dir) != 0 { Glibc._exit(127) }
+                if Glibc.fchdir(dir) != 0 {
+                    // Write exec-error 0x02 + errno before _exit. Capture
+                    // errno FIRST: the marker write itself may clobber it.
+                    var e = errno
+                    var code: UInt8 = 0x02
+                    _ = Glibc.write(errPipeWrite, &code, 1)
+                    _ = Glibc.write(errPipeWrite, &e, 4)
+                    Glibc._exit(127)
+                }
 #else
-                if Darwin.fchdir(dir) != 0 { Darwin._exit(127) }
+                if Darwin.fchdir(dir) != 0 {
+                    var e = errno
+                    var code: UInt8 = 0x02
+                    _ = Darwin.write(errPipeWrite, &code, 1)
+                    _ = Darwin.write(errPipeWrite, &e, 4)
+                    Darwin._exit(127)
+                }
 #endif
+            }
+            // C2 exec-error pipe: close read end, write 0x01 marker before execve
+            close(errPipeRead)
+            // Child's dup2 wiring already closed outR/errR, but keep errPipeWrite
+            // Write 0x01 with EINTR retry; EPIPE means parent closed, still exec
+            do {
+                var m: UInt8 = 0x01
+                var written = 0
+                while written < 1 {
+#if canImport(Glibc)
+                    let n = Glibc.write(errPipeWrite, &m, 1)
+#else
+                    let n = Darwin.write(errPipeWrite, &m, 1)
+#endif
+                    if n == 1 { written = 1; break }
+                    if n < 0 && errno == EINTR { continue }
+                    break // EPIPE or other, still try exec
+                }
             }
             // C1: execPath split — the display argv[0] stays the resolved
             // path, but the kernel executes the /proc/self/fd path.
@@ -1120,21 +1430,111 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 }
             }
             if needsFree { free(UnsafeMutablePointer(mutating: execvePath)) }
+            // execve failed: write 0x02 + errno. Capture errno before the
+            // marker write clobbers it.
+            do {
+                var e = errno
+                var code: UInt8 = 0x02
 #if canImport(Glibc)
-            Glibc._exit(127)
+                _ = Glibc.write(errPipeWrite, &code, 1)
+                _ = Glibc.write(errPipeWrite, &e, 4)
+                Glibc._exit(127)
 #else
-            Darwin._exit(127)
+                _ = Darwin.write(errPipeWrite, &code, 1)
+                _ = Darwin.write(errPipeWrite, &e, 4)
+                Darwin._exit(127)
 #endif
+            }
         }
         // Parent closes write ends immediately so EOF is observable.
+        // C2: close exec-error write, parent will read it before drain loop
+        close(errPipeWrite)
         close(outW)
         close(errW)
+        var execStarted = false
+        var execError: (code: UInt8, errno: Int32)? = nil
+        // C2 exec-error pipe: the write end is CLOEXEC, so a successful
+        // execve closes it (the parent observes EOF); a failed execve or
+        // fchdir writes 0x02+errno (native int32, little-endian hosts);
+        // death before the marker yields EOF with no bytes. Framing (child
+        // writes are tiny, order preserved):
+        //   []                → child died before the marker (pre-dispatch)
+        //   [0x01] + EOF      → execve succeeded (definitely started)
+        //   [0x02 e0..e3]     → pre-exec failure with errno (fchdir path)
+        //   [0x01 0x02 e0..e3]→ execve failed after the marker (never started)
+        // Any observed 0x02 ⇒ no image ever executed ⇒ pre-dispatch
+        // `failed`. EOF terminates every case (execve-CLOEXEC or _exit);
+        // the 2 s deadline is a backstop only — an inconclusive wait (no
+        // bytes, no EOF) leaves both flags clear and lets the main
+        // deadline/reap machinery decide instead of fabricating a verdict.
+        do {
+            var errBytes: [UInt8] = []
+            errBytes.reserveCapacity(8)
+            let readDeadline = NativeToolExecutor.monotonicNanos() + 2_000_000_000
+            var eof = false
+            while errBytes.count < 8 && !eof && NativeToolExecutor.monotonicNanos() < readDeadline {
+                var pfd = pollfd(fd: errPipeRead, events: Int16(POLLIN), revents: 0)
+                let pr = poll(&pfd, 1, 100)
+                if pr > 0 && (pfd.revents & Int16(POLLIN)) != 0 {
+                    var tmp = [UInt8](repeating: 0, count: 8 - errBytes.count)
+                    let n = tmp.withUnsafeMutableBytes { ptr in
+#if canImport(Glibc)
+                        Glibc.read(errPipeRead, ptr.baseAddress!, ptr.count)
+#else
+                        Darwin.read(errPipeRead, ptr.baseAddress!, ptr.count)
+#endif
+                    }
+                    if n > 0 {
+                        errBytes.append(contentsOf: tmp[0..<n])
+                        if errBytes.count >= 5 && errBytes[0] == 0x02 { break }
+                        if errBytes.count >= 6 && errBytes[0] == 0x01 && errBytes[1] == 0x02 { break }
+                    } else if n == 0 {
+                        eof = true
+                    } else {
+                        if errno == EINTR { continue }
+                        break
+                    }
+                } else if pr == 0 {
+                    continue
+                } else {
+                    if errno == EINTR { continue }
+                    break
+                }
+            }
+            // Little-endian reconstruction: the child wrote a native int32
+            // on this host (all supported hosts are little-endian).
+            func decodeErrno(_ bytes: [UInt8]) -> Int32 {
+                var v: Int32 = 0
+                for (i, b) in bytes.prefix(4).enumerated() {
+                    v |= Int32(b) << (i * 8)
+                }
+                return v
+            }
+            if errBytes.isEmpty {
+                if eof { execError = (0x00, 0) }
+            } else if errBytes[0] == 0x02 {
+                execError = (0x02, errBytes.count >= 5 ? decodeErrno(Array(errBytes[1...])) : 0)
+            } else if errBytes[0] == 0x01 {
+                if errBytes.count >= 2 && errBytes[1] == 0x02 {
+                    execError = (0x02, errBytes.count >= 6 ? decodeErrno(Array(errBytes[2...])) : 0)
+                } else {
+                    execStarted = true
+                }
+            } else {
+                // Unknown first byte: never produced by our child; treat as
+                // inconclusive-started rather than fabricate pre-dispatch.
+                execStarted = true
+            }
+        }
+        // Close the read end after classification (defer close)
+        close(errPipeRead)
         var outData = Data()
         var errData = Data()
-        func appendBounded(_ chunk: Data, cap: Int, current: inout Data, trunc: inout Bool) {
+        func appendBounded(_ chunk: Data, cap: Int, current: inout Data, trunc: inout Bool, discarded: inout Int64) {
             if chunk.isEmpty { return }
             if current.count >= cap {
                 trunc = true
+                discarded += Int64(chunk.count)
                 return
             }
             let room = cap - current.count
@@ -1143,11 +1543,12 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             } else {
                 current.append(chunk.prefix(room))
                 trunc = true
+                discarded += Int64(chunk.count - room)
             }
         }
         // Bounded per-wakeup drain: sustained output must not starve the
         // timeout/cancellation checks below.
-        func drain(fd: Int32, eof: inout Bool, current: inout Data, trunc: inout Bool, cap: Int, budget: Int) {
+        func drain(fd: Int32, eof: inout Bool, current: inout Data, trunc: inout Bool, discarded: inout Int64, cap: Int, budget: Int) {
             if eof { return }
             var buf = [UInt8](repeating: 0, count: 8192)
             var remaining = budget
@@ -1160,7 +1561,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
 #endif
                 }
                 if n > 0 {
-                    appendBounded(Data(buf[0..<n]), cap: cap, current: &current, trunc: &trunc)
+                    appendBounded(Data(buf[0..<n]), cap: cap, current: &current, trunc: &trunc, discarded: &discarded)
                     remaining -= 1
                 } else if n == 0 {
                     eof = true
@@ -1177,6 +1578,8 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         var errEOF = false
         var outTruncCap = false
         var errTruncCap = false
+        var outDiscarded: Int64 = 0
+        var errDiscarded: Int64 = 0
         var exitStatus: Int32 = -1
         var childDone = false
         // Monotonic clock: wall-clock changes must not extend/truncate the
@@ -1204,9 +1607,9 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 }
                 for pfd in pfds where pfd.revents != 0 {
                     if pfd.fd == outR {
-                        drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, cap: stdoutCap, budget: 64)
+                        drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, discarded: &outDiscarded, cap: stdoutCap, budget: 64)
                     } else {
-                        drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, cap: stderrCap, budget: 64)
+                        drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, discarded: &errDiscarded, cap: stderrCap, budget: 64)
                     }
                 }
             } else {
@@ -1423,8 +1826,8 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 usleep(200_000)
             }
             // Final bounded drain after escalation (before the single final reap).
-            drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, cap: stdoutCap, budget: 1024)
-            drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, cap: stderrCap, budget: 1024)
+            drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, discarded: &outDiscarded, cap: stdoutCap, budget: 1024)
+            drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, discarded: &errDiscarded, cap: stderrCap, budget: 1024)
         }
         // Clean-completion reap: leader is zombie (!reaped) but group empty
         // (probe false) — still must reap before return. Also covers rg/git
@@ -1453,6 +1856,28 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         }
         close(outR)
         close(errR)
+        // C2 exec-error pipe classification
+        // - 0x02 + errno => execve failed, no process executed (pre-dispatch)
+        // - EOF without 0x01 => child died before exec (fchdir/setsid/dup2)
+        // - 0x01 + EOF => execve succeeded, process definitely began execution
+        // A death after 0x01 but before execve is conservatively classified as started.
+        if let err = execError {
+            if err.code == 0x02 {
+                // execve failure: map errno to pre-dispatch status
+                let summary: String
+                switch err.errno {
+                case ENOENT: summary = "exec failed: \(String(cString: strerror(err.errno)))"
+                case EACCES: summary = "exec failed: \(String(cString: strerror(err.errno)))"
+                case ENOEXEC: summary = "exec failed: invalid executable format"
+                case EBADF: summary = "exec failed: bad descriptor"
+                default: summary = "exec failed: \(String(cString: strerror(err.errno)))"
+                }
+                // Close the read end already done, now throw pre-dispatch
+                throw ToolFailure.preDispatch(status: "failed", summary: summary)
+            } else if err.code == 0x00 {
+                throw ToolFailure.preDispatch(status: "failed", summary: "child died before exec")
+            }
+        }
         if cancelled {
             throw CancellationError()
         }
@@ -1465,7 +1890,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         // escalation (clean pipes but live group) is also a timeout — descendant
         // survived the leader, not a clean success.
         let timedOut = deadlineExceeded || hardStopped || !childDone || unsafeToSignal || probeEscalated
-        return BoundedRunResult(stdout: outData, stderr: errData, status: exitStatus, truncated: outTruncCap || errTruncCap, stdoutTruncated: outTruncCap, timedOut: timedOut)
+        return BoundedRunResult(stdout: outData, stderr: errData, status: exitStatus, truncated: outTruncCap || errTruncCap, stdoutTruncated: outTruncCap, stdoutDiscarded: outDiscarded, stderrDiscarded: errDiscarded, timedOut: timedOut)
     }
 
     /// Version gate over the qualified FD path with sanitized env, bounded

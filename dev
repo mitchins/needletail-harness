@@ -51,7 +51,7 @@ FILTER_PRESENTATION_PURE="NeedletailPresentationTests"
 # Suites owned by the serialized lanes (FINAL-02 timing, FINAL-03 e2e):
 # every bulk swift-test invocation skips them; the lanes certify them
 # in isolation with identical assertions and thresholds.
-BULK_SKIP="--skip TransportCancellationTests --skip B5CEndToEndTests --skip TOOL10DiffTests --skip ProductionCLIWiringTests --skip ProductionExportCLIWiringTests --skip CrossRunGateCLITests --skip B1ContainmentTests --skip CrashMatrixTests --skip TOOL09OrderedBatchTests --skip SessionExportTests --skip C1ProcRunnerTests --skip C1QualificationTests"
+BULK_SKIP="--skip TransportCancellationTests --skip B5CEndToEndTests --skip TOOL10DiffTests --skip ProductionCLIWiringTests --skip ProductionExportCLIWiringTests --skip CrossRunGateCLITests --skip B1ContainmentTests --skip CrashMatrixTests --skip TOOL09OrderedBatchTests --skip SessionExportTests --skip C1ProcRunnerTests --skip C1QualificationTests --skip C2ExecDurableTests"
 
 swift_test() {
     # One test worker at a time: loopback suites share process/OS
@@ -225,7 +225,7 @@ test)
         _e2e_xunit_actual="${_e2e_xunit_base%.xml}-swift-testing.xml"
         mkdir -p "$root_dir/.needletail-dev/logs" "$root_dir/.needletail-dev/xunit"
         rm -f "$_e2e_xunit_base" "$_e2e_xunit_actual"
-        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --xunit-output "$_e2e_xunit_base" > "$_e2e_log" 2>&1; then
+        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --xunit-output "$_e2e_xunit_base" > "$_e2e_log" 2>&1; then
             _e2e_rc=0
         else
             _e2e_rc=$?

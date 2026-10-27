@@ -283,6 +283,36 @@ public protocol SessionStore: Sendable {
         session: SessionID, expectedWriter: String, newWriter: String,
         authorization: RecoveryAuthorization
     ) throws
+
+    // MARK: - M2-C C2 spill-lease API (per-stream, boot-qualified)
+
+    /// One lease per output stream (stdout/stderr), granted immediately before
+    /// spawn. The staging file is `.tmp-lease-<leaseID>-<stream>`.
+    func openArtifactSpill(session: SessionID, as identity: WriterIdentity, kind: String, stream: String, requestedBytes: Int64) throws -> SpillHandle
+    /// Publish a previously opened spill file to a durable artifact. The
+    /// artifact is fsync'd and the reference is inserted in the same
+    /// transaction as the lease deletion — never a reference to a missing file.
+    func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle) throws -> ArtifactRef
+    /// Release a spill lease and unlink its staging file (synchronous, fenced).
+    func releaseArtifactSpill(as identity: WriterIdentity, handle: SpillHandle) throws
+}
+
+public struct SpillHandle: Sendable, Equatable {
+    public let leaseID: UUID
+    public let session: SessionID
+    public let stream: String
+    public let kind: String
+    public let path: String
+    public let bytes: Int64
+
+    public init(leaseID: UUID, session: SessionID, stream: String, kind: String, path: String, bytes: Int64) {
+        self.leaseID = leaseID
+        self.session = session
+        self.stream = stream
+        self.kind = kind
+        self.path = path
+        self.bytes = bytes
+    }
 }
 
 extension SessionStore {
@@ -311,6 +341,22 @@ extension SessionStore {
     ) throws {
         _ = session; _ = expectedWriter; _ = newWriter; _ = authorization
         throw StoreError.integrity("writer recovery is not supported by this store")
+    }
+
+    /// Default spill-lease refusal: stores without the v4 spill seam fail closed.
+    public func openArtifactSpill(session: SessionID, as identity: WriterIdentity, kind: String, stream: String, requestedBytes: Int64) throws -> SpillHandle {
+        _ = session; _ = identity; _ = kind; _ = stream; _ = requestedBytes
+        throw StoreError.integrity("spill lease not supported by this store")
+    }
+
+    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle) throws -> ArtifactRef {
+        _ = session; _ = identity; _ = kind; _ = spill
+        throw StoreError.integrity("spill publish not supported by this store")
+    }
+
+    public func releaseArtifactSpill(as identity: WriterIdentity, handle: SpillHandle) throws {
+        _ = identity; _ = handle
+        throw StoreError.integrity("spill release not supported by this store")
     }
 }
 

@@ -33,6 +33,7 @@ E2E_SUITES = {
     "TOOL09OrderedBatchTests",
     "C1ProcRunnerTests",
     "C1QualificationTests",
+    "C2ExecDurableTests",
     "SessionExportTests",
 }
 

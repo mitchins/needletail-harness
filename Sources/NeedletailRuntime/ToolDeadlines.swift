@@ -8,13 +8,19 @@ import Foundation
 public struct ToolDeadlines: Sendable, Equatable {
     public var localIO: TimeInterval
     public var search: TimeInterval
+    public var exec: TimeInterval
 
-    public init(localIO: TimeInterval = 30, search: TimeInterval = 120) {
+    public init(localIO: TimeInterval = 30, search: TimeInterval = 120, exec: TimeInterval = 120) {
         self.localIO = localIO
         self.search = search
+        self.exec = exec
     }
 
     public func seconds(for tool: String) -> TimeInterval {
-        tool == "search" ? search : localIO
+        switch tool {
+        case "search": return search
+        case "exec": return exec
+        default: return localIO
+        }
     }
 }
