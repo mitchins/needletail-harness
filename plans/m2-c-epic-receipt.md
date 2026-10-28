@@ -1,9 +1,10 @@
 # M2-C Epic Receipt — READY FOR M2-C EPIC REVIEW (C3 closeout)
 
 Authoritative candidate: branch `m2-c-planning`, qualified code
-head `26496db` (DeepSeek C3 re-review fix: M2 receipt truthfulness in
-the cancelled-pending held branch + reducer-level regression test;
-prior qualified head `be2620a` fully green per §2, delta re-tested).
+head `fe8d631` (CodeRabbit whole-system review fixes, all §2 evidence
+re-measured at this head — see §8; prior qualified heads `be2620a`
+(full-lane evidence) and `26496db` (DeepSeek final APPROVED) are
+ancestors with docs-only deltas between them except the noted fixes).
 Closeout commits after the qualified head are docs-only
 (this receipt, STATUS.md). Final HEAD contains everything; see §8.
 No push, PR, merge, or tag performed. No live-model qualification,
@@ -43,9 +44,10 @@ Certified by native evidence (all green; see §2):
 - `C3ExecQualificationTests`: 18/18 (real binary + loopback SSE + PTY).
 - `C1QualificationTests`: 23/23. `C1ProcRunnerTests`: 3/3.
 - `e2e` lane (13 suites incl. C2+C3): 231/231.
-- `native` lane: 193/193. `timing`: 8/8. `quick`: green except one
+- `native` lane: 192/192. `timing`: 8/8. `quick`: green except one
   pre-existing A2 contention flake (fails ~50% on the base commit too;
-  unrelated to this slice — verified by clean-tree comparison).
+  unrelated to this slice — verified by clean-tree comparison and by
+  stash-comparison of the fix delta).
 - M1-D HEAD cases, C0 actor suites, StateTests: green.
 - Known environmental flakes (not evidence against): A2 contention
   (pre-existing), actor bare-yield tests under 300+ load (verified
@@ -123,6 +125,25 @@ Certified by native evidence (all green; see §2):
 - GLM targeted audit (process identity/signalling/reaping):
   C1 guarantees stand; no new false-negative or leak paths
   introduced; remaining notes documented as accepted deviations.
+- CodeRabbit whole-system review (PR #7): CHANGES_REQUESTED with 20
+  inline findings (2 Majors, 14 Minors, 4 Trivial). Reconciled at
+  `fe8d631`: both approval-display Majors fixed fail-closed
+  (argv elision removed; batch truncation replaced by typed
+  invalid-arguments refusal); probe entry cap removed (deadline-only
+  bound); cwd identity maps required to agree; cwd fds keep CLOEXEC;
+  spill rootFD cleanup fenced; InMemory mirror enforces recordCap,
+  bound names, and lease existence; exec deadline default honors the
+  advertised max (1800); nested argv/env schemas + envelope test;
+  7 test-fidelity fixes (consult fixture, deleted tautological probe,
+  real pipe-buffer flood, retry-attempts comparison, advertisement
+  assertion, prompt-readiness signal, file-list regeneration).
+  Skipped with documented rationale (fail-closed or unreachable on
+  qualified platforms): anchored-walk unification (digest-binding
+  fail-closes any divergence), non-Glibc lock clock (Linux-only
+  execution contract), gateway char-vs-byte truncation (both
+  construction paths now fail closed, truncation unreachable),
+  Sonar MAJOR (vacuous ternary) fixed. SonarQube quality gate
+  re-run pending on the fix head.
 - Verdict sought: READY FOR M2-C EPIC REVIEW. "C2 independently
   APPROVED" is NOT claimed (per mission rule).
 
@@ -153,13 +174,17 @@ Certified by native evidence (all green; see §2):
 - C0: `fa69525`. C1 head: `5a1763b`.
 - C2 base: `116ec6b`; C2 hardening: `3a42908`.
 - C3 implementation + review follow-ups: `7938925`, `3ed1326`,
-  `d676b20`, `14255e2`, `be2620a` (qualified; all §2
-  evidence measured here or on identical code), `26496db`
-  (qualified code head: DeepSeek re-review M2 fix — held-branch
-  receipt reports reducer verdict `unknown`; reducer-level regression
-  test `lateExecSuccessAfterCancelReadsUnknown`; CancellationTests +
-  B0SpineTests green at this head). Closeout commits after the
-  qualified head touch only this receipt and STATUS.md.
+  `d676b20`, `14255e2`, `be2620a` (qualified; full-lane §2 evidence
+  measured here), `26496db` (DeepSeek final APPROVED: M2 held-branch
+  receipt fix + regression test), `fe8d631` (qualified code head:
+  CodeRabbit whole-system review reconciliation — 2 approval-display
+  fail-closed Majors, probe/lock/fd hardening, InMemory contract,
+  exec deadline ceiling, nested argv/env schemas, 7 test-fidelity
+  fixes; all lanes re-measured green at this head: C2 41/41 no-retry,
+  C3 18/18, C1 23+3, e2e 231/231, native 192/192, timing 8/8,
+  StateTests 105/105, quick green except pre-existing A2 flake).
+  Closeout commits after the qualified head touch only this receipt
+  and STATUS.md.
 - Changed files (vs `db3c239`, regenerated from
   `git diff --name-only`): `Sources/NeedletailCore/ExecContract.swift`,
   `Sources/NeedletailCore/SessionActor.swift`,
@@ -195,8 +220,9 @@ Certified by native evidence (all green; see §2):
   `STATUS.md`, `dev`, `.github/scripts/merge-xunit.py`,
   `plans/m2-c-epic-receipt.md` (this file), `plans/m2-c-plan.md`.
 - Test totals at candidate: C2 41/41, C3 18/18, C1 23+3,
-  e2e 231/231 (13 suites), native 193/193, timing 8/8,
-  quick green (1 pre-existing flake), M1-D HEAD cases green.
+  e2e 231/231 (13 suites), native 192/192, timing 8/8,
+  StateTests 105/105, quick green (1 pre-existing flake),
+  M1-D HEAD cases green.
 - Stop. No push, PR, merge, live-model run, M2-D, or M3 work.
 - Next (separately authorized): CodeRabbit whole-system review of
   this branch; production exec enablement decision; M2-D scoping.
