@@ -1074,6 +1074,18 @@ struct C3ExecQualificationTests {
         #expect(result.ptyOutput.contains("not OS-isolated"), "banner present on composed run")
         let bodies = server.requests.map { String(decoding: $0.body, as: UTF8.self) }
         #expect(bodies.contains(where: { $0.contains("DIVERGENT-SECRET") }), "exec read the outside file")
+        // The native read refused the same path: denial recorded, nothing read.
+        let sessions = try Self.sessions(dbPath: Self.dbPath(in: stateDir))
+        var sawReadDenial = false
+        for session in sessions {
+            for record in try Self.allRecords(dbPath: Self.dbPath(in: stateDir), session: session) {
+                if case .operationResult(let ref, let outcome) = record, ref.callID == "c1" {
+                    #expect(outcome.contains("denied") || outcome.contains("invalid-arguments"), "read denial recorded, got \(outcome)")
+                    sawReadDenial = true
+                }
+            }
+        }
+        #expect(sawReadDenial, "native read denial is durable")
     }
 
     @Test("C3 binary: crash mid-exec leaves a hold that blocks the next run")

@@ -308,13 +308,14 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                 await self.invokeExecutor(reservation: reservation)
             }
         case .emitUI(let projection):
-            // M2-C C3: no UI effect may land after a terminal phase. The
-            // run_finished envelope is terminal-last by construction; a
-            // late cancellation/complete effect must not resurrect the UI
-            // (e.g. a run:tool-exec arriving after run_finished).
-            // Terminal-idempotent: dropping post-terminal UI is safe
-            // (durable records already carry the evidence).
-            guard !state.phase.isTerminal else { break }
+            // M2-C C3: a late run:tool-exec must never land after the
+            // terminal run_finished (a deferred cancellation/completion can
+            // otherwise reorder the stream and flip UI back to busy). Only
+            // the tool-exec kind is suppressed post-terminal: every other
+            // terminal-adjacent projection (denied/run:completed/run:failed
+            // etc.) is part of the terminal transition itself and must
+            // still be delivered.
+            if state.phase.isTerminal, projection.kind == "run:tool-exec" { break }
             do {
                 try await sink.emit(projection)
             } catch {

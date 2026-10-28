@@ -1118,8 +1118,8 @@ struct C2ExecDurableTests {
         func openArtifactSpill(session: SessionID, as identity: WriterIdentity, kind: String, stream: String, requestedBytes: Int64) throws -> SpillHandle {
             try inner.openArtifactSpill(session: session, as: identity, kind: kind, stream: stream, requestedBytes: requestedBytes)
         }
-        func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle) throws -> ArtifactRef {
-            try inner.publishArtifactFromFile(session: session, as: identity, kind: kind, spill: spill)
+        func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle, operationID: OperationID? = nil) throws -> ArtifactRef {
+            try inner.publishArtifactFromFile(session: session, as: identity, kind: kind, spill: spill, operationID: operationID)
         }
         func releaseArtifactSpill(as identity: WriterIdentity, handle: SpillHandle) throws {
             try inner.releaseArtifactSpill(as: identity, handle: handle)

@@ -1593,13 +1593,13 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
 #endif
                 }
             }
+            // execve failed: report errno. Capture it BEFORE free() below:
+            // free() is not guaranteed to preserve errno, and a clobbered
+            // value would misclassify the failure.
+            let execErrno = errno
             if execPath != nil { free(UnsafeMutablePointer(mutating: execvePath)) }
-            // execve failed: report errno (captured before the marker
-            // write could clobber it), then _exit. A missing/truncated
-            // frame classifies fail-safe upstream (pre-dispatch death).
             do {
-                let e = errno
-                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                Self.reportExecError(fd: errPipeWrite, errnoValue: execErrno)
 #if canImport(Glibc)
                 Glibc._exit(127)
 #else

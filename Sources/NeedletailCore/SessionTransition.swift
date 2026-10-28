@@ -1433,6 +1433,7 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         guard s1.turnsUsed < s1.turnLimit else { return failRun(state, failure: .budgetExhausted("turn budget exhausted"), hold: true, atMillis: atMillis, ids: &ids) }
         var records: [DurableRecord] = []
         var transcripts: [DurableRecord] = []
+        var uiEffects: [Effect] = []
         for prop in batch.proposals {
             let isMut = prop.tool != "read" && prop.tool != "search" && prop.tool != "consult"
             let opID = ids.nextOperationID()
@@ -1440,14 +1441,20 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
             let resultRef = OperationRef(operationID: opID, callID: prop.callID, state: .done, mutating: isMut)
             records.append(.operationIntent(intentRef))
             records.append(.operationResult(resultRef, outcome: "tool-failure: \(summary) (\(status))"))
-            transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: "denied: \(summary)")))
+            var denyText = "denied: \(summary)"
+            if prop.tool == "exec" {
+                let receipt = execReceiptText(callID: prop.callID, op: opID, status: status, started: false, artifact: nil, truncated: false, summary: summary)
+                denyText += "\n[\(receipt)]"
+                uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+            }
+            transcripts.append(.transcriptAppended(.toolResponse(callID: prop.callID, text: denyText)))
         }
         let nextEffectID = ids.nextEffectID()
         let seq = ids.nextSequence()
         let reservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
         let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: state.epoch.profile.alias, epochID: state.epoch.epochID, sealed: run.sealed, turnsLeft: state.turnLimit - s1.turnsUsed, deadlineMillis: state.runDeadlineMillis, historyDigest: fnv1aHex("\(state.sessionID.raw):\(seq.value):absolute"))
         let next = s1.replacing(phase: .requesting, turnsUsed: s1.turnsUsed + 1, pendingBatch: .some(nil), liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
-        return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
+        return Transition(state: next, effects: uiEffects + [.reserveEffect(reservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + records + transcripts)
     }
     // Capability grant check (I05): proposals without an effective grant
     // are denied as typed receipts — never executed, never silently dropped.
@@ -1477,14 +1484,15 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
             liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
         // The denial joins the transcript as tool responses: without it the
         // model re-proposes the same tools forever. Never executed, never
-        // silently dropped (I05). Exec denials also carry the NC-9 receipt.
+        // silently dropped (I05). Exec denials also carry the NC-9 receipt,
+        // keyed to the committed batch-level denial record (a stable,
+        // durable opID — never a minted-but-uncommitted one).
         let denial = "tools denied by effective capabilities: \(denied.joined(separator: ", "))"
         var uiExecEffects: [Effect] = []
         let responses = batch.proposals.map { prop -> DurableRecord in
             var text = "denied: \(denial)"
             if prop.tool == "exec" {
-                let opID = ids.nextOperationID()
-                let receipt = execReceiptText(callID: prop.callID, op: opID, status: "denied", started: false, artifact: nil, truncated: false, summary: denial)
+                let receipt = execReceiptText(callID: prop.callID, op: ref.operationID, status: "denied", started: false, artifact: nil, truncated: false, summary: denial)
                 text += "\n[\(receipt)]"
                 uiExecEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
             }
@@ -2228,7 +2236,15 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
             if seen.contains(call.callID) { tainted.insert(call.callID) } else { seen.insert(call.callID) }
         }
         for call in result.calls {
-            if tainted.contains(call.callID) { continue }
+            if tainted.contains(call.callID) {
+                // Tainted in a cancelled batch: unknown + hold, with a receipt.
+                if let prop = reservation.batch.proposals.first(where: { $0.callID == call.callID }), prop.tool == "exec" {
+                    let tref = OperationRef(operationID: operationID(effectID: effectID, callID: call.callID), callID: call.callID, state: .unknown, mutating: true)
+                    let receipt = execReceiptText(callID: call.callID, op: tref.operationID, status: "unknown", started: nil, artifact: nil, truncated: false, summary: "duplicate callID in cancelled batch")
+                    uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+                }
+                continue
+            }
             let proposal = reservation.batch.proposals.first(where: { $0.callID == call.callID })
             guard let prop = proposal else {
                 // Unexpected callID: ignore, no result for non-reserved operation (authoritative discharge only described)
