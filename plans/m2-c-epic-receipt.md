@@ -1,4 +1,4 @@
-# M2-C Epic Receipt — READY FOR M2-C EPIC REVIEW (C3 closeout)
+# M2-C Epic Receipt — READY TO MERGE (all gates green, merge awaits authorization)
 
 Authoritative candidate: branch `m2-c-planning`, qualified code
 head `fe8d631` (CodeRabbit whole-system review fixes, all §2 evidence
@@ -226,3 +226,35 @@ Certified by native evidence (all green; see §2):
 - Stop. No push, PR, merge, live-model run, M2-D, or M3 work.
 - Next (separately authorized): CodeRabbit whole-system review of
   this branch; production exec enablement decision; M2-D scoping.
+
+## 9. Phase 4 — exact-head gates and merge recommendation (PR #7)
+
+Exact head: `m2-c-planning` @ `9963b13` (qualified code `fe8d631`
++ docs-only receipt/STATUS). All gates measured on this exact head:
+
+- GitHub CI `offline build and tests (Linux x86_64)`: PASS (39m34s,
+  run 40650994573).
+- `release bundle smoke (clean host)`: PASS (6m2s, same run).
+- SonarCloud Code Analysis: PASS. SonarQube Cloud quality gate:
+  PASS (prior C-Reliability failure cleared by the vacuous-ternary
+  fix in `fe8d631`).
+- CodeRabbit whole-system review: PASS (check green); all 21 inline
+  threads reconciled (17 fixed in `fe8d631`, 3 skipped with
+  documented rationale, 2 of the skips explicitly withdrawn by the
+  reviewer; per-thread replies posted, summary comment on the PR).
+- GitGuardian Security Checks: PASS.
+- DeepSeek C3 slice review: FINAL APPROVED (nothing open).
+- Local re-measurement at `fe8d631`: C2 41/41 no-retry, C3 18/18,
+  C1 23+3, e2e 231/231, native 192/192, timing 8/8, StateTests
+  105/105, quick green except the pre-existing A2 contention flake
+  (verified identical on clean base and by stash-comparison).
+
+Residual limitations (unchanged, documented in §7): Linux-only exec
+path; no production model-directed exec until separately authorized;
+no live models; pre-existing A2/A5-1 environmental flakes reported
+separately, never counted as passes.
+
+**Merge recommendation: READY TO MERGE.** No Blocker or Major open
+in any review; all exact-head gates green; evidence complete with
+exact SHAs. Merge itself explicitly NOT performed — awaiting
+operator authorization per mission stop rule. No M2-D/M3 work begun.
