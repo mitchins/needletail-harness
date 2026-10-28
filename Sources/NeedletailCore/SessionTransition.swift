@@ -2122,18 +2122,14 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             records.append(.operationResult(ref, outcome: outcomeText))
         }
         // M2-C C3 (NC-9): exec calls carry an operator-visible receipt into
-        // the provider continuation AND the terminal/JSONL sink: command
-        // identity (call ID + operation ID), status, start certitude,
-        // artifact reference, truncation flag, and the executor's outcome
-        // summary (exit code, byte counts, truncation/discarded counts,
-        // artifact digests). Stdout/stderr evidence stays distinct (the
-        // data preview is stdout only; stderr has its own artifact); the
-        // preview is unchanged for non-exec tools. Terminal safety is
-        // enforced by runUpdate at construction; the fields are bounded by
-        // construction (numbers, digests, fixed literals, strerror text).
+        // the provider continuation AND the terminal/JSONL sink. The receipt
+        // reports the REDUCER's verdict (unknown+hold reason when held),
+        // not just the executor's raw status — never a fabricated success.
+        let receiptStatus = hold ? "unknown" : outcome.status
+        let receiptSummary = hold ? outcomeText : outcome.summary
         let toolText: String
         if proposal.tool == "exec" {
-            let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: outcome.status, started: outcome.started, artifact: outcome.artifactID, secondary: outcome.secondaryArtifactIDs, truncated: outcome.truncated, summary: outcome.summary)
+            let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: receiptStatus, started: outcome.started, artifact: outcome.artifactID, secondary: outcome.secondaryArtifactIDs, truncated: outcome.truncated, summary: receiptSummary)
             toolText = outcome.data.isEmpty ? "[\(receipt)]" : "\(outcome.data)\n[\(receipt)]"
             uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
         } else {
@@ -2276,11 +2272,11 @@ private func completeCancelledPendingFailed<I: IDSource>(_ state: SessionState, 
     consumed.insert(effectID)
     let errRecord = CancelledPendingError(effectID: effectID, operationIDs: reservation.batch.proposals.map { operationID(effectID: effectID, callID: $0.callID) }, error: error, atMillis: atMillis)
     let next = state.replacing(consumedEffects: consumed, cancelledPendingReservations: pending)
-    // NC-9: the failure carries no per-call outcome, but exec calls still
-    // get an operator-visible receipt (identity + failure, never started).
+    // NC-9: the failure itself is uncertain (completion unknown), so the
+    // receipt never certifies non-dispatch — started is unknown, not false.
     let uiEffects: [Effect] = reservation.batch.proposals.compactMap { prop in
         guard prop.tool == "exec" else { return nil }
-        let receipt = execReceiptText(callID: prop.callID, op: operationID(effectID: effectID, callID: prop.callID), status: "failed", started: false, artifact: nil, truncated: false, summary: error)
+        let receipt = execReceiptText(callID: prop.callID, op: operationID(effectID: effectID, callID: prop.callID), status: "unknown", started: nil, artifact: nil, truncated: false, summary: "cancelled-pending failed: \(error)")
         return .emitUI(.runUpdate(phase: "tool-exec", detail: receipt))
     }
     return Transition(state: next, effects: uiEffects, records: [.cancelledPendingError(errRecord)])
@@ -2330,6 +2326,9 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
     var pending: [EffectReservation] = state.cancelledPendingReservations
     var live: [EffectReservation] = []
     var consumed = state.consumedEffects
+    // NC-9: exec cancellations surface immediately (the completion may
+    // never arrive to report them).
+    var uiEffects: [Effect] = []
 
     for reservation in state.liveReservations {
         // Provider reservations: not retained, just consumed.
@@ -2359,6 +2358,10 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
             if isMutating {
                 let ref = OperationRef(operationID: operationID(effectID: reservation.effectID, callID: prop.callID), callID: prop.callID, state: .unknown, mutating: true)
                 mutatingRefs.append(ref)
+                if prop.tool == "exec" {
+                    let receipt = execReceiptText(callID: prop.callID, op: ref.operationID, status: "unknown", started: nil, artifact: nil, truncated: false, summary: "cancel requested; outcome withheld")
+                    uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+                }
             }
         }
         if mutatingRefs.isEmpty {
@@ -2394,7 +2397,7 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
         cancelledPendingReservations: pending,
         generation: state.generation + 1,
         unresolvedOperations: unresolved)
-    var effects: [Effect] = [.emitUI(.runUpdate(phase: "cancelling", detail: "cancelled; queue held"))]
+    var effects: [Effect] = uiEffects + [.emitUI(.runUpdate(phase: "cancelling", detail: "cancelled; queue held"))]
     if let run = state.activeRun {
         effects.append(.cancelInFlight(runID: run.runID, reason: "operator cancel"))
         effects.append(.cancelTimer(purpose: "cancel-grace", runID: run.runID))

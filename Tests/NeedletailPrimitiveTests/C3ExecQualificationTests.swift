@@ -536,6 +536,9 @@ struct C3ExecQualificationTests {
             }
         }
         #expect(sawDenial, "denial receipt committed")
+        // NC-9: the denial is operator-visible in JSONL too.
+        let deniedEnvelopes = try Self.jsonLines(result.stdout)
+        #expect(deniedEnvelopes.contains(where: { ($0["kind"] as? String) == "run:tool-exec" }), "denial emits a tool-exec receipt")
     }
 
     @Test("C3 binary: headless approval-required exits 3 with nothing spawned")
@@ -759,6 +762,32 @@ struct C3ExecQualificationTests {
         }
     }
 
+    @Test("C3 binary: credential overlay is refused with a receipt, never spawned")
+    func execCredentialOverlayRefused() throws {
+        let server = try LoopbackSSEServer()
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory); server.stop() }
+        let ws = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        // The loopback credential name is a registered harness secret: a
+        // model-authored overlay carrying it must be refused pre-dispatch.
+        let execArgs = "{\"executable\":\"/bin/true\",\"argv\":[\"/bin/true\"],\"env\":{\"NEEDLETAIL_LOOPBACK_TEST_KEY\":\"x\"},\"timeoutSecs\":30}"
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.toolCallChunk(callID: "c1", tool: "exec", arguments: execArgs).utf8))]))
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("done").utf8))]))
+        server.start()
+        let config = try Self.writeConfig(directory, port: server.port)
+        let stateDir = directory.appendingPathComponent("state")
+        let result = try Self.runWithPTY(
+            ["run", "--config", config, "--prompt", "go", "--format", "jsonl", "--alias", "loop",
+             "--workspace", ws.path, "--allow-exec"],
+            env: Self.environment(stateDir: stateDir), input: "y\n")
+        #expect(result.exit == 0, "credential refusal fails the call, not the run: \(result.stdout.prefix(300))")
+        let envelopes = try Self.jsonLines(result.stdout)
+        #expect(envelopes.contains(where: { ($0["kind"] as? String) == "run:tool-exec" }), "refusal emits a tool-exec receipt")
+        let bodies = server.requests.map { String(decoding: $0.body, as: UTF8.self) }
+        #expect(bodies.contains(where: { $0.contains("credential overlay") }), "provider saw the credential refusal")
+    }
+
     @Test("C3 binary: launch failure is a deterministic receipt, never spawned")
     func execLaunchFailureDeterministic() throws {
         let server = try LoopbackSSEServer()
@@ -886,6 +915,7 @@ struct C3ExecQualificationTests {
         let stateDir = directory.appendingPathComponent("state")
         let outcomeBox = LockedBox<Int32>(-1)
         let ptyBox = LockedBox<String>("")
+        let stdoutBox = LockedBox<String>("")
         let pidBox = LockedBox<Int32>(-1)
         let group = DispatchGroup()
         group.enter()
@@ -896,6 +926,7 @@ struct C3ExecQualificationTests {
                      "--workspace", ws.path, "--allow-exec"],
                     env: Self.environment(stateDir: stateDir), input: "y\n", childPID: pidBox)
                 ptyBox.set(result.stdout.suffix(2000).description + "\n---PTY---\n" + result.ptyOutput.suffix(2000).description)
+                stdoutBox.set(result.stdout)
                 outcomeBox.set(result.exit)
             } catch {
                 outcomeBox.set(999)
@@ -916,6 +947,9 @@ struct C3ExecQualificationTests {
             print("C3DIAG exit=\(outcomeBox.get()) out=\(ptyBox.get().prefix(1500))")
         }
         #expect(outcomeBox.get() == 4, "interrupted exec holds ambiguous, got \(outcomeBox.get())")
+        // NC-9: the hold is operator-visible in JSONL.
+        let interruptEnvelopes = try Self.jsonLines(stdoutBox.get())
+        #expect(interruptEnvelopes.contains(where: { ($0["kind"] as? String) == "run:tool-exec" }), "interrupted exec emits a tool-exec receipt")
         let sessions = try Self.sessions(dbPath: Self.dbPath(in: stateDir))
         let store = try GRDBSessionStore(path: Self.dbPath(in: stateDir))
         defer { try? store.close() }
@@ -1011,6 +1045,35 @@ struct C3ExecQualificationTests {
         init(_ value: T) { self.value = value }
         func set(_ v: T) { lock.withLock { value = v } }
         func get() -> T { lock.withLock { value } }
+    }
+
+    @Test("C3 binary: divergent access — exec reads what native read denies (not OS-isolated)")
+    func execDivergentAccess() throws {
+        let server = try LoopbackSSEServer()
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory); server.stop() }
+        let ws = directory.appendingPathComponent("ws")
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        // A file outside the workspace: native `read` denies absolute paths.
+        let outside = directory.appendingPathComponent("outside.txt")
+        try "DIVERGENT-SECRET\n".write(to: outside, atomically: true, encoding: .utf8)
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.toolCallChunk(callID: "c1", tool: "read", arguments: "{\"path\":\"\(outside.path)\"}").utf8))]))
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.toolCallChunk(callID: "c2", tool: "exec", arguments: "{\"executable\":\"/bin/cat\",\"argv\":[\"/bin/cat\",\"\(outside.path)\"],\"timeoutSecs\":30}").utf8))]))
+        server.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(Self.finalText("done").utf8))]))
+        server.start()
+        let config = try Self.writeConfig(directory, port: server.port)
+        let stateDir = directory.appendingPathComponent("state")
+        let result = try Self.runWithPTY(
+            ["run", "--config", config, "--prompt", "go", "--format", "jsonl", "--alias", "loop",
+             "--workspace", ws.path, "--allow-exec"],
+            env: Self.environment(stateDir: stateDir), input: "y\n")
+        #expect(result.exit == 0, "run completes: \(result.stdout.prefix(300))")
+        // The native read refuses the absolute path; the approved exec
+        // reads the same bytes. This asymmetry is exactly what the §10.4
+        // banner warns about (host execution is not OS-isolated).
+        #expect(result.ptyOutput.contains("not OS-isolated"), "banner present on composed run")
+        let bodies = server.requests.map { String(decoding: $0.body, as: UTF8.self) }
+        #expect(bodies.contains(where: { $0.contains("DIVERGENT-SECRET") }), "exec read the outside file")
     }
 
     @Test("C3 binary: crash mid-exec leaves a hold that blocks the next run")
