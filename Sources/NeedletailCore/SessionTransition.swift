@@ -2264,10 +2264,13 @@ private func completeCancelledPending<I: IDSource>(_ state: SessionState, effect
                 }
             } else {
                 // Started or unknown: keep marker, no new record (hold remains).
-                // The operator still sees what is held and why.
+                // The operator still sees what is held and why. The receipt
+                // reports the REDUCER verdict (unknown), never the raw
+                // executor outcome: a late "success" arriving after cancel
+                // won the race is uncertain by construction (M2).
                 if prop.tool == "exec" {
                     let holdRef = OperationRef(operationID: operationID(effectID: effectID, callID: call.callID), callID: call.callID, state: .unknown, mutating: true)
-                    let receipt = execReceiptText(callID: call.callID, op: holdRef.operationID, status: call.status, started: call.started, artifact: call.artifactID, secondary: call.secondaryArtifactIDs, truncated: call.truncated, summary: "uncertain completion withheld")
+                    let receipt = execReceiptText(callID: call.callID, op: holdRef.operationID, status: "unknown", started: call.started, artifact: call.artifactID, secondary: call.secondaryArtifactIDs, truncated: call.truncated, summary: "uncertain completion withheld")
                     uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
                 }
                 continue
