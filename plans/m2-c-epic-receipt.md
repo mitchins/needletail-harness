@@ -1,6 +1,6 @@
 # M2-C Epic Receipt — READY FOR M2-C EPIC REVIEW (C3 closeout)
 
-Authoritative candidate head: `m2-c-planning` @ `14255e2`
+Authoritative candidate head: `m2-c-planning` @ `be2620a`
 (this commit; see §8 for exact-SHA CI and changed files).
 No push, PR, merge, or tag performed. No live-model qualification,
 no M2-D/M3 work. Branch unpushed by direction.
@@ -35,10 +35,10 @@ Certified by native evidence (all green; see §2):
 
 ## 2. Green evidence at the candidate head
 
-- `C2ExecDurableTests`: 40/40 (incl. no-retry first-attempt run).
-- `C3ExecQualificationTests`: 16/16 (real binary + loopback SSE + PTY).
+- `C2ExecDurableTests`: 41/41 (incl. no-retry first-attempt run).
+- `C3ExecQualificationTests`: 18/18 (real binary + loopback SSE + PTY).
 - `C1QualificationTests`: 23/23. `C1ProcRunnerTests`: 3/3.
-- `e2e` lane (12 suites incl. C2+C3): 228/228.
+- `e2e` lane (13 suites incl. C2+C3): 231/231.
 - `native` lane: 193/193. `timing`: 8/8. `quick`: green except one
   pre-existing A2 contention flake (fails ~50% on the base commit too;
   unrelated to this slice — verified by clean-tree comparison).
@@ -123,7 +123,7 @@ Certified by native evidence (all green; see §2):
   orphaned leases. Pre-existing store semantics otherwise unchanged.
 - C2 test retries apply ONLY to the safe-direction probe-flake
   signature (timeout + exit-0); a `NEEDLETAIL_C2_NO_RETRY` knob
-  supports first-attempt measurement (37/37 green first-attempt).
+  supports first-attempt measurement (41/41 green first-attempt).
 - Known pre-existing flakes (A2 contention, actor bare-yield tests
   under extreme load) are environmental and unchanged by this slice;
   verified identical on the clean base tree.
@@ -136,7 +136,7 @@ Certified by native evidence (all green; see §2):
 - C0: `fa69525`. C1 head: `5a1763b`.
 - C2 base: `116ec6b`; C2 hardening: `3a42908`.
 - C3 implementation + review follow-ups: `7938925`, `3ed1326`,
-  `d676b20`, `14255e2`; candidate head: `14255e2`.
+  `d676b20`, `14255e2`, `be2620a`; candidate head: `be2620a`.
 - Changed files (vs `db3c239`): `Sources/NeedletailCore/SessionStore.swift`,
   `Sources/NeedletailCore/SessionActor.swift`,
   `Sources/NeedletailCore/SessionTransition.swift`,
@@ -151,8 +151,8 @@ Certified by native evidence (all green; see §2):
   `Tests/NeedletailPrimitiveTests/C3ExecQualificationTests.swift` (new),
   `STATUS.md`, `dev`, `.github/scripts/merge-xunit.py`,
   `plans/m2-c-epic-receipt.md` (this file).
-- Test totals at candidate: C2 40/40, C3 16/16, C1 23+3,
-  e2e 228/228 (12 suites), native 193/193, timing 8/8,
+- Test totals at candidate: C2 41/41, C3 18/18, C1 23+3,
+  e2e 231/231 (13 suites), native 193/193, timing 8/8,
   quick green (1 pre-existing flake), M1-D HEAD cases green.
 - Stop. No push, PR, merge, live-model run, M2-D, or M3 work.
 - Next (separately authorized): CodeRabbit whole-system review of
