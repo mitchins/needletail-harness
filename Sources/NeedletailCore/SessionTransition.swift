@@ -2083,7 +2083,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
                 if isMutating {
                     stateForResult = .unknown
                     hold = true
-                    outcomeText = "unknown: contradictory \(status) with started==false"
+                    outcomeText = "contradictory \(status) with started==false"
                 } else {
                     transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
                     continue
@@ -2103,7 +2103,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
                 if isMutating {
                     stateForResult = .unknown
                     hold = true
-                    outcomeText = "unknown: \(status) after started"
+                    outcomeText = "\(status) after started"
                 } else {
                     transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: outcome.data)))
                     continue

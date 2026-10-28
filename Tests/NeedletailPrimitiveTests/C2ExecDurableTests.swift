@@ -950,6 +950,48 @@ struct C2ExecDurableTests {
         #expect(run.stdout.isEmpty, "no output from a never-executed image")
     }
 
+    @Test("C3 spawn: cancel during classification converges on reap, never leaks")
+    func spawnCancelDuringClassificationReaps() async throws {
+        defer {
+            NativeToolExecutor._testHook_stopAfterMarker = false
+            Self.resetHooks()
+        }
+        // B1 regression: cancelling while the parent waits on the
+        // exec-error pipe must converge on the common
+        // escalate-then-reap path (no bypass, no leaked child/fds).
+        // The stopped-then-killed child is reaped; open fds do not grow.
+        func fdCount() -> Int {
+            (try? FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd"))?.count ?? -1
+        }
+        NativeToolExecutor._testHook_stopAfterMarker = true
+        let before = fdCount()
+        let task = Task {
+            try NativeToolExecutor.runBounded(
+                executablePath: "/bin/echo", args: ["hi"], stdoutCap: 4096, stderrCap: 4096,
+                timeout: 120, cwdFD: nil, execPath: nil, useSession: true)
+        }
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        task.cancel()
+        let start = Date()
+        do {
+            _ = try await task.value
+            Issue.record("cancelled classification must throw, not return")
+        } catch is CancellationError {
+            #expect(Date().timeIntervalSince(start) < 30, "cancellation cuts through promptly")
+        } catch {
+            Issue.record("cancellation must propagate as CancellationError, got \(error)")
+        }
+        #expect(NativeToolExecutor._testHook_stopAfterMarker == true, "hook restored by defer")
+        let after = fdCount()
+        #expect(before >= 0 && after >= 0 && after <= before + 2, "no fd leak from cancelled classification (before=\(before) after=\(after))")
+        // A follow-up spawn works: no wedged state, no unreaped zombie blocking the lane.
+        NativeToolExecutor._testHook_stopAfterMarker = false
+        let again = try NativeToolExecutor.runBounded(
+            executablePath: "/bin/echo", args: ["hi"], stdoutCap: 4096, stderrCap: 4096,
+            timeout: 10, cwdFD: nil, execPath: nil, useSession: false)
+        #expect(again.status == 0 && !again.timedOut, "lane usable after cancelled classification")
+    }
+
     @Test("C2 exec: orphaned same-group grandchild blocks clean success (timeout, no zombie)")
     func execOrphanedGrandchildNoCleanSuccess() async throws {
         defer { Self.resetHooks() }

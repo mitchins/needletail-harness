@@ -450,6 +450,12 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             throw ExecPostSpawnError(summary: "spill write open failed: \(String(cString: strerror(errno)))")
         }
         defer { close(fd) }
+        // The staging file must be a regular file: no FIFOs, sockets,
+        // devices or directories masquerading under a lease name.
+        var fst = stat()
+        guard fstat(fd, &fst) == 0, (fst.st_mode & S_IFMT) == S_IFREG else {
+            throw ExecPostSpawnError(summary: "spill staging is not a regular file")
+        }
         var offset = 0
         let total = data.count
         while offset < total {
@@ -1620,6 +1626,9 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         let hardNanos = deadlineNanos + 6_000_000_000
         var execStarted = false
         var execError: (code: UInt8, errno: Int32)? = nil
+        // Declared before the classification wait so a cancelled wait
+        // converges on the common escalation/reap path below.
+        var cancelled = false
         // C2 exec-error pipe: the write end is CLOEXEC, so a successful
         // execve closes it (the parent observes EOF); a failed execve or
         // fchdir writes 0x02+errno (native int32, little-endian hosts);
@@ -1646,12 +1655,18 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             errBytes.reserveCapacity(8)
             let readDeadline = deadlineNanos
             var eof = false
+            // B1: cancellation converges on the common escalation/reap path
+            // below — never a bare throw from inside the classification
+            // wait, which would leak the child and all four pipe fds.
+            // A cancelled wait leaves execStarted/execError as observed and
+            // falls through to drain/escalate/reap; a definitive 0x02 frame
+            // still classifies pre-dispatch (fail-closed and truthful), and
+            // any other outcome surfaces as CancellationError at the end.
             while errBytes.count < 8 && !eof && NativeToolExecutor.monotonicNanos() < readDeadline {
-                // Cooperative cancellation: a stopped-after-marker child
-                // holds the pipe open, so the wait is deadline-bounded —
-                // but an explicit cancel must still cut through promptly
-                // rather than burn the whole run budget.
-                if Task.isCancelled { throw CancellationError() }
+                if Task.isCancelled {
+                    cancelled = true
+                    break
+                }
                 var pfd = pollfd(fd: errPipeRead, events: Int16(POLLIN), revents: 0)
                 let pr = poll(&pfd, 1, 100)
                 // POLLHUP/POLLERR without POLLIN (all writers gone, no data
@@ -1775,7 +1790,6 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         var killSent = false
         var intSent = false
         var reaped = false
-        var cancelled = false
         var unsafeToSignal = false
         while true {
             var pfds: [pollfd] = []
@@ -2058,6 +2072,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 throw ToolFailure.preDispatch(status: "failed", summary: "child died before exec")
             }
         }
+        // Cancellation observed anywhere (classification wait, drain,
+        // escalation) surfaces as CancellationError, never as a normal
+        // result: the caller abandoned the run, so any outcome would be
+        // uncertain by construction. A definitive pre-dispatch frame above
+        // takes precedence when nothing was dispatched (fail-closed).
         if cancelled {
             throw CancellationError()
         }
