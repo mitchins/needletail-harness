@@ -1,4 +1,4 @@
-# M2-C Epic Receipt — READY TO MERGE (all gates green, merge awaits authorization)
+# M2-C Epic Receipt — READY TO MERGE (required gates passed; A2 flake documented; merge awaits authorization)
 
 Authoritative candidate: branch `m2-c-planning`, qualified code
 head `fe8d631` (CodeRabbit whole-system review fixes, all §2 evidence
@@ -125,25 +125,30 @@ Certified by native evidence (all green; see §2):
 - GLM targeted audit (process identity/signalling/reaping):
   C1 guarantees stand; no new false-negative or leak paths
   introduced; remaining notes documented as accepted deviations.
-- CodeRabbit whole-system review (PR #7): CHANGES_REQUESTED with 20
-  inline findings (2 Majors, 14 Minors, 4 Trivial). Reconciled at
-  `fe8d631`: both approval-display Majors fixed fail-closed
+- CodeRabbit whole-system review (PR #7): CHANGES_REQUESTED with 21
+  inline findings (2 Majors, 15 Minors, 4 Trivial). Reconciled at
+  `fe8d631`: 18 fixed — both approval-display Majors fixed fail-closed
   (argv elision removed; batch truncation replaced by typed
-  invalid-arguments refusal); probe entry cap removed (deadline-only
-  bound); cwd identity maps required to agree; cwd fds keep CLOEXEC;
-  spill rootFD cleanup fenced; InMemory mirror enforces recordCap,
-  bound names, and lease existence; exec deadline default honors the
-  advertised max (1800); nested argv/env schemas + envelope test;
-  7 test-fidelity fixes (consult fixture, deleted tautological probe,
-  real pipe-buffer flood, retry-attempts comparison, advertisement
-  assertion, prompt-readiness signal, file-list regeneration).
+  invalid-arguments refusal); pre-dispatch refusal receipt built with
+  the canonical helper; probe entry cap removed (deadline-only
+  bound); cwd identity maps required to agree; outer exec deadline
+  +15s slack so the runner keeps its timeout classification; cwd fds
+  keep CLOEXEC; spill rootFD cleanup fenced; InMemory mirror enforces
+  recordCap, bound names, and lease existence; exec deadline default
+  honors the advertised max (1800); nested argv/env schemas +
+  envelope test; 7 test-fidelity fixes (consult fixture, deleted
+  tautological probe, real pipe-buffer flood, retry-attempts
+  comparison, advertisement assertion, prompt-readiness signal,
+  file-list regeneration).
   Skipped with documented rationale (fail-closed or unreachable on
-  qualified platforms): anchored-walk unification (digest-binding
-  fail-closes any divergence), non-Glibc lock clock (Linux-only
-  execution contract), gateway char-vs-byte truncation (both
-  construction paths now fail closed, truncation unreachable),
-  Sonar MAJOR (vacuous ternary) fixed. SonarQube quality gate
-  re-run pending on the fix head.
+  qualified platforms; 3 skips total, 2 of them explicitly withdrawn
+  by the reviewer on re-review): anchored-walk unification
+  (digest-binding fail-closes any divergence — withdrawn),
+  non-Glibc lock clock (Linux-only execution contract — standing
+  skip), gateway char-vs-byte truncation (both construction paths
+  now fail closed, truncation unreachable — withdrawn),
+  Sonar MAJOR (vacuous ternary) fixed. SonarQube quality gate PASS
+  on the fix head (re-run green).
 - Verdict sought: READY FOR M2-C EPIC REVIEW. "C2 independently
   APPROVED" is NOT claimed (per mission rule).
 
@@ -239,11 +244,17 @@ Exact head: `m2-c-planning` @ `9963b13` (qualified code `fe8d631`
   PASS (prior C-Reliability failure cleared by the vacuous-ternary
   fix in `fe8d631`).
 - CodeRabbit whole-system review: PASS (check green); all 21 inline
-  threads reconciled (17 fixed in `fe8d631`, 3 skipped with
-  documented rationale, 2 of the skips explicitly withdrawn by the
-  reviewer; per-thread replies posted, summary comment on the PR).
+  threads reconciled — 18 fixed in `fe8d631`, 3 skipped with
+  documented rationale (the 2 safety-relevant skips explicitly
+  withdrawn by the reviewer on re-review; 1 standing skip:
+  non-Glibc lock clock, unreachable on the Linux-only execution
+  path); per-thread replies posted, summary comment on the PR.
 - GitGuardian Security Checks: PASS.
-- DeepSeek C3 slice review: FINAL APPROVED (nothing open).
+- DeepSeek C3 slice review: FINAL APPROVED covering `be2620a..26496db`
+  (the M2 held-branch receipt fix) — nothing open within that scope.
+  The later `fe8d631` CodeRabbit-reconciliation delta is NOT covered
+  by DeepSeek; it is covered by CodeRabbit whole-system review
+  (PASS), full local lane re-measurement, and exact-head CI.
 - Local re-measurement at `fe8d631`: C2 41/41 no-retry, C3 18/18,
   C1 23+3, e2e 231/231, native 192/192, timing 8/8, StateTests
   105/105, quick green except the pre-existing A2 contention flake
@@ -255,6 +266,9 @@ no live models; pre-existing A2/A5-1 environmental flakes reported
 separately, never counted as passes.
 
 **Merge recommendation: READY TO MERGE.** No Blocker or Major open
-in any review; all exact-head gates green; evidence complete with
-exact SHAs. Merge itself explicitly NOT performed — awaiting
-operator authorization per mission stop rule. No M2-D/M3 work begun.
+in any review; all required exact-head gates passed (quick retains
+one documented pre-existing A2 contention flake, verified identical
+on the clean base — reported separately, never counted as a pass);
+evidence complete with exact SHAs. Merge itself explicitly NOT
+performed — awaiting operator authorization per mission stop rule.
+No M2-D/M3 work begun.
