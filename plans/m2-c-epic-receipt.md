@@ -1,9 +1,11 @@
 # M2-C Epic Receipt — READY FOR M2-C EPIC REVIEW (C3 closeout)
 
 Authoritative candidate: branch `m2-c-planning`, qualified code
-head `be2620a` (all implementation + tests; fully green per §2).
-Closeout commits after `be2620a` are docs-only (this receipt,
-STATUS.md). Final HEAD contains everything; see §8.
+head `26496db` (DeepSeek C3 re-review fix: M2 receipt truthfulness in
+the cancelled-pending held branch + reducer-level regression test;
+prior qualified head `be2620a` fully green per §2, delta re-tested).
+Closeout commits after the qualified head are docs-only
+(this receipt, STATUS.md). Final HEAD contains everything; see §8.
 No push, PR, merge, or tag performed. No live-model qualification,
 no M2-D/M3 work. Branch unpushed by direction.
 
@@ -98,13 +100,22 @@ Certified by native evidence (all green; see §2):
 
 - DeepSeek C2 review (116ec6b): NEEDS-CHANGES (4 High + Mediums).
 - DeepSeek delta disposition (3a42908): punchlist partially closed.
-- DeepSeek C3 review (d32732f + follow-ups, this head): punchlist
-  addressed — bounded artifact lock with cancellation, NC-9 complete
-  on all exec paths (incl. validation/failed/cancelled variants),
-  secondary artifact IDs, receipt truthfulness (reducer verdict, not
-  raw outcome), terminal-guard narrowing, writeSpillFile fstat +
-  name binding, errno-capture ordering, no test-only code in the
-  child path post-fork, STATUS/docs updates.
+- DeepSeek C3 review (first round, at 7504896): NEEDS-CHANGES with
+  1 Blocker (B1) + 8 Majors (M1–M8), ALL addressed in-tree with
+  regression coverage — bounded artifact lock with cancellation,
+  NC-9 complete on all exec paths (incl. validation/failed/cancelled
+  variants), secondary artifact IDs, receipt truthfulness (reducer
+  verdict, not raw outcome), terminal-guard narrowing,
+  writeSpillFile fstat + name binding, errno-capture ordering,
+  no test-only code in the child path post-fork, STATUS/docs updates.
+- DeepSeek C3 re-review (fix delta 7504896..be2620a): NEEDS_CHANGES
+  with exactly one open Major — the M2 held-branch receipt in
+  `completeCancelledPending` (SessionTransition.swift:2270) reported
+  the raw executor outcome for late completions after cancel;
+  fixed at 26496db (status forced to the reducer verdict "unknown",
+  reducer-level regression test `lateExecSuccessAfterCancelReadsUnknown`
+  added and green). B1/M1/M3–M8 confirmed CLOSED, no Blocker open.
+  Final verdict pending re-review of 26496db.
 - GLM targeted audit (process identity/signalling/reaping):
   C1 guarantees stand; no new false-negative or leak paths
   introduced; remaining notes documented as accepted deviations.
@@ -138,9 +149,13 @@ Certified by native evidence (all green; see §2):
 - C0: `fa69525`. C1 head: `5a1763b`.
 - C2 base: `116ec6b`; C2 hardening: `3a42908`.
 - C3 implementation + review follow-ups: `7938925`, `3ed1326`,
-  `d676b20`, `14255e2`, `be2620a` (qualified code head; all §2
-  evidence measured here or on identical code). Closeout commits
-  after `be2620a` touch only this receipt and STATUS.md.
+  `d676b20`, `14255e2`, `be2620a` (qualified; all §2
+  evidence measured here or on identical code), `26496db`
+  (qualified code head: DeepSeek re-review M2 fix — held-branch
+  receipt reports reducer verdict `unknown`; reducer-level regression
+  test `lateExecSuccessAfterCancelReadsUnknown`; CancellationTests +
+  B0SpineTests green at this head). Closeout commits after the
+  qualified head touch only this receipt and STATUS.md.
 - Changed files (vs `db3c239`): `Sources/NeedletailCore/SessionStore.swift`,
   `Sources/NeedletailCore/SessionActor.swift`,
   `Sources/NeedletailCore/SessionTransition.swift`,
