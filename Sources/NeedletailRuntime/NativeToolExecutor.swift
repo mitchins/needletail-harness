@@ -327,7 +327,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         // Content hash over the held fd's bytes (the fd the spawn will use).
         let contentSHA = try Self.sha256Hex(fd: finalFD)
         let dev = UInt64(st.st_dev), ino = UInt64(st.st_ino)
-        let resolved = resolvedPath + (resolvedPath.isEmpty ? "" : "") 
+        let resolved = resolvedPath
         let commandDigest = Self.sha256Hex(of: "\(resolved)\n\(dev)\n\(ino)\n\(size)\n\(contentSHA)")
         cache[digestKey] = (dev, ino, size, commandDigest, resolved)
         let cwdID = try cwdIdentity(callID: callID, args: args)
@@ -594,7 +594,13 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// cancels the loser, so no task leaks. Outer cancellation propagates
     /// as CancellationError (never converted to a timeout outcome).
     private func executeWithDeadline(proposal: ToolProposal, reservation: EffectReservation) async throws -> ToolCallOutcome {
-        let limit = deadlines.seconds(for: proposal.tool)
+        // The outer timer must not preempt the runner's own timeout
+        // escalation: for exec, runBounded classifies the deadline itself
+        // (exit code / signal / timeout with the exec-error pipe verdict),
+        // while an outer DeadlineExceeded would surface as a bare
+        // CancellationError and lose that classification. Slack only ever
+        // delays the outer bound, never shortens any inner deadline.
+        let limit = deadlines.seconds(for: proposal.tool) + (proposal.tool == "exec" ? 15 : 0)
         let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
         return try await withThrowingTaskGroup(of: ToolCallOutcome.self) { group in
             group.addTask {
@@ -664,6 +670,13 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 if parts.count == 2, let d = UInt64(parts[0]), let i = UInt64(parts[1]) {
                     approvedCwd = (d, i)
                 }
+            }
+            // The digest and cwd maps are built from the same identity
+            // array: a digest without a matching valid cwd identity is a
+            // wiring defect. Refuse rather than run with a partially-bound
+            // identity (fail closed — an unbound cwd is never executed).
+            if (approvedDigest != nil) != (approvedCwd != nil) {
+                throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity binding incomplete for exec \(proposal.callID)")
             }
             // For C2, approvedDigest must be present (grant) — otherwise pre-dispatch conflict
             guard let digest = approvedDigest else {
@@ -1194,12 +1207,13 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     }
 
     private static func scanGroupOnce(pgid: pid_t, entries: [String], deadline: UInt64) -> ProbeScan {
-        var scanned = 0
         for name in entries {
             if _testHook_probeForceTruncate { return .liveFound }
-            if scanned >= 8192 || monotonicNanos() > deadline { return .inconclusive }
+            // No entry cap: the wall-clock deadline below is the only
+            // bound. Capping entries would report inconclusive (hence
+            // escalate, time out, and hold) on every exec on large hosts.
+            if monotonicNanos() > deadline { return .inconclusive }
             guard let pid = Int32(name), pid > 0 else { continue }
-            scanned += 1
             // Skip leader itself — its own escalation already covers it.
             if pid == pgid { continue }
             // Fast stat read (M2-C C2): one open/read/close of ≤256 bytes.

@@ -1398,6 +1398,10 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
             }
             let root = artifactsRoot
             let rootFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            // Cleanup registered immediately: the handle-binding guard and
+            // the lease-row delete below both throw, and neither may leak
+            // the root descriptor.
+            defer { if rootFD >= 0 { closeArtifactFD(rootFD) } }
             // Bound to the lease's own staging name (reconstructed, never
             // trusted from the handle path): a forged handle can neither
             // delete an arbitrary path nor escape the root. No
@@ -1411,7 +1415,6 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ? AND writer = ?", arguments: [handle.leaseID.uuidString, identity.writer])
             }
             if rootFD >= 0 {
-                defer { closeArtifactFD(rootFD) }
                 _ = boundName.withCString { unlinkat(rootFD, $0, 0) }
             }
         }

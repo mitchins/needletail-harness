@@ -102,22 +102,21 @@ struct C0ExecContractTests {
         #expect(args.env == ["MY_VAR": "v", "TZ": "UTC"])
     }
 
-    @Test("exec display bound: elision renders; only unelidable overflow is rejected")
+    @Test("exec display bound: over-budget rendering is rejected, never elided")
     func displayBound() {
-        // argv-heavy: elision shrinks the projection — renders with an
-        // explicit elision marker, never rejected.
+        // argv-heavy: the full rendering exceeds the budget — rejected
+        // outright (fail closed). No argv entry is ever hidden from the
+        // operator while the remainder executes.
         let argv = ["/usr/bin/python3"] + (0..<12).map { _ in String(repeating: "x", count: 800) }
-        let elided = ExecArguments(executable: "/usr/bin/python3", argv: argv, cwd: nil, timeoutSecs: 120, env: [:])
-        let rendered = renderExecApprovalDisplay(elided)
-        #expect(rendered != nil, "argv overflow elides, never rejects")
-        #expect(rendered?.contains("elided") == true, "elision is explicit")
-        #expect(rendered!.utf8.count <= 8 * 1024, "the rendered display is bounded")
-        // env-heavy: elision cannot shrink env values — an unelidable
-        // overflow is REJECTED at validation (an unrenderable command is
-        // unapprovable).
+        let over = ExecArguments(executable: "/usr/bin/python3", argv: argv, cwd: nil, timeoutSecs: 120, env: [:])
+        #expect(renderExecApprovalDisplay(over) == nil, "over-budget argv rejects, never elides")
+        let big = (0..<12).map { _ in "\"\(String(repeating: "x", count: 800))\"" }.joined(separator: ",")
+        #expect(rejected("{\"executable\":\"/usr/bin/python3\",\"argv\":[\"/usr/bin/python3\",\(big)]}", contains: "rendering bound"), "over-budget argv rejected at validation")
+        // env-heavy: unrenderable overflow is likewise REJECTED at
+        // validation (an unrenderable command is unapprovable).
         let env = ["A": String(repeating: "x", count: 8000), "B": String(repeating: "y", count: 8000)]
         let unelidable = ExecArguments(executable: "/usr/bin/python3", argv: ["/usr/bin/python3"], cwd: nil, timeoutSecs: 120, env: env)
-        #expect(renderExecApprovalDisplay(unelidable) == nil, "unelidable overflow renders nil")
+        #expect(renderExecApprovalDisplay(unelidable) == nil, "unrenderable overflow renders nil")
         #expect(rejected("{\"executable\":\"/usr/bin/python3\",\"argv\":[\"/usr/bin/python3\"],\"env\":{\"A\":\"\(String(repeating: "x", count: 8000))\",\"B\":\"\(String(repeating: "y", count: 8000))\"}}", contains: "rendering bound"))
     }
 
@@ -128,9 +127,11 @@ struct C0ExecContractTests {
         let good = ToolBatch([ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: Self.validExec)])
         #expect((try? ToolValidator.validateBatchArguments(batch: good)) != nil, "schema-valid exec validates")
         let consult = ToolBatch([ToolProposal(callID: "c1", tool: "consult", argumentsDigest: "d", arguments: "{}")])
-        #expect((try? ToolValidator.validateBatchArguments(batch: consult)) != nil, "consult empty shape passes validation; capability denial handles the rest (pre-existing behavior)")
-        let consultField = ToolBatch([ToolProposal(callID: "c1", tool: "consult", argumentsDigest: "d", arguments: "{\\\"x\\\":1}")])
-        #expect((try? ToolValidator.validateBatchArguments(batch: consultField)) == nil, "consult unknown fields still field-rejected (denied milestone)")
+        #expect((try? ToolValidator.validateBatchArguments(batch: consult)) != nil, "consult empty shape validates; capability denial handles the rest (pre-existing behavior)")
+        let consultField = ToolBatch([ToolProposal(callID: "c1", tool: "consult", argumentsDigest: "d", arguments: #"{"x":1}"#)])
+        #expect(throws: ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown field x for exec/consult")) {
+            try ToolValidator.validateBatchArguments(batch: consultField)
+        }
         var tooMany: [ToolProposal] = []
         for i in 0..<9 {
             tooMany.append(ToolProposal(callID: "e\(i)", tool: "exec", argumentsDigest: "d", arguments: Self.validExec))
@@ -235,25 +236,6 @@ struct C0ExecContractTests {
         #expect((params["required"] as? [String])?.sorted() == ["argv", "executable"], "required keys exact")
         let hidden = ToolAdvertisement.definitions(for: execCaps, nativeExecComposed: false).map(\.name)
         #expect(!hidden.contains("exec"), "uncomposed exec hidden even when granted")
-    }
-
-    @Test("wrong-impl probe: non-exec batches must NOT resolve (hasExec gate)")
-    func wrongImplProbeNonExecMustNotResolve() throws {
-        // MUST-FAIL PROBE: without the hasExec gate, a protected-path write
-        // batch would resolve identities before approval. Removing the gate
-        // makes this fail. The batch-level validator proves the category
-        // is not validation — a write batch validates, but its approval
-        // carries no exec identities and no resolution seed.
-        let batch = [ToolProposal(callID: "c1", tool: "write", argumentsDigest: "d",
-                                  arguments: "{\"path\":\"a\",\"content\":\"b\"}")]
-        let validated = try #require(try? ToolValidator.validateBatchArguments(batch: ToolBatch(batch)))
-        #expect(validated.first?.tool == "write", "write batch validates — the gate tested is RESOLUTION, not validation")
-        // Pure check: authorising a write batch under the native epoch
-        // must NOT take the two-phase path (hasExec gate). The state that
-        // reaches authorising carries the effective caps of the epoch; the
-        // approved-approach-path is tested in C0TwoPhaseActorTests.
-        let hasExec = batch.map(\.tool).contains("exec")
-        #expect(!hasExec, "the batch under test contains no exec proposal")
     }
 
     @Test("crash in the phase-1 window: reopen reconciles clean, hold-free")

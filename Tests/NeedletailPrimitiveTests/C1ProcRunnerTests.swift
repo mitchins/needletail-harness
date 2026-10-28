@@ -51,14 +51,16 @@ struct C1ProcRunnerTests {
     @Test("PROC-01 via NativeToolExecutor runBounded dual flood (rg-style caps)")
     func proc01ViaRunBounded() throws {
         // Use the existing rg-style runner to prove the dual-drain primitive
-        // still works after the C1 group/escalation changes.
+        // still works after the C1 group/escalation changes. Each stream
+        // carries ~80 KB — past the 64 KiB pipe buffer — so a runner that
+        // drains only one pipe at a time would deadlock here.
         let result = try NativeToolExecutor.runBounded(
-            executablePath: "/bin/sh", args: ["-c", "for i in $(seq 1 2000); do echo x; echo y >&2; done"],
-            stdoutCap: 4 * 1024 * 1024, stderrCap: 4 * 1024 * 1024, timeout: 5,
+            executablePath: "/bin/sh", args: ["-c", "for i in $(seq 1 40000); do echo x; echo y >&2; done"],
+            stdoutCap: 4 * 1024 * 1024, stderrCap: 4 * 1024 * 1024, timeout: 15,
             useSession: true)
         #expect(result.status == 0)
         #expect(!result.timedOut)
-        #expect(result.stdout.count > 0)
-        #expect(result.stderr.count > 0)
+        #expect(result.stdout.count > 65536, "stdout past the pipe buffer, fully drained")
+        #expect(result.stderr.count > 65536, "stderr past the pipe buffer, fully drained")
     }
 }

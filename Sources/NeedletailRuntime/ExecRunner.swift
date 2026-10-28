@@ -268,9 +268,11 @@ public struct ExecRunner: Sendable {
             let held = fcntl(resolvedCwdFD, F_DUPFD, 3)
             close(resolvedCwdFD)
             guard held >= 0 else { close(lifted); throw ToolFailure.preDispatch(status: "failed", summary: "cwd fd lift failed") }
-            let cflags = fcntl(held, F_GETFD)
-            if cflags >= 0 { _ = fcntl(held, F_SETFD, cflags & ~FD_CLOEXEC) }
-            // Actually cwdFD should be inheritable? For fchdir, it needs to be open in child, but not necessarily CLOEXEC cleared? We clear for consistency.
+            // The cwd fd stays CLOEXEC: the child uses it for fchdir before
+            // execve (an inheritable-across-fork fd is sufficient), so it
+            // must never leak into the executed program. Only the
+            // executable descriptor (`lifted`) is inheritable, because #!
+            // scripts are re-opened through /proc/self/fd/N.
             cwdFD = held
         } else if let expected = expectedCwd {
             // No cwd in args: the workspace root IS the cwd (plan: omitted
@@ -290,8 +292,7 @@ public struct ExecRunner: Sendable {
             let heldRoot = fcntl(pinned, F_DUPFD, 3)
             close(pinned)
             guard heldRoot >= 0 else { close(lifted); throw ToolFailure.preDispatch(status: "failed", summary: "cwd fd lift failed") }
-            let rflags = fcntl(heldRoot, F_GETFD)
-            if rflags >= 0 { _ = fcntl(heldRoot, F_SETFD, rflags & ~FD_CLOEXEC) }
+            // Same as above: CLOEXEC retained, fchdir-safe, never leaked.
             cwdFD = heldRoot
         }
 

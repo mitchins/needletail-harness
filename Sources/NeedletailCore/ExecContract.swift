@@ -200,8 +200,8 @@ public enum ExecEnvPolicy {
 /// Renders the operator-facing command description. Returns nil when the
 /// rendering would exceed `ExecArguments.maxDisplayBytes` — the validator
 /// rejects such proposals outright (an unrenderable command is
-/// unapprovable). Long argv/env projections are elided with explicit
-/// markers; the rendered text is terminal-safe at construction.
+/// unapprovable: every approved byte is shown, nothing is elided).
+/// The rendered text is terminal-safe at construction.
 public func renderExecApprovalDisplay(_ args: ExecArguments) -> String? {
     func safe(_ s: String) -> String {
         // Terminal-safe projection: C0 control scalars (except tab) render
@@ -235,14 +235,11 @@ public func renderExecApprovalDisplay(_ args: ExecArguments) -> String? {
     }
     envPart += " timeout=\(args.timeoutSecs)s"
     parts.append("[\(argvRendered.joined(separator: ", "))]\(cwdPart)\(envPart)")
-    var text = parts.joined(separator: " ")
-    // Elide with explicit markers when over the display budget.
-    while text.utf8.count > ExecArguments.maxDisplayBytes, argv.count > 1 {
-        argv.removeLast()
-        let elided = argvRendered.dropLast(argvRendered.count - max(1, argv.count))
-        text = "exec \(safe(args.executable)) [\(elided.joined(separator: ", ")), …+\(argvRendered.count - max(1, argv.count)) elided]\(cwdPart)\(envPart)"
-    }
-    // If even the elided argv cannot fit (only executable/cwd/env remain), the command is unrenderable.
+    let text = parts.joined(separator: " ")
+    // Every byte the operator approves must be shown: an over-budget
+    // command is unrenderable, hence unapprovable (fail closed — the
+    // validator rejects the proposal; no argv is ever elided from
+    // the approval display).
     if text.utf8.count > ExecArguments.maxDisplayBytes { return nil }
     return text
 }

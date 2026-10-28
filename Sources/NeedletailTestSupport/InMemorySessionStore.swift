@@ -215,6 +215,16 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
             guard kind == spill.kind else { throw StoreError.integrity("publish kind mismatch") }
             guard let owner = claims[identity.session.raw], owner == identity.writer else { throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer) }
             guard spillLeases[spill.leaseID.uuidString] != nil else { throw StoreError.integrity("lease not found") }
+            // Bound to the lease's own staging name (reconstructed, never
+            // trusted from the handle path) — mirrors GRDB: a forged or
+            // stale handle can neither publish nor delete an arbitrary file.
+            let boundName = ".tmp-lease-\(spill.leaseID.uuidString)-\(spill.stream)"
+            guard (spill.path as NSString).lastPathComponent == boundName else {
+                throw StoreError.integrity("spill handle does not bind its lease file")
+            }
+            guard log.count + 1 <= Self.recordCap else {
+                throw StoreError.quotaExceeded(limit: Self.recordCap)
+            }
             let data = try Data(contentsOf: URL(fileURLWithPath: spill.path))
             guard data.count <= Self.artifactByteLimit else { throw StoreError.quotaExceeded(limit: Self.artifactByteLimit) }
             let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -232,6 +242,11 @@ public final class InMemorySessionStore: SessionStore, @unchecked Sendable {
     public func releaseArtifactSpill(as identity: WriterIdentity, handle: SpillHandle) throws {
         try lock.withLock {
             guard let owner = claims[handle.session.raw], owner == identity.writer else { throw StoreError.notWriter(session: handle.session.raw, writer: identity.writer) }
+            guard spillLeases[handle.leaseID.uuidString] != nil else { throw StoreError.integrity("lease not found") }
+            let boundName = ".tmp-lease-\(handle.leaseID.uuidString)-\(handle.stream)"
+            guard (handle.path as NSString).lastPathComponent == boundName else {
+                throw StoreError.integrity("spill handle does not bind its lease file")
+            }
             spillLeases.removeValue(forKey: handle.leaseID.uuidString)
             try? FileManager.default.removeItem(atPath: handle.path)
         }

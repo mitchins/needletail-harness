@@ -179,4 +179,34 @@ struct ToolAdvertisementTests {
         // with a path/artifactId XOR; edit/write: alias + conditional keys).
         #expect(sawPartialRequired, "optional properties must exist, or strict:false is unjustified")
     }
+
+    @Test("advertisement envelope includes composed exec with nested argv/env schemas")
+    func openAIEnvelopeIncludesComposedExec() throws {
+        // exec is advertised only when granted AND composed (NC-7); when
+        // composed, its envelope must mirror the dispatch validator
+        // (argv 1–64 strings; env string-valued) so expressible proposals
+        // are exactly the dispatchable ones.
+        let all = ToolCapabilities(
+            read: true, search: true, edit: true, write: true,
+            exec: .ask, consult: false)
+        let denied = ToolAdvertisement.definitions(for: all)
+        #expect(!denied.map(\.name).contains("exec"), "uncomposed exec is not advertised")
+        let definitions = ToolAdvertisement.definitions(for: all, nativeExecComposed: true)
+        #expect(definitions.count == 5)
+        #expect(Set(definitions.map(\.name)) == ["read", "search", "edit", "write", "exec"])
+        let execDef = try #require(definitions.first(where: { $0.name == "exec" }))
+        let envelopes = openAIToolEnvelopes([execDef])
+        #expect(envelopes.count == 1)
+        let function = try #require(envelopes[0]["function"] as? [String: Any])
+        let parameters = try #require(function["parameters"] as? [String: Any])
+        let properties = try #require(parameters["properties"] as? [String: Any])
+        let argv = try #require(properties["argv"] as? [String: Any])
+        #expect(argv["type"] as? String == "array")
+        #expect((argv["items"] as? [String: Any])?["type"] as? String == "string")
+        #expect(argv["minItems"] as? Int == 1)
+        #expect(argv["maxItems"] as? Int == 64)
+        let env = try #require(properties["env"] as? [String: Any])
+        #expect(env["type"] as? String == "object")
+        #expect((env["additionalProperties"] as? [String: Any])?["type"] as? String == "string")
+    }
 }

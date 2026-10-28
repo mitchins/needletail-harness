@@ -75,9 +75,18 @@ public enum ToolAdvertisement {
     // MARK: - Strict schemas (mirror ToolValidator contracts)
 
     private static func schema(properties: [(String, String)], required: [String], descriptions: [String: String]) -> String {
+        schema(properties: properties.map { ($0.0, ["type": $0.1] as [String: Any]) }, required: required, descriptions: descriptions)
+    }
+
+    /// Nested-schema variant: property values carry their own facets
+    /// (items, min/maxItems, additionalProperties) so the advertised
+    /// exec envelope mirrors the dispatch validator exactly (argv: 1–64
+    /// strings; env: string-valued object). Dispatch stays strict: a
+    /// proposal the envelope could not express is refused, never run.
+    private static func schema(properties: [(String, [String: Any])], required: [String], descriptions: [String: String]) -> String {
         var props: [String: Any] = [:]
-        for (key, type) in properties {
-            var prop: [String: Any] = ["type": type]
+        for (key, base) in properties {
+            var prop = base
             if let d = descriptions[key] { prop["description"] = d }
             props[key] = prop
         }
@@ -140,7 +149,13 @@ public enum ToolAdvertisement {
         name: "exec",
         description: "Run one explicitly authorized local command by absolute path. Direct argv execution (no shell, no PATH search): executable must be an absolute path and argv[0] must equal it. cwd is workspace-relative; timeoutSecs bounds the run (default 120, max 1800); env is an operator-approved overlay (loader variables, PATH and credential names are refused). Every invocation requires explicit operator approval of the resolved command. Not sandboxed: interpreters and build scripts execute with this session's privileges.",
         parametersJSON: schema(
-            properties: [("argv", "array"), ("cwd", "string"), ("env", "object"), ("executable", "string"), ("timeoutSecs", "integer")],
+            properties: [
+                ("argv", ["type": "array", "items": ["type": "string"], "minItems": 1, "maxItems": 64] as [String: Any]),
+                ("cwd", ["type": "string"] as [String: Any]),
+                ("env", ["type": "object", "additionalProperties": ["type": "string"]] as [String: Any]),
+                ("executable", ["type": "string"] as [String: Any]),
+                ("timeoutSecs", ["type": "integer"] as [String: Any]),
+            ],
             required: ["argv", "executable"],
             descriptions: [
                 "argv": "Argument vector; argv[0] must equal executable. 1-64 string entries, no NUL or control bytes.",

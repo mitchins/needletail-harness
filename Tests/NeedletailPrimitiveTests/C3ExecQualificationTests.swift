@@ -160,7 +160,7 @@ struct C3ExecQualificationTests {
     /// delayInput the driver waits for the approval prompt first.
     private static func runWithPTY(
         _ arguments: [String], env: [String: String], input: String, delayInput: Bool = false,
-        childPID: LockedBox<Int32>? = nil, expectSignal: Int32? = nil
+        childPID: LockedBox<Int32>? = nil, expectSignal: Int32? = nil, promptReady: LockedBox<Bool>? = nil
     ) throws -> (exit: Int32, stdout: String, ptyOutput: String) {
         var master: Int32 = -1
         var slave: Int32 = -1
@@ -228,7 +228,7 @@ struct C3ExecQualificationTests {
         // (cancellation/crash legs). No /proc discovery races.
         childPID?.set(process.processIdentifier)
         try stdinHandle.close()
-        if delayInput {
+        if delayInput || promptReady != nil {
             let promptStop = Date().addingTimeInterval(30)
             var sawPrompt = false
             while Date() < promptStop {
@@ -238,10 +238,13 @@ struct C3ExecQualificationTests {
                 }
                 Thread.sleep(forTimeInterval: 0.05)
             }
-            #expect(sawPrompt, "approval prompt must render on the terminal")
-            #expect(process.isRunning, "the run waits for the operator decision (no premature exit)")
-            Thread.sleep(forTimeInterval: 1.0)
-            #expect(process.isRunning, "still awaiting the decision after a beat")
+            promptReady?.set(sawPrompt)
+            if delayInput {
+                #expect(sawPrompt, "approval prompt must render on the terminal")
+                #expect(process.isRunning, "the run waits for the operator decision (no premature exit)")
+                Thread.sleep(forTimeInterval: 1.0)
+                #expect(process.isRunning, "still awaiting the decision after a beat")
+            }
         }
         let inputBytes = Array(input.utf8)
         _ = inputBytes.withUnsafeBufferPointer { buf in
@@ -436,7 +439,7 @@ struct C3ExecQualificationTests {
                 env: Self.environment(stateDir: directory.appendingPathComponent("state")))
             #expect(result.exit == 0, "run completes: \(result.stderr.prefix(300))")
             let firstBody = String(decoding: server.requests.first?.body ?? [], as: UTF8.self)
-            #expect(firstBody.contains("\"exec\"") || firstBody.contains("exec"), "exec advertised when granted+composed, body=\(firstBody.prefix(400))")
+            #expect(firstBody.contains("\"name\":\"exec\""), "exec advertised when granted+composed, body=\(firstBody.prefix(400))")
         }
         // Without --allow-exec (denied caps): no exec definition offered.
         do {
@@ -1004,6 +1007,7 @@ struct C3ExecQualificationTests {
         let stateDir = directory.appendingPathComponent("state")
         let outcomeBox = LockedBox<Int32>(-1)
         let pidBox = LockedBox<Int32>(-1)
+        let promptBox = LockedBox<Bool>(false)
         let group = DispatchGroup()
         group.enter()
         DispatchQueue.global().async {
@@ -1012,14 +1016,15 @@ struct C3ExecQualificationTests {
                 let result = try Self.runWithPTY(
                     ["run", "--config", config, "--prompt", "go", "--format", "jsonl", "--alias", "loop",
                      "--workspace", ws.path, "--allow-exec"],
-                    env: Self.environment(stateDir: stateDir), input: "", delayInput: true, childPID: pidBox)
+                    env: Self.environment(stateDir: stateDir), input: "", childPID: pidBox, promptReady: promptBox)
                 outcomeBox.set(result.exit)
             } catch {
                 outcomeBox.set(999)
             }
             group.leave()
         }
-        // Wait until the binary is parked at the approval prompt, then SIGINT.
+        // Wait until the binary is parked at the approval prompt (readiness
+        // signal from the pty stream, never a fixed sleep), then SIGINT.
         let deadline = Date().addingTimeInterval(60)
         var binaryPID: Int32 = -1
         while Date() < deadline {
@@ -1032,7 +1037,11 @@ struct C3ExecQualificationTests {
             group.wait()
             return
         }
-        Thread.sleep(forTimeInterval: 2.0)
+        let promptDeadline = Date().addingTimeInterval(60)
+        while Date() < promptDeadline && !promptBox.get() {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        #expect(promptBox.get(), "prompt rendered before the signal (no sleep-in-place-of-readiness)")
         kill(binaryPID, SIGINT)
         group.wait()
         #expect(outcomeBox.get() == 130, "interrupt with nothing dispatched exits 130, got \(outcomeBox.get())")

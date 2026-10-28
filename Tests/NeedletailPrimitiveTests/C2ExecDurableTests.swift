@@ -1332,7 +1332,7 @@ struct C2ExecDurableTests {
             switch try await Self.runActorSuccessOnce() {
             case .success: return
             case .flaky(let note):
-                if attempt == 3 { Issue.record("safe-direction flake persisted across attempts: \(note)") }
+                if attempt == Self.retryAttempts { Issue.record("safe-direction flake persisted across attempts: \(note)") }
             case .failed: return
             }
         }

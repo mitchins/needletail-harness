@@ -1603,9 +1603,15 @@ private func execIdentitiesResolved<I: IDSource>(
             lines.append("\(prop.tool) \(prop.callID): \(summary)")
         }
     }
-    var operation = lines.joined(separator: "; ")
-    if operation.utf8.count > 8 * 1024 {
-        operation = String(operation.prefix(8 * 1024)) + "…[elided]"
+    let operation = lines.joined(separator: "; ")
+    // Every approved command must be fully visible: an over-budget batch
+    // is unapprovable (typed pre-dispatch refusal, no hold). Truncating
+    // here would hide later execs' argv while they still dispatch.
+    guard operation.utf8.count <= ExecArguments.maxDisplayBytes else {
+        return execResolutionFailed(
+            state, resolutionID: resolutionID, status: "invalid-arguments",
+            summary: "batch approval display exceeds \(ExecArguments.maxDisplayBytes) bytes; propose fewer or shorter commands",
+            ids: &ids)
     }
     let request = ApprovalRequest(
         requestID: run.requestID, runID: run.runID, generation: run.revision,
@@ -1886,7 +1892,7 @@ private func continueAfterPreDispatchFailure<I: IDSource>(_ state: SessionState,
         // receipt (identity + deterministic verdict, never dispatched).
         var text = "preDispatch \(status): \(summary)"
         if proposal.tool == "exec" {
-            let receipt = "exec \(proposal.callID) \(status) op=\(ref.operationID.raw) started=false artifact=- truncated=false :: \(summary)"
+            let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: status, started: false, artifact: nil, truncated: false, summary: summary)
             text += "\n[\(receipt)]"
             uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
         }
