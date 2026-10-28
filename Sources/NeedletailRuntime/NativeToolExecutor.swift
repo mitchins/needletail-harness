@@ -428,7 +428,10 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// the lease binds the staging inode the sweep attributes by name.
     /// The handle is re-bound here (basename reconstructed from the lease
     /// identity, root-pinned open): a forged handle fails closed before
-    /// any byte is written.
+    /// any byte is written. The artifact-root identity itself is enforced
+    /// at publish time (spillDir == artifactsRoot), where the store knows
+    /// its own root — a forged in-root path can stage bytes but can never
+    /// publish them (accepted residual; fail-closed).
     private func writeSpillFile(_ handle: SpillHandle, data: Data) throws {
         let boundName = ".tmp-lease-\(handle.leaseID.uuidString)-\(handle.stream)"
         guard (handle.path as NSString).lastPathComponent == boundName,
@@ -1165,7 +1168,12 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// (M2-C C2: a saturated host can stall a single scan past any fixed
     /// bound; squaring the observation keeps the fail-closed mapping while
     /// making spurious escalation rare — two consecutive timeouts still
-    /// return conservative-true). Hook-forced truncate/unreadable/deadline-0
+    /// return conservative-true). A clean verdict requires one complete
+    /// scan of a current listing; a member forked after the scan passed
+    /// its /proc position is not seen in that pass (documented residual:
+    /// zero-member groups cannot gain members, and only live members fork —
+    /// a descendant that outlives the leader is caught by the NEXT
+    /// observation, never silently adopted). Hook-forced truncate/unreadable/deadline-0
     /// return true immediately (C1 RED pins); per-pid unreadable-with-present
     /// file stays immediate-true. Non-Linux: nil (unqualified).
     /// Bound raised from 200/20ms to avoid host-specific false positives on
