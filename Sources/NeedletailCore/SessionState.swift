@@ -209,14 +209,18 @@ public struct ApprovalRequest: Sendable, Equatable {
     public let operation: String
     public let requiredGrant: String
     public let protectedPaths: [String]
+    /// M2-C C0 (plan REV12 §3.4b): per-exec-call resolved identity bound
+    /// into the approval. Empty for non-exec batches and demo displays.
+    public let execIdentities: [ExecCommandIdentity]
 
-    public init(requestID: RequestID, runID: RunID, generation: Revision, operation: String, requiredGrant: String, protectedPaths: [String] = []) {
+    public init(requestID: RequestID, runID: RunID, generation: Revision, operation: String, requiredGrant: String, protectedPaths: [String] = [], execIdentities: [ExecCommandIdentity] = []) {
         self.requestID = requestID
         self.runID = runID
         self.generation = generation
         self.operation = terminalSafe(operation)
         self.requiredGrant = requiredGrant
         self.protectedPaths = protectedPaths
+        self.execIdentities = execIdentities
     }
 }
 
@@ -262,14 +266,34 @@ public struct EpochDescriptor: Sendable, Equatable, Codable {
     public let profile: ModelProfile
     public let effectiveCaps: EffectiveCapabilities
     public let route: Route
+    /// M2-C C0 (plan REV12 §3.1/§3.8): the single composition fact — true
+    /// only when the native executor is composed AND effective exec is not
+    /// denied. Gates the two-phase resolution.
+    public let execComposed: Bool
 
-    public init(epochID: EpochID, parentEpochID: EpochID? = nil, configSnapshot: ConfigSnapshot, profile: ModelProfile, effectiveCaps: EffectiveCapabilities, route: Route) {
+    public init(epochID: EpochID, parentEpochID: EpochID? = nil, configSnapshot: ConfigSnapshot, profile: ModelProfile, effectiveCaps: EffectiveCapabilities, route: Route, execComposed: Bool = false) {
         self.epochID = epochID
         self.parentEpochID = parentEpochID
         self.configSnapshot = configSnapshot
         self.profile = profile
         self.effectiveCaps = effectiveCaps
         self.route = route
+        self.execComposed = execComposed
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case epochID, parentEpochID, configSnapshot, profile, effectiveCaps, route, execComposed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        epochID = try c.decode(EpochID.self, forKey: .epochID)
+        parentEpochID = try c.decodeIfPresent(EpochID.self, forKey: .parentEpochID)
+        configSnapshot = try c.decode(ConfigSnapshot.self, forKey: .configSnapshot)
+        profile = try c.decode(ModelProfile.self, forKey: .profile)
+        effectiveCaps = try c.decode(EffectiveCapabilities.self, forKey: .effectiveCaps)
+        route = try c.decode(Route.self, forKey: .route)
+        execComposed = try c.decodeIfPresent(Bool.self, forKey: .execComposed) ?? false
     }
 }
 
@@ -286,6 +310,7 @@ extension SessionState {
         turnLimit: Int? = nil, runDeadlineMillis: UInt64?? = nil,
         preSendRetries: Int? = nil, invalidTracker: InvalidTracker? = nil,
         pendingApproval: ApprovalRequest?? = nil, pendingBatch: ToolBatch?? = nil,
+        pendingResolution: ExecResolutionSeed?? = nil, pendingExecIdentities: [ExecCommandIdentity]?? = nil,
         retryDeadlineMillis: UInt64?? = nil,
         liveReservations: [EffectReservation]? = nil,
         cancelledPendingReservations: [EffectReservation]? = nil, generation: UInt64? = nil,
@@ -307,6 +332,8 @@ extension SessionState {
             invalidTracker: invalidTracker ?? self.invalidTracker,
             pendingApproval: pendingApproval ?? self.pendingApproval,
             pendingBatch: pendingBatch ?? self.pendingBatch,
+            pendingResolution: pendingResolution ?? self.pendingResolution,
+            pendingExecIdentities: pendingExecIdentities ?? self.pendingExecIdentities,
             retryDeadlineMillis: retryDeadlineMillis ?? self.retryDeadlineMillis,
             liveReservations: liveReservations ?? self.liveReservations,
             cancelledPendingReservations: cancelledPendingReservations ?? self.cancelledPendingReservations,
@@ -387,6 +414,11 @@ public struct SessionState: Sendable, Equatable {
     /// authorising, cleared on grant/deny/cancel). Empty batch short-
     /// circuits back to requesting without approval.
     public let pendingBatch: ToolBatch?
+    /// M2-C C0 two-phase resolution (plan REV12 §3.4b): the in-flight
+    /// resolution seed (ephemeral — phase 1 writes no records) and the
+    /// resolved identities awaiting grant.
+    public let pendingResolution: ExecResolutionSeed?
+    public let pendingExecIdentities: [ExecCommandIdentity]?
     /// Armed retry deadline (M1-C backoff): set by the preSend-retry arm,
     /// consumed ONLY by the `tick` row in requesting phase, cleared on
     /// cancel/epoch/dispatch. Nil normally.
@@ -415,6 +447,7 @@ public struct SessionState: Sendable, Equatable {
         turnsUsed: Int = 0, turnLimit: Int = 80, runDeadlineMillis: UInt64? = nil,
         preSendRetries: Int = 0, invalidTracker: InvalidTracker = InvalidTracker(),
         pendingApproval: ApprovalRequest? = nil, pendingBatch: ToolBatch? = nil,
+        pendingResolution: ExecResolutionSeed? = nil, pendingExecIdentities: [ExecCommandIdentity]? = nil,
         retryDeadlineMillis: UInt64? = nil,
         liveReservations: [EffectReservation] = [],
         cancelledPendingReservations: [EffectReservation] = [],
@@ -439,6 +472,8 @@ public struct SessionState: Sendable, Equatable {
         self.invalidTracker = invalidTracker
         self.pendingApproval = pendingApproval
         self.pendingBatch = pendingBatch
+        self.pendingResolution = pendingResolution
+        self.pendingExecIdentities = pendingExecIdentities
         self.retryDeadlineMillis = retryDeadlineMillis
         self.liveReservations = liveReservations
         self.cancelledPendingReservations = cancelledPendingReservations

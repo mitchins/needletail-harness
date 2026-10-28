@@ -847,7 +847,7 @@ struct B2ClosureTests {
             echo 'ripgrep 99.0.0'
             exit 0
             fi
-            trap '' TERM
+            trap '' INT TERM
             sleep 32
             exec \(realRg) "$@"
             """

@@ -54,26 +54,39 @@ public struct ToolDefinition: Sendable, Equatable {
 public enum ToolAdvertisement {
     /// Definitions visible under the given (already intersected) effective
     /// tool capabilities, in fixed order read/search/edit/write. Never
-    /// contains exec, consult or diff.
-    public static func definitions(for tools: ToolCapabilities) -> [ToolDefinition] {
+    /// contains consult or diff. `exec` is advertised iff its effective
+    /// policy is not denied AND the native executor is actually composed
+    /// (plan REV12 §3.8 / NC-7): the demo/scripted backend never advertises
+    /// exec, so `--trusted` cannot gain the tool by caps alone.
+    public static func definitions(for tools: ToolCapabilities, nativeExecComposed: Bool = false) -> [ToolDefinition] {
         var out: [ToolDefinition] = []
         if tools.read { out.append(readDefinition) }
         if tools.search { out.append(searchDefinition) }
         if tools.edit { out.append(editDefinition) }
         if tools.write { out.append(writeDefinition) }
+        if tools.exec != .denied && nativeExecComposed { out.append(execDefinition) }
         return out
     }
 
-    public static func names(for tools: ToolCapabilities) -> [String] {
-        definitions(for: tools).map(\.name)
+    public static func names(for tools: ToolCapabilities, nativeExecComposed: Bool = false) -> [String] {
+        definitions(for: tools, nativeExecComposed: nativeExecComposed).map(\.name)
     }
 
     // MARK: - Strict schemas (mirror ToolValidator contracts)
 
     private static func schema(properties: [(String, String)], required: [String], descriptions: [String: String]) -> String {
+        schema(properties: properties.map { ($0.0, ["type": $0.1] as [String: Any]) }, required: required, descriptions: descriptions)
+    }
+
+    /// Nested-schema variant: property values carry their own facets
+    /// (items, min/maxItems, additionalProperties) so the advertised
+    /// exec envelope mirrors the dispatch validator exactly (argv: 1–64
+    /// strings; env: string-valued object). Dispatch stays strict: a
+    /// proposal the envelope could not express is refused, never run.
+    private static func schema(properties: [(String, [String: Any])], required: [String], descriptions: [String: String]) -> String {
         var props: [String: Any] = [:]
-        for (key, type) in properties {
-            var prop: [String: Any] = ["type": type]
+        for (key, base) in properties {
+            var prop = base
             if let d = descriptions[key] { prop["description"] = d }
             props[key] = prop
         }
@@ -125,6 +138,31 @@ public enum ToolAdvertisement {
                 "oldBytes": "Text to replace, exactly once (alias old_string).",
                 "old_string": "Text to replace, exactly once (alias oldBytes).",
                 "path": "Workspace-relative file path.",
+            ]))
+
+    /// M2-C C0 (plan REV12 §3.3): the exec discovery schema mirrors the
+    /// strict dispatch contract exactly. Direct argv execution, absolute
+    /// executable, workspace-relative cwd, bounded timeout, explicitly
+    /// authorized environment overlay. Interpreters are ordinary host
+    /// execution — never "read-only" by name (SPEC §10.4).
+    static let execDefinition = ToolDefinition(
+        name: "exec",
+        description: "Run one explicitly authorized local command by absolute path. Direct argv execution (no shell, no PATH search): executable must be an absolute path and argv[0] must equal it. cwd is workspace-relative; timeoutSecs bounds the run (default 120, max 1800); env is an operator-approved overlay (loader variables, PATH and credential names are refused). Every invocation requires explicit operator approval of the resolved command. Not sandboxed: interpreters and build scripts execute with this session's privileges.",
+        parametersJSON: schema(
+            properties: [
+                ("argv", ["type": "array", "items": ["type": "string"], "minItems": 1, "maxItems": 64] as [String: Any]),
+                ("cwd", ["type": "string"] as [String: Any]),
+                ("env", ["type": "object", "additionalProperties": ["type": "string"]] as [String: Any]),
+                ("executable", ["type": "string"] as [String: Any]),
+                ("timeoutSecs", ["type": "integer"] as [String: Any]),
+            ],
+            required: ["argv", "executable"],
+            descriptions: [
+                "argv": "Argument vector; argv[0] must equal executable. 1-64 string entries, no NUL or control bytes.",
+                "cwd": "Workspace-relative working directory (optional; default: workspace root). Read-only roots are never exec cwds.",
+                "env": "Additional environment entries approved verbatim by the operator (optional; denied names refused).",
+                "executable": "Absolute path of the program to run. Resolved and content-hashed before approval; no PATH search.",
+                "timeoutSecs": "Integer 1-1800 (optional; default 120). Effective deadline is min(requested, policy ceiling, remaining run deadline).",
             ]))
 
     private static let writeDefinition = ToolDefinition(

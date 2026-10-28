@@ -121,4 +121,47 @@ struct CancellationTests {
         let idle = transition(forced.state, .dismissRun(atMillis: 9002), &ids)
         #expect(idle.state.phase == .idle, "explicit ack returns to idle")
     }
+
+    @Test("M2-C3 late exec success after cancel keeps unknown marker and an unknown receipt")
+    func lateExecSuccessAfterCancelReadsUnknown() throws {
+        // M2 receipt truthfulness: a late executor "success" arriving after
+        // cancel won the race must not surface as success — the reducer
+        // keeps the unknown marker (hold remains) and the NC-9 receipt
+        // reports the reducer verdict ("unknown"), never the raw outcome.
+        var ids = StateFixtures.ids()
+        var state = try StateFixtures.idle(permissive: true)
+        let run = RunDescriptor(runID: RunID("run-1"), requestID: RequestID("req-1"), revision: Revision(1), startedAtMillis: 1000, sealed: false)
+        let batch = ToolBatch([
+            ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: #"{"argv":["/bin/echo","hi"]}"#),
+        ])
+        state = state.replacing(phase: .executing, activeRun: run, liveReservations: [
+            EffectReservation(effectID: EffectID("eff-1"), runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: true, batch: batch, kind: .executor)
+        ], generation: 1)
+        let cancelled = transition(state, .cancelRequested(atMillis: 2000), &ids)
+        guard case .cancelling = cancelled.state.phase else {
+            Issue.record("expected cancelling"); return
+        }
+        #expect(cancelled.state.cancelledPendingReservations.count == 1, "reservation retained for late completion")
+        // Late executor report: claims success after the child allegedly ran.
+        let late = ToolCallOutcome(callID: "c1", status: "success", summary: "exit 0", data: "hi", started: true)
+        let result = ExecutorResult(receipt: ExecutorReceipt(callID: "batch", status: "success", summary: "batch"), calls: [late])
+        let completed = transition(cancelled.state, .effectCompleted(effectID: EffectID("eff-1"), runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 2001), &ids)
+        #expect(completed.state.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown }), "unknown marker kept, hold remains")
+        #expect(!completed.records.contains(where: {
+            if case .operationResult(let ref, _) = $0 { return ref.callID == "c1" }
+            return false
+        }), "no result record supersedes the held marker")
+        let receipts = completed.effects.compactMap { effect -> String? in
+            switch effect {
+            case .emitUI(let proj) where proj.kind == "run:tool-exec": return proj.detail
+            default: return nil
+            }
+        }
+        #expect(receipts.count == 1, "exactly one held-completion receipt, got: \(receipts)")
+        if let receipt = receipts.first {
+            #expect(receipt.contains("exec c1 unknown "), "receipt must read the reducer verdict unknown, got: \(receipt)")
+            #expect(!receipt.contains("exec c1 success "), "receipt must never report raw executor success, got: \(receipt)")
+            #expect(receipt.contains("uncertain completion withheld"), "receipt must say why, got: \(receipt)")
+        }
+    }
 }

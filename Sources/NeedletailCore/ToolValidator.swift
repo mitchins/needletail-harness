@@ -43,6 +43,11 @@ public enum ToolValidator {
     public static func validateBatchArguments(batch: ToolBatch) throws -> [ValidatedToolCall] {
         // Check total batch size
         var validated: [ValidatedToolCall] = []
+        // NC-15: resolution (and later spawn) work is bounded per batch.
+        let execCalls = batch.proposals.filter { $0.tool == "exec" }.count
+        if execCalls > ExecArguments.maxExecCallsPerBatch {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "too many exec calls in batch (\(execCalls) > \(ExecArguments.maxExecCallsPerBatch))")
+        }
         for proposal in batch.proposals {
             // callID and tool already validated at enterAuthorising, but double-check
             guard !proposal.callID.isEmpty else {
@@ -73,12 +78,17 @@ public enum ToolValidator {
                 validatedCall = try validateEdit(callID: proposal.callID, json: json, raw: argsStr)
             case "write":
                 validatedCall = try validateWrite(callID: proposal.callID, json: json, raw: argsStr)
-            case "exec", "consult":
-                // These are denied regardless, but still validate shape for deterministic failure
+            case "exec":
+                // M2-C C0: a real schema (plan REV12 §3.3). Shape-validated
+                // here; existence/identity are bound later by the
+                // resolution phase (Runtime) — the validator stays pure.
+                _ = try validateExec(callID: proposal.callID, json: json)
+                validatedCall = ValidatedToolCall(callID: proposal.callID, tool: proposal.tool, paths: [], isMutating: true, rawArguments: argsStr)
+            case "consult":
+                // Still denied/unadvertised; keep the deterministic
+                // per-field rejection until its own milestone.
                 try validateExecConsult(callID: proposal.callID, json: json, raw: argsStr)
-                // For exec/consult, we still return a validated call with isMutating false/true for capability check
-                let isMut = proposal.tool == "exec"
-                validatedCall = ValidatedToolCall(callID: proposal.callID, tool: proposal.tool, paths: [], isMutating: isMut, rawArguments: argsStr)
+                validatedCall = ValidatedToolCall(callID: proposal.callID, tool: proposal.tool, paths: [], isMutating: false, rawArguments: argsStr)
             default:
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown tool \(proposal.tool)")
             }
@@ -358,11 +368,175 @@ public enum ToolValidator {
     }
 
     private static func validateExecConsult(callID: String, json: [String: Any], raw: String) throws {
-        // For exec/consult, just check no unknown fields? But they are denied anyway.
+        // For consult, just check no unknown fields? But they are denied anyway.
         // Allow no args or empty, but check types
         for key in json.keys {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown field \(key) for exec/consult")
         }
+    }
+
+    // MARK: - exec schema (M2-C C0, plan REV12 §3.3)
+
+    private static let execAllowedKeys: Set<String> = ["executable", "argv", "cwd", "timeoutSecs", "env"]
+
+    /// Strict exec validation: parse + shape-check, then the bounded
+    /// approval-display guard. Returns the validated call (mutating).
+    static func validateExec(callID: String, json: [String: Any]) throws -> ValidatedToolCall {
+        _ = try parseExecArguments(callID: callID, json: json)
+        return ValidatedToolCall(callID: callID, tool: "exec", paths: [], isMutating: true, rawArguments: "")
+    }
+    private static let maxEnvKeyBytes = 256
+    private static let maxEnvValueBytes = 8 * 1024
+    private static let maxComponentBytes = 255
+
+    /// Absolute-path component rules (plan REV12 §3.3): byte-exact split at
+    /// "/", no empty/`.`/`..`/trailing-slash components, each ≤ 255 B, total
+    /// ≤ 4096 B, no NUL. Mirrors validatePath's byte discipline for the
+    /// absolute (executable) case.
+    static func validateAbsoluteComponents(_ path: String, what: String, callID: String) throws {
+        if path.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "\(what) contains NUL for exec \(callID)") }
+        if path.utf8.count > maxPathLength { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "\(what) too long for exec \(callID)") }
+        guard path.utf8.first == 0x2F else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "\(what) must be absolute for exec \(callID) (no PATH search)")
+        }
+        if path.utf8.last == 0x2F {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "trailing slash in \(what) for exec \(callID)")
+        }
+        // Byte-exact: Character splitting would hide an embedded "/" + combining mark.
+        for p in Self.byteComponents(of: path).dropFirst() {
+            let c = p
+            if c.isEmpty { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "empty component in \(what) for exec \(callID)") }
+            if c == "." { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "dot component not allowed in \(what) for exec \(callID)") }
+            if c == ".." { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "parent escape not allowed in \(what) for exec \(callID)") }
+            if c.utf8.count > maxComponentBytes { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "component too long in \(what) for exec \(callID)") }
+        }
+    }
+
+    private static func printableSafe(_ s: String) -> Bool {
+        // Printable ASCII plus tab and UTF-8 multibyte sequences; raw C0
+        // control bytes (except tab) are refused — the approval display
+        // would otherwise need lossy handling for model-authored text.
+        var i = s.startIndex
+        while i < s.endIndex {
+            let scalar = s.unicodeScalars[i]
+            if scalar.value < 0x20 && scalar.value != 0x09 { return false }
+            if scalar.value == 0x7F { return false }
+            i = s.index(after: i)
+        }
+        return true
+    }
+
+    /// Pure parse+shape-check for the exec schema. Throws preDispatch on
+    /// any violation; returns the typed arguments on success.
+    public static func parseExecArguments(callID: String, json: [String: Any]) throws -> ExecArguments {
+        for key in json.keys where !execAllowedKeys.contains(key) {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown field \(key) for exec \(callID)")
+        }
+        guard let executable = json["executable"] as? String else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "executable required (string, absolute) for exec \(callID)")
+        }
+        try validateAbsoluteComponents(executable, what: "executable", callID: callID)
+        guard let argv = json["argv"] as? [Any] else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv required (array of strings) for exec \(callID)")
+        }
+        guard !argv.isEmpty, argv.count <= ExecArguments.maxArgvEntries else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv must hold 1...\(ExecArguments.maxArgvEntries) entries for exec \(callID)")
+        }
+        var argvStrings: [String] = []
+        for entry in argv {
+            guard let s = entry as? String else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv entries must be strings for exec \(callID)")
+            }
+            if s.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv entry contains NUL for exec \(callID)") }
+            if s.utf8.count > maxPathLength { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv entry too long for exec \(callID)") }
+            if !printableSafe(s) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv entry carries control bytes for exec \(callID)") }
+            argvStrings.append(s)
+        }
+        // Identity honesty: argv[0] IS the executable (prevents argv[0]
+        // spoofing the displayed command).
+        guard argvStrings[0] == executable else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv[0] must equal executable for exec \(callID)")
+        }
+        var cwd: String? = nil
+        if json.keys.contains("cwd") {
+            guard let c = json["cwd"] as? String else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "cwd must be a string for exec \(callID)")
+            }
+            // Shape only (workspace-relative, byte-exact components);
+            // existence/identity bind in the resolution phase.
+            try validatePath(c, callID: callID, tool: "exec")
+            cwd = c
+        }
+        var timeoutSecs = ExecArguments.defaultTimeoutSecs
+        if json.keys.contains("timeoutSecs") {
+            // Strict integer: JSON booleans and number-strings are refused.
+            // NSNumber type-puns on corelibs (`0 is Bool` answers true), so
+            // the ObjC type encoding is the discriminator: only "i"/"q"/"l"
+            // (integer encodings) are accepted; "c" (boolean) and "d"
+            // (double) are refused.
+            guard let number = json["timeoutSecs"] as? NSNumber else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "timeoutSecs must be an integer for exec \(callID)")
+            }
+            let encoding = String(cString: number.objCType)
+            guard encoding == "i" || encoding == "q" || encoding == "l", let t = number as? Int else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "timeoutSecs must be an integer for exec \(callID)")
+            }
+            guard t >= 1, t <= ExecArguments.maxTimeoutSecs else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "timeoutSecs out of range 1...\(ExecArguments.maxTimeoutSecs) for exec \(callID)")
+            }
+            timeoutSecs = t
+        }
+        var env: [String: String] = [:]
+        if json.keys.contains("env") {
+            guard let rawEnv = json["env"] as? [String: Any] else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "env must be an object for exec \(callID)")
+            }
+            guard rawEnv.count <= ExecArguments.maxEnvEntries else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "too many env entries for exec \(callID)")
+            }
+            for (key, value) in rawEnv {
+                guard key.utf8.count <= maxEnvKeyBytes, !key.isEmpty else {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "env key out of bounds for exec \(callID)")
+                }
+                let bytes = Array(key.utf8)
+                func isNameByte(_ b: UInt8) -> Bool {
+                    (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || (b >= 0x30 && b <= 0x39) || b == 0x5F
+                }
+                func isNameStart(_ b: UInt8) -> Bool {
+                    (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F
+                }
+                // [A-Za-z_][A-Za-z0-9_]*: the first byte may not be a digit.
+                guard let first = bytes.first, isNameStart(first), bytes.dropFirst().allSatisfy(isNameByte) else {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "env key must match [A-Za-z_][A-Za-z0-9_]* for exec \(callID)")
+                }
+                if ExecEnvPolicy.isDenied(key: key) {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "env key \(key) is denied for exec \(callID)")
+                }
+                guard let v = value as? String else {
+                    throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "env values must be strings for exec \(callID)")
+                }
+                if v.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "env value contains NUL for exec \(callID)") }
+                if v.utf8.count > maxEnvValueBytes { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "env value too large for exec \(callID)") }
+                if !printableSafe(v) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "env value carries control bytes for exec \(callID)") }
+                env[key] = v
+            }
+        }
+        let args = ExecArguments(executable: executable, argv: argvStrings, cwd: cwd, timeoutSecs: timeoutSecs, env: env)
+        // Bounded approval display: an unrenderable command is unapprovable.
+        guard renderExecApprovalDisplay(args) != nil else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "command display exceeds the approval rendering bound for exec \(callID)")
+        }
+        return args
+    }
+
+    /// Re-parse path for the resolution phase (Runtime): JSON + duplicate
+    /// keys + the same shape rules, returning the typed arguments.
+    public static func execArguments(fromRaw raw: String) throws -> ExecArguments {
+        guard let data = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
+            throw ExecResolutionError.qualification("exec arguments are not a JSON object")
+        }
+        return try parseExecArguments(callID: "resolve", json: json)
     }
 
     /// Byte-exact path components: split UTF-8 bytes at 0x2F. Character

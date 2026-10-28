@@ -58,6 +58,8 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     private var rawRingBytes: Int = 0
     private var rawRingMaxCount: Int { 8 }
     private var rawRingMaxBytes: Int { 16 * 1024 * 1024 }
+    /// M2-C C0 (plan REV12 §3.4b.1): the injected identity resolver.
+    private let execResolver: (any ExecIdentityResolver)?
 
     /// Throws when the fencing claim cannot be established: constructing a
     /// live writer against a session held by a DIFFERENT writer is a loud
@@ -65,7 +67,8 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     public init(
         state: SessionState, ids: IDs, clock: ClockType,
         transport: Transport, executor: Executor, store: Store, approvals: Approvals,
-        sink: any UISink = NoopUISink(), writer: String
+        sink: any UISink = NoopUISink(), writer: String,
+        execResolver resolver: (any ExecIdentityResolver)? = nil
     ) throws {
         self.state = state
         self.ids = ids
@@ -76,6 +79,7 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         self.approvals = approvals
         self.sink = sink
         self.writer = writer
+        self.execResolver = resolver
         // A2 fencing: this live actor instance establishes its writer
         // identity BEFORE any durable mutation. Idempotent for a same-
         // identity restart; a competing live writer fails here, loudly —
@@ -144,6 +148,13 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// Explicit-time tick (tests, replays). Production timers call `tick()`.
     public func tick(at nowMillis: UInt64) async {
         await apply(.tick(nowMillis: nowMillis))
+    }
+
+    /// C0 replay/test seam (plan REV12 §3.4b.5): drive a stamped event
+    /// through the SAME transition path — a replayed resolution reply must
+    /// drop as stale via checkStale.
+    public func applyExternalEvent(_ event: SessionEvent) async {
+        await apply(event)
     }
 
     /// Invalid/denied input note (M1-D CLI feeds parse failures here;
@@ -235,14 +246,15 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                         activeRun: .some(nil), activeRequest: .some(nil),
                         queueHeld: true, heldReason: .error(reason),
                         pendingApproval: .some(nil), pendingBatch: .some(nil),
+                        pendingResolution: .some(nil), pendingExecIdentities: .some(nil),
                         retryDeadlineMillis: .some(nil),
                         liveReservations: [],
                         unresolvedOperations: markers)
                 } else {
-                    state = prior.replacing(phase: .failed(.integrityStopped(reason)))
+                    state = prior.replacing(phase: .failed(.integrityStopped(reason)), pendingResolution: .some(nil), pendingExecIdentities: .some(nil))
                 }
             } else {
-                state = prior.replacing(phase: .failed(.integrityStopped(reason)))
+                state = prior.replacing(phase: .failed(.integrityStopped(reason)), pendingResolution: .some(nil), pendingExecIdentities: .some(nil))
             }
             return
         }
@@ -296,6 +308,14 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                 await self.invokeExecutor(reservation: reservation)
             }
         case .emitUI(let projection):
+            // M2-C C3: a late run:tool-exec must never land after the
+            // terminal run_finished (a deferred cancellation/completion can
+            // otherwise reorder the stream and flip UI back to busy). Only
+            // the tool-exec kind is suppressed post-terminal: every other
+            // terminal-adjacent projection (denied/run:completed/run:failed
+            // etc.) is part of the terminal transition itself and must
+            // still be delivered.
+            if state.phase.isTerminal, projection.kind == "run:tool-exec" { break }
             do {
                 try await sink.emit(projection)
             } catch {
@@ -319,6 +339,40 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                 let decision = await self.approvals.decide(request)
                 await self.decideApproval(decision, requestID: request.requestID, generation: request.generation)
             }
+        case .resolveExecIdentities(let resolutionID, let batch):
+            guard state.pendingResolution?.resolutionID == resolutionID else { return }
+            let identities: [ResolvedExecIdentity]
+            do {
+                if let resolver = execResolver {
+                    identities = try resolver.resolveIdentities(batch: batch)
+                } else {
+                    throw ExecResolutionError.unavailable("resolution unavailable: no identity resolver composed")
+                }
+                let expected = Set(batch.proposals.filter { $0.tool == "exec" }.map(\.callID))
+                let got = Set(identities.map(\.callID))
+                guard expected == got, identities.count == expected.count else {
+                    throw ExecResolutionError.unavailable("resolver reply does not match the batch exec callIDs")
+                }
+            } catch let error as ExecResolutionError {
+                await apply(.execResolutionFailed(
+                    resolutionID: resolutionID, runID: state.activeRun?.runID ?? RunID("none"),
+                    generation: state.activeRun?.revision ?? Revision(0),
+                    status: error.preDispatchStatus, summary: error.preDispatchSummary,
+                    atMillis: clock.nowMillis()))
+                return
+            } catch {
+                let mapped = ExecResolutionError.unavailable("resolver failure: \(error)")
+                await apply(.execResolutionFailed(
+                    resolutionID: resolutionID, runID: state.activeRun?.runID ?? RunID("none"),
+                    generation: state.activeRun?.revision ?? Revision(0),
+                    status: mapped.preDispatchStatus, summary: mapped.preDispatchSummary,
+                    atMillis: clock.nowMillis()))
+                return
+            }
+            guard let run = state.activeRun else { return }
+            await apply(.execIdentitiesResolved(
+                resolutionID: resolutionID, runID: run.runID, generation: run.revision,
+                identities: identities, atMillis: clock.nowMillis()))
         case .cancelInFlight:
             inFlight?.cancel()
         case .startTimer(let deadlineMillis, let purpose, let runID):
@@ -352,7 +406,7 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         await apply(.cancelRequested(atMillis: clock.nowMillis()))
         inFlight?.cancel()
         reservations = [:]
-        state = state.replacing(phase: .failed(.integrityStopped("sink emit failed: \(error)")))
+        state = state.replacing(phase: .failed(.integrityStopped("sink emit failed: \(error)")), pendingResolution: .some(nil), pendingExecIdentities: .some(nil))
     }
 
     private func invokeTransport(invocation: ProviderInvocation, reservation: EffectReservation) async {

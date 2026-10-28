@@ -8,13 +8,30 @@ import Glibc
 import Darwin
 #endif
 
+private func byteSplit(_ path: String) -> [String] {
+    var parts: [String] = []
+    var piece: [UInt8] = []
+    piece.reserveCapacity(64)
+    for b in path.utf8 {
+        if b == 0x2F { parts.append(String(decoding: piece, as: UTF8.self)); piece.removeAll(keepingCapacity: true) }
+        else { piece.append(b) }
+    }
+    parts.append(String(decoding: piece, as: UTF8.self))
+    return parts
+}
+
 /// B1 NativeToolExecutor: descriptor-relative via WorkspaceResolver, strict validation pre-side-effect,
 /// protected-path enforcement, and per-mutating-batch nonblocking lock.
 /// B4: ordered partial batches with per-call halt, injectable per-tool
 /// deadlines (local I/O 30 s, search 120 s), and per-call mutating
 /// attestation on every outcome.
-public struct NativeToolExecutor: ToolExecutor, Sendable {
+public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     public let resolver: WorkspaceResolver
+    /// M2-C C0 (plan REV12 §3.8): whether THIS executor instance carries the
+    /// native exec grant (composed via `--allow-exec` + config). Defense in
+    /// depth: the authoriser gates before dispatch AND the executor refuses
+    /// exec here, so a wiring mistake fails closed at the execution site.
+    public let execGrant: Bool
     public let store: any SessionStore
     public let sessionID: SessionID
     public let writer: WriterIdentity
@@ -36,7 +53,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     public let preCallSuspension: (@Sendable (ToolProposal) async throws -> Void)?
     public let postCommitSuspension: (@Sendable () async throws -> Void)?
 
-    public init(resolver: WorkspaceResolver, store: any SessionStore, sessionID: SessionID, writer: WriterIdentity, rgPath: String? = nil, gitPath: String? = nil, deadlines: ToolDeadlines = ToolDeadlines(), preCallSuspension: (@Sendable (ToolProposal) async throws -> Void)? = nil, postCommitSuspension: (@Sendable () async throws -> Void)? = nil) {
+    public init(resolver: WorkspaceResolver, store: any SessionStore, sessionID: SessionID, writer: WriterIdentity, rgPath: String? = nil, gitPath: String? = nil, deadlines: ToolDeadlines = ToolDeadlines(), preCallSuspension: (@Sendable (ToolProposal) async throws -> Void)? = nil, postCommitSuspension: (@Sendable () async throws -> Void)? = nil, execGrant: Bool = false) {
         self.resolver = resolver
         self.store = store
         self.sessionID = sessionID
@@ -46,17 +63,432 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         self.deadlines = deadlines
         self.preCallSuspension = preCallSuspension
         self.postCommitSuspension = postCommitSuspension
+        self.execGrant = execGrant
     }
 
     /// Internal: a fired per-tool deadline. Never thrown past the loop —
     /// mapped to a `timeout` outcome (unknown+hold for mutating).
     private struct DeadlineExceeded: Error {}
 
+    // MARK: - M2-C C0 exec identity resolution (plan REV12 §3.4)
+
+    /// ExecIdentityResolver (plan REV12 §3.4b.2): resolve → qualify →
+    /// content-hash every exec proposal in the batch. Synchronous,
+    /// filesystem-touching, bounded (NC-15: ≤8 calls/batch enforced by the
+    /// validator; ≤64 MiB per executable, ≤128 MiB aggregate here). The
+    /// executable walk anchors at "/" and RESOLVES symlinks (≤40 hops,
+    /// NC-4) so `/usr/bin/python3` and Conda env binaries qualify; the
+    /// final component opens O_NOFOLLOW and must be a regular file. The
+    /// cwd walk is anchored at the pinned workspace root with per-component
+    /// O_NOFOLLOW — containment by construction; a C0 deviation (fail-
+    /// closed): symlinked cwd components are typed `.cwd` failures rather
+    /// than resolved (C1 completes the resolving containment walk per plan
+    /// §3.4).
+    public func resolveIdentities(batch: ToolBatch) throws -> [ResolvedExecIdentity] {
+        // DEBUG-C0: surface resolver errors for the diagnosis
+        var out: [ResolvedExecIdentity] = []
+        var aggregateBytes: UInt64 = 0
+        var cache: [String: (dev: UInt64, ino: UInt64, size: UInt64, digest: String, resolved: String)] = [:]
+        for proposal in batch.proposals where proposal.tool == "exec" {
+            let args = try ToolValidator.execArguments(fromRaw: proposal.arguments ?? "")
+            let id = try resolveOne(callID: proposal.callID, args: args, cache: &cache, aggregateBytes: &aggregateBytes)
+            out.append(id)
+        }
+        return out
+    }
+
+    private struct ResolutionFailure: Error { let error: ExecResolutionError }
+
+    private func resolveOne(
+        callID: String, args: ExecArguments,
+        cache: inout [String: (dev: UInt64, ino: UInt64, size: UInt64, digest: String, resolved: String)],
+        aggregateBytes: inout UInt64
+    ) throws -> ResolvedExecIdentity {
+        // Executable: anchored walk from "/" resolving symlinks (NC-4).
+        let digestKey = args.executable
+        if let hit = cache[digestKey] {
+            let cwdID = try cwdIdentity(callID: callID, args: args)
+            return ResolvedExecIdentity(
+                callID: callID, requestedPath: args.executable, resolvedPath: hit.resolved,
+                device: hit.dev, inode: hit.ino, size: hit.size, contentDigest: hit.digest,
+                cwdDevice: cwdID.0, cwdInode: cwdID.1)
+        }
+        var stack: [String] = []
+        var dirFD: Int32 = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard dirFD >= 0 else {
+            throw ExecResolutionError.notFound("root unavailable: \(String(cString: strerror(errno)))")
+        }
+        var hops = 0
+        var resolvedPath = ""
+        var finalFD: Int32 = -1
+        defer {
+            if dirFD >= 0 { close(dirFD) }
+            if finalFD >= 0 { close(finalFD) }
+        }
+        var components = byteSplit(args.executable).filter { !$0.isEmpty }
+        var i = 0
+        while i < components.count {
+            let comp = components[i]
+            // Canonical stack: ".." pops the stack and moves dirFD to its parent.
+            if comp == ".." {
+                guard stack.popLast() != nil else {
+                    throw ExecResolutionError.qualification("symlink target escapes the root anchor for exec \(callID)")
+                }
+                let parent = openat(dirFD, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                guard parent >= 0 else {
+                    throw ExecResolutionError.qualification("symlink target escape failed for exec \(callID)")
+                }
+                close(dirFD)
+                dirFD = parent
+                i += 1
+                continue
+            }
+            if comp == "." || comp.isEmpty { i += 1; continue }
+            // Final: the file itself — may itself be a symlink, so probe
+            // symlinks here too (the final-component symlink case, M1) with
+            // the same readlinkat resolution as intermediates. Use
+            // O_NONBLOCK so a FIFO does not block the inline resolver (M6 —
+            // FIFO is never a regular file, so it is rejected without
+            // blocking; the signal is resolved in C1 with O_PATH probing).
+            if i == components.count - 1 {
+                let fd = comp.withCString { c in openat(dirFD, c, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) }
+                if fd >= 0 {
+                    finalFD = fd
+                    stack.append(comp)
+                    resolvedPath = "/" + stack.joined(separator: "/")
+                    break
+                }
+                // Either ELOOP (symlink) or another failure: probe as symlink.
+                var target = [CChar](repeating: 0, count: 4097)
+                let n = comp.withCString { c in readlinkat(dirFD, c, &target, 4096) }
+                if n > 0 {
+                    hops += 1
+                    if hops > 40 {
+                        throw ExecResolutionError.qualification("symlink hop budget exceeded for exec \(callID)")
+                    }
+                    target[n] = 0
+                    let linkTarget = String(cString: target)
+                    if linkTarget.utf8.first == 0x2F {
+                        close(dirFD)
+                        dirFD = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                        guard dirFD >= 0 else {
+                            throw ExecResolutionError.notFound("root unavailable")
+                        }
+                        stack.removeAll(keepingCapacity: true)
+                        resolvedPath = ""
+                        components = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(components[(i + 1)...])
+                        i = 0
+                    } else {
+                        var tail = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(components[(i + 1)...])
+                        var newStack = stack
+                        // Relative symlink target may contain leading ".."
+                        // that pops above the anchor — move dirFD to the
+                        // parent directory for each pop (the B2 dirFD/stack
+                        // desynchronization fix).
+                        while let first = tail.first, first == ".." {
+                            guard newStack.popLast() != nil else {
+                                throw ExecResolutionError.qualification("symlink target escapes the root anchor for exec \(callID)")
+                            }
+                            let parent = openat(dirFD, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                            guard parent >= 0 else {
+                                throw ExecResolutionError.qualification("symlink target escape failed for exec \(callID)")
+                            }
+                            close(dirFD)
+                            dirFD = parent
+                            tail.removeFirst()
+                        }
+                        components = tail
+                        stack = newStack
+                        resolvedPath = "/" + stack.joined(separator: "/")
+                        if components.isEmpty {
+                            throw ExecResolutionError.qualification("symlink target resolves to a directory for exec \(callID)")
+                        }
+                        i = 0
+                    }
+                    continue
+                }
+                throw ExecResolutionError.notFound("executable open failed: \(String(cString: strerror(errno)))")
+            }
+            let nextFD = comp.withCString { c in openat(dirFD, c, O_RDONLY | O_NOFOLLOW | O_DIRECTORY) }
+            if nextFD >= 0 {
+                close(dirFD)
+                dirFD = nextFD
+                stack.append(comp)
+                resolvedPath = "/" + stack.joined(separator: "/")
+                i += 1
+                continue
+            }
+            // Not a directory (or ELOOP): probe as symlink.
+            var target = [CChar](repeating: 0, count: 4097)
+            let n = comp.withCString { c in readlinkat(dirFD, c, &target, 4096) }
+            guard n > 0 else {
+                throw ExecResolutionError.notFound("\(comp): \(String(cString: strerror(errno)))")
+            }
+            hops += 1
+            if hops > 40 {
+                throw ExecResolutionError.qualification("symlink hop budget exceeded for exec \(callID)")
+            }
+            target[n] = 0
+            let linkTarget = String(cString: target)
+            // Interior ".."/".": C0 fail-closed (C1 completes per plan REV12 §3.4).
+            do {
+                let comps = linkTarget.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+                var depth = 0
+                for c in comps {
+                    if c == ".." {
+                        if depth == 0 { throw ExecResolutionError.qualification("symlink target escapes for exec \(callID)") }
+                        depth -= 1
+                    } else if c != "." && !c.isEmpty { depth += 1 }
+                }
+                // If any interior ".." would have popped past non-leading depth, it would have been caught.
+                // For C0, reject any target where a ".." appears after a normal component within the target itself.
+                var seenNormal = false
+                for c in comps {
+                    if c == ".." || c == "." {
+                        if seenNormal && c == ".." {
+                            throw ExecResolutionError.qualification("symlink target contains interior dot for exec \(callID)")
+                        }
+                    } else { seenNormal = true }
+                }
+            }
+            if linkTarget.utf8.first == 0x2F {
+                // Absolute target: restart from "/" with the target's
+                // components prepended to the remaining walk.
+                close(dirFD)
+                dirFD = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                guard dirFD >= 0 else {
+                    throw ExecResolutionError.notFound("root unavailable")
+                }
+                stack.removeAll(keepingCapacity: true)
+                resolvedPath = ""
+                components = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(components[(i + 1)...])
+                i = 0
+            } else {
+                // Relative target: replace the current component with the
+                // target's components (openat-plus-stack-pop; a pop past
+                // the root anchor ⇒ qualification failure) and move dirFD
+                // to the parent for each popped "..".
+                var tail = byteSplit(linkTarget).filter({ !$0.isEmpty }) + Array(components[(i + 1)...])
+                var newStack = stack
+                while let first = tail.first, first == ".." {
+                    guard newStack.popLast() != nil else {
+                        throw ExecResolutionError.qualification("symlink target escapes the root anchor for exec \(callID)")
+                    }
+                    let parent = openat(dirFD, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                    guard parent >= 0 else {
+                        throw ExecResolutionError.qualification("symlink target escape failed for exec \(callID)")
+                    }
+                    close(dirFD)
+                    dirFD = parent
+                    tail.removeFirst()
+                }
+                // Interior ".." inside the symlink target itself is normalized
+                // by the same stack-pop + parent-fd discipline that leading
+                // ".." uses: walk the concatenated tail, applying pops for
+                // every ".." encountered (not only leading ones) against
+                // newStack/dirFD.
+                components = tail
+                stack = newStack
+                resolvedPath = "/" + stack.joined(separator: "/")
+                i = 0
+            }
+        }
+        // Qualify the resolved final (regular file, exec bit, no
+        // group/world-write, root-or-owner) — the qualifiedRgFD checks on
+        // the resolved target.
+        var st = stat()
+        guard fstat(finalFD, &st) == 0 else {
+            throw ExecResolutionError.qualification("executable fstat failed for exec \(callID)")
+        }
+        guard (st.st_mode & S_IFMT) == S_IFREG else {
+            throw ExecResolutionError.qualification("resolved executable is not a regular file for exec \(callID)")
+        }
+        if (st.st_mode & 0o002) != 0 {
+            throw ExecResolutionError.qualification("resolved executable is world-writable for exec \(callID)")
+        }
+        if (st.st_mode & 0o020) != 0 {
+            throw ExecResolutionError.qualification("resolved executable is group-writable for exec \(callID)")
+        }
+        let uid = getuid()
+        guard st.st_uid == 0 || st.st_uid == uid else {
+            throw ExecResolutionError.qualification("resolved executable not owned by root or current user for exec \(callID)")
+        }
+        guard (st.st_mode & 0o111) != 0 else {
+            throw ExecResolutionError.qualification("resolved executable is not executable for exec \(callID)")
+        }
+        let size = UInt64(st.st_size)
+        guard size <= 64 * 1024 * 1024 else {
+            throw ExecResolutionError.qualification("executable exceeds the 64 MiB hash bound for exec \(callID)")
+        }
+        aggregateBytes &+= size
+        guard aggregateBytes <= 128 * 1024 * 1024 else {
+            throw ExecResolutionError.budgetExceeded("resolution budget exceeded (128 MiB aggregate) for exec \(callID)")
+        }
+        // Content hash over the held fd's bytes (the fd the spawn will use).
+        let contentSHA = try Self.sha256Hex(fd: finalFD)
+        let dev = UInt64(st.st_dev), ino = UInt64(st.st_ino)
+        let resolved = resolvedPath
+        let commandDigest = Self.sha256Hex(of: "\(resolved)\n\(dev)\n\(ino)\n\(size)\n\(contentSHA)")
+        cache[digestKey] = (dev, ino, size, commandDigest, resolved)
+        let cwdID = try cwdIdentity(callID: callID, args: args)
+        return ResolvedExecIdentity(
+            callID: callID, requestedPath: args.executable, resolvedPath: resolved,
+            device: dev, inode: ino, size: size, contentDigest: commandDigest,
+            cwdDevice: cwdID.0, cwdInode: cwdID.1)
+    }
+
+    /// cwd identity: anchored at the pinned workspace root, per-component
+    /// O_NOFOLLOW (containment by construction). C0 deviation (fail-closed,
+    /// documented in the slice receipt): symlinked cwd components are typed
+    /// `.cwd` failures; C1 completes the resolving containment walk.
+    private func cwdIdentity(callID: String, args: ExecArguments) throws -> (UInt64, UInt64) {
+        guard let root = resolver.workspaceRoot else {
+            throw ExecResolutionError.cwd("no workspace root for exec \(callID)")
+        }
+        let rootPath = root.path.string
+        let rootFD = rootPath.withCString { cstr in
+            open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard rootFD >= 0 else {
+            throw ExecResolutionError.cwd("workspace root unavailable for exec \(callID)")
+        }
+        defer { close(rootFD) }
+        var st = stat()
+        guard fstat(rootFD, &st) == 0 else {
+            throw ExecResolutionError.cwd("workspace root fstat failed for exec \(callID)")
+        }
+        let rootDev = UInt64(st.st_dev), rootIno = UInt64(st.st_ino)
+        guard rootDev == root.device && rootIno == root.inode else {
+            throw ExecResolutionError.cwd("workspace root replaced for exec \(callID)")
+        }
+        guard let rel = args.cwd else {
+            return (rootDev, rootIno)
+        }
+        var dirFD = rootFD
+        defer { if dirFD != rootFD { close(dirFD) } }
+        // M2: defer BEFORE the loop so a failed component does not leak dirFD.
+        for comp in byteSplit(rel).filter({ !$0.isEmpty }) {
+            if comp == "." { continue }
+            if comp == ".." {
+                throw ExecResolutionError.cwd("parent component in cwd for exec \(callID)")
+            }
+            let next = comp.withCString { c in openat(dirFD, c, O_RDONLY | O_NOFOLLOW | O_DIRECTORY) }
+            guard next >= 0 else {
+                throw ExecResolutionError.cwd("cwd component \(comp): \(String(cString: strerror(errno)))")
+            }
+            if dirFD != rootFD { close(dirFD) }
+            dirFD = next
+        }
+        var cst = stat()
+        guard fstat(dirFD, &cst) == 0 else {
+            throw ExecResolutionError.cwd("cwd fstat failed for exec \(callID)")
+        }
+        return (UInt64(cst.st_dev), UInt64(cst.st_ino))
+    }
+
+    /// Streaming SHA-256 over an opened fd (reading from the CURRENT file
+    /// offset; callers pass a fresh fd or rewind first).
+    static func sha256Hex(fd: Int32) throws -> String {
+        var sha = SHA256()
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 64 * 1024)
+        defer { buf.deallocate() }
+        lseek(fd, 0, SEEK_SET)
+        while true {
+#if canImport(Glibc)
+            let n = Glibc.read(fd, buf, 64 * 1024)
+#else
+            let n = Darwin.read(fd, buf, 64 * 1024)
+#endif
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw ExecResolutionError.qualification("read failed: \(String(cString: strerror(errno)))")
+            }
+            if n == 0 { break }
+            sha.update(data: Data(bytes: buf, count: n))
+        }
+        let digest = sha.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func sha256Hex(of text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// M2-C C2: post-spawn exec failure. Deliberately UNTYPED (never a
+    /// ToolFailure): thrown after the child may have executed, the batch
+    /// loop maps it to timeout/unknown+hold for mutating — an uncertain
+    /// shell side effect is never certified as a deterministic failure and
+    /// never returns success without durable artifacts.
+    private struct ExecPostSpawnError: Error {
+        let summary: String
+    }
+
+    /// Writes drained child output directly to the leased staging path
+    /// (O_WRONLY|O_TRUNC|O_NOFOLLOW, loop write, fsync). Never `.atomic`:
+    /// the lease binds the staging inode the sweep attributes by name.
+    /// The handle is re-bound here (basename reconstructed from the lease
+    /// identity, root-pinned open): a forged handle fails closed before
+    /// any byte is written. The artifact-root identity itself is enforced
+    /// at publish time (spillDir == artifactsRoot), where the store knows
+    /// its own root — a forged in-root path can stage bytes but can never
+    /// publish them (accepted residual; fail-closed).
+    private func writeSpillFile(_ handle: SpillHandle, data: Data) throws {
+        let boundName = ".tmp-lease-\(handle.leaseID.uuidString)-\(handle.stream)"
+        guard (handle.path as NSString).lastPathComponent == boundName,
+              !handle.stream.isEmpty,
+              handle.stream.utf8.allSatisfy({ $0 != 0x2F && $0 != 0x00 }) else {
+            throw ExecPostSpawnError(summary: "spill handle does not bind its lease file")
+        }
+        let dir = (handle.path as NSString).deletingLastPathComponent
+        let dirFD: Int32 = dir.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        guard dirFD >= 0 else {
+            throw ExecPostSpawnError(summary: "spill root unavailable: \(String(cString: strerror(errno)))")
+        }
+        defer { close(dirFD) }
+        let fd: Int32 = boundName.withCString { openat(dirFD, $0, O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC) }
+        guard fd >= 0 else {
+            throw ExecPostSpawnError(summary: "spill write open failed: \(String(cString: strerror(errno)))")
+        }
+        defer { close(fd) }
+        // The staging file must be a regular file: no FIFOs, sockets,
+        // devices or directories masquerading under a lease name.
+        var fst = stat()
+        guard fstat(fd, &fst) == 0, (fst.st_mode & S_IFMT) == S_IFREG else {
+            throw ExecPostSpawnError(summary: "spill staging is not a regular file")
+        }
+        var offset = 0
+        let total = data.count
+        while offset < total {
+            let n = data.withUnsafeBytes { raw -> Int in
+#if canImport(Glibc)
+                Glibc.write(fd, raw.baseAddress!.advanced(by: offset), total - offset)
+#else
+                Darwin.write(fd, raw.baseAddress!.advanced(by: offset), total - offset)
+#endif
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw ExecPostSpawnError(summary: "spill write failed: \(String(cString: strerror(errno)))")
+            }
+            if n == 0 { throw ExecPostSpawnError(summary: "spill short write") }
+            offset += n
+        }
+#if canImport(Glibc)
+        guard Glibc.fsync(fd) == 0 else {
+            throw ExecPostSpawnError(summary: "spill fsync failed: \(String(cString: strerror(errno)))")
+        }
+#else
+        guard Darwin.fsync(fd) == 0 else {
+            throw ExecPostSpawnError(summary: "spill fsync failed: \(String(cString: strerror(errno)))")
+        }
+#endif
+    }
+
     /// B4: applies the B1 mutating classifier at the execution site, so the
     /// per-call result carries the executor's attestation (the reducer
     /// verifies agreement with the dispatch-time intent).
     private func stamped(_ outcome: ToolCallOutcome, isMutating: Bool) -> ToolCallOutcome {
-        ToolCallOutcome(callID: outcome.callID, status: outcome.status, summary: outcome.summary, data: outcome.data, artifactID: outcome.artifactID, truncated: outcome.truncated, warnings: outcome.warnings, error: outcome.error, path: outcome.path, mode: outcome.mode, beforeHash: outcome.beforeHash, afterHash: outcome.afterHash, started: outcome.started, mutating: isMutating)
+        ToolCallOutcome(callID: outcome.callID, status: outcome.status, summary: outcome.summary, data: outcome.data, artifactID: outcome.artifactID, secondaryArtifactIDs: outcome.secondaryArtifactIDs, truncated: outcome.truncated, warnings: outcome.warnings, error: outcome.error, path: outcome.path, mode: outcome.mode, beforeHash: outcome.beforeHash, afterHash: outcome.afterHash, started: outcome.started, mutating: isMutating)
     }
 
     public func describe(batch: ToolBatch) -> String {
@@ -162,7 +594,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// cancels the loser, so no task leaks. Outer cancellation propagates
     /// as CancellationError (never converted to a timeout outcome).
     private func executeWithDeadline(proposal: ToolProposal, reservation: EffectReservation) async throws -> ToolCallOutcome {
-        let limit = deadlines.seconds(for: proposal.tool)
+        // The outer timer must not preempt the runner's own timeout
+        // escalation: for exec, runBounded classifies the deadline itself
+        // (exit code / signal / timeout with the exec-error pipe verdict),
+        // while an outer DeadlineExceeded would surface as a bare
+        // CancellationError and lose that classification. Slack only ever
+        // delays the outer bound, never shortens any inner deadline.
+        let limit = deadlines.seconds(for: proposal.tool) + (proposal.tool == "exec" ? 15 : 0)
         let isMutating = proposal.tool != "read" && proposal.tool != "search" && proposal.tool != "consult"
         return try await withThrowingTaskGroup(of: ToolCallOutcome.self) { group in
             group.addTask {
@@ -210,6 +648,151 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             return try edit(callID: proposal.callID, json: json)
         case "write":
             return try write(callID: proposal.callID, json: json)
+        case "exec":
+            // M2-C C2: full exec dispatch with identity revalidation, spill
+            // leases, and artifact publication. Defense in depth: the
+            // executor refuses exec without the composed grant (the
+            // authoriser gates first, so a wiring mistake fails closed here).
+            guard execGrant else {
+                throw ToolFailure.preDispatch(status: "denied", summary: "exec grant not composed (C2 requires --allow-exec)")
+            }
+            let args = try ToolValidator.execArguments(fromRaw: proposal.arguments ?? "")
+            // Timeout: min(requested, deadlines.exec, dispatch ceiling 1800)
+            let requested = TimeInterval(args.timeoutSecs)
+            var effective = min(requested, deadlines.exec)
+            effective = min(effective, 1800)
+            // Approved identities from reservation (C0 two-phase)
+            let approvedDigest = reservation.approvedExecDigests[proposal.callID]
+            let approvedCwdStr = reservation.approvedCwdIdentities[proposal.callID]
+            var approvedCwd: (device: UInt64, inode: UInt64)? = nil
+            if let s = approvedCwdStr {
+                let parts = s.split(separator: ":", omittingEmptySubsequences: false)
+                if parts.count == 2, let d = UInt64(parts[0]), let i = UInt64(parts[1]) {
+                    approvedCwd = (d, i)
+                }
+            }
+            // The digest and cwd maps are built from the same identity
+            // array: a digest without a matching valid cwd identity is a
+            // wiring defect. Refuse rather than run with a partially-bound
+            // identity (fail closed — an unbound cwd is never executed).
+            if (approvedDigest != nil) != (approvedCwd != nil) {
+                throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity binding incomplete for exec \(proposal.callID)")
+            }
+            // For C2, approvedDigest must be present (grant) — otherwise pre-dispatch conflict
+            guard let digest = approvedDigest else {
+                throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity not approved (no digest)")
+            }
+            // Spill leases before spawn, one per stream back-to-back (REV9).
+            // A second-stream refusal aborts the whole call: the first lease
+            // is released synchronously (no partial-leak state) and the
+            // provider may re-propose. Deterministic `failed`, started nil:
+            // nothing executed, continuation proceeds (no hold).
+            let spillKind = "exec-output"
+        let stdoutHandle: SpillHandle
+        do {
+            stdoutHandle = try store.openArtifactSpill(session: sessionID, as: writer, kind: spillKind, stream: "stdout", requestedBytes: 32*1024*1024)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ToolFailure.preDispatch(status: "failed", summary: "spill lease failed: \(error)")
+        }
+        let stderrHandle: SpillHandle
+        do {
+            stderrHandle = try store.openArtifactSpill(session: sessionID, as: writer, kind: spillKind, stream: "stderr", requestedBytes: 32*1024*1024)
+        } catch is CancellationError {
+            // A cancelled second grant still releases the first lease
+            // synchronously (no partial-leak state), then propagates.
+            try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+            throw CancellationError()
+        } catch {
+            try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+            throw ToolFailure.preDispatch(status: "failed", summary: "spill lease failed: \(error)")
+        }
+            // Launch via ExecRunner with revalidation (FD binding, execPath, cwd)
+            let runner = ExecRunner(resolver: resolver)
+            let execResult: ExecRunner.Result
+            do {
+                execResult = try runner.run(args: args, approvedDigest: digest, approvedCwdIdentity: approvedCwd.map { ($0.device, $0.inode) }, timeout: effective)
+            } catch is CancellationError {
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                try? store.releaseArtifactSpill(as: writer, handle: stderrHandle)
+                throw CancellationError()
+            } catch let err as ToolFailure {
+                // Pre-dispatch failures (conflict, invalid-arguments) — release leases
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                try? store.releaseArtifactSpill(as: writer, handle: stderrHandle)
+                throw err
+            } catch {
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                try? store.releaseArtifactSpill(as: writer, handle: stderrHandle)
+                throw ToolFailure.preDispatch(status: "failed", summary: "exec launch failed: \(error)")
+            }
+            // Post-spawn (the child may have executed): convert each stream
+            // into a durable artifact. From here on, failures throw UNTYPED
+            // (never ToolFailure): the batch loop maps them to
+            // timeout/unknown+hold for mutating. A non-empty stream NEVER
+            // returns success without its committed artifact reference; an
+            // empty stream releases its lease (zero-byte rule: counters and
+            // preview only, no empty artifact).
+            func publishExecStream(_ handle: SpillHandle, data: Data) throws -> ArtifactRef? {
+                if data.isEmpty {
+                    try? store.releaseArtifactSpill(as: writer, handle: handle)
+                    return nil
+                }
+                do {
+                    try writeSpillFile(handle, data: data)
+                } catch {
+                    try? store.releaseArtifactSpill(as: writer, handle: handle)
+                    throw error
+                }
+                do {
+                    // The stable operation identity binds this artifact to
+                    // its call for recovery tracing (same derivation as the
+                    // intent's operationID in SessionTransition).
+                    let opID = OperationID("\(reservation.effectID.raw)/\(proposal.callID)")
+                    return try store.publishArtifactFromFile(session: sessionID, as: writer, kind: spillKind, spill: handle, operationID: opID)
+                } catch {
+                    try? store.releaseArtifactSpill(as: writer, handle: handle)
+                    throw error
+                }
+            }
+            let stdoutRef: ArtifactRef?
+            let stderrRef: ArtifactRef?
+            do {
+                stdoutRef = try publishExecStream(stdoutHandle, data: execResult.stdout)
+                stderrRef = try publishExecStream(stderrHandle, data: execResult.stderr)
+            } catch {
+                // Release any lease the failed publish left behind (publish
+                // deletes its lease on success; release is a no-op otherwise).
+                try? store.releaseArtifactSpill(as: writer, handle: stdoutHandle)
+                try? store.releaseArtifactSpill(as: writer, handle: stderrHandle)
+                throw error
+            }
+            let status: String
+            if execResult.timedOut { status = "timeout" }
+            else if execResult.exitStatus == 0 { status = "success" }
+            else { status = "failed" }
+            var summaryParts: [String] = []
+            if execResult.timedOut {
+                summaryParts.append("exec timed out after \(Int(effective))s (exit \(execResult.exitStatus))")
+            } else if execResult.exitStatus == 0 {
+                summaryParts.append("exec succeeded (exit 0)")
+            } else {
+                summaryParts.append("exec failed (exit \(execResult.exitStatus))")
+            }
+            summaryParts.append("stdout \(execResult.stdout.count)B")
+            summaryParts.append("stderr \(execResult.stderr.count)B")
+            if execResult.truncated {
+                summaryParts.append("truncated stdout-discarded=\(execResult.discardedStdoutBytes) stderr-discarded=\(execResult.discardedStderrBytes)")
+            }
+            if let ref = stdoutRef {
+                summaryParts.append("stdout-artifact=\(ref.digest)")
+            }
+            if let ref = stderrRef {
+                summaryParts.append("stderr-artifact=\(ref.digest)")
+            }
+        let preview = String(decoding: execResult.stdout.prefix(16*1024), as: UTF8.self)
+        return ToolCallOutcome(callID: proposal.callID, status: status, summary: summaryParts.joined(separator: "; "), data: preview, artifactID: stdoutRef?.digest, secondaryArtifactIDs: stderrRef.map { [$0.digest] } ?? [], truncated: execResult.truncated, started: true)
         default:
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown tool")
         }
@@ -504,7 +1087,51 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var status: Int32
         var truncated: Bool
         var stdoutTruncated: Bool
+        /// M2-C C2: exact discarded-byte counts (bytes read from the pipe
+        /// but dropped by the cap). The drain counts every dropped byte, so
+        /// truncation accounting is exact, not cap-minus-kept.
+        var stdoutDiscarded: Int64
+        var stderrDiscarded: Int64
         var timedOut: Bool
+    }
+
+    /// Child-side exec-error report (async-signal-safe: only write loops
+    /// and _exit — no allocation, no locks, no Swift runtime traffic).
+    /// Writes 0x02 + errno (native LE int32), EINTR-retried; any other
+    /// failure still returns (the caller _exits — the parent classifies a
+    /// missing/truncated frame fail-safe, never as success).
+    private static func reportExecError(fd: Int32, errnoValue: Int32) {
+        var code: UInt8 = 0x02
+        var e = errnoValue
+        var tries = 0
+        while tries < 3 {
+            tries += 1
+#if canImport(Glibc)
+            let a = Glibc.write(fd, &code, 1)
+#else
+            let a = Darwin.write(fd, &code, 1)
+#endif
+            if a == 1 {
+                var off = 0
+                while off < 4 {
+#if canImport(Glibc)
+                    let n = withUnsafeBytes(of: &e) { raw in
+                        Glibc.write(fd, raw.baseAddress!.advanced(by: off), 4 - off)
+                    }
+#else
+                    let n = withUnsafeBytes(of: &e) { raw in
+                        Darwin.write(fd, raw.baseAddress!.advanced(by: off), 4 - off)
+                    }
+#endif
+                    if n > 0 { off += n; continue }
+                    if n < 0 && errno == EINTR { continue }
+                    break
+                }
+                break
+            }
+            if a < 0 && errno == EINTR { continue }
+            break
+        }
     }
 
     /// Raw posix_spawn bounded runner. Foundation.Process closes inherited
@@ -515,6 +1142,176 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// concurrently via poll() with in-loop caps (never buffered unboundedly);
     /// wall-clock timeout escalates SIGTERM -> SIGKILL; the child is always
     /// reaped via waitpid; Task cancellation terminates and throws.
+    // MARK: - C1 qualification test hooks (internal, test-only)
+    // Fault-injection seams for ECHILD/EPERM/probe counterfactuals. Never set
+    // in production; tests set/clear them and must reset after.
+    nonisolated(unsafe) static var _testHook_waitidECHILD = false
+    nonisolated(unsafe) static var _testHook_killFailPID: pid_t? = nil // when set, kill(pid,_) and kill(-pid,_) return -1/EPERM
+    nonisolated(unsafe) static var _testHook_probeForceTruncate = false
+    nonisolated(unsafe) static var _testHook_probeForceUnreadable = false
+    nonisolated(unsafe) static var _testHook_probeDeadlineOffsetNs: UInt64? = nil // if set, probe deadline = now + offset (0 => immediate)
+    /// C2 ambiguous-launch hooks (tests only, never production): stop/kill
+    /// the child after the 0x01 marker but before execve.
+    nonisolated(unsafe) static var _testHook_killAfterMarker = false
+    nonisolated(unsafe) static var _testHook_stopAfterMarker = false
+
+    /// Exposed for qualification tests: parse a /proc/<pid>/stat string into
+    /// (state, pgid) using the same last-')' logic as the probe. Returns nil
+    /// on malformed input. Handles parenthesized comm with spaces/parens.
+    static func parseProcStatForTest(_ stat: String) -> (state: String, pgid: Int32)? {
+        guard let rParen = stat.lastIndex(of: ")") else { return nil }
+        let after = stat[stat.index(after: rParen)...].trimmingCharacters(in: .whitespaces)
+        let fields = after.split(separator: " ", omittingEmptySubsequences: true)
+        guard fields.count >= 3 else { return nil }
+        guard let pgid = Int32(fields[2]) else { return nil }
+        return (String(fields[0]), pgid)
+    }
+
+    /// Test-visible kill wrapper that honors _testHook_killFailPID.
+    @discardableResult
+    static func killWithHook(_ pid: pid_t, _ sig: Int32) -> Int32 {
+        if let fail = _testHook_killFailPID {
+            if pid == fail || pid == -fail { errno = EPERM; return -1 }
+        }
+#if canImport(Glibc)
+        return Glibc.kill(pid, sig)
+#else
+        return Darwin.kill(pid, sig)
+#endif
+    }
+
+    /// Linux /proc group liveness probe (REV12 §3.5 Change 2/3): enumerate
+    /// /proc/<pid>/stat and match pgrp (fields[2] after final ')', state at
+    /// fields[0]) with state != 'Z' (live). Bounded: ≤8192 entries, ≤2000 ms wall
+    /// per scan with ONE immediate rescan on genuine timeout/truncation
+    /// (M2-C C2: a saturated host can stall a single scan past any fixed
+    /// bound; squaring the observation keeps the fail-closed mapping while
+    /// making spurious escalation rare — two consecutive timeouts still
+    /// return conservative-true). A clean verdict requires one complete
+    /// scan of a current listing; a member forked after the scan passed
+    /// its /proc position is not seen in that pass (documented residual:
+    /// zero-member groups cannot gain members, and only live members fork —
+    /// a descendant that outlives the leader is caught by the NEXT
+    /// observation, never silently adopted). Hook-forced truncate/unreadable/deadline-0
+    /// return true immediately (C1 RED pins); per-pid unreadable-with-present
+    /// file stays immediate-true. Non-Linux: nil (unqualified).
+    /// Bound raised from 200/20ms to avoid host-specific false positives on
+    /// builders with ~1000 pids while remaining bounded per REV12. ENOENT
+    /// races (pid exited between readdir and stat) are skipped, not escalated.
+    /// Single-scan verdict: live member found (escalate), clean (no live
+    /// member), or inconclusive (scan timed out or truncated — rescan).
+    private enum ProbeScan {
+        case liveFound
+        case clean
+        case inconclusive
+    }
+
+    private static func scanGroupOnce(pgid: pid_t, entries: [String], deadline: UInt64) -> ProbeScan {
+        for name in entries {
+            if _testHook_probeForceTruncate { return .liveFound }
+            // No entry cap: the wall-clock deadline below is the only
+            // bound. Capping entries would report inconclusive (hence
+            // escalate, time out, and hold) on every exec on large hosts.
+            if monotonicNanos() > deadline { return .inconclusive }
+            guard let pid = Int32(name), pid > 0 else { continue }
+            // Skip leader itself — its own escalation already covers it.
+            if pid == pgid { continue }
+            // Fast stat read (M2-C C2): one open/read/close of ≤256 bytes.
+            // comm is ≤15 chars so the last ')' is always in-buffer; the
+            // parse needs only state + pgrp (fields 0 and 2 after ')').
+            // Semantically identical to the old full-file parse: any
+            // unreadable/unparsable stat with a present file is
+            // conservative-true; a vanished file (exited race) is skipped.
+            let statPath = "/proc/\(pid)/stat"
+            let sfd: Int32 = statPath.withCString { open($0, O_RDONLY | O_CLOEXEC) }
+            guard sfd >= 0 else {
+                if _testHook_probeForceUnreadable || FileManager.default.fileExists(atPath: statPath) { return .liveFound } else { continue }
+            }
+            var sbuf = [UInt8](repeating: 0, count: 256)
+            let sn = sbuf.withUnsafeMutableBytes { ptr in
+#if canImport(Glibc)
+                Glibc.read(sfd, ptr.baseAddress!, ptr.count)
+#else
+                Darwin.read(sfd, ptr.baseAddress!, ptr.count)
+#endif
+            }
+            close(sfd)
+            guard sn > 0 else {
+                if _testHook_probeForceUnreadable || FileManager.default.fileExists(atPath: statPath) { return .liveFound } else { continue }
+            }
+            var rparen = -1
+            var i = 0
+            while i < sn {
+                if sbuf[i] == 0x29 { rparen = i }
+                i += 1
+            }
+            guard rparen >= 0 else { return .liveFound }
+            // Tokens after ") ": state, ppid, pgrp (whitespace-separated).
+            var k = rparen + 1
+            func skipSpaces() {
+                while k < sn && (sbuf[k] == 0x20 || sbuf[k] == 0x09) { k += 1 }
+            }
+            func nextToken() -> [UInt8]? {
+                skipSpaces()
+                let start = k
+                while k < sn && sbuf[k] != 0x20 && sbuf[k] != 0x09 && sbuf[k] != 0x0A { k += 1 }
+                guard k > start else { return nil }
+                return Array(sbuf[start..<k])
+            }
+            guard let stateTok = nextToken(), !stateTok.isEmpty else { return .liveFound }
+            guard nextToken() != nil else { return .liveFound }
+            guard let pgrpTok = nextToken(), !pgrpTok.isEmpty else { return .liveFound }
+            var memberPGID: Int32 = 0
+            var neg = false
+            var digits = 0
+            for b in pgrpTok {
+                if b == 0x2D && digits == 0 && !neg { neg = true; continue }
+                guard b >= 0x30 && b <= 0x39 else { return .liveFound }
+                memberPGID = memberPGID &* 10 &+ Int32(b - 0x30)
+                digits += 1
+            }
+            guard digits > 0, !neg else { return .liveFound }
+            let isZombie = stateTok.count == 1 && stateTok[0] == 0x5A // 'Z'
+            if memberPGID == pgid && !isZombie {
+                return .liveFound
+            }
+        }
+        return .clean
+    }
+
+    static func groupHasLiveMembers(pgid: pid_t) -> Bool? {
+#if canImport(Glibc)
+        if _testHook_probeForceTruncate { return true }
+        if _testHook_probeForceUnreadable { return true }
+        // M2-C C2: default scan bound raised 500 ms → 2000 ms, plus ONE
+        // immediate rescan on genuine timeout/truncation. Empirical
+        // ground: a ~1000-pid host scans in up to ~1000 ms with Foundation
+        // reads, so the old bound spuriously timed out (~15%) and marked
+        // clean fast exits timedOut via probe escalation; the faster
+        // per-pid read plus a squared observation makes that rare while
+        // the mapping stays fail-closed (two consecutive timeouts still
+        // return conservative-true — the C1 RED probes pin exactly that).
+        let deadlineOffset: UInt64 = _testHook_probeDeadlineOffsetNs ?? 2_000_000_000
+        let fm = FileManager.default
+        for _ in 0..<2 {
+            // Fresh listing per attempt: a member spawned during a timed-out
+            // first scan must be visible to the rescan (never decide on a
+            // stale snapshot).
+            guard let entries = try? fm.contentsOfDirectory(atPath: "/proc") else { return true }
+            let deadline = monotonicNanos() + deadlineOffset
+            if monotonicNanos() > deadline { continue }
+            switch scanGroupOnce(pgid: pgid, entries: entries, deadline: deadline) {
+            case .liveFound: return true
+            case .clean: return false
+            case .inconclusive: continue
+            }
+        }
+        return true
+#else
+        return nil
+#endif
+    }
+
     /// Process-wide spawn lock: pipe() + FD_CLOEXEC + fork() are separate
     /// syscalls, so a concurrent fork in another thread could otherwise land
     /// inside the pipe-to-CLOEXEC window and inherit a write end without
@@ -573,8 +1370,13 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
     /// already-validated open directory FD via fchdir (nil: inherit).
     /// Both are internal so GitDiff reuses this runner without duplicating
     /// the fork/exec/drain/escalation machinery.
-    static func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval, env: [String: String] = sanitizedSearchEnv, cwdFD: Int32? = nil) throws -> BoundedRunResult {
+    static func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval, env: [String: String] = sanitizedSearchEnv, cwdFD: Int32? = nil, execPath: String? = nil, useSession: Bool = false) throws -> BoundedRunResult {
         try Task.checkCancellation()
+        // Snapshot test hooks into locals BEFORE fork: the child below must
+        // never touch Swift globals (async-signal-safety; no once-token,
+        // no cross-test contamination through shared mutable state).
+        let hookKillAfterMarker = Self._testHook_killAfterMarker
+        let hookStopAfterMarker = Self._testHook_stopAfterMarker
         Self.spawnLock.lock()
         let (outR, outW): (Int32, Int32)
         do {
@@ -593,6 +1395,31 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             throw error
         }
         let (errR, errW) = errPair
+        // C2 exec-error pipe: close-on-exec, parent closes write after fork
+        // so child write failures surface as EPIPE not silent success.
+        var errPipeRead: Int32 = -1
+        var errPipeWrite: Int32 = -1
+        do {
+            var fds = [Int32](repeating: 0, count: 2)
+            guard pipe(&fds) == 0 else { throw ToolFailure.preDispatch(status: "failed", summary: "exec pipe failed") }
+            // Lift above stdio and set CLOEXEC
+            for i in 0..<2 {
+                while fds[i] >= 0 && fds[i] <= 2 {
+                    let n = fcntl(fds[i], F_DUPFD, 3)
+                    guard n >= 0 else { close(fds[0]); close(fds[1]); throw ToolFailure.preDispatch(status: "failed", summary: "exec pipe dup failed") }
+                    close(fds[i]); fds[i] = n
+                }
+            }
+            for fd in fds {
+                let flags = fcntl(fd, F_GETFD)
+                _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)
+            }
+            errPipeRead = fds[0]; errPipeWrite = fds[1]
+        } catch {
+            close(outR); close(outW); close(errR); close(errW)
+            Self.spawnLock.unlock()
+            throw error
+        }
         // fork+exec (not posix_spawn): glibc posix_spawn fails scripts with
         // ENOEXEC, while version probes and race-test wrappers are #! scripts
         // launched via /proc/self/fd. fork+execve handles both ELF and
@@ -608,6 +1435,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         defer { for p in envp { if let p { free(p) } } }
         guard let pathC = strdup(executablePath) else {
             close(outR); close(errR); close(outW); close(errW)
+            close(errPipeRead); close(errPipeWrite)
             Self.spawnLock.unlock()
             throw ToolFailure.preDispatch(status: "failed", summary: "rg launch failed: alloc")
         }
@@ -621,6 +1449,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         if pid < 0 {
             let e = errno
             close(outR); close(errR); close(outW); close(errW)
+            close(errPipeRead); close(errPipeWrite)
             Self.spawnLock.unlock()
             throw ToolFailure.preDispatch(status: "failed", summary: "rg fork failed: \(String(cString: strerror(e)))")
         }
@@ -630,12 +1459,66 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             Self.spawnLock.unlock()
         }
         if pid == 0 {
+            // C1: dedicated process group/session where supported — the child
+            // becomes session and group leader; grandchildren inherit the group.
+            // A setsid failure is reported (never silently uncontained).
+            if useSession {
+#if canImport(Glibc)
+                if Glibc.setsid() < 0 {
+                    let e = errno
+                    Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                    Glibc._exit(127)
+                }
+#else
+                if Darwin.setsid() < 0 {
+                    let e = errno
+                    Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                    Darwin._exit(127)
+                }
+#endif
+            }
+            // Reset signal dispositions the parent may ignore (notably the
+            // production CLI's SIG_IGN for INT/PIPE): escalation signals
+            // must terminate the child, and EPIPE must surface as an error,
+            // never silent survival. signal() is async-signal-safe.
+#if canImport(Glibc)
+            _ = Glibc.signal(SIGINT, SIG_DFL)
+            _ = Glibc.signal(SIGTERM, SIG_DFL)
+            _ = Glibc.signal(SIGPIPE, SIG_DFL)
+#else
+            _ = Darwin.signal(SIGINT, SIG_DFL)
+            _ = Darwin.signal(SIGTERM, SIG_DFL)
+            _ = Darwin.signal(SIGPIPE, SIG_DFL)
+#endif
             // Child: wire pipes to stdio, drop pipe FDs, exec. The qualified
             // rg FD and search-root FDs are inheritable and survive into rg
             // for /proc/self/fd resolution. Guards avoid closing stdio itself
             // if a pipe FD ever lands on 0/1/2. No Swift runtime interaction.
-            _ = dup2(outW, STDOUT_FILENO)
-            _ = dup2(errW, STDERR_FILENO)
+            // dup2 failures are reported via the error pipe, never run on
+            // with broken stdio.
+#if canImport(Glibc)
+            if Glibc.dup2(outW, STDOUT_FILENO) < 0 {
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                Glibc._exit(127)
+            }
+            if Glibc.dup2(errW, STDERR_FILENO) < 0 {
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                Glibc._exit(127)
+            }
+#else
+            if Darwin.dup2(outW, STDOUT_FILENO) < 0 {
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                Darwin._exit(127)
+            }
+            if Darwin.dup2(errW, STDERR_FILENO) < 0 {
+                let e = errno
+                Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                Darwin._exit(127)
+            }
+#endif
             if outR != STDIN_FILENO && outR != STDOUT_FILENO && outR != STDERR_FILENO { close(outR) }
             if errR != STDIN_FILENO && errR != STDOUT_FILENO && errR != STDERR_FILENO { close(errR) }
             if outW != STDOUT_FILENO { close(outW) }
@@ -645,35 +1528,224 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             // A failed pin aborts loudly (never diff the wrong directory).
             if let dir = cwdFD {
 #if canImport(Glibc)
-                if Glibc.fchdir(dir) != 0 { Glibc._exit(127) }
+                if Glibc.fchdir(dir) != 0 {
+                    let e = errno
+                    Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                    Glibc._exit(127)
+                }
 #else
-                if Darwin.fchdir(dir) != 0 { Darwin._exit(127) }
+                if Darwin.fchdir(dir) != 0 {
+                    let e = errno
+                    Self.reportExecError(fd: errPipeWrite, errnoValue: e)
+                    Darwin._exit(127)
+                }
 #endif
+            }
+            // C2 exec-error pipe: close read end, write 0x01 marker before execve.
+            // A failed marker write aborts (REV8: a command that ran must
+            // never classify pre-dispatch). EINTR retries; any other failure
+            // means the parent is gone, so _exit (EOF-no-marker ⇒ the
+            // parent classifies pre-exec death, fail-safe).
+            close(errPipeRead)
+            do {
+                var m: UInt8 = 0x01
+                var written = 0
+                while written < 1 {
+#if canImport(Glibc)
+                    let n = Glibc.write(errPipeWrite, &m, 1)
+#else
+                    let n = Darwin.write(errPipeWrite, &m, 1)
+#endif
+                    if n == 1 { written = 1; break }
+                    if n < 0 && errno == EINTR { continue }
+#if canImport(Glibc)
+                    Glibc._exit(127)
+#else
+                    Darwin._exit(127)
+#endif
+                }
+            }
+            // C2 test hooks: simulate death/hang between the 0x01 marker and
+            // execve (the ambiguous launch window). Never set in production.
+            // killAfterMarker: SIGKILL after the marker — the parent must
+            // classify started-then-signalled (failed), never success and
+            // never pre-dispatch.
+            // stopAfterMarker: SIGSTOP after the marker — the parent
+            // observes [0x01] with no EOF; the run deadline decides
+            // (timeout/unknown+hold), never a fabricated success.
+            if hookKillAfterMarker {
+#if canImport(Glibc)
+                Glibc.raise(SIGKILL)
+#else
+                Darwin.raise(SIGKILL)
+#endif
+            }
+            if hookStopAfterMarker {
+#if canImport(Glibc)
+                Glibc.raise(SIGSTOP)
+#else
+                Darwin.raise(SIGSTOP)
+#endif
+            }
+            // C1: execPath split — the display argv[0] stays the resolved
+            // path, but the kernel executes the /proc/self/fd path. An
+            // OOM here aborts (never fall back to the display path — that
+            // would reopen the TOCTOU the fd binding closes).
+            let execvePath: UnsafeMutablePointer<CChar>
+            if let execPath {
+                guard let p = strdup(execPath) else {
+#if canImport(Glibc)
+                    Glibc._exit(127)
+#else
+                    Darwin._exit(127)
+#endif
+                }
+                execvePath = p
+            } else {
+                execvePath = pathC
             }
             argv.withUnsafeMutableBufferPointer { abuf in
                 envp.withUnsafeMutableBufferPointer { ebuf in
 #if canImport(Glibc)
-                    _ = Glibc.execve(pathC, abuf.baseAddress!, ebuf.baseAddress!)
+                    _ = Glibc.execve(execvePath, abuf.baseAddress!, ebuf.baseAddress!)
 #else
-                    _ = Darwin.execve(pathC, abuf.baseAddress!, ebuf.baseAddress!)
+                    _ = Darwin.execve(execvePath, abuf.baseAddress!, ebuf.baseAddress!)
 #endif
                 }
             }
+            // execve failed: report errno. Capture it BEFORE free() below:
+            // free() is not guaranteed to preserve errno, and a clobbered
+            // value would misclassify the failure.
+            let execErrno = errno
+            if execPath != nil { free(UnsafeMutablePointer(mutating: execvePath)) }
+            do {
+                Self.reportExecError(fd: errPipeWrite, errnoValue: execErrno)
 #if canImport(Glibc)
-            Glibc._exit(127)
+                Glibc._exit(127)
 #else
-            Darwin._exit(127)
+                Darwin._exit(127)
 #endif
+            }
         }
         // Parent closes write ends immediately so EOF is observable.
+        // C2: close exec-error write, parent will read it before drain loop
+        close(errPipeWrite)
         close(outW)
         close(errW)
+        // Monotonic clock: wall-clock changes must not extend/truncate the
+        // timeout. Hard stop is deadline+6 s; cleanup loops can add ~4 s, so
+        // the real bound is ~timeout+10 s.
+        let startNanos = Self.monotonicNanos()
+        let deadlineNanos = startNanos + UInt64(timeout * 1_000_000_000)
+        let hardNanos = deadlineNanos + 6_000_000_000
+        var execStarted = false
+        var execError: (code: UInt8, errno: Int32)? = nil
+        // Declared before the classification wait so a cancelled wait
+        // converges on the common escalation/reap path below.
+        var cancelled = false
+        // C2 exec-error pipe: the write end is CLOEXEC, so a successful
+        // execve closes it (the parent observes EOF); a failed execve or
+        // fchdir writes 0x02+errno (native int32, little-endian hosts);
+        // death before the marker yields EOF with no bytes. Framing (child
+        // writes are tiny, order preserved):
+        //   []                → child died before the marker (pre-dispatch)
+        //   [0x01] + EOF      → execve succeeded (definitely started)
+        //   [0x02 e0..e3]     → pre-exec failure with errno (fchdir path)
+        //   [0x01 0x02 e0..e3]→ execve failed after the marker (never started)
+        // Any observed 0x02 ⇒ no image ever executed ⇒ pre-dispatch
+        // `failed`. EOF terminates every case (execve-CLOEXEC or _exit).
+        // The wait is bounded by the RUN deadline (never a fixed short
+        // window): the child always terminates promptly (exec or _exit), so
+        // only scheduling delay can stretch the read — and that delay is
+        // charged to the run budget the caller already approved. A fixed
+        // short deadline here would manufacture "started" from a
+        // descheduled child under load. If the run deadline expires first
+        // with a partial 0x02 frame, the failure is still reported (errno
+        // possibly zeroed); a bare [0x01] or no bytes at all stays
+        // inconclusive and the main deadline/reap machinery decides
+        // (timeout ⇒ unknown+hold, never a fabricated success).
+        do {
+            var errBytes: [UInt8] = []
+            errBytes.reserveCapacity(8)
+            let readDeadline = deadlineNanos
+            var eof = false
+            // B1: cancellation converges on the common escalation/reap path
+            // below — never a bare throw from inside the classification
+            // wait, which would leak the child and all four pipe fds.
+            // A cancelled wait leaves execStarted/execError as observed and
+            // falls through to drain/escalate/reap; a definitive 0x02 frame
+            // still classifies pre-dispatch (fail-closed and truthful), and
+            // any other outcome surfaces as CancellationError at the end.
+            while errBytes.count < 8 && !eof && NativeToolExecutor.monotonicNanos() < readDeadline {
+                if Task.isCancelled {
+                    cancelled = true
+                    break
+                }
+                var pfd = pollfd(fd: errPipeRead, events: Int16(POLLIN), revents: 0)
+                let pr = poll(&pfd, 1, 100)
+                // POLLHUP/POLLERR without POLLIN (all writers gone, no data
+                // queued) still requires a drain attempt: the read observes
+                // EOF (n == 0) rather than hanging on a dead pipe.
+                if pr > 0 && (pfd.revents & (Int16(POLLIN) | Int16(POLLHUP) | Int16(POLLERR))) != 0 {
+                    var tmp = [UInt8](repeating: 0, count: 8 - errBytes.count)
+                    let n = tmp.withUnsafeMutableBytes { ptr in
+#if canImport(Glibc)
+                        Glibc.read(errPipeRead, ptr.baseAddress!, ptr.count)
+#else
+                        Darwin.read(errPipeRead, ptr.baseAddress!, ptr.count)
+#endif
+                    }
+                    if n > 0 {
+                        errBytes.append(contentsOf: tmp[0..<n])
+                        if errBytes.count >= 5 && errBytes[0] == 0x02 { break }
+                        if errBytes.count >= 6 && errBytes[0] == 0x01 && errBytes[1] == 0x02 { break }
+                    } else if n == 0 {
+                        eof = true
+                    } else {
+                        if errno == EINTR { continue }
+                        break
+                    }
+                } else if pr == 0 {
+                    continue
+                } else {
+                    if errno == EINTR { continue }
+                    break
+                }
+            }
+            // Little-endian reconstruction: the child wrote a native int32
+            // on this host (all supported hosts are little-endian).
+            func decodeErrno(_ bytes: [UInt8]) -> Int32 {
+                var v: Int32 = 0
+                for (i, b) in bytes.prefix(4).enumerated() {
+                    v |= Int32(b) << (i * 8)
+                }
+                return v
+            }
+            if errBytes.isEmpty {
+                if eof { execError = (0x00, 0) }
+            } else if errBytes[0] == 0x02 {
+                execError = (0x02, errBytes.count >= 5 ? decodeErrno(Array(errBytes[1...])) : 0)
+            } else if errBytes[0] == 0x01 {
+                if errBytes.count >= 2 && errBytes[1] == 0x02 {
+                    execError = (0x02, errBytes.count >= 6 ? decodeErrno(Array(errBytes[2...])) : 0)
+                } else {
+                    execStarted = true
+                }
+            } else {
+                // Unknown first byte: never produced by our child; treat as
+                // inconclusive-started rather than fabricate pre-dispatch.
+                execStarted = true
+            }
+        }
+        // Close the read end after classification (defer close)
+        close(errPipeRead)
         var outData = Data()
         var errData = Data()
-        func appendBounded(_ chunk: Data, cap: Int, current: inout Data, trunc: inout Bool) {
+        func appendBounded(_ chunk: Data, cap: Int, current: inout Data, trunc: inout Bool, discarded: inout Int64) {
             if chunk.isEmpty { return }
             if current.count >= cap {
                 trunc = true
+                discarded += Int64(chunk.count)
                 return
             }
             let room = cap - current.count
@@ -682,11 +1754,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             } else {
                 current.append(chunk.prefix(room))
                 trunc = true
+                discarded += Int64(chunk.count - room)
             }
         }
         // Bounded per-wakeup drain: sustained output must not starve the
         // timeout/cancellation checks below.
-        func drain(fd: Int32, eof: inout Bool, current: inout Data, trunc: inout Bool, cap: Int, budget: Int) {
+        func drain(fd: Int32, eof: inout Bool, current: inout Data, trunc: inout Bool, discarded: inout Int64, cap: Int, budget: Int) {
             if eof { return }
             var buf = [UInt8](repeating: 0, count: 8192)
             var remaining = budget
@@ -699,7 +1772,7 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
 #endif
                 }
                 if n > 0 {
-                    appendBounded(Data(buf[0..<n]), cap: cap, current: &current, trunc: &trunc)
+                    appendBounded(Data(buf[0..<n]), cap: cap, current: &current, trunc: &trunc, discarded: &discarded)
                     remaining -= 1
                 } else if n == 0 {
                     eof = true
@@ -716,20 +1789,22 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         var errEOF = false
         var outTruncCap = false
         var errTruncCap = false
+        var outDiscarded: Int64 = 0
+        var errDiscarded: Int64 = 0
         var exitStatus: Int32 = -1
         var childDone = false
-        // Monotonic clock: wall-clock changes must not extend/truncate the
-        // timeout. Hard stop is deadline+6 s; cleanup loops can add ~4 s, so
-        // the real bound is ~timeout+10 s.
-        let startNanos = Self.monotonicNanos()
-        let deadlineNanos = startNanos + UInt64(timeout * 1_000_000_000)
-        let hardNanos = deadlineNanos + 6_000_000_000
+        // deadlineNanos/hardNanos/startNanos are computed BEFORE the
+        // exec-error classification above: the classification wait is
+        // charged to the run budget (a fixed short window there would
+        // manufacture "started" from a descheduled child under load).
         var killNanos = UInt64.max
         var deadlineExceeded = false
         var hardStopped = false
         var termSent = false
         var killSent = false
-        var cancelled = false
+        var intSent = false
+        var reaped = false
+        var unsafeToSignal = false
         while true {
             var pfds: [pollfd] = []
             if !outEOF { pfds.append(pollfd(fd: outR, events: Int16(POLLIN), revents: 0)) }
@@ -740,9 +1815,9 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 }
                 for pfd in pfds where pfd.revents != 0 {
                     if pfd.fd == outR {
-                        drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, cap: stdoutCap, budget: 64)
+                        drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, discarded: &outDiscarded, cap: stdoutCap, budget: 64)
                     } else {
-                        drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, cap: stderrCap, budget: 64)
+                        drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, discarded: &errDiscarded, cap: stderrCap, budget: 64)
                     }
                 }
             } else {
@@ -750,19 +1825,70 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 usleep(10_000)
             }
             var st: Int32 = 0
-            let wr = waitpid(pid, &st, WNOHANG)
-            if wr == pid {
+            var st2: Int32 = 0
+#if canImport(Glibc)
+            // Linux certified path: probe without reaping so leader stays zombie
+            // and pgid cannot be recycled. Final bounded reap (below) is the
+            // only place that sets reaped. Darwin: waitid+WNOWAIT not certified,
+            // fallback to waitpid and treat Darwin as unqualified for lifecycle.
+            // siginfo_t field access via raw offsets (si_code@8, si_pid@16,
+            // si_status@24) because Swift's Glibc overlay doesn't expose the
+            // macro-mapped si_pid/si_status members.
+            if _testHook_waitidECHILD {
+                errno = ECHILD
                 childDone = true
-                if (st & 0x7F) == 0 {
-                    exitStatus = (st >> 8) & 0xFF
-                } else {
-                    exitStatus = 128
+                // Do not set reaped — leave real child for final reap to avoid leak
+                unsafeToSignal = true
+            } else {
+                var info = siginfo_t()
+                let wr = Glibc.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+                if wr == 0 {
+                    let siCode: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 8, as: Int32.self) }
+                    let siPid: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 16, as: Int32.self) }
+                    if siPid == pid {
+                        childDone = true
+                        // Do NOT set reaped — leader stays unreaped zombie until final reap.
+                        if siCode == CLD_EXITED {
+                            let siStatus: Int32 = withUnsafeBytes(of: info) { $0.load(fromByteOffset: 24, as: Int32.self) }
+                            exitStatus = siStatus
+                            st2 = siStatus
+                        } else {
+                            exitStatus = 128
+                            st2 = 128
+                        }
+                        st = st2
+                    }
+                } else if wr != 0 && errno == ECHILD {
+                    childDone = true
+                    reaped = true
+                    unsafeToSignal = true
                 }
-            } else if wr < 0 && errno == ECHILD {
-                // Reaped elsewhere: no zombie can remain, but the status is
-                // unknown and the pid must never be signalled (reuse risk).
-                childDone = true
             }
+#else
+            if _testHook_waitidECHILD {
+                errno = ECHILD
+                childDone = true
+                unsafeToSignal = true
+            } else {
+                let wr = waitpid(pid, &st2, WNOHANG)
+                if wr == pid {
+                    childDone = true
+                    // Darwin fallback: waitpid reaps; pgid recycle risk unqualified.
+                    // Set reaped here on Darwin so group signals stop (safe fallback).
+                    reaped = true
+                    if (st2 & 0x7F) == 0 {
+                        exitStatus = (st2 >> 8) & 0xFF
+                    } else {
+                        exitStatus = 128
+                    }
+                    st = st2
+                } else if wr < 0 && errno == ECHILD {
+                    childDone = true
+                    reaped = true
+                    unsafeToSignal = true
+                }
+            }
+#endif
             let now = Self.monotonicNanos()
             // Deadline expiry is sticky and independent of child state: it is
             // evaluated BEFORE any success break, so a clean exit-0 whose EOF
@@ -775,21 +1901,34 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
                 cancelled = true
                 break
             }
-            if !childDone && now >= deadlineNanos && !termSent {
+            if (!childDone || (!reaped && useSession)) && now >= deadlineNanos && !intSent {
                 deadlineExceeded = true
-                termSent = true
+                intSent = true
 #if canImport(Glibc)
-                Glibc.kill(pid, SIGTERM)
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGINT) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGINT) }
 #else
-                Darwin.kill(pid, SIGTERM)
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGINT) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGINT) }
 #endif
                 killNanos = now + 2_000_000_000
-            }
-            if !childDone && termSent && !killSent && now >= killNanos {
+            } else if (!childDone || (!reaped && useSession)) && intSent && !termSent && now >= killNanos {
+                termSent = true
 #if canImport(Glibc)
-                Glibc.kill(pid, SIGKILL)
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGTERM) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGTERM) }
 #else
-                Darwin.kill(pid, SIGKILL)
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGTERM) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGTERM) }
+#endif
+                killNanos = now + 2_000_000_000
+            } else if (!childDone || (!reaped && useSession)) && termSent && !killSent && now >= killNanos {
+#if canImport(Glibc)
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGKILL) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGKILL) }
+#else
+                if !childDone && !unsafeToSignal { Self.killWithHook(pid, SIGKILL) }
+                if useSession && !reaped && !unsafeToSignal { Self.killWithHook(-pid, SIGKILL) }
 #endif
                 killSent = true
                 killNanos = now + 2_000_000_000
@@ -803,69 +1942,155 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
             }
             if childDone && outEOF && errEOF { break }
         }
-        if cancelled || (!childDone) {
-            // Escalate and reap; cancellation always terminates the child.
-            // Never signal a reaped pid (reuse risk): waitpid ECHILD marks
-            // childDone above, and every kill below is guarded by !childDone.
-            if !childDone {
-#if canImport(Glibc)
-                Glibc.kill(pid, SIGTERM)
-#else
-                Darwin.kill(pid, SIGTERM)
-#endif
+        // C1: cancellation/timeout/clean-probe share group-aware escalation.
+        // When useSession, the group is the containment boundary; when the
+        // leader is zombie (!reaped) but group still has live members (REV12
+        // /proc probe), the group signals must still be sent. The probe gates
+        // pointless escalation on every success (zombie leader alone answers
+        // kill(-pgid,0) but is not live). ECHILD sets unsafeToSignal/timeout.
+        let needsGroupProbe: Bool = {
+            guard useSession && !reaped && !unsafeToSignal else { return false }
+            if let live = Self.groupHasLiveMembers(pgid: pid) { return live }
+            return false // non-Linux unqualified or empty -> no group escalation on clean success
+        }()
+        let probeEscalated = needsGroupProbe
+        let enteredChildDone = childDone
+        if cancelled || (!childDone) || needsGroupProbe {
+            // Escalate before the single final reap (REV12). The leader stays
+            // zombie (waitid WNOWAIT) until the final bounded waitpid below,
+            // so TERM/KILL are not skipped. Probe-triggered escalation is
+            // marked timedOut (not success) even though pipes are EOF.
+            if !unsafeToSignal {
+                if !childDone && useSession {
+                    Self.killWithHook(pid, SIGINT); Self.killWithHook(-pid, SIGINT)
+                } else if !childDone {
+                    Self.killWithHook(pid, SIGINT)
+                } else if !reaped && useSession {
+                    // Zombie leader + live group (closed-stdio descendant)
+                    Self.killWithHook(-pid, SIGINT)
+                }
             }
+            // Wait 2s after INT without reaping (WNOWAIT poll) — TERM stage.
+            var intWaited = 0
+            while intWaited < 20 && !unsafeToSignal {
+#if canImport(Glibc)
+                var info2 = siginfo_t()
+                let wrInt = Glibc.waitid(P_PID, id_t(pid), &info2, WEXITED | WNOHANG | WNOWAIT)
+                if wrInt == 0 {
+                    let siPid2: Int32 = withUnsafeBytes(of: info2) { $0.load(fromByteOffset: 16, as: Int32.self) }
+                    if siPid2 == pid {
+                        childDone = true
+                        let siCode2: Int32 = withUnsafeBytes(of: info2) { $0.load(fromByteOffset: 8, as: Int32.self) }
+                        if siCode2 == CLD_EXITED {
+                            let siStatus2: Int32 = withUnsafeBytes(of: info2) { $0.load(fromByteOffset: 24, as: Int32.self) }
+                            exitStatus = siStatus2
+                        } else { exitStatus = 128 }
+                    }
+                } else if wrInt != 0 && errno == ECHILD {
+                    childDone = true; reaped = true; unsafeToSignal = true; break
+                }
+#else
+                let wrInt2 = waitpid(pid, &exitStatus, WNOHANG)
+                if wrInt2 == pid { childDone = true } // Darwin: waitpid reaps but we keep reaped false until final
+                if wrInt2 < 0 && errno == ECHILD { childDone = true; reaped = true; unsafeToSignal = true; break }
+#endif
+                if childDone && !enteredChildDone { break }
+                usleep(100_000); intWaited += 1
+            }
+            if !reaped && !unsafeToSignal {
+                // TERM grace (INT already sent). Covers cancellation and probe live.
+                if useSession { Self.killWithHook(-pid, SIGTERM) }
+                if !childDone { Self.killWithHook(pid, SIGTERM) }
+                var termWaited = 0
+                while termWaited < 20 && !unsafeToSignal {
+#if canImport(Glibc)
+                    var infoT = siginfo_t()
+                    let wrT = Glibc.waitid(P_PID, id_t(pid), &infoT, WEXITED | WNOHANG | WNOWAIT)
+                    if wrT == 0 {
+                        let siPidT: Int32 = withUnsafeBytes(of: infoT) { $0.load(fromByteOffset: 16, as: Int32.self) }
+                        if siPidT == pid {
+                            childDone = true
+                            let siCodeT: Int32 = withUnsafeBytes(of: infoT) { $0.load(fromByteOffset: 8, as: Int32.self) }
+                            if siCodeT == CLD_EXITED {
+                                let siStatusT: Int32 = withUnsafeBytes(of: infoT) { $0.load(fromByteOffset: 24, as: Int32.self) }
+                                exitStatus = siStatusT
+                            } else { exitStatus = 128 }
+                        }
+                    } else if wrT != 0 && errno == ECHILD { childDone = true; reaped = true; unsafeToSignal = true; break }
+#else
+                    let wrT2 = waitpid(pid, &exitStatus, WNOHANG)
+                    if wrT2 == pid { childDone = true }
+                    if wrT2 < 0 && errno == ECHILD { childDone = true; reaped = true; unsafeToSignal = true; break }
+#endif
+                    if childDone && !enteredChildDone { break }
+                    usleep(100_000); termWaited += 1
+                }
+            }
+            if !reaped && !unsafeToSignal {
+                // Final KILL escalation (split predicate) — before single final reap.
+                if useSession { Self.killWithHook(-pid, SIGKILL) }
+                if !childDone { Self.killWithHook(pid, SIGKILL) }
+                // Brief wait before final reap (so KILL has time to act), but do not reap yet.
+                usleep(200_000)
+            }
+            // Final bounded drain after escalation (before the single final reap).
+            drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, discarded: &outDiscarded, cap: stdoutCap, budget: 1024)
+            drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, discarded: &errDiscarded, cap: stderrCap, budget: 1024)
+        }
+        // Clean-completion reap: leader is zombie (!reaped) but group empty
+        // (probe false) — still must reap before return. Also covers rg/git
+        // when waitid WNOWAIT left zombie (Linux). Bounded, no signals.
+        // Not gated on unsafeToSignal — the ECHILD hook leaves a real child
+        // unreaped (reaped false, unsafe true) that must still be reaped; real
+        // ECHILD (no child) will return ECHILD and set reaped.
+        if !reaped {
             var st: Int32 = 0
             var waited = 0
-            while !childDone && waited < 20 {
-                let wr2 = waitpid(pid, &st, WNOHANG)
-                if wr2 == pid {
+            while !reaped && waited < 20 {
+                let wr = waitpid(pid, &st, WNOHANG)
+                if wr == pid {
+                    reaped = true
                     childDone = true
-                    if (st & 0x7F) == 0 {
-                        exitStatus = (st >> 8) & 0xFF
-                    } else {
-                        exitStatus = 128
-                    }
+                    if (st & 0x7F) == 0 { exitStatus = (st >> 8) & 0xFF } else { exitStatus = 128 }
                     break
                 }
-                if wr2 < 0 && errno == ECHILD {
-                    childDone = true
-                    break
-                }
-                usleep(100_000)
-                waited += 1
+                if wr < 0 && errno == ECHILD { reaped = true; childDone = true; unsafeToSignal = true; break }
+                usleep(100_000); waited += 1
             }
-            if !childDone {
-#if canImport(Glibc)
-                Glibc.kill(pid, SIGKILL)
-#else
-                Darwin.kill(pid, SIGKILL)
-#endif
-                var waited2 = 0
-                while !childDone && waited2 < 20 {
-                    let wr3 = waitpid(pid, &st, WNOHANG)
-                    if wr3 == pid {
-                        childDone = true
-                        if (st & 0x7F) == 0 {
-                            exitStatus = (st >> 8) & 0xFF
-                        } else {
-                            exitStatus = 128
-                        }
-                        break
-                    }
-                    if wr3 < 0 && errno == ECHILD {
-                        childDone = true
-                        break
-                    }
-                    usleep(100_000)
-                    waited2 += 1
-                }
+            if !reaped {
+                // Still unreaped after bound — leak, report as timeout (stop condition).
+                hardStopped = true
             }
-            // Final bounded drain after termination.
-            drain(fd: outR, eof: &outEOF, current: &outData, trunc: &outTruncCap, cap: stdoutCap, budget: 1024)
-            drain(fd: errR, eof: &errEOF, current: &errData, trunc: &errTruncCap, cap: stderrCap, budget: 1024)
         }
         close(outR)
         close(errR)
+        // C2 exec-error pipe classification
+        // - 0x02 + errno => execve failed, no process executed (pre-dispatch)
+        // - EOF without 0x01 => child died before exec (fchdir/setsid/dup2)
+        // - 0x01 + EOF => execve succeeded, process definitely began execution
+        // A death after 0x01 but before execve is conservatively classified as started.
+        if let err = execError {
+            if err.code == 0x02 {
+                // execve failure: map errno to pre-dispatch status
+                let summary: String
+                switch err.errno {
+                case ENOENT: summary = "exec failed: \(String(cString: strerror(err.errno)))"
+                case EACCES: summary = "exec failed: \(String(cString: strerror(err.errno)))"
+                case ENOEXEC: summary = "exec failed: invalid executable format"
+                case EBADF: summary = "exec failed: bad descriptor"
+                default: summary = "exec failed: \(String(cString: strerror(err.errno)))"
+                }
+                // Close the read end already done, now throw pre-dispatch
+                throw ToolFailure.preDispatch(status: "failed", summary: summary)
+            } else if err.code == 0x00 {
+                throw ToolFailure.preDispatch(status: "failed", summary: "child died before exec")
+            }
+        }
+        // Cancellation observed anywhere (classification wait, drain,
+        // escalation) surfaces as CancellationError, never as a normal
+        // result: the caller abandoned the run, so any outcome would be
+        // uncertain by construction. A definitive pre-dispatch frame above
+        // takes precedence when nothing was dispatched (fail-closed).
         if cancelled {
             throw CancellationError()
         }
@@ -873,9 +2098,12 @@ public struct NativeToolExecutor: ToolExecutor, Sendable {
         // still counts as a timeout (partial output is never success). An
         // unreaped survivor past the hard stop, or a hard stop with
         // unobservable EOF (reaped child, descendant-held pipe), is likewise
-        // a timeout — never masked as success.
-        let timedOut = deadlineExceeded || hardStopped || !childDone
-        return BoundedRunResult(stdout: outData, stderr: errData, status: exitStatus, truncated: outTruncCap || errTruncCap, stdoutTruncated: outTruncCap, timedOut: timedOut)
+        // a timeout — never masked as success. ECHILD (reaped elsewhere) is
+        // also a timeout — status unknown, never success. Probe-triggered
+        // escalation (clean pipes but live group) is also a timeout — descendant
+        // survived the leader, not a clean success.
+        let timedOut = deadlineExceeded || hardStopped || !childDone || unsafeToSignal || probeEscalated
+        return BoundedRunResult(stdout: outData, stderr: errData, status: exitStatus, truncated: outTruncCap || errTruncCap, stdoutTruncated: outTruncCap, stdoutDiscarded: outDiscarded, stderrDiscarded: errDiscarded, timedOut: timedOut)
     }
 
     /// Version gate over the qualified FD path with sanitized env, bounded

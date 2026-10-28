@@ -64,9 +64,20 @@ struct ApprovalPolicyTests {
         let (workspaceReads, _) = try Self.authorisingState(mode: .workspace, batch: reads, ids: &ids)
         #expect(workspaceReads.phase == .executing, "workspace reads need no approval")
         var ids2 = StateFixtures.ids(prefix: "u")
-        let askBatch = ToolBatch([ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d", arguments: "{}")])
+        // M2-C C0 fixture migration: the exec shape is now a real schema
+        // (plan REV12 §3.2); the demo single-hop approval outcome is
+        // preserved (trustedExec + ask ⇒ authorising).
+        let askBatch = ToolBatch([ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"/usr/bin/pytest\",\"argv\":[\"/usr/bin/pytest\",\"-q\"]}")] )
         let (trustedAsk, _) = try Self.authorisingState(mode: .trustedExec, batch: askBatch, ids: &ids2)
         #expect(trustedAsk.phase == .authorising, "exec=ask always asks, even trusted")
+        #expect(trustedAsk.pendingApproval?.operation.contains("unresolved (demo)") == true, "demo approval carries the unresolved marker")
+        // M2-C C0: the malformed `{}` shape is now invalid — deterministic
+        // continuation, never an approval (NC-5).
+        var ids3 = StateFixtures.ids(prefix: "m")
+        let malformed = ToolBatch([ToolProposal(callID: "c3", tool: "exec", argumentsDigest: "d", arguments: "{}")])
+        let (malformedOutcome, _) = try Self.authorisingState(mode: .trustedExec, batch: malformed, ids: &ids3)
+        #expect(malformedOutcome.phase == .requesting, "malformed exec takes the deterministic continuation, never approval")
+        #expect(malformedOutcome.pendingApproval == nil)
         // Observe + exec-allowed caps is a contradictory session: refused at creation.
         let snapshot = try StateFixtures.snapshot()
         do {

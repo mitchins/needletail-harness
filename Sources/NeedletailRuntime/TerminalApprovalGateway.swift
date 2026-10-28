@@ -50,7 +50,21 @@ public struct TerminalApprovalGateway: ApprovalGateway, Sendable {
             return .unavailable("no interactive terminal: headless approval unavailable")
         }
         var prompt = "needletail approval required\n"
-        prompt += "  operation: \(terminalSafe(request.operation))\n"
+        // M2-C C0 (plan REV12 §3.3): bounded display. The constructor
+        // already bounds `operation` at 8 KiB (the validator rejects
+        // unrenderable commands); this is defense in depth for any
+        // construction path — truncation is explicit and marked.
+        var operationDisplay = terminalSafe(request.operation)
+        if operationDisplay.utf8.count > 8 * 1024 {
+            operationDisplay = String(operationDisplay.prefix(8 * 1024)) + "…[elided]"
+        }
+        prompt += "  operation: \(operationDisplay)\n"
+        if !request.execIdentities.isEmpty {
+            prompt += "  bound identities (content-digest verified at dispatch):\n"
+            for id in request.execIdentities {
+                prompt += "    - \(terminalSafe(id.resolvedPath)) digest=\(terminalSafe(String(id.contentDigest.prefix(16))))…\n"
+            }
+        }
         prompt += "  grant: \(terminalSafe(request.requiredGrant))\n"
         if request.protectedPaths.isEmpty {
             prompt += "  paths: (none)\n"

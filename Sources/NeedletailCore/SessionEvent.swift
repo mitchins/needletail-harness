@@ -31,6 +31,10 @@ public enum SessionEvent: Sendable, Equatable {
     case effectCompleted(effectID: EffectID, runID: RunID, generation: Revision, expectedRevision: Revision, mutating: Bool, outcome: EffectOutcome, atMillis: UInt64)
     case effectFailed(effectID: EffectID, runID: RunID, generation: Revision, expectedRevision: Revision, mutating: Bool, error: String, atMillis: UInt64)
     case cancelledPendingRemoved(effectID: EffectID, atMillis: UInt64)
+    /// M2-C C0 phase 2 (plan REV12 §3.4b): resolution replies for an
+    /// in-flight `.resolveExecIdentities` effect.
+    case execIdentitiesResolved(resolutionID: String, runID: RunID, generation: Revision, identities: [ResolvedExecIdentity], atMillis: UInt64)
+    case execResolutionFailed(resolutionID: String, runID: RunID, generation: Revision, status: String, summary: String, atMillis: UInt64)
     case tick(nowMillis: UInt64)
 }
 

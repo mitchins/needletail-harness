@@ -66,9 +66,9 @@ private enum M1DCases {
     static func writeTools(_ directory: URL) throws -> String {
         let entries = [
             ["tool": "read", "arguments": "{\"path\":\"src/main.py\"}", "result": "read result"],
-            ["tool": "edit", "arguments": "{\"path\":\"src/main.py\",\"old\":\"a\",\"new\":\"b\"}", "result": "edit applied"],
-            ["tool": "exec", "arguments": "{\"command\":\"pytest\"}", "result": "pytest failure"],
-            ["tool": "edit", "arguments": "{\"path\":\"src/main.py\",\"old\":\"bad\",\"new\":\"fixed\"}", "result": "repair applied"],
+            ["tool": "edit", "arguments": "{\"path\":\"src/main.py\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"a\",\"new_string\":\"b\"}", "result": "edit applied"],
+            ["tool": "exec", "arguments": "{\"executable\":\"/usr/bin/pytest\",\"argv\":[\"/usr/bin/pytest\",\"-q\"]}", "result": "pytest failure"],
+            ["tool": "edit", "arguments": "{\"path\":\"src/main.py\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"bad\",\"new_string\":\"fixed\"}", "result": "repair applied"],
         ]
         let url = directory.appendingPathComponent("tools.json")
         try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys]).write(to: url)
@@ -125,11 +125,11 @@ private enum M1DCases {
             SSEScript(chunks: [ScriptChunk(bytes: Array(try toolCall(
                 "call-read-1", tool: "read", arguments: "{\"path\":\"src/main.py\"}").utf8))]),
             SSEScript(chunks: [ScriptChunk(bytes: Array(try toolCall(
-                "call-edit-1", tool: "edit", arguments: "{\"path\":\"src/main.py\",\"old\":\"a\",\"new\":\"b\"}").utf8))]),
+                "call-edit-1", tool: "edit", arguments: "{\"path\":\"src/main.py\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"a\",\"new_string\":\"b\"}").utf8))]),
             SSEScript(chunks: [ScriptChunk(bytes: Array(try toolCall(
-                "call-exec-1", tool: "exec", arguments: "{\"command\":\"pytest\"}").utf8))]),
+                "call-exec-1", tool: "exec", arguments: "{\"executable\":\"/usr/bin/pytest\",\"argv\":[\"/usr/bin/pytest\",\"-q\"]}").utf8))]),
             SSEScript(chunks: [ScriptChunk(bytes: Array(try toolCall(
-                "call-edit-2", tool: "edit", arguments: "{\"path\":\"src/main.py\",\"old\":\"bad\",\"new\":\"fixed\"}").utf8))]),
+                "call-edit-2", tool: "edit", arguments: "{\"path\":\"src/main.py\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"bad\",\"new_string\":\"fixed\"}").utf8))]),
             SSEScript(chunks: [ScriptChunk(bytes: Array(try finalText("fixed and tests pass").utf8))]),
         ]
     }
@@ -209,7 +209,7 @@ struct M1DCasesTests {
         let result = try M1DCases.run(M1DCases.runArguments(
             config: config, trace: directory.appendingPathComponent("trace.jsonl").path,
             tools: tools, trusted: true))
-        #expect(result.exit == 0, "headless loop completed: \(result.stderr)")
+        #expect(result.exit == 0, "headless loop completed: \(result.stderr) ")
         #expect(result.stdout.contains("\"kind\":\"delta\""), "streamed output visible in JSONL")
         #expect(result.stdout.contains("\"kind\":\"run_finished\""))
         #expect(server.requests.count == 5, "one request per turn, got \(server.requests.count)")
@@ -342,7 +342,7 @@ struct M1DCasesTests {
         defer { try? FileManager.default.removeItem(at: approvalDirectory) }
         let approvalServer = try LoopbackSSEServer()
         approvalServer.enqueue(SSEScript(chunks: [ScriptChunk(bytes: Array(
-            try M1DCases.toolCall("call-exec", tool: "exec", arguments: "{\"command\":\"pytest\"}").utf8))]))
+            try M1DCases.toolCall("call-exec", tool: "exec", arguments: "{\"executable\":\"/usr/bin/pytest\",\"argv\":[\"/usr/bin/pytest\",\"-q\"]}").utf8))]))
         approvalServer.start()
         defer { approvalServer.stop() }
         let approvalConfig = try M1DCases.writeConfig(

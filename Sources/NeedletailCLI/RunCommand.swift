@@ -50,6 +50,9 @@ struct RunCommand: ParsableCommand {
     @Flag(name: .long, help: "Trusted execution fixture: allow all tools without approval (demo only, not the default).")
     var trusted: Bool = false
 
+    @Flag(name: .long, help: "Allow native command execution inside the workspace (requires --workspace; every command needs explicit operator approval of its resolved identity; config tools.exec must also be granted). Conflicts with --trusted and --sealed.")
+    var allowExec: Bool = false
+
     @Option(name: .long, help: "Workspace root (must exist) for mutating file tools.")
     var workspace: String?
 
@@ -92,6 +95,22 @@ struct RunCommand: ParsableCommand {
         // silently ignored tool script would be a dispatch ambiguity.
         if tools != nil && (workspace != nil || !readRoot.isEmpty) {
             eprint("error: --tools and --workspace/--read-root are mutually exclusive (script entries require the scripted backend)")
+            throw ExitCode(2)
+        }
+        // M2-C C0 (plan REV12 §3.1): --allow-exec requires --workspace and
+        // conflicts with the demo/sealed modes. Host execution without
+        // workspace trust is the demo contradiction; sealed is monotone
+        // (I06); trusted is and stays the scripted demo path.
+        if allowExec && workspace == nil {
+            eprint("error: --allow-exec requires --workspace (host execution without workspace trust is not a supported combination)")
+            throw ExitCode(2)
+        }
+        if allowExec && trusted {
+            eprint("error: --allow-exec and --trusted are mutually exclusive (--trusted is the scripted demonstration mode)")
+            throw ExitCode(2)
+        }
+        if allowExec && sealed {
+            eprint("error: --allow-exec and --sealed are mutually exclusive")
             throw ExitCode(2)
         }
         if let ws = workspace {
@@ -156,12 +175,15 @@ struct RunCommand: ParsableCommand {
         let semBox = SemBox()
         let sealedCopy = sealed
         let trustedCopy = trusted
+        let allowExecCopy = allowExec
         Task { @Sendable in
             do {
                 try await RunCommand.executeStatic(
                     prompt: promptCopy, config: configCopy, trace: traceCopy,
                     format: formatCopy, tools: toolsCopy, alias: aliasCopy,
-                    maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy, workspace: workspaceCopy, readRoot: readRootCopy,                     acknowledgedDetermination: acknowledgedDetermination, interactiveApproval: interactiveApprovalTTY, isJSONL: isJSONL)
+                    maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy,
+                    allowExec: allowExecCopy, workspace: workspaceCopy, readRoot: readRootCopy,
+                    acknowledgedDetermination: acknowledgedDetermination, interactiveApproval: interactiveApprovalTTY, isJSONL: isJSONL)
             } catch let error as ExitCode {
                 box.lock.withLock { box.exitCode = error.rawValue }
             } catch {
@@ -353,7 +375,7 @@ struct RunCommand: ParsableCommand {
         return store
     }
 
-    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, workspace: String?, readRoot: [String], acknowledgedDetermination: String?, interactiveApproval: Bool, isJSONL: Bool) async throws {
+    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, allowExec: Bool, workspace: String?, readRoot: [String], acknowledgedDetermination: String?, interactiveApproval: Bool, isJSONL: Bool) async throws {
         // Unused format param kept for future envelope versioning
         _ = format
         // Private-by-default file creation for EVERYTHING this process
@@ -412,7 +434,12 @@ struct RunCommand: ParsableCommand {
         if trusted {
             workspaceGrant = .allAllowed
         } else if workspace != nil {
-            workspaceGrant = ToolCapabilities(read: true, search: true, edit: true, write: true, exec: .denied, consult: false)
+            // M2-C C0: --allow-exec raises the workspace grant ceiling to
+            // .ask (per-command approval). The EFFECTIVE policy remains the
+            // existing intersection — config tools.exec must also grant
+            // (absent defaults denied), and .allowed is structurally
+            // unreachable under native composition (NC-1 posture).
+            workspaceGrant = ToolCapabilities(read: true, search: true, edit: true, write: true, exec: allowExec ? .ask : .denied, consult: false)
         } else if !readRoot.isEmpty {
             workspaceGrant = ToolCapabilities(read: true, search: true, edit: false, write: false, exec: .denied, consult: false)
         } else {
@@ -428,10 +455,15 @@ struct RunCommand: ParsableCommand {
             eprint("trust inconsistency: \(error)")
             throw ExitCode(2)
         }
+        // M2-C C0 (plan REV12 §3.1): the single composition fact — native
+        // executor composed AND effective exec granted. Gates the two-phase
+        // resolution; advertisement threads this same field.
+        let execComposed = !trusted && !sealed && workspace != nil
+            && effective.tools.exec != .denied
         let epoch = EpochDescriptor(
             epochID: EpochID("epoch-run-\(UUID().uuidString)"),
             configSnapshot: snapshot, profile: profile,
-            effectiveCaps: effective, route: route)
+            effectiveCaps: effective, route: route, execComposed: execComposed)
         let state = SessionState(
             sessionID: SessionID("sess-run-\(UUID().uuidString)"),
             epoch: epoch, trustMode: mode, phase: .idle,
@@ -757,7 +789,8 @@ struct RunCommand: ParsableCommand {
                 nativeExecutor = NativeToolExecutor(
                     resolver: resolver, store: production,
                     sessionID: state.sessionID, writer: runIdentity,
-                    rgPath: Self.locateExecutable("rg"), gitPath: nil)
+                    rgPath: Self.locateExecutable("rg"), gitPath: nil,
+                    execGrant: execComposed)
             }
         }
         // Exactly one backend per run: native when composed above (always
@@ -792,7 +825,8 @@ struct RunCommand: ParsableCommand {
             messageProvider: messageProvider,
             credentialProvider: { ref, op in try credentialStore.resolve(ref, for: op) },
             snapshotProvider: { snapshot },
-            advertisedTools: effective.tools)
+            advertisedTools: effective.tools,
+            nativeExecComposed: execComposed)
 
         // 7. Actor
         // The fencing claim above already established this writer identity;
@@ -808,13 +842,32 @@ struct RunCommand: ParsableCommand {
             TerminalApprovalGateway, SystemClock, DeterministicIDSource
         >
         do {
+            // M2-C C0 (plan REV12 §3.4b.1): the native executor is the
+            // injected identity resolver when composed; nil otherwise
+            // (fail-closed default — hop 1 resolves .unavailable).
+            let identityResolver: (any ExecIdentityResolver)?
+            if execComposed, let native = nativeExecutor {
+                identityResolver = native
+            } else {
+                identityResolver = nil
+            }
             actor = try SessionActor(
                 state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
                 transport: transport, executor: executor, store: store,
-                approvals: TerminalApprovalGateway(), sink: sink, writer: writerID)
+                approvals: TerminalApprovalGateway(), sink: sink, writer: writerID,
+                execResolver: identityResolver)
         } catch {
             try? await httpClient.shutdown().get()
             throw error
+        }
+
+        // M2-C C3 §10.4: operator-visible composition banner. Emitted on
+        // stderr (stdout stays JSONL-pure) whenever the native executor is
+        // actually composed — host execution is NOT OS-isolated, and the
+        // /proc/self/fd execution path is Linux-only. No banner on
+        // scripted/sealed/demo runs (nothing executes on the host there).
+        if execComposed, nativeExecutor != nil {
+            eprint("needletail: native exec composed (host execution is not OS-isolated; Linux-only execution path)")
         }
 
         // H2: catchable SIGINT drives production cancellation (not a default

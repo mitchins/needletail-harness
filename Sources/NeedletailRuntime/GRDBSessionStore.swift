@@ -53,7 +53,8 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     /// physical bytes: one row per digest with at least one committed
     /// reference, plus reconciled orphans). Migration backfills both via
     /// recompute-to-expected (see migrateIfNeeded).
-    public static let schemaVersion: Int32 = 3
+    /// v4 (M2-C C2): spill leases for exec output (per-stream, boot-qualified)
+    public static let schemaVersion: Int32 = 4
 
     /// B3-B byte quotas (SPEC §9.2): 1 GiB per-session logical,
     /// 5 GiB global physical, 256 MiB free-space reserve. Configurable at
@@ -113,6 +114,13 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 try db.execute(sql: "PRAGMA synchronous = FULL")
             }
             try migrateIfNeeded()
+            // M2-C C2: reclaim crashed/other-boot spill leases once per open,
+            // before any run begins (dual reclaim — never races live leases).
+            // A sweep failure fails the open closed (fail-closed recovery):
+            // an unreclaimed lease table would silently poison grant quotas.
+            // A skipped sweep (unreadable boot-id) is a documented leak, not
+            // an error — live leases are never reclaimed on an unsound base.
+            try sweepSpillLeases()
         } catch let error as StoreError {
             throw error
         } catch {
@@ -143,7 +151,8 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 let userTables = try Set(String.fetchAll(
                     db, sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"))
                 let v2Shape: Set<String> = ["records", "writer"]
-                if !userTables.isEmpty && userTables != Set(Self.declaredShape.keys) && userTables != v2Shape {
+                let v3Shape: Set<String> = ["records", "writer", "byte_usage", "artifact_physical"]
+                if !userTables.isEmpty && userTables != Set(Self.declaredShape.keys) && userTables != v2Shape && userTables != v3Shape {
                     throw StoreError.integrity(
                         "foreign unversioned store: tables [\(userTables.sorted().joined(separator: ", "))] are not a needletail schema")
                 }
@@ -235,6 +244,21 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
                 _ = try Self.reconcileByteUsageInTxn(db, artifactsRoot: Self.artifactsRoot(for: path))
                 try db.execute(sql: "PRAGMA user_version = 3")
             }
+            if version < 4 {
+                try db.execute(sql: """
+                    CREATE TABLE IF NOT EXISTS spill_leases(
+                        leaseID TEXT PRIMARY KEY,
+                        session TEXT NOT NULL,
+                        stream TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        bytes INTEGER NOT NULL CHECK (bytes >= 0),
+                        grantedBootID TEXT NOT NULL,
+                        grantedMonotonic INTEGER NOT NULL,
+                        writer TEXT NOT NULL)
+                    """)
+                try db.execute(sql: "CREATE INDEX IF NOT EXISTS spill_leases_session ON spill_leases(session)")
+                try db.execute(sql: "PRAGMA user_version = 4")
+            }
         try Self.assertSchemaShape(db)
         try db.execute(sql: "PRAGMA user_version = \(Self.schemaVersion)")
         }
@@ -270,6 +294,16 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         "artifact_physical": [
             ColumnSpec("digest", "TEXT", pk: true),
             ColumnSpec("size", "INTEGER"),
+        ],
+        "spill_leases": [
+            ColumnSpec("leaseID", "TEXT", pk: true),
+            ColumnSpec("session", "TEXT"),
+            ColumnSpec("stream", "TEXT"),
+            ColumnSpec("kind", "TEXT"),
+            ColumnSpec("bytes", "INTEGER"),
+            ColumnSpec("grantedBootID", "TEXT"),
+            ColumnSpec("grantedMonotonic", "INTEGER"),
+            ColumnSpec("writer", "TEXT"),
         ],
     ]
 
@@ -997,6 +1031,504 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
     }
 }
 
+    // MARK: - M2-C C2 spill-lease API (per-stream, boot-qualified)
+
+    /// Injectable seams for tests (never set in production): TTL override,
+    /// boot-id override/failure injection, and monotonic-clock override.
+    nonisolated(unsafe) static var _testHook_spillTTL: TimeInterval?
+    nonisolated(unsafe) static var _testHook_bootIDFails = false
+    nonisolated(unsafe) static var _testHook_bootIDOverride: String?
+    nonisolated(unsafe) static var _testHook_monotonicOverride: UInt64?
+
+    private static var spillTTL: TimeInterval { _testHook_spillTTL ?? 2400 }
+
+    private static func currentBootID() -> String? {
+        if _testHook_bootIDFails { return nil }
+        if let override = _testHook_bootIDOverride { return override }
+        if let id = try? String(contentsOfFile: "/proc/sys/kernel/random/boot_id", encoding: .utf8) {
+            let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+#if canImport(Darwin)
+        // No boot_id file on Darwin: kern.boottime changes every boot, so it
+        // is a valid boot identity (wall-clock derived, not kernel-random).
+        var bt = timeval()
+        var size = MemoryLayout<timeval>.size
+        let rc = "kern.boottime".withCString { name in
+            sysctlbyname(name, &bt, &size, nil, 0)
+        }
+        if rc == 0 { return "darwin-boot-\(bt.tv_sec)-\(bt.tv_usec)" }
+#endif
+        return nil
+    }
+
+    private static func currentMonotonic() -> UInt64 {
+        if let override = _testHook_monotonicOverride { return override }
+#if canImport(Glibc)
+        var ts = timespec()
+        clock_gettime(CLOCK_BOOTTIME, &ts)
+        return UInt64(ts.tv_sec) * 1_000_000_000 + UInt64(ts.tv_nsec)
+#else
+        return UInt64(Date().timeIntervalSince1970 * 1e9)
+#endif
+    }
+
+    public func openArtifactSpill(session: SessionID, as identity: WriterIdentity, kind: String, stream: String, requestedBytes: Int64) throws -> SpillHandle {
+        do {
+            return try openArtifactSpillImpl(session: session, as: identity, kind: kind, stream: stream, requestedBytes: requestedBytes)
+        } catch { throw Self.translate(error) }
+    }
+
+    private func openArtifactSpillImpl(session: SessionID, as identity: WriterIdentity, kind: String, stream: String, requestedBytes: Int64) throws -> SpillHandle {
+        guard session == identity.session else { throw StoreError.integrity("spill session/identity mismatch") }
+        guard !kind.isEmpty, !stream.isEmpty else { throw StoreError.integrity("spill kind/stream empty") }
+        // Handle-confinement: the stream becomes a filename component, so it
+        // must be a bare name (no separators, dot-segments, or NUL). The
+        // executor only ever passes "stdout"/"stderr"; anything else that
+        // reaches the store fails closed here, before any filesystem touch.
+        guard stream.utf8.allSatisfy({ $0 != 0x2F && $0 != 0x00 }),
+              stream != ".", stream != "..",
+              !stream.contains("..") else { throw StoreError.integrity("spill stream is not a bare name") }
+        guard !kind.contains("/") && !kind.contains("\0") else { throw StoreError.integrity("spill kind invalid") }
+        guard requestedBytes >= 0 && requestedBytes <= 32*1024*1024 else { throw StoreError.quotaExceeded(limit: 32*1024*1024) }
+        return try withArtifactLock(timeout: 10) {
+            gate.lock(); defer { gate.unlock() }
+            try assertOpenLocked()
+            let holder: String? = try queue.read { db in try String.fetchOne(db, sql: "SELECT writer FROM writer WHERE session = ?", arguments: [identity.session.raw]) }
+            guard holder == identity.writer else { throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer) }
+            // Boot-qualified time base (REV8/REV9): an unreadable boot-id
+            // fails the grant typed — never grant unsound leases. A
+            // second-stream refusal aborts the whole exec call (the
+            // executor releases the first lease synchronously).
+            guard let bootID = Self.currentBootID(), !bootID.isEmpty else { throw StoreError.integrity("boot_id unavailable") }
+            let mono = Self.currentMonotonic()
+            // A publish commits one artifactPublished row: enforce the
+            // record-count quotas at grant (fail before spawn, not after).
+            let root = artifactsRoot
+            do {
+                try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            } catch {
+                // A pre-existing root is fine (verified below via the held
+                // root FD); anything else fails closed (precedent pattern).
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: root, isDirectory: &isDir),
+                      isDir.boolValue else {
+                    throw StoreError.integrity("artifact root is not a directory: \(root)")
+                }
+            }
+            let rootFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard rootFD >= 0 else { throw StoreError.integrity("artifact root open failed") }
+            defer { closeArtifactFD(rootFD) }
+            let global = try queue.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records") } ?? 0
+            guard global + 1 <= globalRecordLimit else { throw StoreError.quotaExceeded(limit: globalRecordLimit) }
+            let sessionRows = try queue.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE session = ?", arguments: [identity.session.raw]) } ?? 0
+            guard sessionRows + 1 <= sessionRecordLimit else { throw StoreError.quotaExceeded(limit: sessionRecordLimit) }
+            // Lease-aware byte quotas (REV9 formula): committed + outstanding
+            // leases + this grant must fit both dimensions. The grant key is
+            // a certainly-new digest so the precedent check counts it fully.
+            let leaseID = UUID()
+            let grantKey = "spill-grant-\(leaseID.uuidString)"
+            do {
+                var view = try queue.read { db in try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: nil) }
+                let outstanding: (session: Int64, global: Int64) = try queue.read { db in
+                    let s = try Int64.fetchOne(db, sql: "SELECT COALESCE(SUM(bytes),0) FROM spill_leases WHERE session = ?", arguments: [identity.session.raw]) ?? 0
+                    let g = try Int64.fetchOne(db, sql: "SELECT COALESCE(SUM(bytes),0) FROM spill_leases") ?? 0
+                    return (s, g)
+                }
+                view.logicalCurrent += outstanding.session
+                view.physicalSum += outstanding.global
+                try checkByteQuotas(view, session: identity.session.raw, payloadBytes: 512, digest: grantKey, size: requestedBytes)
+            } catch { throw Self.translate(error) }
+            // Free-space with undrawn leases (REV8): bytes already drawn to
+            // staging are reflected in statfs itself, so only undrawn bytes
+            // (granted − min(granted, staged size)) of existing leases count
+            // on top of the reserve + this grant. All opens are
+            // descriptor-relative with O_NOFOLLOW; a missing staging file
+            // counts fully undrawn (conservative). Sampled before statfs —
+            // the residual race is bounded by the byte quotas (REV8 minor).
+            do {
+                let others: [(id: String, stream: String, granted: Int64)] = try queue.read { db in
+                    try Row.fetchAll(db, sql: "SELECT leaseID, stream, bytes FROM spill_leases").compactMap { row in
+                        guard let id: String = row["leaseID"], let stream: String = row["stream"] else { return nil }
+                        return (id, stream, (row["bytes"] as Int64?) ?? 0)
+                    }
+                }
+                var undrawn: UInt64 = 0
+                for other in others where other.granted > 0 {
+                    let stagedName = ".tmp-lease-\(other.id)-\(other.stream)"
+                    var stagedSize: Int64 = 0
+                    let sfd: Int32 = stagedName.withCString { openat(rootFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+                    if sfd >= 0 {
+                        var fst = stat()
+                        if fstat(sfd, &fst) == 0, (fst.st_mode & S_IFMT) == S_IFREG {
+                            stagedSize = Int64(fst.st_size)
+                        }
+                        closeArtifactFD(sfd)
+                    }
+                    let drawn = min(other.granted, max(0, stagedSize))
+                    undrawn += UInt64(bitPattern: other.granted - drawn)
+                }
+                let fsPath = URL(fileURLWithPath: path).deletingLastPathComponent().path
+                if let free = Self.freeBytesAvailable(atPath: fsPath) {
+                    let (need1, o1) = UInt64(bitPattern: freeSpaceReserve).addingReportingOverflow(UInt64(bitPattern: requestedBytes))
+                    let (need, o2) = need1.addingReportingOverflow(undrawn)
+                    guard !o1, !o2, free >= need else { throw StoreError.quotaExceeded(limit: Int(freeSpaceReserve)) }
+                }
+            } catch let error as StoreError { throw error } catch { throw Self.translate(error) }
+            // Grant order: row first, then the staging file (REV9 grant-order
+            // argument — a row-less staging file is provably never live, and
+            // the sweep reclaims it by TTL). O_EXCL so a reused name fails.
+            let name = ".tmp-lease-\(leaseID.uuidString)-\(stream)"
+            try queue.write { db in
+                let h2: String? = try String.fetchOne(db, sql: "SELECT writer FROM writer WHERE session = ?", arguments: [identity.session.raw])
+                guard h2 == identity.writer else { throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer) }
+                try db.execute(sql: "INSERT INTO spill_leases(leaseID, session, stream, kind, bytes, grantedBootID, grantedMonotonic, writer) VALUES (?,?,?,?,?,?,?,?)",
+                               arguments: [leaseID.uuidString, session.raw, stream, kind, requestedBytes, bootID, Int64(bitPattern: mono), identity.writer])
+            }
+            let fd: Int32 = name.withCString { openat(rootFD, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600)) }
+            guard fd >= 0 else {
+                try? queue.write { db in try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ?", arguments: [leaseID.uuidString]) }
+                throw StoreError.integrity("spill file create failed: \(String(cString: strerror(errno)))")
+            }
+            closeArtifactFD(fd)
+            let spillPath = (root as NSString).appendingPathComponent(name)
+            return SpillHandle(leaseID: leaseID, session: session, stream: stream, kind: kind, path: spillPath, bytes: requestedBytes)
+        }
+    }
+
+    public func publishArtifactFromFile(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle, operationID: OperationID? = nil) throws -> ArtifactRef {
+        do {
+            return try publishArtifactFromFileImpl(session: session, as: identity, kind: kind, spill: spill, operationID: operationID)
+        } catch { throw Self.translate(error) }
+    }
+
+    private func publishArtifactFromFileImpl(session: SessionID, as identity: WriterIdentity, kind: String, spill: SpillHandle, operationID: OperationID? = nil) throws -> ArtifactRef {
+        guard session == identity.session && session == spill.session else { throw StoreError.integrity("publish session mismatch") }
+        guard kind == spill.kind else { throw StoreError.integrity("publish kind mismatch") }
+        return try withArtifactLock {
+            gate.lock(); defer { gate.unlock() }
+            try assertOpenLocked()
+            // Writer-fencing pre-work (REV9 M2): the session's claim must
+            // still be ours before any filesystem work.
+            let holder: String? = try queue.read { db in try String.fetchOne(db, sql: "SELECT writer FROM writer WHERE session = ?", arguments: [identity.session.raw]) }
+            guard holder == identity.writer else { throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer) }
+            // The staging file must live directly in OUR artifact root AND be
+            // exactly this lease's file: a forged handle pointing elsewhere
+            // — or at another lease's staging file — fails here and never
+            // publishes, renames, or deletes foreign bytes.
+            let root = artifactsRoot
+            let spillDir = (spill.path as NSString).deletingLastPathComponent
+            guard spillDir == root else { throw StoreError.integrity("spill path escapes artifact root") }
+            let stagingBase = (spill.path as NSString).lastPathComponent
+            let boundName = ".tmp-lease-\(spill.leaseID.uuidString)-\(spill.stream)"
+            guard stagingBase == boundName else { throw StoreError.integrity("spill handle does not bind its lease file") }
+            guard spill.bytes >= 0 else { throw StoreError.integrity("spill size invalid") }
+            let leaseRow: (stream: String, kind: String, bytes: Int64)? = try queue.read { db in
+                try Row.fetchOne(db, sql: "SELECT stream, kind, bytes FROM spill_leases WHERE leaseID = ? AND session = ? AND writer = ?", arguments: [spill.leaseID.uuidString, session.raw, identity.writer]).map { row in
+                    ((row["stream"] as String?) ?? "", (row["kind"] as String?) ?? "", (row["bytes"] as Int64?) ?? -1)
+                }
+            }
+            guard let leaseRow, leaseRow.stream == spill.stream, leaseRow.kind == spill.kind, leaseRow.bytes == spill.bytes,
+                  leaseRow.kind == kind else {
+                throw StoreError.integrity("lease not found, reclaimed, or mismatched")
+            }
+            // A publish commits one artifactPublished row: record-count
+            // quotas are enforced before touching the filesystem.
+            let global = try queue.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records") } ?? 0
+            guard global + 1 <= globalRecordLimit else { throw StoreError.quotaExceeded(limit: globalRecordLimit) }
+            let sessionRows = try queue.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE session = ?", arguments: [identity.session.raw]) } ?? 0
+            guard sessionRows + 1 <= sessionRecordLimit else { throw StoreError.quotaExceeded(limit: sessionRecordLimit) }
+            // Stage read (fd-relative, no-follow, bounded): the staging file
+            // is the authority — a missing/swapped/non-regular staging file
+            // fails closed, never an empty or foreign artifact.
+            do {
+                try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            } catch {
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: root, isDirectory: &isDir),
+                      isDir.boolValue else {
+                    throw StoreError.integrity("artifact root is not a directory: \(root)")
+                }
+            }
+            let rootFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard rootFD >= 0 else { throw StoreError.integrity("artifact root open failed") }
+            defer { closeArtifactFD(rootFD) }
+            let stagedFD: Int32 = stagingBase.withCString { openat(rootFD, $0, O_RDWR | O_NOFOLLOW | O_CLOEXEC) }
+            guard stagedFD >= 0 else { throw StoreError.integrity("spill staging file missing: \(String(cString: strerror(errno)))") }
+            defer { closeArtifactFD(stagedFD) }
+            var stagedStatus = stat()
+            guard fstat(stagedFD, &stagedStatus) == 0, (stagedStatus.st_mode & S_IFMT) == S_IFREG else {
+                throw StoreError.integrity("spill staging is not a regular file")
+            }
+            guard fsync(stagedFD) == 0 else { throw StoreError.integrity("spill staging fsync failed") }
+            let staged: Data
+            do {
+                staged = try readBoundedFD(stagedFD, bound: artifactByteLimit + 1)
+            } catch let error as StoreError { throw error } catch {
+                throw StoreError.integrity("spill staging read failed: \(error)")
+            }
+            guard staged.count <= artifactByteLimit else { throw StoreError.quotaExceeded(limit: artifactByteLimit) }
+            // The lease reserves staging headroom: drained output can never
+            // exceed the grant (caps are equal by construction, but the
+            // store enforces its own bound rather than trusting the caller).
+            guard Int64(staged.count) <= spill.bytes else { throw StoreError.integrity("spill staging exceeds its lease") }
+            // Zero-byte rule (plan §3.6): no empty artifacts — an empty
+            // staging file releases its lease via releaseArtifactSpill and
+            // never publishes. A direct publish call on empty staging fails
+            // closed (the executor upholds the rule; the store enforces it).
+            guard !staged.isEmpty else { throw StoreError.integrity("spill staging is empty") }
+            let digest = artifactSHA256Hex(staged)
+            guard !digest.isEmpty else { throw StoreError.integrity("spill digest failed") }
+            let ref = ArtifactRef(digest: digest, size: staged.count, kind: kind, operationID: operationID)
+            let payload = try RecordCodec.encode(DurableRecord.artifactPublished(ref))
+            let finalPath = try resolveArtifactPath(root: root, name: digest)
+            var didRename = false
+            var adoptedFinal = false
+            do { try queue.write { db in
+                // In-transaction writer-fence re-check (REV9 M2) + lease
+                // re-check under the lock (reclaimed while we waited ⇒ typed
+                // failure, never a false success). Record-count quotas are
+                // enforced HERE (not just at the pre-work read above): the
+                // check and the commit are one atomic unit, so concurrent
+                // publishers cannot jointly overshoot the limits.
+                let h2: String? = try String.fetchOne(db, sql: "SELECT writer FROM writer WHERE session = ?", arguments: [identity.session.raw])
+                guard h2 == identity.writer else { throw StoreError.notWriter(session: identity.session.raw, writer: identity.writer) }
+                let lease2: Int = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spill_leases WHERE leaseID = ? AND writer = ?", arguments: [spill.leaseID.uuidString, identity.writer]) ?? 0
+                guard lease2 > 0 else { throw StoreError.integrity("lease reclaimed") }
+                let globalInTxn = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records") ?? 0
+                guard globalInTxn + 1 <= globalRecordLimit else { throw StoreError.quotaExceeded(limit: globalRecordLimit) }
+                let sessionInTxn = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE session = ?", arguments: [identity.session.raw]) ?? 0
+                guard sessionInTxn + 1 <= sessionRecordLimit else { throw StoreError.quotaExceeded(limit: sessionRecordLimit) }
+                // Adopt path (identical-digest second publish): a verifying
+                // final file means the bytes are already durable — skip the
+                // rename, still commit the reference + lease deletion.
+                // Quota then skips the adopted size globally while the
+                // snapshot accounts it exactly once either way (precedent).
+                if FileManager.default.fileExists(atPath: finalPath) {
+                    let afd: Int32 = digest.withCString { openat(rootFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+                    guard afd >= 0 else { throw StoreError.integrity("artifact file cannot be opened (symlink?): \(digest)") }
+                    defer { closeArtifactFD(afd) }
+                    var astat = stat()
+                    guard fstat(afd, &astat) == 0, (astat.st_mode & S_IFMT) == S_IFREG else {
+                        throw StoreError.integrity("artifact path is not a regular file: \(digest)")
+                    }
+                    let existing: Data
+                    do { existing = try readBoundedFD(afd, bound: staged.count + 1) } catch let error as StoreError { throw error } catch {
+                        throw StoreError.integrity("artifact verification failed for digest \(digest): \(error)")
+                    }
+                    guard existing.count == staged.count, artifactSHA256Hex(existing) == digest else {
+                        throw StoreError.integrity("artifact collision at digest \(digest): stored bytes differ")
+                    }
+                    guard fchmod(afd, mode_t(0o600)) == 0 else { throw StoreError.integrity("artifact file mode cannot be repaired: \(digest)") }
+                    guard fsync(afd) == 0 else { throw StoreError.integrity("artifact file sync failed: \(digest)") }
+                    try syncArtifactDirectory(atPath: root)
+                    adoptedFinal = true
+                }
+                let snap = try Self.snapshotByteQuotas(db, artifactsRoot: root, session: identity.session.raw, digest: digest)
+                try checkByteQuotas(snap, session: identity.session.raw, payloadBytes: Int64(payload.count), digest: digest, size: Int64(staged.count), globalSizeAlreadyCounted: adoptedFinal)
+                let sessionHasD = snap.sessionHasDigest
+                // Re-verify the staging file (fresh open relative to the
+                // held root FD, no-follow, digest). The held root FD pins
+                // the directory: a swapped root or planted symlink fails.
+                let stagingVerified: Bool = {
+                    let fd: Int32 = stagingBase.withCString { openat(rootFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+                    guard fd >= 0 else { return false }
+                    defer { closeArtifactFD(fd) }
+                    guard let data = try? readBoundedFD(fd, bound: staged.count + 1),
+                          data.count == staged.count,
+                          artifactSHA256Hex(data) == digest else { return false }
+                    return true
+                }()
+                guard stagingVerified else { throw StoreError.integrity("spill staging failed verification for digest \(digest)") }
+                if !adoptedFinal {
+                    let renameOK: Bool = digest.withCString { newName in
+                        stagingBase.withCString { stagingC in
+                            renameat(rootFD, stagingC, rootFD, newName) == 0
+                        }
+                    }
+                    guard renameOK else { throw StoreError.integrity("spill rename failed: \(String(cString: strerror(errno)))") }
+                    didRename = true
+                    try syncArtifactDirectory(atPath: root)
+                }
+                try commitRecordBytes(db, session: identity.session.raw, payload: payload, digest: digest, size: Int64(staged.count), sessionHasDigest: sessionHasD)
+                try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ?", arguments: [spill.leaseID.uuidString])
+            } } catch {
+                // Conditional cleanup in a SECOND queue.write under the SAME
+                // artifact lock: delete the staging always (it is ours and
+                // unreferenced by definition — staging names are leaseIDs,
+                // never reference targets), and delete the final file ONLY
+                // when this call renamed it AND no committed reference for
+                // this digest exists AND no committed physical row for it is
+                // live — never a pre-existing file this call merely observed.
+                try? queue.write { db in
+                    guard didRename else { return }
+                    let refExists: Bool
+                    do { refExists = try Self.hasCommittedReference(db, digest: digest) } catch { return }
+                    let physCount = (try? Int.fetchOne(db, sql: "SELECT COUNT(*) FROM artifact_physical WHERE digest = ?", arguments: [digest])) ?? 1
+                    if !refExists && physCount == 0 {
+                        _ = digest.withCString { unlinkat(rootFD, $0, 0) }
+                    }
+                }
+                _ = stagingBase.withCString { unlinkat(rootFD, $0, 0) }
+                throw Self.translate(error)
+            }
+            if adoptedFinal {
+                // Adopt left our staging file behind: remove it now that the
+                // reference + lease deletion committed (a failure here leaves
+                // a row-less .tmp-lease- name the sweep reclaims by TTL).
+                _ = stagingBase.withCString { unlinkat(rootFD, $0, 0) }
+            }
+            return ref
+        }
+    }
+
+    public func releaseArtifactSpill(as identity: WriterIdentity, handle: SpillHandle) throws {
+        do {
+            try releaseArtifactSpillImpl(as: identity, handle: handle)
+        } catch { throw Self.translate(error) }
+    }
+
+    private func releaseArtifactSpillImpl(as identity: WriterIdentity, handle: SpillHandle) throws {
+        try withArtifactLock(timeout: 10) {
+            gate.lock(); defer { gate.unlock() }
+            try assertOpenLocked()
+            let holder: String? = try queue.read { db in try String.fetchOne(db, sql: "SELECT writer FROM writer WHERE session = ?", arguments: [handle.session.raw]) }
+            if holder != identity.writer {
+                throw StoreError.notWriter(session: handle.session.raw, writer: identity.writer)
+            }
+            let root = artifactsRoot
+            let rootFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            // Cleanup registered immediately: the handle-binding guard and
+            // the lease-row delete below both throw, and neither may leak
+            // the root descriptor.
+            defer { if rootFD >= 0 { closeArtifactFD(rootFD) } }
+            // Bound to the lease's own staging name (reconstructed, never
+            // trusted from the handle path): a forged handle can neither
+            // delete an arbitrary path nor escape the root. No
+            // FileManager fallback — fd-relative or nothing.
+            let boundName = ".tmp-lease-\(handle.leaseID.uuidString)-\(handle.stream)"
+            guard (handle.path as NSString).deletingLastPathComponent == root,
+                  (handle.path as NSString).lastPathComponent == boundName else {
+                throw StoreError.integrity("spill handle does not bind its lease file")
+            }
+            try queue.write { db in
+                try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ? AND writer = ?", arguments: [handle.leaseID.uuidString, identity.writer])
+            }
+            if rootFD >= 0 {
+                _ = boundName.withCString { unlinkat(rootFD, $0, 0) }
+            }
+        }
+    }
+
+    /// M2-C C2 startup spill-lease sweep (dual reclaim, REV6/REV9). Runs once
+    /// per store open, under the artifact lock, before any run begins so it
+    /// can never race the live run's own leases:
+    /// - boot-id mismatch ⇒ unconditional reclaim (every old-boot process
+    ///   is gone — closes the host-reboot hole);
+    /// - same-boot leases older than the TTL ⇒ reclaim (crashed sessions are
+    ///   unreachable via claim takeover, so TTL is the reachability path);
+    /// - row-less `.tmp-lease-` staging files older than the TTL ⇒ delete
+    ///   (row-less files are provably never live: the lease row is inserted
+    ///   before the staging file is created, and publish requires the row).
+    /// A clock step forward can make a young row-less file look old
+    /// (premature deletion — safe, row-less files are never live); a step
+    /// backward delays reclamation. An unreadable boot-id skips the sweep
+    /// for that run (conservative leak, documented — never reclaim live
+    /// leases on an unsound time base).
+    func sweepSpillLeases() throws {
+        do {
+            try sweepSpillLeasesImpl()
+        } catch { throw Self.translate(error) }
+    }
+
+    private func sweepSpillLeasesImpl() throws {
+        try withArtifactLock {
+            gate.lock(); defer { gate.unlock() }
+            try assertOpenLocked()
+            guard let boot = Self.currentBootID(), !boot.isEmpty else { return }
+            let now = Self.currentMonotonic()
+            let ttlNanos = UInt64(Self.spillTTL * 1_000_000_000)
+            let root = artifactsRoot
+            var staleNames: [String] = []
+            try queue.write { db in
+                for row in try Row.fetchAll(db, sql: "SELECT leaseID, session, stream, grantedBootID, grantedMonotonic FROM spill_leases") {
+                    guard let id: String = row["leaseID"], let stream: String = row["stream"] else { continue }
+                    // Sweep-time confinement: only bare-name streams are
+                    // ever unlinked, and only by fd-relative basename.
+                    // A tampered row (separator, dot-segment, NUL) is
+                    // deleted from the table but its file is left for the
+                    // row-less sweep below (which applies the same name
+                    // gate plus a TTL), never unlinked by a raw path.
+                    guard !stream.isEmpty,
+                          stream.utf8.allSatisfy({ $0 != 0x2F && $0 != 0x00 }),
+                          stream != ".", stream != "..", !stream.contains(".."),
+                          UUID(uuidString: id) != nil else {
+                        try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ?", arguments: [id])
+                        continue
+                    }
+                    let gBoot: String? = row["grantedBootID"]
+                    let gMono: Int64? = row["grantedMonotonic"]
+                    var stale = false
+                    if gBoot != boot {
+                        stale = true
+                    } else if let m = gMono {
+                        let mu = UInt64(bitPattern: m)
+                        // A backward clock step (now < granted) never counts
+                        // as stale — only forward age past the TTL reclaims.
+                        if now >= mu && now - mu > ttlNanos { stale = true }
+                    }
+                    if stale {
+                        try db.execute(sql: "DELETE FROM spill_leases WHERE leaseID = ?", arguments: [id])
+                        staleNames.append(".tmp-lease-\(id)-\(stream)")
+                    }
+                }
+            }
+            // Fd-relative unlink against the held root FD (no path
+            // traversal: basenames only, O_NOFOLLOW not needed for unlinkat
+            // with a validated bare name, and the root FD pins the
+            // directory — a swapped root fails at open).
+            let rootFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            if rootFD >= 0 {
+                defer { closeArtifactFD(rootFD) }
+                for name in staleNames {
+                    _ = name.withCString { unlinkat(rootFD, $0, 0) }
+                }
+            }
+            // Row-less sweep: staging names whose lease row is gone and whose
+            // mtime is older than the TTL. File age uses wall-clock mtime
+            // (approximate, documented direction notes above).
+            guard FileManager.default.fileExists(atPath: root) else { return }
+            let sweepFD: Int32 = root.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            guard sweepFD >= 0 else { return }
+            defer { closeArtifactFD(sweepFD) }
+            let entries = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
+            let ttlSecs = Self.spillTTL
+            let wallNow = Date().timeIntervalSince1970
+            for entry in entries where entry.hasPrefix(".tmp-lease-") {
+                let rest = String(entry.dropFirst(".tmp-lease-".count))
+                // Format: <36-char UUID>-<stream>, with a bare-name stream
+                // (same gate as grant time). Anything else is not ours:
+                // left alone here (never unlinked by an unvalidated name).
+                guard rest.count > 37, rest[rest.index(rest.startIndex, offsetBy: 36)] == "-" else { continue }
+                let idPart = String(rest.prefix(36))
+                guard UUID(uuidString: idPart) != nil else { continue }
+                let streamPart = String(rest.dropFirst(37))
+                guard !streamPart.isEmpty,
+                      streamPart.utf8.allSatisfy({ $0 != 0x2F && $0 != 0x00 }),
+                      streamPart != ".", streamPart != "..", !streamPart.contains("..") else { continue }
+                let liveRow: Bool = (try? queue.read { db in
+                    (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spill_leases WHERE leaseID = ?", arguments: [idPart]) ?? 0) > 0
+                }) ?? true
+                if liveRow { continue }
+                let full = (root as NSString).appendingPathComponent(entry)
+                let age: TimeInterval? = (try? FileManager.default.attributesOfItem(atPath: full)[.modificationDate] as? Date).map { wallNow - $0.timeIntervalSince1970 }
+                if let age, age > ttlSecs {
+                    _ = entry.withCString { unlinkat(sweepFD, $0, 0) }
+                }
+            }
+        }
+    }
+
     /// Reads a published artifact by reference. The digest, not the
     /// database, is the authority: absent files, symlinks, non-regular
     /// files, unreadable files, size drift and digest mismatches all fail
@@ -1081,7 +1613,7 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         dbPath + "-artifacts.lock"
     }
 
-    private func withArtifactLock<T>(_ body: () throws -> T) throws -> T {
+    private func withArtifactLock<T>(timeout: TimeInterval = 60, _ body: () throws -> T) throws -> T {
         let lockPath = Self.artifactLockPath(for: path)
         let fd: Int32 = lockPath.withCString { cstr in
             open(cstr, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
@@ -1094,15 +1626,27 @@ public final class GRDBSessionStore: SessionStore, @unchecked Sendable {
         guard fstat(fd, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFREG else {
             throw StoreError.integrity("artifact lock is not a regular file")
         }
-        var tries = 0
+        // M2-C C3 bounded acquisition: nonblocking attempts against a
+        // monotonic deadline (default 60 s per the plan's publish bound;
+        // callers pass shorter budgets for pre-spawn gates). A wedged
+        // holder can never hang publication, grant, sweep, or the calling
+        // task indefinitely: expiry surfaces typed `.contention` (the
+        // honest classification — the operation could not proceed), and
+        // task cancellation aborts the wait promptly. EINTR retries inside
+        // the budget; any other flock error fails closed immediately.
+        let waitDeadline = Self.currentMonotonic() + UInt64(max(timeout, 0) * 1_000_000_000)
         while true {
-            if flock(fd, LOCK_EX) == 0 { break }
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 { break }
             let e = errno
-            if e == EINTR, tries < 5 {
-                tries += 1
-                continue
+            if e == EINTR { continue }
+            guard e == EWOULDBLOCK else {
+                throw StoreError.integrity("artifact lock failed: \(String(cString: strerror(e)))")
             }
-            throw StoreError.integrity("artifact lock failed: \(String(cString: strerror(e)))")
+            if Task.isCancelled { throw CancellationError() }
+            if Self.currentMonotonic() >= waitDeadline {
+                throw StoreError.contention("artifact lock unavailable within budget")
+            }
+            usleep(10_000)
         }
         defer { flock(fd, LOCK_UN) }
         return try body()
