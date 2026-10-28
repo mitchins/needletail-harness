@@ -1,8 +1,9 @@
 # M2-C Epic Receipt — READY FOR M2-C EPIC REVIEW (C3 closeout)
 
-Authoritative candidate head: `m2-c-planning` @ `ab790eb`
-(closeout commit; qualified code head `be2620a`, docs-only delta;
-see §8 for exact-SHA CI and changed files).
+Authoritative candidate: branch `m2-c-planning`, qualified code
+head `be2620a` (all implementation + tests; fully green per §2).
+Closeout commits after `be2620a` are docs-only (this receipt,
+STATUS.md). Final HEAD contains everything; see §8.
 No push, PR, merge, or tag performed. No live-model qualification,
 no M2-D/M3 work. Branch unpushed by direction.
 
@@ -137,9 +138,9 @@ Certified by native evidence (all green; see §2):
 - C0: `fa69525`. C1 head: `5a1763b`.
 - C2 base: `116ec6b`; C2 hardening: `3a42908`.
 - C3 implementation + review follow-ups: `7938925`, `3ed1326`,
-  `d676b20`, `14255e2`, `be2620a`; qualified code head: `be2620a`;
-  closeout head: `ab790eb` (this commit; docs-only delta: receipt
-  counts/SHAs + STATUS).
+  `d676b20`, `14255e2`, `be2620a` (qualified code head; all §2
+  evidence measured here or on identical code). Closeout commits
+  after `be2620a` touch only this receipt and STATUS.md.
 - Changed files (vs `db3c239`): `Sources/NeedletailCore/SessionStore.swift`,
   `Sources/NeedletailCore/SessionActor.swift`,
   `Sources/NeedletailCore/SessionTransition.swift`,
