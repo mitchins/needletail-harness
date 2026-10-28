@@ -115,7 +115,11 @@ Certified by native evidence (all green; see §2):
   fixed at 26496db (status forced to the reducer verdict "unknown",
   reducer-level regression test `lateExecSuccessAfterCancelReadsUnknown`
   added and green). B1/M1/M3–M8 confirmed CLOSED, no Blocker open.
-  Final verdict pending re-review of 26496db.
+- DeepSeek C3 final verification (fix delta be2620a..26496db):
+  **APPROVED** — M2 confirmed closed (held-branch receipt reports
+  the reducer verdict; contradictory-outcome sub-cases covered;
+  regression test verified to fail pre-fix). Nothing else open.
+  C3 slice review is COMPLETE.
 - GLM targeted audit (process identity/signalling/reaping):
   C1 guarantees stand; no new false-negative or leak paths
   introduced; remaining notes documented as accepted deviations.
