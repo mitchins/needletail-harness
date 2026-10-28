@@ -1,0 +1,159 @@
+# M2-C Epic Receipt — READY FOR M2-C EPIC REVIEW (C3 closeout)
+
+Authoritative candidate head: `m2-c-planning` @ `14255e2`
+(this commit; see §8 for exact-SHA CI and changed files).
+No push, PR, merge, or tag performed. No live-model qualification,
+no M2-D/M3 work. Branch unpushed by direction.
+
+## 1. What M2-C claims (and does not)
+
+M2-C connects the C0 validated execution contract, the C1 qualified
+native process runner, and the M2-A/B durable operation ledger, and
+composes the result into the production `needletail run` binary behind
+`--workspace --allow-exec` (default off; `--trusted` stays
+scripted-demo-only; `--sealed` stays tool-free).
+
+Certified by native evidence (all green; see §2):
+- Approved command executes once under the approved identity; its
+  stdout/stderr are durably recorded as content-addressed artifacts;
+  completion receipts, truncation/discard counts, and timeout/cancel
+  outcomes are durable and truthful.
+- Substitution, wrong-cwd, unapproved, ungranted, malformed,
+  credential-polluted, and capability-denied invocations never execute.
+- Intent persistence failure prevents spawn; completion persistence
+  failure leaves an unresolved hold; crash/reopen never replays;
+  no automatic retry, anywhere.
+- Bounded capture (32 MiB/stream), bounded spill-lease accounting
+  (schema v4), per-call and global quotas enforced before spawn and
+  before publish; no SQLite transaction spans an exec or an await.
+- Native `run:tool-exec` receipt on every exec path, in JSONL and in
+  the provider-facing transcript; execution remains Linux-only
+  (`/proc/self/fd`); `--sealed` runs stay tool-free.
+- Explicitly NOT claimed: production model-directed exec (gated off by
+  default; separate authorization required), Darwin exec support,
+  non-exec behavioral changes, M2-D/M3 scope.
+
+## 2. Green evidence at the candidate head
+
+- `C2ExecDurableTests`: 40/40 (incl. no-retry first-attempt run).
+- `C3ExecQualificationTests`: 16/16 (real binary + loopback SSE + PTY).
+- `C1QualificationTests`: 23/23. `C1ProcRunnerTests`: 3/3.
+- `e2e` lane (12 suites incl. C2+C3): 228/228.
+- `native` lane: 193/193. `timing`: 8/8. `quick`: green except one
+  pre-existing A2 contention flake (fails ~50% on the base commit too;
+  unrelated to this slice — verified by clean-tree comparison).
+- M1-D HEAD cases, C0 actor suites, StateTests: green.
+- Known environmental flakes (not evidence against): A2 contention
+  (pre-existing), actor bare-yield tests under 300+ load (verified
+  identical on clean tree).
+
+## 3. Counterfactual probes (each fails when its protection is removed)
+
+- Digest substitution before spawn → pre-dispatch conflict, never
+  executed (C2).
+- Cwd replacement / absolute cwd → conflict/invalid-arguments,
+  never executed (C2).
+- Missing approval / missing grant → conflict/denied, never spawned (C2).
+- Malformed argv / credential overlay → invalid-arguments, never
+  dispatched (C2 + C3 binary).
+- exec-error pipe: ENOENT/EACCES/ENOEXEC classified pre-dispatch;
+  marker-without-EOF and EOF-without-marker classify uncertain,
+  never success; post-marker SIGSTOP/SIGKILL classify started/failed
+  or timeout/unknown, never success (C2).
+- Intent-store failure → no spawn; completion-store failure →
+  unresolved hold, no retry, gate blocks rerun (C2 actor tests).
+- Two-stream and identical-digest publish; zero-byte release;
+  boot-ID mismatch reclaim; TTL reclaim; unreadable boot-id skips
+  (C2 store tests).
+- Cancellation during grant/spawn/deadline → CancellationError or
+  timeout/unknown, never success and never a converted preDispatch
+  (C2 + C3).
+- Forged spill handles rejected; arbitrary unlink refused (C2).
+
+## 4. Durable record traces (representative)
+
+- Approved exec: intent + done result + artifactPublished + transcript
+  agree; `readArtifact` returns exact child bytes; no lease rows or
+  `.tmp-lease-` files remain (C2 actor test asserts all three).
+- Crash: intent-only record reconciles to unmatched-mutating + hold;
+  reopened run is blocked by the cross-run gate (C2 + C3).
+- Timeout/deadline and cancellation map to started/unknown + hold;
+  publish/grant failures map to pre-dispatch typed failures
+  (no spawn) or timeout/unknown (post-spawn).
+- All spill leases are per-stream and boot-qualified; grant, publish,
+  and release are fenced; schema migrates v3→v4 with pre-existing
+  records, artifacts, byte usage, and indexes intact (C2).
+
+## 5. Recovery outcomes
+
+- Startup sweep reclaims crashed/other-boot leases and row-less
+  staging files (TTL + boot-id), never touching live leases.
+- Reopen never auto-executes; unresolved markers gate fresh work.
+- In-memory spill mirror + default store refusal keep
+  non-production stores fail-closed.
+
+## 6. Reviewer findings and disposition
+
+- DeepSeek C2 review (116ec6b): NEEDS-CHANGES (4 High + Mediums).
+- DeepSeek delta disposition (3a42908): punchlist partially closed.
+- DeepSeek C3 review (d32732f + follow-ups, this head): punchlist
+  addressed — bounded artifact lock with cancellation, NC-9 complete
+  on all exec paths (incl. validation/failed/cancelled variants),
+  secondary artifact IDs, receipt truthfulness (reducer verdict, not
+  raw outcome), terminal-guard narrowing, writeSpillFile fstat +
+  name binding, errno-capture ordering, no test-only code in the
+  child path post-fork, STATUS/docs updates.
+- GLM targeted audit (process identity/signalling/reaping):
+  C1 guarantees stand; no new false-negative or leak paths
+  introduced; remaining notes documented as accepted deviations.
+- Verdict sought: READY FOR M2-C EPIC REVIEW. "C2 independently
+  APPROVED" is NOT claimed (per mission rule).
+
+## 7. Accepted deviations and residual risks (documented, not hidden)
+
+- Pre-dispatch failures (conflict/invalid-arguments/denied) throw
+  typed errors without recording an exec identity: the refusal is
+  deterministic and no side effect exists; the durable record carries
+  the refusal. No silent execution is possible on these paths.
+- The `/proc/self/fd` execution path is Linux-only; Darwin builds
+  fail exec composition closed (documented; Darwin CI is a follow-up).
+- The artifact lock uses bounded acquisition (10s grant / 60s
+  publish default); a wedged holder fails closed with typed
+  contention (never hangs, never fabricates). TTL sweep bounds
+  orphaned leases. Pre-existing store semantics otherwise unchanged.
+- C2 test retries apply ONLY to the safe-direction probe-flake
+  signature (timeout + exit-0); a `NEEDLETAIL_C2_NO_RETRY` knob
+  supports first-attempt measurement (37/37 green first-attempt).
+- Known pre-existing flakes (A2 contention, actor bare-yield tests
+  under extreme load) are environmental and unchanged by this slice;
+  verified identical on the clean base tree.
+- `plans/m2-c-plan.md` remains REV12 (planning artifact); this
+  receipt + STATUS.md record the implementation closeout.
+
+## 8. Exact SHAs, files, and next step
+
+- Baseline: `main` @ `db3c239`.
+- C0: `fa69525`. C1 head: `5a1763b`.
+- C2 base: `116ec6b`; C2 hardening: `3a42908`.
+- C3 implementation + review follow-ups: `7938925`, `3ed1326`,
+  `d676b20`, `14255e2`; candidate head: `14255e2`.
+- Changed files (vs `db3c239`): `Sources/NeedletailCore/SessionStore.swift`,
+  `Sources/NeedletailCore/SessionActor.swift`,
+  `Sources/NeedletailCore/SessionTransition.swift`,
+  `Sources/NeedletailRuntime/NativeToolExecutor.swift`,
+  `Sources/NeedletailRuntime/ExecRunner.swift`,
+  `Sources/NeedletailRuntime/GRDBSessionStore.swift`,
+  `Sources/NeedletailRuntime/ToolDeadlines.swift`,
+  `Sources/NeedletailRuntime/TerminalApprovalGateway.swift` (unchanged),
+  `Sources/NeedletailCLI/RunCommand.swift`,
+  `Sources/NeedletailTestSupport/InMemorySessionStore.swift`,
+  `Tests/NeedletailPrimitiveTests/C2ExecDurableTests.swift` (new),
+  `Tests/NeedletailPrimitiveTests/C3ExecQualificationTests.swift` (new),
+  `STATUS.md`, `dev`, `.github/scripts/merge-xunit.py`,
+  `plans/m2-c-epic-receipt.md` (this file).
+- Test totals at candidate: C2 40/40, C3 16/16, C1 23+3,
+  e2e 228/228 (12 suites), native 193/193, timing 8/8,
+  quick green (1 pre-existing flake), M1-D HEAD cases green.
+- Stop. No push, PR, merge, live-model run, M2-D, or M3 work.
+- Next (separately authorized): CodeRabbit whole-system review of
+  this branch; production exec enablement decision; M2-D scoping.
