@@ -50,14 +50,18 @@ public func resumeSession<IDs: IDSource>(
     var state = SessionState.resumedAfterReopen(
         sessionID: session, epoch: epoch, trustMode: trustMode,
         heldOperations: report.heldOperations)
-    let heldCount = recon.entries.filter { $0.state == .held }.count
-    var held: HoldReason?? = state.heldReason
-    if case .none = held, recon.queueHeld {
-        let heldCount = recon.entries.filter { $0.state == .held }.count
-        held = .some(.error("reopen: \(recon.unknownLinks.count) uncompleted dispatch(es), \(recon.failedLinks.count) failed dispatch(es), \(heldCount) held"))
+    // Hold reason: an existing unresolved-operations reason wins (more
+    // urgent); otherwise a queue hold gets an explicit reopen reason.
+    // (Tested: `state.heldReason` here is `HoldReason?`, so a plain nil
+    // check applies — do NOT lift to `HoldReason??` first, as `.some(nil)`
+    // would make a `case .none` match unreachable.)
+    var heldReason: HoldReason? = state.heldReason
+    if heldReason == nil, recon.queueHeld {
+        let held = recon.entries.filter { $0.state == .held }.count
+        heldReason = .error("reopen: \(recon.unknownLinks.count) uncompleted dispatch(es), \(recon.failedLinks.count) failed, \(held) held")
     }
     return state.replacing(
         queue: recon.entries,
-        queueHeld: state.queueHeld || recon.queueHeld, heldReason: held,
+        queueHeld: state.queueHeld || recon.queueHeld, heldReason: heldReason,
         admittedCommands: recon.acks)
 }

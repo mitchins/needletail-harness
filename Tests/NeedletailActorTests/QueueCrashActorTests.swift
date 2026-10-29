@@ -150,6 +150,7 @@ struct QueueCrashActorTests {
         let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids)
         #expect(rebuilt.queue.first?.state == .heldUnknown, "sent but uncompleted holds unknown")
         #expect(rebuilt.queueHeld, "unknown delivery holds the queue")
+        #expect(rebuilt.heldReason != nil, "reopen carries an explicit hold reason")
         // Resume does not release or dispatch it; no provider effect runs.
         let g2 = GatedTransport()
         let actor2 = try Self.makeGatedActor(store: store, state: rebuilt, transport: g2, ids: rids)
