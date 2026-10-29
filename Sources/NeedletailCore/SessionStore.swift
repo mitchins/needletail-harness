@@ -12,6 +12,10 @@ public enum DurableRecord: Sendable, Equatable, Codable {
     case operationResult(OperationRef, outcome: String)
     case queueAdmitted(QueueEntry)
     case queueUpdated(QueueEntry)
+    /// M2-D D0: dispatch linkage (see QueueDispatchLink). Committed
+    /// atomically with the dispatch group (history admission + intent +
+    /// transcript); replay joins it against run-completion events.
+    case queueDispatched(QueueDispatchLink)
     case checkpointCommitted(EpochDescriptor)
     /// Authoritative conversation element (M1-D transcript, ARCH §1).
     case transcriptAppended(TranscriptEntry)

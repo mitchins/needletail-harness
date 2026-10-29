@@ -305,6 +305,10 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return withdrawEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.idle, .queueResume(let at)):
         return resumeQueue(state, atMillis: at, ids: &ids)
+    case (.idle, .queueRetarget(let entryID, let at)):
+        return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (.idle, .queueReconcile(let entryID, let at)):
+        return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.idle, .switchModel(let alias, let at)):
         return switchModel(state, alias: alias, atMillis: at, ids: &ids)
     case (.idle, .checkpointRequested(let at)):
@@ -389,6 +393,10 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return dismissTerminal(state, atMillis: at, ids: &ids)
     case (.failed, .queueResume(let at)), (.completed, .queueResume(let at)), (.interrupted, .queueResume(let at)):
         return resumeQueue(state, atMillis: at, ids: &ids)
+    case (.failed, .queueRetarget(let entryID, let at)), (.completed, .queueRetarget(let entryID, let at)), (.interrupted, .queueRetarget(let entryID, let at)):
+        return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (.failed, .queueReconcile(let entryID, let at)), (.completed, .queueReconcile(let entryID, let at)), (.interrupted, .queueReconcile(let entryID, let at)):
+        return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.failed, .queueEdit(let entryID, let newText, let baseRevision, let at)),
          (.completed, .queueEdit(let entryID, let newText, let baseRevision, let at)),
          (.interrupted, .queueEdit(let entryID, let newText, let baseRevision, let at)):
@@ -423,6 +431,10 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return withdrawEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (_, .queueResume(let at)):
         return resumeQueue(state, atMillis: at, ids: &ids)
+    case (_, .queueRetarget(let entryID, let at)):
+        return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (_, .queueReconcile(let entryID, let at)):
+        return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (_, .invalidInput(let fingerprint, let cause, let at)):
         return stepInvalid(state, fingerprint: fingerprint, cause: cause, atMillis: at, ids: &ids)
     default:
@@ -630,7 +642,9 @@ private func sequenced<I: IDSource>(_ state: SessionState, kind: String, digest:
     return (next, [.eventAppended(seq: seq, kind: kind, digest: digest)])
 }
 
-private func eventDigest(_ parts: String...) -> String {
+/// M2-D: shared with the queue reconciler (recomputed run-completion
+/// digests must match the ones committed here bit-for-bit).
+func eventDigest(_ parts: String...) -> String {
     fnv1aHex(parts.joined(separator: "\n"))
 }
 
@@ -889,19 +903,124 @@ private func resumeQueue<I: IDSource>(_ state: SessionState, atMillis: UInt64, i
         let (s1, prefix) = sequenced(state, kind: "queue-resume-blocked", digest: "resume-blocked", ids: &ids)
         return Transition(state: s1, effects: [.emitUI(.denied(cause: "queue blocked: reconcile or decide approval first"))], records: prefix)
     }
-    let queue = state.queue.map { entry -> QueueEntry in
-        guard entry.state == .held else { return entry }
-        return QueueEntry(
+    // M2-D D0: resume unholds only entries bound to the current epoch.
+    // Stale-target entries stay held (explicit retarget or withdraw to
+    // proceed — resuming must not silently re-target them), and
+    // held-unknown entries stay held (explicit reconciliation only).
+    // Every unhold is durable so reopen sees the released queue.
+    var queue = state.queue
+    var unholds: [DurableRecord] = []
+    var released = 0
+    var stale = 0
+    for i in queue.indices where queue[i].state == .held {
+        let entry = queue[i]
+        guard entry.targetEpochID == state.epoch.epochID else {
+            stale += 1
+            continue
+        }
+        released += 1
+        queue[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .queued, revision: entry.revision, text: entry.text,
             targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+        unholds.append(.queueUpdated(queue[i]))
     }
     let (s1, prefix) = sequenced(state, kind: "queue-resumed", digest: "resumed", ids: &ids)
-    let next = s1.replacing(queue: queue, queueHeld: false, heldReason: .some(nil))
+    // Stale-target and unknown-delivery entries stay held: the former
+    // need explicit retarget, the latter explicit reconciliation. The
+    // queue stays held while any remain, so the next completion
+    // re-trips the head barrier instead of dispatching around them.
+    let stillHeld = stale > 0 || queue.contains(where: { $0.state == .heldUnknown })
+    let next = s1.replacing(
+        queue: queue, queueHeld: stillHeld,
+        heldReason: stillHeld
+            ? .some(.error(stale > 0 ? "stale-target entries held; retarget or withdraw" : "unknown deliveries held; reconcile or withdraw"))
+            : .some(nil))
+    let detail: String
+    if stale == 0 && !queue.contains(where: { $0.state == .heldUnknown }) {
+        detail = "resumed"
+    } else {
+        detail = "resumed (\(released) released; held entries remain: retarget, reconcile, or withdraw)"
+    }
     return Transition(
         state: next,
-        effects: [.emitUI(.runUpdate(phase: "queue", detail: "resumed"))],
-        records: prefix)
+        effects: [.emitUI(.runUpdate(phase: "queue", detail: detail))],
+        records: prefix + unholds)
+}
+
+/// M2-D D0: retarget a stale-epoch entry to the current epoch. The
+/// retarget re-validates route + sealed consistency under the current
+/// epoch (mirroring admission); a refusal changes nothing. Success
+/// records the new target but does NOT release any hold — resume (or
+/// reconcile, for unknown deliveries) releases separately, so no single
+/// operator action both re-targets and dispatches.
+private func retargetQueueEntry<I: IDSource>(_ state: SessionState, entryID: String, atMillis: UInt64, ids: inout I) -> Transition {
+    _ = atMillis
+    guard let position = state.queue.firstIndex(where: { $0.entryID == entryID }) else {
+        let (s1, prefix) = sequenced(state, kind: "queue-retarget-unknown", digest: eventDigest("retarget", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "unknown queue entry"))], records: prefix)
+    }
+    let entry = state.queue[position]
+    switch entry.state {
+    case .queued, .held, .heldUnknown:
+        break
+    case .withdrawn, .dispatched, .admittedToHistory:
+        let (s1, prefix) = sequenced(state, kind: "queue-retarget-refused", digest: eventDigest("retarget", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "terminal entries are history, not retargetable"))], records: prefix)
+    }
+    if entry.targetEpochID == state.epoch.epochID {
+        let (s1, prefix) = sequenced(state, kind: "queue-retarget-noop", digest: eventDigest("retarget", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.runUpdate(phase: "queue", detail: "already current epoch"))], records: prefix)
+    }
+    // Re-validate under the CURRENT epoch (admission-equivalent checks):
+    // the route must still allow this profile, and sealed consistency
+    // must hold for the entry's own sealing flag.
+    if case .denied(let denial) = selectRoute(
+        snapshot: state.epoch.configSnapshot, requestedAlias: state.epoch.profile.alias, sealed: entry.sealed) {
+        let (s1, prefix) = sequenced(state, kind: "queue-retarget-denied", digest: eventDigest("retarget", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "retarget refused: route \(denial.message)"))], records: prefix)
+    }
+    var queue = state.queue
+    queue[position] = QueueEntry(
+        entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
+        state: entry.state, revision: entry.revision, text: entry.text,
+        targetEpochID: state.epoch.epochID, orderKey: entry.orderKey, sealed: entry.sealed)
+    let (s1, prefix) = sequenced(state, kind: "queue-retargeted", digest: eventDigest("retarget", entryID), ids: &ids)
+    let next = s1.replacing(queue: queue)
+    return Transition(
+        state: next,
+        effects: [.emitUI(.runUpdate(phase: "queue", detail: "retargeted \(entryID) to current epoch"))],
+        records: prefix + [.queueUpdated(queue[position])])
+}
+
+/// M2-D D0: explicit operator reconciliation of a held-unknown delivery.
+/// Requeue releases the entry for redispatch (the operator asserts
+/// non-delivery or accepts the duplicate risk — recorded, never a proof
+/// of non-delivery). Withdrawal uses the existing withdraw path. Only
+/// `.heldUnknown` entries qualify; anything else is a denial, and resume
+/// never touches this state.
+private func reconcileQueueEntry<I: IDSource>(_ state: SessionState, entryID: String, atMillis: UInt64, ids: inout I) -> Transition {
+    _ = atMillis
+    guard let position = state.queue.firstIndex(where: { $0.entryID == entryID }) else {
+        let (s1, prefix) = sequenced(state, kind: "queue-reconcile-unknown", digest: eventDigest("reconcile", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "unknown queue entry"))], records: prefix)
+    }
+    let entry = state.queue[position]
+    guard entry.state == .heldUnknown else {
+        let (s1, prefix) = sequenced(state, kind: "queue-reconcile-refused", digest: eventDigest("reconcile", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "only held-unknown deliveries need reconciliation"))], records: prefix)
+    }
+    var queue = state.queue
+    queue[position] = QueueEntry(
+        entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
+        state: .queued, revision: entry.revision, text: entry.text,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+    let (s1, prefix) = sequenced(state, kind: "queue-reconciled", digest: eventDigest("reconcile", entryID), ids: &ids)
+    let next = s1.replacing(queue: queue)
+    return Transition(
+        state: next,
+        effects: [.emitUI(.runUpdate(phase: "queue", detail: "reconciled \(entryID): requeued by explicit operator decision"))],
+        records: prefix + [.queueUpdated(queue[position])])
 }
 
 // MARK: Model / checkpoint meta-commands
@@ -930,16 +1049,21 @@ private func switchModel<I: IDSource>(_ state: SessionState, alias: String, atMi
         effectiveCaps: state.epoch.effectiveCaps, route: .allowed(endpoint: endpointURL(for: state.epoch.configSnapshot.profiles[alias]!), alias: alias),
         execComposed: state.epoch.execComposed)
     var queue = state.queue
+    var heldChanges: [DurableRecord] = []
     for i in queue.indices where queue[i].targetEpochID != epoch.epochID && (queue[i].state == .queued) {
         let entry = queue[i]
         queue[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .held, revision: entry.revision, text: entry.text,
             targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+        // M2-D D0: the stale-epoch hold is durable — a reopen must see
+        // these entries as held (retarget or withdraw to proceed), not
+        // as silently dispatchable.
+        heldChanges.append(.queueUpdated(queue[i]))
     }
     let (s1, prefix) = sequenced(state, kind: "epoch-opened", digest: eventDigest("epoch", alias), ids: &ids)
     let next = s1.replacing(epoch: epoch, queue: queue, admittedCommands: [:])
-    return Transition(state: next, effects: [.emitUI(.runUpdate(phase: "epoch", detail: "switched to \(terminalSafe(alias))"))], records: prefix + [.epochOpened(epoch)])
+    return Transition(state: next, effects: [.emitUI(.runUpdate(phase: "epoch", detail: "switched to \(terminalSafe(alias))"))], records: prefix + [.epochOpened(epoch)] + heldChanges)
 }
 
 private func requestCheckpoint<I: IDSource>(_ state: SessionState, atMillis: UInt64, ids: inout I) -> Transition {
@@ -1104,6 +1228,40 @@ private func finishRunWithQueue<I: IDSource>(
         if let position = state.queue.firstIndex(where: {
             $0.kind == kind && $0.state == .queued && $0.targetEpochID == state.epoch.epochID
         }) {
+            // M2-D D0 head barrier: a non-terminal entry ahead of the
+            // candidate that is not dispatchable (held for any reason, or
+            // targeting a stale epoch) blocks the whole queue — later
+            // entries never overtake a held head, and a stale head never
+            // silently skips. The queue holds with an explicit reason
+            // until the operator resolves, retargets, or withdraws.
+            let blocked = state.queue[..<position].first(where: { entry in
+                switch entry.state {
+                case .withdrawn, .admittedToHistory:
+                    return false
+                case .queued:
+                    return entry.targetEpochID != state.epoch.epochID
+                case .held, .heldUnknown, .dispatched:
+                    return true
+                }
+            })
+            if let head = blocked {
+                let reason: HoldReason
+                if head.targetEpochID != state.epoch.epochID {
+                    reason = .error("queue head targets a stale epoch; retarget or withdraw \(head.entryID)")
+                } else {
+                    reason = .error("queue head held; resolve, reconcile, or withdraw \(head.entryID)")
+                }
+                let (s1, prefix) = sequenced(state, kind: "completed-barred", digest: eventDigest("completed", run.runID.raw), ids: &ids)
+                let next = s1.replacing(
+                    phase: .completed(receiptValue), activeRun: .some(nil), activeRequest: .some(nil),
+                    pendingApproval: .some(nil), pendingBatch: .some(nil),
+                    pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
+                let held = next.replacing(queueHeld: true, heldReason: .some(reason))
+                return Transition(
+                    state: held,
+                    effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished; queue held at \(head.entryID)"))],
+                    records: prefix)
+            }
             var queue = state.queue
             let entry = queue[position]
             let dispatched = QueueEntry(
@@ -1168,6 +1326,17 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
         preSendRetries: 0, retryDeadlineMillis: .some(nil),
         liveReservations: state.liveReservations + [reservation],
         generation: generation, lastSequence: seq.value)
+    // M2-D D0 dispatch linkage: bind the entry to the exact provider
+    // run/request/effect/epoch being invoked, committed ATOMICALLY with
+    // the history admission + intent + transcript below (same records
+    // group the actor commits before any effect performs). A crash
+    // before this group commits leaves no link (boundary 1: never sent);
+    // a crash after leaves a link the reopen join resolves against the
+    // run-completion event (boundary 2 vs 3). No link, no dispatch.
+    let link = QueueDispatchLink(
+        entryID: entry.entryID, commandID: entry.commandID,
+        runID: run.runID, requestID: run.requestID, effectID: effectID,
+        epochID: state.epoch.epochID)
     return Transition(
         state: next,
         effects: [
@@ -1177,6 +1346,7 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
         records: [
             .eventAppended(seq: seq, kind: "run-admitted", digest: eventDigest("admit", entry.commandID.raw)),
             .operationIntent(OperationRef(operationID: ids.nextOperationID(), state: .intent, mutating: false)),
+            .queueDispatched(link),
             .queueUpdated(history),
             // The dispatched queued text opens the transcript (D1).
             .transcriptAppended(.user(entry.text)),
@@ -1771,8 +1941,12 @@ private func holdForApproval<I: IDSource>(
     _ = requestID
     _ = atMillis
     let (s1, prefix) = sequenced(state, kind: "approval-required", digest: "unavailable", ids: &ids)
+    // M2-D D0: a headless approval stop holds the queue — queued entries
+    // must not auto-dispatch into a run that can never be approved.
+    // Explicit resume releases the hold (the next run re-requests
+    // approval through the normal authorising path).
     return Transition(
-        state: s1,
+        state: s1.replacing(queueHeld: true, heldReason: .approvalPending),
         effects: [.emitUI(.runUpdate(phase: "authorising", detail: "approval required: \(terminalSafe(reason))"))],
         records: prefix)
 }
@@ -2407,6 +2581,18 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
 
     // Idempotent: if no new pending and no live executor left, no duplicate markers (already handled by filtering).
     let (s1, prefix) = sequenced(state, kind: "cancelling", digest: "cancel", ids: &ids)
+    // M2-D D0 durable hold: queued entries become held IN the ledger
+    // (queueUpdated per changed entry), so a reopen reconstructs the
+    // held queue instead of silently resuming dispatch. History and
+    // terminal entries are untouched; heldUnknown entries stay held.
+    var queue = state.queue
+    for i in queue.indices where queue[i].state == .queued {
+        queue[i] = QueueEntry(
+            entryID: queue[i].entryID, commandID: queue[i].commandID, kind: queue[i].kind,
+            state: .held, revision: queue[i].revision, text: queue[i].text,
+            targetEpochID: queue[i].targetEpochID, orderKey: queue[i].orderKey, sealed: queue[i].sealed)
+        records.append(.queueUpdated(queue[i]))
+    }
     var active: ActiveRequest? = nil
     if let request = state.activeRequest {
         active = ActiveRequest(requestID: request.requestID, runID: request.runID, generation: request.generation, delivery: .deliveryUnknown, bytesOut: request.bytesOut)
@@ -2414,6 +2600,7 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
     let nextPhase: SessionPhase = .cancelling
     let next = s1.replacing(
         phase: nextPhase, activeRequest: active,
+        queue: queue,
         queueHeld: true, heldReason: .cancelled(sinceMillis: atMillis),
         consumedEffects: consumed,
         pendingApproval: .some(nil), pendingBatch: .some(nil),

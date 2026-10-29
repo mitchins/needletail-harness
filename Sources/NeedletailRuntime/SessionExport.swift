@@ -134,6 +134,13 @@ public enum SessionExport {
             return queueRow(seq: seq, action: "admitted", entry: entry, includeContent: includeContent)
         case .queueUpdated(let entry):
             return queueRow(seq: seq, action: "updated", entry: entry, includeContent: includeContent)
+        case .queueDispatched(let link):
+            // Linkage is identity only (entry/run/request/effect/epoch
+            // IDs) — no prompt text, safe to export with or without content.
+            return ["seq": seq, "kind": "queue", "action": "dispatched",
+                    "entryID": link.entryID, "commandID": link.commandID.raw,
+                    "runID": link.runID.raw, "requestID": link.requestID.raw,
+                    "effectID": link.effectID.raw, "epochID": link.epochID.raw]
         case .checkpointCommitted(let epoch):
             var row: [String: Any] = ["seq": seq, "kind": "checkpoint",
                                       "epochID": epoch.epochID.raw,

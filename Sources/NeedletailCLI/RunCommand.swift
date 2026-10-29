@@ -727,6 +727,10 @@ struct RunCommand: ParsableCommand {
             if !holds.isEmpty {
                 let namedSessions = holds.map(\.session.raw).sorted().map { terminalSafe($0) }.joined(separator: ", ")
                 let heldOpCount = holds.reduce(0) { $0 + $1.operationIDs.count }
+                // M2-D D0: queued dispatches with linkage but no run
+                // completion hold like unresolved operations (possible
+                // in-flight provider delivery — never auto-resent).
+                let heldQueueCount = holds.reduce(0) { $0 + $1.unknownQueueDeliveries.count }
                 // B5-C read-only carve-out: the gate protects MUTATING
                 // execution. A run that cannot mutate (read/search/consult
                 // only, exec denied — enforced by caps at admission AND by
@@ -736,7 +740,7 @@ struct RunCommand: ParsableCommand {
                 let runMayMutate = effective.tools.edit || effective.tools.write
                     || effective.tools.exec != .denied
                 if !runMayMutate {
-                    eprint("note: proceeding read-only with \(heldOpCount) unresolved operation(s) in session(s) \(namedSessions) (history preserved for future mutating runs)")
+                    eprint("note: proceeding read-only with \(heldOpCount) unresolved operation(s) and \(heldQueueCount) uncompleted queued dispatch(es) in session(s) \(namedSessions) (history preserved for future mutating runs)")
                 } else if let determination = acknowledgedDetermination {
                     // The RECORD is the decision — the flag alone authorizes
                     // nothing. Append under this run's fenced writer
@@ -766,7 +770,7 @@ struct RunCommand: ParsableCommand {
                     // only the explicit flag. NOT exit 4 (no run/ambiguous
                     // delivery occurred) and NOT exit 6 (the ledgers are
                     // readable; their outcomes are unknown, not corrupt).
-                    eprint("blocked: unresolved mutating outcomes in session(s) \(namedSessions) (\(heldOpCount) operation(s)) — an explicit operator decision is required before mutating work. Inspect with `needletail session export SESSION --output FILE`, then re-run with --acknowledge-unresolved-outcomes 'operator-accepted-risk' (or 'manually-reconciled:<note>').")
+                    eprint("blocked: unresolved mutating outcomes (\(heldOpCount) operation(s)) and uncompleted queued dispatches (\(heldQueueCount)) in session(s) \(namedSessions) — an explicit operator decision is required before mutating work. Inspect with `needletail session export SESSION --output FILE`, then re-run with --acknowledge-unresolved-outcomes 'operator-accepted-risk' (or 'manually-reconciled:<note>').")
                     throw ExitCode(3)
                 }
             }

@@ -172,7 +172,7 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             toolIDs.insert(ref.operationID)
         case .cancelledPendingError(let err):
             cancelledErrors.append(err)
-        case .acknowledgedUnresolved, .artifactPublished, .transcriptAppended, .eventAppended, .queueAdmitted, .queueUpdated, .checkpointCommitted, .writerRecovered, .sessionOpened, .epochOpened:
+        case .acknowledgedUnresolved, .artifactPublished, .transcriptAppended, .eventAppended, .queueAdmitted, .queueUpdated, .queueDispatched, .checkpointCommitted, .writerRecovered, .sessionOpened, .epochOpened:
             continue
         }
     }
@@ -283,4 +283,176 @@ extension SessionState {
                 "reopen: \(heldOperations.count) unresolved operation(s); reconcile before dispatch"),
             unresolvedOperations: heldOperations)
     }
+}
+
+// MARK: - M2-D D0 durable queue reconstruction (SPEC §9.1 queue half)
+
+/// Rebuilt queue state from a session's durable record stream. Pure —
+/// no I/O, no clock, no IDs minted. Consumed two ways: same-session
+/// resume composes it into `resumedAfterReopen` via `replacing`
+/// (queue, acks, hold); the cross-run gate scans it for unknown
+/// deliveries without rebuilding live state.
+public struct QueueReconstruction: Sendable, Equatable {
+    /// Entries in first-admission order (replay preserves the live array
+    /// order: append on admit, replace in place on update).
+    public let entries: [QueueEntry]
+    /// Ack index rebuilt from admissions (ack sequence = the admission
+    /// orderKey, which IS the admission sequence by construction in
+    /// admitToQueueState) and latest per-entry revision/state, pruned to
+    /// the retention bound exactly like live admission.
+    public let acks: [CommandID: QueueAck]
+    /// True when any reconstructed entry is held or held-unknown.
+    /// Callers OR this with their own hold (e.g. unresolved operations).
+    public let queueHeld: Bool
+    /// Unknown deliveries: linked entries with no run completion in the
+    /// log. Never auto-dispatched, never auto-resent — each needs an
+    /// explicit operator reconciliation (requeue or withdraw).
+    public let unknownLinks: [QueueDispatchLink]
+}
+
+/// Durable queue replay. Fail-closed like `reconcileOperations`: duplicate
+/// entry admissions, updates or links for unknown entries, and link-less
+/// contradictions throw `.integrity`.
+///
+/// Crash boundaries (durable, in log order):
+/// - queueAdmitted with no link: never sent. Reconstructed as recorded
+///   (queued/held) — resumable, no unknown delivery.
+/// - link without a run-completion event for the linked runID: sent but
+///   uncompleted. Reconstructed as `.heldUnknown` + queue hold, no matter
+///   what the last recorded entry state says. This is the delivery-unknown
+///   case: the provider effect may have run, the outcome is lost.
+/// - link with a run-completion event: the run ended. The entry stands as
+///   recorded (normally admittedToHistory) — done, no hold from this entry.
+/// - link superseded by an explicit reconcile: a post-link queueUpdated
+///   moving the entry to .queued from .heldUnknown/.admittedToHistory/
+///   .dispatched can only come from the reconcile transition (resume only
+///   unholds plain .held; admission only creates new entries). The
+///   recorded decision stands — requeued, resumable; this is recorded
+///   operator judgment, never proof of non-delivery.
+/// A run-completion event is `eventAppended` kind "completed*“ with digest
+/// `eventDigest("completed", runID)`, recomputed per link (digests are
+/// hashes and cannot be inverted). Legacy logs predate linkage: a
+/// recorded dispatched/history entry without a link keeps its recorded
+/// state (status quo ante — inert without a link, never auto-dispatched).
+public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruction {
+    var entries: [QueueEntry] = []
+    var positions: [String: Int] = [:]
+    var links: [String: QueueDispatchLink] = [:]
+    var linkPositions: [String: Int] = [:]
+    var completedDigests = Set<String>()
+    // Reconcile-pattern updates (operator explicitly released an unknown
+    // delivery): a queueUpdated to .queued whose tracked pre-update state
+    // was .heldUnknown, .admittedToHistory, or .dispatched. Only the
+    // reconcile transition produces those moves (resume only unholds
+    // plain .held; admission only creates new entries). Maps entry to the
+    // log index of its latest such update.
+    var reconcilePositions: [String: Int] = [:]
+    for (index, record) in records.enumerated() {
+        switch record {
+        case .queueAdmitted(let entry):
+            guard positions[entry.entryID] == nil else {
+                throw StoreError.integrity("duplicate queue admission for entry \(entry.entryID)")
+            }
+            positions[entry.entryID] = entries.count
+            entries.append(entry)
+        case .queueUpdated(let entry):
+            guard let position = positions[entry.entryID] else {
+                throw StoreError.integrity("queue update for unknown entry \(entry.entryID)")
+            }
+            let prior = entries[position].state
+            entries[position] = entry
+            if entry.state == .queued, prior == .heldUnknown || prior == .admittedToHistory || prior == .dispatched {
+                reconcilePositions[entry.entryID] = index
+            }
+        case .queueDispatched(let link):
+            guard positions[link.entryID] != nil else {
+                throw StoreError.integrity("dispatch linkage for unknown entry \(link.entryID)")
+            }
+            links[link.entryID] = link
+            linkPositions[link.entryID] = index
+        case .eventAppended(let seq, let kind, let digest):
+            _ = seq
+            if kind.hasPrefix("completed") {
+                completedDigests.insert(digest)
+            }
+        default:
+            continue
+        }
+    }
+    var unknownLinks: [QueueDispatchLink] = []
+    var queueHeld = false
+    for i in entries.indices {
+        let entry = entries[i]
+        if entry.state == .withdrawn {
+            continue
+        }
+        guard let link = links[entry.entryID] else {
+            // No linkage: never sent (D0 epoch), or a legacy pre-linkage
+            // record. Either way the recorded state stands — nothing was
+            // (or can be proven) dispatched, so there is nothing unknown.
+            if entry.state == .held {
+                queueHeld = true
+            }
+            continue
+        }
+        // Recompute the run-completion digest (hashes do not invert).
+        let doneDigest = eventDigest("completed", link.runID.raw)
+        if completedDigests.contains(doneDigest) {
+            continue
+        }
+        // An explicit reconcile decision supersedes the unknown: a
+        // post-link reconcile-pattern update means the operator asserted
+        // non-delivery or accepted the risk and requeued (or is about to
+        // redispatch). The recorded state then stands as decided — this is
+        // a recorded decision, never proof of non-delivery.
+        if let reconciledAt = reconcilePositions[entry.entryID],
+           let linkedAt = linkPositions[entry.entryID],
+           reconciledAt > linkedAt {
+            continue
+        }
+        // Sent but uncompleted: the delivery is uncertain by construction.
+        // Force held-unknown whatever the last recorded state says — a
+        // recorded dispatched/history without completion is exactly the
+        // crash window, not evidence of completion.
+        entries[i] = QueueEntry(
+            entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
+            state: .heldUnknown, revision: entry.revision, text: entry.text,
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+        unknownLinks.append(link)
+        queueHeld = true
+    }
+    // Ack index: latest admission per command wins (matches live
+    // re-admission after prune); revision/state from the entry's final
+    // recorded state; ack sequence IS the admission orderKey (same seq
+    // by construction in admitToQueueState).
+    var lastAdmission: [CommandID: QueueEntry] = [:]
+    var ackOrder: [CommandID] = []
+    for record in records {
+        if case .queueAdmitted(let entry) = record {
+            if lastAdmission[entry.commandID] == nil {
+                ackOrder.append(entry.commandID)
+            }
+            lastAdmission[entry.commandID] = entry
+        }
+    }
+    var acks: [CommandID: QueueAck] = [:]
+    for commandID in ackOrder {
+        let admitted = lastAdmission[commandID]!
+        let final = entries[positions[admitted.entryID]!]
+        acks[commandID] = QueueAck(
+            commandID: commandID, entryID: admitted.entryID,
+            sequence: SequenceNumber(admitted.orderKey),
+            revision: final.revision, state: final.state)
+    }
+    // Retention bound, exactly like live admission: keep the newest
+    // maxAdmittedCommands acks by sequence; older command IDs re-admit
+    // as new on retry (tellable: different entryID/sequence).
+    if acks.count > maxAdmittedCommands {
+        let ordered = ackOrder.compactMap { acks[$0] }.sorted { $0.sequence < $1.sequence }
+        let drop = ordered.prefix(acks.count - maxAdmittedCommands)
+        for ack in drop {
+            acks.removeValue(forKey: ack.commandID)
+        }
+    }
+    return QueueReconstruction(entries: entries, acks: acks, queueHeld: queueHeld, unknownLinks: unknownLinks)
 }

@@ -124,6 +124,14 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         await apply(.queueResume(atMillis: clock.nowMillis()))
     }
 
+    public func retargetQueueEntry(entryID: String) async {
+        await apply(.queueRetarget(entryID: entryID, atMillis: clock.nowMillis()))
+    }
+
+    public func reconcileQueue(entryID: String) async {
+        await apply(.queueReconcile(entryID: entryID, atMillis: clock.nowMillis()))
+    }
+
     public func cancel() async {
         await apply(.cancelRequested(atMillis: clock.nowMillis()))
         inFlight?.cancel()

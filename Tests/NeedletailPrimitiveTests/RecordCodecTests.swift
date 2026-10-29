@@ -63,6 +63,10 @@ struct RecordCodecTests {
             .queueUpdated(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .steer,
                                      state: .dispatched, revision: 4, text: "fix the bug NOW",
                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false)),
+            .queueDispatched(QueueDispatchLink(
+                entryID: "q-1", commandID: CommandID("cmd-1"),
+                runID: RunID("r-1"), requestID: RequestID("req-1"),
+                effectID: EffectID("eff-1"), epochID: EpochID("epoch-1"))),
             .checkpointCommitted(try epoch(id: "epoch-3", parent: EpochID("epoch-1"),
                                            route: .allowed(endpoint: "http://127.0.0.1:11434/v1", alias: "local-coder"))),
             .transcriptAppended(.assistantText("covered here too, not only in the sibling test")),
@@ -92,6 +96,7 @@ struct RecordCodecTests {
         case .operationResult: return "operationResult"
         case .queueAdmitted: return "queueAdmitted"
         case .queueUpdated: return "queueUpdated"
+        case .queueDispatched: return "queueDispatched"
         case .checkpointCommitted: return "checkpointCommitted"
         case .transcriptAppended: return "transcriptAppended"
         case .writerRecovered: return "writerRecovered"
@@ -104,7 +109,7 @@ struct RecordCodecTests {
 
     private static let expectedCaseNames: Set<String> = [
         "sessionOpened", "epochOpened", "eventAppended", "operationIntent",
-        "operationResult", "queueAdmitted", "queueUpdated",
+        "operationResult", "queueAdmitted", "queueUpdated", "queueDispatched",
         "checkpointCommitted", "transcriptAppended", "writerRecovered",
         "artifactPublished", "cancelledPendingMarker", "cancelledPendingError",
         "acknowledgedUnresolved",
@@ -137,7 +142,7 @@ struct RecordCodecTests {
         // The table must have exercised every case exactly by name; a new
         // case without a fixture fails here even before the build break.
         #expect(covered == Self.expectedCaseNames,
-                "fixture table must cover all fourteen cases, covered=\(covered.sorted())")
+                "fixture table must cover all fifteen cases, covered=\(covered.sorted())")
     }
 
     @Test("record codec round-trips every TranscriptEntry case losslessly")

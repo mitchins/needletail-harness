@@ -12,6 +12,14 @@ public enum SessionEvent: Sendable, Equatable {
     case queueEdit(entryID: String, newText: String, baseRevision: UInt64, atMillis: UInt64)
     case queueWithdraw(entryID: String, atMillis: UInt64)
     case queueResume(atMillis: UInt64)
+    /// M2-D D0: retarget a stale-epoch entry to the current epoch (with
+    /// route/consent re-validation). Recorded; the hold is NOT released —
+    /// resume (or reconcile, for unknown deliveries) releases separately.
+    case queueRetarget(entryID: String, atMillis: UInt64)
+    /// M2-D D0: explicit operator reconciliation of a held-unknown
+    /// delivery (requeue for redispatch, or withdraw to drop). Recorded;
+    /// never automatic, never a non-delivery proof.
+    case queueReconcile(entryID: String, atMillis: UInt64)
     case approvalGrant(requestID: RequestID, generation: Revision, atMillis: UInt64)
     case approvalDeny(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
     case approvalUnavailable(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)

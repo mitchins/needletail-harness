@@ -123,6 +123,13 @@ public enum QueueKind: String, Sendable, Equatable, Codable {
 public enum QueueEntryState: String, Sendable, Equatable, Codable {
     case queued
     case held
+    /// M2-D D0: dispatched but without observed completion. Reconstructed
+    /// on reopen when a dispatch linkage has no run-completion event, and
+    /// set live only by replay — never by dispatch itself. Held until an
+    /// explicit operator reconciliation (requeue or withdraw); resumeQueue
+    /// and the auto-pop never touch it, so an uncertain delivery can never
+    /// auto-dispatch or auto-resend.
+    case heldUnknown
     case dispatched
     case admittedToHistory
     case withdrawn
@@ -166,6 +173,31 @@ public struct QueueEntry: Sendable, Equatable, Codable {
             entryID: entryID, commandID: commandID, kind: kind,
             state: state, revision: revision, text: text,
             targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed)
+    }
+}
+
+/// M2-D D0: durable dispatch linkage. Binds one queued entry to the exact
+/// provider run/request/effect/epoch it was dispatched as, committed
+/// atomically with the dispatch (history admission + intent + transcript).
+/// Reopen replay joins each link against run-completion events: a link
+/// with a completion means the run ended (entry done); a link without one
+/// means the delivery is uncertain (entry held-unknown, never auto-sent).
+/// The link record itself carries no verdict — it is pure identity.
+public struct QueueDispatchLink: Sendable, Equatable, Codable {
+    public let entryID: String
+    public let commandID: CommandID
+    public let runID: RunID
+    public let requestID: RequestID
+    public let effectID: EffectID
+    public let epochID: EpochID
+
+    public init(entryID: String, commandID: CommandID, runID: RunID, requestID: RequestID, effectID: EffectID, epochID: EpochID) {
+        self.entryID = entryID
+        self.commandID = commandID
+        self.runID = runID
+        self.requestID = requestID
+        self.effectID = effectID
+        self.epochID = epochID
     }
 }
 
@@ -375,6 +407,7 @@ public func deliveryStatus(entry: QueueEntry, activeRequest: ActiveRequest?) -> 
     switch entry.state {
     case .withdrawn: return .withdrawn
     case .held: return .held
+    case .heldUnknown: return .deliveryUnknown
     case .queued: return .queued
     case .dispatched, .admittedToHistory:
         guard let active = activeRequest else { return .queued }
