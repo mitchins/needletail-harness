@@ -59,31 +59,14 @@ struct QueueCrashActorTests {
     /// Rebuild state after a crash: replay the durable stream, reconcile
     /// operations + queue, compose over a fresh idle state. Same-session
     /// resume path (cross-session new runs never see this state).
+    /// M2-D D0 closure: reopen through the single production entry
+    /// point — no manual reconstruction. Fencing, replay, ack retention,
+    /// hold composition, and ID-allocator seeding all happen inside.
     private static func reopenedState(
-        store: InMemorySessionStore, session: SessionID, epoch: EpochDescriptor
+        store: InMemorySessionStore, session: SessionID, epoch: EpochDescriptor,
+        ids: inout DeterministicIDSource
     ) throws -> SessionState {
-        var stream: [DurableRecord] = []
-        var cursor: UInt64 = 0
-        while true {
-            let (page, next) = try store.records(session: session, since: cursor, limit: 500)
-            stream += page.map(\.record)
-            guard let advanced = next else { break }
-            cursor = advanced
-        }
-        let report = try reconcileOperations(stream)
-        let recon = try reconcileQueue(stream)
-        var state = SessionState.resumedAfterReopen(
-            sessionID: session, epoch: epoch, trustMode: .workspace,
-            heldOperations: report.heldOperations)
-        var reason = state.heldReason
-        if case .none = reason, recon.queueHeld {
-            let held = recon.entries.filter { $0.state == .held }.count
-            reason = .some(.error("reopen: \(recon.unknownLinks.count) uncompleted dispatch(es), \(held) held"))
-        }
-        return state.replacing(
-            queue: recon.entries,
-            queueHeld: state.queueHeld || recon.queueHeld, heldReason: reason,
-            admittedCommands: recon.acks)
+        try resumeSession(store: store, session: session, epoch: epoch, trustMode: .workspace, as: "q-writer", ids: &ids)
     }
 
     private static func makeGatedActor(
@@ -106,30 +89,6 @@ struct QueueCrashActorTests {
             approvals: ScriptedApprovals(), writer: writer)
     }
 
-    /// M2-D D0: the ID allocator must continue past the reopened log, or
-    /// new admissions reuse sequence numbers and the next reconcile fails
-    /// closed on its own log ("duplicate queue admission"). Seed from the
-    /// durable high-water mark (event sequences + entry orderKeys).
-    private static func replayWatermark(store: InMemorySessionStore, session: SessionID) throws -> UInt64 {
-        var maxSeq: UInt64 = 0
-        var cursor: UInt64 = 0
-        while true {
-            let (page, next) = try store.records(session: session, since: cursor, limit: 500)
-            for rec in page {
-                maxSeq = max(maxSeq, rec.sequence.value)
-                switch rec.record {
-                case .queueAdmitted(let e), .queueUpdated(let e):
-                    maxSeq = max(maxSeq, e.orderKey)
-                default:
-                    break
-                }
-            }
-            guard let advanced = next else { break }
-            cursor = advanced
-        }
-        return maxSeq
-    }
-
     @Test("D0 boundary 1: crash before linkage resumes dispatchable with no duplicate")
     func crashBeforeLinkageResumes() async throws {
         let store = InMemorySessionStore()
@@ -144,7 +103,9 @@ struct QueueCrashActorTests {
         try await ActorFixtures.awaitPhase(actor1, { $0.queue.count == 1 }, "queued")
         // Crash before the follow-up ever dispatches (no linkage possible).
         // (Actor dropped; the store survives with the committed records.)
-        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        // Reopen through the production entry point (seeds the ID allocator).
+        var rids = DeterministicIDSource(prefix: "qb")
+        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids)
         #expect(rebuilt.queue.count == 1 && rebuilt.queue.first?.state == .queued, "never-sent entry stays queued")
         #expect(!rebuilt.queueHeld, "no hold without linkage or unknowns")
         #expect(rebuilt.admittedCommands[CommandID("f-1")] != nil, "ack survives reopen")
@@ -155,7 +116,7 @@ struct QueueCrashActorTests {
             ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0)),
             ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0)),
         ]
-        let actor2 = try Self.makeScriptedActor(store: store, state: rebuilt, transport: t2, ids: DeterministicIDSource(prefix: "qb"))
+        let actor2 = try Self.makeScriptedActor(store: store, state: rebuilt, transport: t2, ids: rids)
         await actor2.submitText(commandID: CommandID("run-2"), text: "run2", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(actor2, {
             $0.queue.allSatisfy { $0.state == .admittedToHistory }
@@ -185,12 +146,13 @@ struct QueueCrashActorTests {
         continuation.yield(.respond(ActorFixtures.finalResponse(requestID: inv1[0].requestID, generation: inv1[0].generation)))
         try await ActorFixtures.awaitInvocations(gate, count: 2)
         // Crash with the dispatched provider effect in flight.
-        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        var rids = DeterministicIDSource(prefix: "qd")
+        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids)
         #expect(rebuilt.queue.first?.state == .heldUnknown, "sent but uncompleted holds unknown")
         #expect(rebuilt.queueHeld, "unknown delivery holds the queue")
         // Resume does not release or dispatch it; no provider effect runs.
         let g2 = GatedTransport()
-        let actor2 = try Self.makeGatedActor(store: store, state: rebuilt, transport: g2, ids: DeterministicIDSource(prefix: "qd"))
+        let actor2 = try Self.makeGatedActor(store: store, state: rebuilt, transport: g2, ids: rids)
         await actor2.resumeQueue()
         let held = await actor2.currentState()
         #expect(held.queue.first?.state == .heldUnknown, "resume never releases unknowns")
@@ -216,15 +178,17 @@ struct QueueCrashActorTests {
         try store.claimWriterOwnership(session: idle.sessionID, writer: "q-writer")
         try store.appendBatch([.queueAdmitted(entry), .queueUpdated(dispatched), .queueDispatched(link)], as: identity)
         // Rebuild, reconcile, crash, rebuild: the decision persists.
-        var state = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        var rids = DeterministicIDSource(prefix: "qe")
+        var state = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids)
         #expect(state.queue.first?.state == .heldUnknown)
         let t = ScriptedTransport()
-        let actor = try Self.makeScriptedActor(store: store, state: state, transport: t, ids: DeterministicIDSource(prefix: "qe"))
+        let actor = try Self.makeScriptedActor(store: store, state: state, transport: t, ids: rids)
         await actor.reconcileQueue(entryID: "q-1")
         state = await actor.currentState()
         #expect(state.queue.first?.state == .queued)
         // Crash; reopen must show the queued (reconciled) entry, not unknown.
-        let state2 = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        var rids2 = DeterministicIDSource(prefix: "qe2")
+        let state2 = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids2)
         #expect(state2.queue.first?.state == .queued, "reconcile decision survives reopen")
         #expect(!state2.queueHeld, "no hold after reconciled requeue")
         // Redispatch delivers exactly once: a fresh run completes, the
@@ -235,7 +199,7 @@ struct QueueCrashActorTests {
             ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0)),
             ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0)),
         ]
-        let actor2 = try Self.makeScriptedActor(store: store, state: state2, transport: t2, ids: DeterministicIDSource(prefix: "qe2"))
+        let actor2 = try Self.makeScriptedActor(store: store, state: state2, transport: t2, ids: rids2)
         await actor2.submitText(commandID: CommandID("run-9"), text: "run", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(actor2, {
             $0.queue.allSatisfy { $0.state == .admittedToHistory }
@@ -273,14 +237,15 @@ struct QueueCrashActorTests {
         }, "follow-up dispatched")
         await actor.dismissRun()
         // Crash; reopen sees settled history, no hold, no unknowns.
-        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        var rids = DeterministicIDSource(prefix: "qg2")
+        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids)
         #expect(rebuilt.queue.allSatisfy { $0.state == .admittedToHistory })
         #expect(!rebuilt.queueHeld, "completed work leaves no hold")
         #expect(rebuilt.unresolvedOperations.isEmpty)
         // New work proceeds without acknowledgment.
         let t2 = ScriptedTransport()
         t2.script = [ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0))]
-        let actor2 = try Self.makeScriptedActor(store: store, state: rebuilt, transport: t2, ids: DeterministicIDSource(prefix: "qg"))
+        let actor2 = try Self.makeScriptedActor(store: store, state: rebuilt, transport: t2, ids: rids)
         await actor2.submitText(commandID: CommandID("run-2"), text: "run2", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(actor2, {
             if case .completed = $0.phase { return true }; return false
@@ -343,13 +308,14 @@ struct QueueCrashActorTests {
         try await ActorFixtures.awaitPhase(actor1, { $0.queue.count == 1 }, "queued")
         let ack1 = try #require((await actor1.currentState()).admittedCommands[CommandID("dup")])
         // Crash; reopen; retry the same command ID: identical ack, no duplicate.
-        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        var rids = DeterministicIDSource(prefix: "qj")
+        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids)
         let ackR = try #require(rebuilt.admittedCommands[CommandID("dup")])
         #expect(ackR == ack1, "replayed ack matches the original")
         #expect(rebuilt.queue.count == 1, "no duplicate entry on reopen")
         let t2 = ScriptedTransport()
         t2.script = [ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0))]
-        let actor2 = try Self.makeScriptedActor(store: store, state: rebuilt, transport: t2, ids: DeterministicIDSource(prefix: "qj"))
+        let actor2 = try Self.makeScriptedActor(store: store, state: rebuilt, transport: t2, ids: rids)
         await actor2.submitText(commandID: CommandID("dup"), text: "totally different", kind: .followUp, sealed: false)
         let after = await actor2.currentState()
         #expect(after.queue.count == 1, "retry must not insert")
@@ -369,14 +335,15 @@ struct QueueCrashActorTests {
         try await ActorFixtures.awaitInvocations(gate, count: 1)
         await actor1.submitText(commandID: CommandID("f-1"), text: "follow", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(actor1, { $0.queue.count == 1 }, "queued")
-        // Crash; rebuild with a seeded allocator past the durable high-water mark.
-        let watermark = try Self.replayWatermark(store: store, session: idle.sessionID)
-        #expect(watermark > 0, "log has sequences to continue past")
-        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        // Crash; rebuild with the production entry point, which seeds the
+        // allocator past the durable high-water mark (no manual seeding).
+        var rids = DeterministicIDSource(prefix: "qw")
+        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids)
+        #expect(rids.counter > 0, "reopen advances the allocator past the log")
         let gate2 = GatedTransport()
         let (stream2, continuation2) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
         gate2.gate = stream2
-        let actor2 = try Self.makeGatedActor(store: store, state: rebuilt, transport: gate2, ids: DeterministicIDSource(prefix: "qw", counter: watermark))
+        let actor2 = try Self.makeGatedActor(store: store, state: rebuilt, transport: gate2, ids: rids)
         await actor2.submitText(commandID: CommandID("run-2"), text: "run2", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitInvocations(gate2, count: 1)
         await actor2.submitText(commandID: CommandID("f-2"), text: "follow2", kind: .followUp, sealed: false)
@@ -384,9 +351,10 @@ struct QueueCrashActorTests {
         let after = await actor2.currentState()
         let ids = after.queue.map(\.entryID)
         #expect(Set(ids).count == 2, "no entry ID reuse after reopen, got \(ids)")
-        #expect(after.queue[1].orderKey > watermark, "new admission continues past the watermark")
+        #expect(after.queue[1].orderKey > after.queue[0].orderKey, "new admission continues past replayed IDs")
         // Crash again: reopen must reconcile cleanly (no duplicate-admission integrity fault).
-        let rebuilt2 = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        var rids2 = DeterministicIDSource(prefix: "qw2")
+        let rebuilt2 = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids2)
         #expect(rebuilt2.queue.count == 2, "both entries survive the second reopen")
         #expect(rebuilt2.admittedCommands[CommandID("f-2")]?.entryID == after.queue[1].entryID, "new ack replays")
         continuation.finish()
@@ -408,7 +376,8 @@ struct QueueCrashActorTests {
         await actor1.cancel()
         try await ActorFixtures.awaitPhase(actor1, { $0.queueHeld }, "cancel holds the queue")
         // Crash; reopen must preserve the held queue (entries + hold).
-        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        var rids = DeterministicIDSource(prefix: "qk2")
+        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch, ids: &rids)
         #expect(rebuilt.queue.first?.state == .held, "cancel-held entries stay held")
         #expect(rebuilt.queueHeld, "held queue remains held after reopen")
         continuation.finish()

@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 @testable import NeedletailCore
+import NeedletailTestSupport
 
 /// M2-D D0: durable queue admission/hold/reconcile, dispatch linkage,
 /// head barrier, retarget/reconcile — reducer level (fast, deterministic).
@@ -352,23 +353,28 @@ struct QueueDurabilityTests {
 
     @Test("D0 resume composes replayed holds without bypassing unresolved ops")
     func resumeHonoursReplayedAndUnresolvedHolds() throws {
-        var ids = StateFixtures.ids()
+        // Production reopen path end to end: seed the durable log with one
+        // unresolved operation plus one linked-but-uncompleted dispatch,
+        // then resume through the single production entry point.
+        let store = InMemorySessionStore()
         let base = try StateFixtures.idle()
-        // Reopened state: one unknown delivery + one unresolved operation.
-        let recon = QueueReconstruction(
-            entries: [QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .heldUnknown, revision: 1, text: "u", targetEpochID: base.epoch.epochID, orderKey: 5, sealed: false)],
-            acks: [:], queueHeld: true, unknownLinks: [], failedLinks: [])
+        try store.claimWriterOwnership(session: base.sessionID, writer: "q-writer")
+        let identity = WriterIdentity(session: base.sessionID, writer: "q-writer")
         let held = OperationRef(operationID: OperationID("eff-1/c1"), callID: "c1", state: .unknown, mutating: true)
-        var state = SessionState.resumedAfterReopen(
-            sessionID: base.sessionID, epoch: base.epoch, trustMode: base.trustMode,
-            heldOperations: [held])
-        state = state.replacing(
-            queue: recon.entries,
-            queueHeld: state.queueHeld || recon.queueHeld,
-            heldReason: state.heldReason ?? .error("reopen: held queue entries"),
-            admittedCommands: recon.acks)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "u", targetEpochID: base.epoch.epochID, orderKey: 5, sealed: false)
+        let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: base.epoch.epochID)
+        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "u", targetEpochID: base.epoch.epochID, orderKey: 5, sealed: false)
+        try store.appendBatch([
+            .cancelledPendingMarker(held, outcome: "cancelled: pending c1"),
+            .queueAdmitted(entry),
+            .queueUpdated(dispatched),
+            .queueDispatched(link),
+        ], as: identity)
+        var ids = StateFixtures.ids()
+        let state = try resumeSession(store: store, session: base.sessionID, epoch: base.epoch, trustMode: base.trustMode, as: "q-writer", ids: &ids)
         #expect(state.queueHeld, "reopen holds")
-        #expect(state.unresolvedOperations.count == 1)
+        #expect(state.unresolvedOperations.count == 1, "unresolved markers survive reopen")
+        #expect(state.queue.first?.state == .heldUnknown, "uncompleted dispatch reconstructs held")
         // Resume refuses while unresolved markers stand (existing gate).
         let resume = transition(state, .queueResume(atMillis: 2000), &ids)
         #expect(resume.state.queueHeld, "no resume past unresolved ops")
