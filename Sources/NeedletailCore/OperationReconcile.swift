@@ -301,13 +301,18 @@ public struct QueueReconstruction: Sendable, Equatable {
     /// admitToQueueState) and latest per-entry revision/state, pruned to
     /// the retention bound exactly like live admission.
     public let acks: [CommandID: QueueAck]
-    /// True when any reconstructed entry is held or held-unknown.
+    /// True when any reconstructed entry is held or held-unknown, or any
+    /// linked run failed without a later resume.
     /// Callers OR this with their own hold (e.g. unresolved operations).
     public let queueHeld: Bool
-    /// Unknown deliveries: linked entries with no run completion in the
-    /// log. Never auto-dispatched, never auto-resent — each needs an
-    /// explicit operator reconciliation (requeue or withdraw).
+    /// Unknown deliveries: linked entries with no run completion and no
+    /// run failure in the log. Never auto-dispatched, never auto-resent —
+    /// each needs an explicit operator reconciliation (requeue or withdraw).
     public let unknownLinks: [QueueDispatchLink]
+    /// Determinately failed dispatches: linked run failed, never resumed
+    /// past the failure. History stands; the queue holds exactly as a
+    /// live failed run holds it — explicit resume releases.
+    public let failedLinks: [QueueDispatchLink]
 }
 
 /// Durable queue replay. Fail-closed like `reconcileOperations`: duplicate
@@ -317,21 +322,28 @@ public struct QueueReconstruction: Sendable, Equatable {
 /// Crash boundaries (durable, in log order):
 /// - queueAdmitted with no link: never sent. Reconstructed as recorded
 ///   (queued/held) — resumable, no unknown delivery.
-/// - link without a run-completion event for the linked runID: sent but
-///   uncompleted. Reconstructed as `.heldUnknown` + queue hold, no matter
-///   what the last recorded entry state says. This is the delivery-unknown
-///   case: the provider effect may have run, the outcome is lost.
-/// - link with a run-completion event: the run ended. The entry stands as
-///   recorded (normally admittedToHistory) — done, no hold from this entry.
+/// - link with a run-completion event for the linked runID: the run ended
+///   cleanly. The entry stands as recorded (normally admittedToHistory) —
+///   done, no hold from this entry.
+/// - link with a run-FAILURE event: the run ended determinately without
+///   completing. The recorded state stands, but the queue holds (same as
+///   a live failed run — explicit resume releases it) unless a later
+///   queue-resumed event shows the failure was already resumed past.
 /// - link superseded by an explicit reconcile: a post-link queueUpdated
 ///   moving the entry to .queued from .heldUnknown/.admittedToHistory/
 ///   .dispatched can only come from the reconcile transition (resume only
 ///   unholds plain .held; admission only creates new entries). The
 ///   recorded decision stands — requeued, resumable; this is recorded
 ///   operator judgment, never proof of non-delivery.
-/// A run-completion event is `eventAppended` kind "completed*“ with digest
-/// `eventDigest("completed", runID)`, recomputed per link (digests are
-/// hashes and cannot be inverted). Legacy logs predate linkage: a
+/// - link with neither: sent but uncompleted. Reconstructed as
+///   `.heldUnknown` + queue hold, no matter what the last recorded entry
+///   state says. This is the delivery-unknown case: the provider effect
+///   may have run, the outcome is lost.
+/// A run-completion event is `eventAppended` kind "completed*" with digest
+/// `eventDigest("completed", runID)`; a failure event is kind "failed"
+/// with digest `eventDigest("failed", runID)` (run-scoped since D0; older
+/// fixed-digest failures never match). All digests are recomputed per
+/// link — hashes cannot be inverted. Legacy logs predate linkage: a
 /// recorded dispatched/history entry without a link keeps its recorded
 /// state (status quo ante — inert without a link, never auto-dispatched).
 public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruction {
@@ -340,6 +352,8 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
     var links: [String: QueueDispatchLink] = [:]
     var linkPositions: [String: Int] = [:]
     var completedDigests = Set<String>()
+    var failedDigests = Set<String>()
+    var lastResumeIndex: Int? = nil
     // Reconcile-pattern updates (operator explicitly released an unknown
     // delivery): a queueUpdated to .queued whose tracked pre-update state
     // was .heldUnknown, .admittedToHistory, or .dispatched. Only the
@@ -374,12 +388,17 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
             _ = seq
             if kind.hasPrefix("completed") {
                 completedDigests.insert(digest)
+            } else if kind == "failed" {
+                failedDigests.insert(digest)
+            } else if kind == "queue-resumed" {
+                lastResumeIndex = index
             }
         default:
             continue
         }
     }
     var unknownLinks: [QueueDispatchLink] = []
+    var failedLinks: [QueueDispatchLink] = []
     var queueHeld = false
     for i in entries.indices {
         let entry = entries[i]
@@ -395,9 +414,22 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
             }
             continue
         }
-        // Recompute the run-completion digest (hashes do not invert).
+        // Recompute the run-terminal digests (hashes do not invert).
         let doneDigest = eventDigest("completed", link.runID.raw)
         if completedDigests.contains(doneDigest) {
+            continue
+        }
+        let failedDigest = eventDigest("failed", link.runID.raw)
+        if failedDigests.contains(failedDigest) {
+            // Determinately failed (not unknown): the entry's history
+            // stands. A resume recorded after this failure already released
+            // its hold; otherwise the queue holds exactly as a live failed
+            // run holds it, until explicit resume.
+            failedLinks.append(link)
+            if let resumedAt = lastResumeIndex, let linkedAt = linkPositions[entry.entryID], resumedAt > linkedAt {
+                continue
+            }
+            queueHeld = true
             continue
         }
         // An explicit reconcile decision supersedes the unknown: a
@@ -454,5 +486,5 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
             acks.removeValue(forKey: ack.commandID)
         }
     }
-    return QueueReconstruction(entries: entries, acks: acks, queueHeld: queueHeld, unknownLinks: unknownLinks)
+    return QueueReconstruction(entries: entries, acks: acks, queueHeld: queueHeld, unknownLinks: unknownLinks, failedLinks: failedLinks)
 }

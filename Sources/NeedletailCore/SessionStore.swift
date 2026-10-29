@@ -214,13 +214,18 @@ public struct CancelledPendingError: Sendable, Equatable, Codable {
 public struct Acknowledgment: Sendable, Equatable, Codable {
     public let subjectSessions: [SessionID]
     public let operationIDs: [OperationID]
+    /// M2-D D0: queued dispatches covered by this decision (entry IDs of
+    /// held-unknown deliveries). Optional so pre-D0 rows (no key) still
+    /// decode; new rows always write it (possibly empty).
+    public let queueEntryIDs: [String]?
     public let determination: String
     public let atMillis: UInt64
-    public init(subjectSessions: [SessionID], operationIDs: [OperationID], determination: String, atMillis: UInt64) {
+    public init(subjectSessions: [SessionID], operationIDs: [OperationID], determination: String, atMillis: UInt64, queueEntryIDs: [String]? = nil) {
         self.subjectSessions = subjectSessions
         self.operationIDs = operationIDs
         self.determination = determination
         self.atMillis = atMillis
+        self.queueEntryIDs = queueEntryIDs
     }
 }
 

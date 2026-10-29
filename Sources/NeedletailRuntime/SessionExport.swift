@@ -224,6 +224,7 @@ public enum SessionExport {
             var row: [String: Any] = ["seq": seq, "kind": "acknowledgedUnresolved",
                                       "subjectSessions": ack.subjectSessions.map(\.raw),
                                       "operationIDs": ack.operationIDs.map(\.raw),
+                                      "queueEntryIDs": ack.queueEntryIDs ?? [],
                                       "atMillis": ack.atMillis]
             if includeContent {
                 row["determination"] = ack.determination

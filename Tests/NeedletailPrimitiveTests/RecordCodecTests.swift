@@ -233,6 +233,29 @@ struct RecordCodecTests {
         assertIntegrityFailure(Data("not json".utf8))
     }
 
+    @Test("pre-D0 acknowledgment rows without queueEntryIDs still decode")
+    func decodeLegacyAcknowledgmentWithoutQueueEntryIDs() throws {
+        // Backward compatibility: synthesized Codable omits nil optionals,
+        // so a pre-D0 row (no such key) is byte-identical to a new row
+        // with nil queueEntryIDs — decoding either must yield nil.
+        let ack = Acknowledgment(
+            subjectSessions: [SessionID("s-old")],
+            operationIDs: [OperationID("eo/c1")],
+            determination: "operator-accepted-risk", atMillis: 4242)
+        let full = String(decoding: try RecordCodec.encode(.acknowledgedUnresolved(ack)), as: UTF8.self)
+        #expect(!full.contains("queueEntryIDs"), "nil queueEntryIDs writes no key — old and new rows match")
+        let decoded = try RecordCodec.decode(Data(full.utf8))
+        #expect(decoded == .acknowledgedUnresolved(ack), "nil round-trips losslessly")
+        // Non-nil values round-trip with the key present.
+        let withQ = Acknowledgment(
+            subjectSessions: [SessionID("s-old")],
+            operationIDs: [OperationID("eo/c1")],
+            determination: "operator-accepted-risk", atMillis: 4242,
+            queueEntryIDs: ["q-9"])
+        let back = try RecordCodec.decode(try RecordCodec.encode(.acknowledgedUnresolved(withQ)))
+        #expect(back == .acknowledgedUnresolved(withQ), "queue entry IDs round-trip")
+    }
+
     @Test("encoded rows never carry derived origin/pathPrefix; decode re-derives them")
     func derivedFieldsAreNeverEncoded() throws {
         let record = try Self.allCases()[1] // epochOpened with a full snapshot

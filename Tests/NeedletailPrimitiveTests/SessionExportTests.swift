@@ -88,6 +88,10 @@ struct SessionExportTests {
             .queueUpdated(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .followUp,
                                      state: .dispatched, revision: 4, text: "fix QUEUED-111 now",
                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false)),
+            .queueDispatched(QueueDispatchLink(
+                entryID: "q-1", commandID: CommandID("cmd-1"),
+                runID: RunID("r-1"), requestID: RequestID("req-1"),
+                effectID: EffectID("eff-1"), epochID: EpochID("epoch-1"))),
             .eventAppended(seq: SequenceNumber(77), kind: "requesting", digest: "d1e2"),
             .artifactPublished(ArtifactRef(
                 digest: String(repeating: "a", count: 64), size: 4, kind: "exec-output",
@@ -163,6 +167,7 @@ struct SessionExportTests {
             "reference", "unresolved",
             "artifactKind", "size", "relativePath", "digest",
             "effectID", "operationIDs", "error", "determination", "subjectSessions",
+        "runID", "requestID", "queueEntryIDs",
             "complete", "recordCount",
             "operations", "completed", "held", "unstarted", "orphaned",
         ]
@@ -663,7 +668,8 @@ struct SessionExportTests {
         let ack = Acknowledgment(
             subjectSessions: [SessionID("s-old")],
             operationIDs: [OperationID("eo/c1")],
-            determination: "manually-reconciled:SECRET-NOTE-777", atMillis: 4242)
+            determination: "manually-reconciled:SECRET-NOTE-777", atMillis: 4242,
+            queueEntryIDs: ["q-9"])
         try store.appendBatch([
             .sessionOpened(session: session, atMillis: 1000),
             .acknowledgedUnresolved(ack),
@@ -680,6 +686,7 @@ struct SessionExportTests {
         // Exact structural identity survives redaction.
         #expect(row["subjectSessions"] as? [String] == ["s-old"])
         #expect(row["operationIDs"] as? [String] == ["eo/c1"])
+        #expect(row["queueEntryIDs"] as? [String] == ["q-9"], "queue unknowns named in the audit")
         #expect(row["atMillis"] as? Int == 4242)
         #expect(row["redacted"] as? Bool == true)
         #expect(row["determination"] == nil, "determination key absent without --include-content")

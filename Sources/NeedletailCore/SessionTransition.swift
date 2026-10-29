@@ -863,7 +863,11 @@ private func withdrawEntry<I: IDSource>(_ state: SessionState, entryID: String, 
         return Transition(state: s1, effects: [.emitUI(.denied(cause: "unknown queue entry"))], records: prefix)
     }
     let entry = state.queue[position]
-    guard entry.state == .queued || entry.state == .held else {
+    // Withdrawing an unknown delivery is an explicit operator decision
+    // to drop it — recorded via the tombstone like any withdraw, never
+    // an automatic action. Only reconciliation (requeue) or withdraw can
+    // move a held-unknown entry; resume never touches it.
+    guard entry.state == .queued || entry.state == .held || entry.state == .heldUnknown else {
         let (s1, prefix) = sequenced(state, kind: "queue-withdraw-refused", digest: eventDigest("withdraw", entryID), ids: &ids)
         return Transition(state: s1, effects: [.emitUI(.denied(cause: "dispatched entries are history, not editable"))], records: prefix)
     }
@@ -1050,19 +1054,24 @@ private func switchModel<I: IDSource>(_ state: SessionState, alias: String, atMi
         execComposed: state.epoch.execComposed)
     var queue = state.queue
     var heldChanges: [DurableRecord] = []
+    var heldCount = 0
     for i in queue.indices where queue[i].targetEpochID != epoch.epochID && (queue[i].state == .queued) {
         let entry = queue[i]
         queue[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .held, revision: entry.revision, text: entry.text,
             targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
-        // M2-D D0: the stale-epoch hold is durable — a reopen must see
-        // these entries as held (retarget or withdraw to proceed), not
-        // as silently dispatchable.
+        // M2-D D0: the stale-epoch hold is durable AND holds the queue —
+        // retarget or withdraw is required before anything dispatches
+        // past these entries (the head barrier re-trips otherwise).
         heldChanges.append(.queueUpdated(queue[i]))
+        heldCount += 1
     }
     let (s1, prefix) = sequenced(state, kind: "epoch-opened", digest: eventDigest("epoch", alias), ids: &ids)
-    let next = s1.replacing(epoch: epoch, queue: queue, admittedCommands: [:])
+    let next = s1.replacing(epoch: epoch, queue: queue,
+        queueHeld: heldCount > 0 ? true : s1.queueHeld,
+        heldReason: heldCount > 0 ? .some(.staleAttachment) : s1.heldReason,
+        admittedCommands: [:])
     return Transition(state: next, effects: [.emitUI(.runUpdate(phase: "epoch", detail: "switched to \(terminalSafe(alias))"))], records: prefix + [.epochOpened(epoch)] + heldChanges)
 }
 
@@ -1357,7 +1366,13 @@ private func failRun<I: IDSource>(
     _ state: SessionState, failure: RunFailure, hold: Bool, atMillis: UInt64, ids: inout I
 ) -> Transition {
     _ = atMillis
-    let (s1, prefix) = sequenced(state, kind: "failed", digest: "failed", ids: &ids)
+    // M2-D D0: the failure record is bound to the run when one is active,
+    // so reopen can distinguish a determinately failed run (history stands,
+    // explicit resume releases the hold) from an unknown delivery (hold
+    // until reconciled). Without an active run the legacy fixed digest
+    // stands — nothing attributable exists to bind.
+    let failureDigest = state.activeRun.map { eventDigest("failed", $0.runID.raw) } ?? "failed"
+    let (s1, prefix) = sequenced(state, kind: "failed", digest: failureDigest, ids: &ids)
     let next = s1.replacing(
         phase: .failed(failure), activeRun: .some(nil), activeRequest: .some(nil),
         queueHeld: hold ? true : s1.queueHeld,
@@ -1924,7 +1939,17 @@ private func grantApproval<I: IDSource>(_ state: SessionState, requestID: Reques
     let cwdIds = Dictionary(
         (state.pendingExecIdentities ?? []).map { ($0.callID, "\($0.cwdDevice):\($0.cwdInode)") },
         uniquingKeysWith: { a, _ in a })
-    return dispatchTrustedBatch(state, batch: batch, approvedPaths: approved, approvedExecDigests: digests, approvedCwdIdentities: cwdIds, ids: &ids)
+    // M2-D D0: a grant resolves the approval-unavailable hold it answers.
+    // Clear ONLY that reason: any other hold (cancel/error/stale) stands.
+    // Without this, an unavailable-then-granted approval would end via
+    // completed-held instead of auto-dispatching the queued work.
+    let unheld: SessionState
+    if state.heldReason == .some(.approvalPending) {
+        unheld = state.replacing(queueHeld: false, heldReason: .some(nil))
+    } else {
+        unheld = state
+    }
+    return dispatchTrustedBatch(unheld, batch: batch, approvedPaths: approved, approvedExecDigests: digests, approvedCwdIdentities: cwdIds, ids: &ids)
 }
 
 private func denyApproval<I: IDSource>(_ state: SessionState, ids: inout I) -> Transition {

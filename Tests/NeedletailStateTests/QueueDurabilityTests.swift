@@ -357,7 +357,7 @@ struct QueueDurabilityTests {
         // Reopened state: one unknown delivery + one unresolved operation.
         let recon = QueueReconstruction(
             entries: [QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .heldUnknown, revision: 1, text: "u", targetEpochID: base.epoch.epochID, orderKey: 5, sealed: false)],
-            acks: [:], queueHeld: true, unknownLinks: [])
+            acks: [:], queueHeld: true, unknownLinks: [], failedLinks: [])
         let held = OperationRef(operationID: OperationID("eff-1/c1"), callID: "c1", state: .unknown, mutating: true)
         var state = SessionState.resumedAfterReopen(
             sessionID: base.sessionID, epoch: base.epoch, trustMode: base.trustMode,
@@ -373,6 +373,83 @@ struct QueueDurabilityTests {
         let resume = transition(state, .queueResume(atMillis: 2000), &ids)
         #expect(resume.state.queueHeld, "no resume past unresolved ops")
         #expect(resume.state.queue.first?.state == .heldUnknown, "unknown entry untouched by refused resume")
+    }
+
+    @Test("D0 epoch switch holds stale entries and the queue with durable records")
+    func switchModelHoldsQueue() throws {
+        let twoModel = """
+            {"version":1,"default_model":"local-coder","allow_http_origins":["http://127.0.0.1:11434","http://127.0.0.1:11435"],"models":[{"alias":"local-coder","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11434","model":"qwen","context_window":262144,"max_output":4096,"locality":"local","connect_timeout_s":10,"read_idle_timeout_s":300,"request_timeout_s":1800,"max_in_flight":1},{"alias":"second","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11435","model":"qwen","context_window":262144,"max_output":4096,"locality":"local","connect_timeout_s":10,"read_idle_timeout_s":300,"request_timeout_s":1800,"max_in_flight":1}],"tools":{"read":true}}
+            """
+        let snapshot = try validateConfig(Data(twoModel.utf8))
+        let profile = try #require(snapshot.profiles["local-coder"])
+        let caps = effectiveCapabilities(
+            build: .allAllowed, userConfig: snapshot.tools,
+            workspaceGrant: .allDenied, invocationMask: .allAllowed,
+            sealed: SealedRestrictions(sealed: false))
+        let epoch = EpochDescriptor(
+            epochID: EpochID("epoch-1"), configSnapshot: snapshot, profile: profile,
+            effectiveCaps: caps, route: .allowed(endpoint: "http://127.0.0.1:11434/chat/completions", alias: "local-coder"))
+        var ids = StateFixtures.ids()
+        var state = SessionState(sessionID: SessionID("s-9"), epoch: epoch, trustMode: .workspace, phase: .idle)
+        state = state.replacing(queue: [QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "old", targetEpochID: EpochID("epoch-1"), orderKey: 1, sealed: false)])
+        let switched = transition(state, .switchModel(alias: "second", atMillis: 1001), &ids)
+        #expect(switched.state.queue.first?.state == .held, "stale entries hold on switch")
+        #expect(switched.state.queueHeld, "switch with stale entries holds the queue")
+        if case .staleAttachment = switched.state.heldReason {
+        } else {
+            Issue.record("hold reason must be staleAttachment, got \(String(describing: switched.state.heldReason))")
+        }
+        let holds = switched.records.filter {
+            if case .queueUpdated(let e) = $0, e.state == .held { return true }; return false
+        }
+        #expect(holds.count == 1, "one durable hold record, got \(holds.count)")
+    }
+
+    @Test("D0 failed dispatch holds the queue; resume after failure releases")
+    func failedLinkHoldsQueue() throws {
+        let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        // Link + failed run (no completion): determinate failure, not unknown.
+        let recon = try reconcileQueue([
+            .queueAdmitted(entry),
+            .queueUpdated(history),
+            .queueDispatched(link),
+            .eventAppended(seq: SequenceNumber(4), kind: "failed", digest: eventDigest("failed", "r-9")),
+        ])
+        #expect(recon.entries.first?.state == .admittedToHistory, "failed dispatch keeps history")
+        #expect(recon.queueHeld, "failed dispatch holds the queue like a live failed run")
+        #expect(recon.unknownLinks.isEmpty, "determinate failure is not an unknown delivery")
+        #expect(recon.failedLinks.count == 1)
+        // A resume recorded after the failure releases the failed hold.
+        let recon2 = try reconcileQueue([
+            .queueAdmitted(entry),
+            .queueUpdated(history),
+            .queueDispatched(link),
+            .eventAppended(seq: SequenceNumber(4), kind: "failed", digest: eventDigest("failed", "r-9")),
+            .eventAppended(seq: SequenceNumber(5), kind: "queue-resumed", digest: "resumed"),
+        ])
+        #expect(!recon2.queueHeld, "resume after failure releases the failed hold")
+        #expect(recon2.failedLinks.count == 1, "the failure itself is still recorded")
+    }
+
+    @Test("D0 grant clears only the approval hold, never other holds")
+    func grantClearsOnlyApprovalHold() throws {
+        var ids = StateFixtures.ids()
+        let (admitting, run) = try StateFixtures.admitted("run", ids: &ids)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: #"{"path":"f"}"#)])
+        let request = ApprovalRequest(
+            requestID: run.requestID, runID: run.runID, generation: run.revision,
+            operation: "op", requiredGrant: "explicit approval", protectedPaths: [])
+        let authorising = admitting.replacing(phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch))
+        // Approval hold from a prior unavailable decision: grant clears it.
+        let held = authorising.replacing(queueHeld: true, heldReason: .some(.approvalPending))
+        let granted = transition(held, .approvalGrant(requestID: run.requestID, generation: run.revision, atMillis: 1001), &ids)
+        #expect(!granted.state.queueHeld, "grant releases its own approval hold")
+        // An unrelated hold survives a grant.
+        let otherHeld = authorising.replacing(queueHeld: true, heldReason: .error("unresolved markers"))
+        let stillHeld = transition(otherHeld, .approvalGrant(requestID: run.requestID, generation: run.revision, atMillis: 1001), &ids)
+        #expect(stillHeld.state.queueHeld, "non-approval holds survive a grant")
     }
 
     @Test("D0 64 KiB queue text budget refuses without dropping older entries")

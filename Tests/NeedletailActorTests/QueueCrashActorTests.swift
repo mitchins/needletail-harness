@@ -106,6 +106,30 @@ struct QueueCrashActorTests {
             approvals: ScriptedApprovals(), writer: writer)
     }
 
+    /// M2-D D0: the ID allocator must continue past the reopened log, or
+    /// new admissions reuse sequence numbers and the next reconcile fails
+    /// closed on its own log ("duplicate queue admission"). Seed from the
+    /// durable high-water mark (event sequences + entry orderKeys).
+    private static func replayWatermark(store: InMemorySessionStore, session: SessionID) throws -> UInt64 {
+        var maxSeq: UInt64 = 0
+        var cursor: UInt64 = 0
+        while true {
+            let (page, next) = try store.records(session: session, since: cursor, limit: 500)
+            for rec in page {
+                maxSeq = max(maxSeq, rec.sequence.value)
+                switch rec.record {
+                case .queueAdmitted(let e), .queueUpdated(let e):
+                    maxSeq = max(maxSeq, e.orderKey)
+                default:
+                    break
+                }
+            }
+            guard let advanced = next else { break }
+            cursor = advanced
+        }
+        return maxSeq
+    }
+
     @Test("D0 boundary 1: crash before linkage resumes dispatchable with no duplicate")
     func crashBeforeLinkageResumes() async throws {
         let store = InMemorySessionStore()
@@ -203,6 +227,28 @@ struct QueueCrashActorTests {
         let state2 = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
         #expect(state2.queue.first?.state == .queued, "reconcile decision survives reopen")
         #expect(!state2.queueHeld, "no hold after reconciled requeue")
+        // Redispatch delivers exactly once: a fresh run completes, the
+        // follow-up dispatches (link #2), and exactly one provider
+        // invocation carries the new linked request.
+        let t2 = ScriptedTransport()
+        t2.script = [
+            ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0)),
+            ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0)),
+        ]
+        let actor2 = try Self.makeScriptedActor(store: store, state: state2, transport: t2, ids: DeterministicIDSource(prefix: "qe2"))
+        await actor2.submitText(commandID: CommandID("run-9"), text: "run", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitPhase(actor2, {
+            $0.queue.allSatisfy { $0.state == .admittedToHistory }
+        }, "reconciled entry dispatched and done")
+        let links = try store.records(session: idle.sessionID, since: 0, limit: 500).0.compactMap { rec -> QueueDispatchLink? in
+            if case .queueDispatched(let l) = rec.record { return l }
+            return nil
+        }
+        #expect(links.count == 2, "exactly two dispatches total, got \(links.count)")
+        let link2 = try #require(links.last)
+        #expect(link2.effectID != link.effectID, "redispatch mints a fresh effect identity")
+        let followInvocations = t2.invocations.filter { $0.requestID == link2.requestID }
+        #expect(followInvocations.count == 1, "exactly one provider invocation for the redispatch, got \(followInvocations.count)")
     }
 
     @Test("D0 boundary 3: crash after completion stands as history")
@@ -309,6 +355,42 @@ struct QueueCrashActorTests {
         #expect(after.queue.count == 1, "retry must not insert")
         #expect(after.admittedCommands[CommandID("dup")] == ack1, "retry returns the original ack")
         continuation.finish()
+    }
+
+    @Test("D0 post-reopen admissions continue the ID sequence without collisions")
+    func postReopenAdmissionsUseFreshIDs() async throws {
+        let store = InMemorySessionStore()
+        let idle = try ActorFixtures.idleState()
+        let gate = GatedTransport()
+        let (stream, continuation) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        gate.gate = stream
+        let actor1 = try Self.makeGatedActor(store: store, state: idle, transport: gate, ids: DeterministicIDSource(prefix: "qv"))
+        await actor1.submitText(commandID: CommandID("run-1"), text: "run", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitInvocations(gate, count: 1)
+        await actor1.submitText(commandID: CommandID("f-1"), text: "follow", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitPhase(actor1, { $0.queue.count == 1 }, "queued")
+        // Crash; rebuild with a seeded allocator past the durable high-water mark.
+        let watermark = try Self.replayWatermark(store: store, session: idle.sessionID)
+        #expect(watermark > 0, "log has sequences to continue past")
+        let rebuilt = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        let gate2 = GatedTransport()
+        let (stream2, continuation2) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        gate2.gate = stream2
+        let actor2 = try Self.makeGatedActor(store: store, state: rebuilt, transport: gate2, ids: DeterministicIDSource(prefix: "qw", counter: watermark))
+        await actor2.submitText(commandID: CommandID("run-2"), text: "run2", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitInvocations(gate2, count: 1)
+        await actor2.submitText(commandID: CommandID("f-2"), text: "follow2", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitPhase(actor2, { $0.queue.count == 2 }, "second entry queued")
+        let after = await actor2.currentState()
+        let ids = after.queue.map(\.entryID)
+        #expect(Set(ids).count == 2, "no entry ID reuse after reopen, got \(ids)")
+        #expect(after.queue[1].orderKey > watermark, "new admission continues past the watermark")
+        // Crash again: reopen must reconcile cleanly (no duplicate-admission integrity fault).
+        let rebuilt2 = try Self.reopenedState(store: store, session: idle.sessionID, epoch: idle.epoch)
+        #expect(rebuilt2.queue.count == 2, "both entries survive the second reopen")
+        #expect(rebuilt2.admittedCommands[CommandID("f-2")]?.entryID == after.queue[1].entryID, "new ack replays")
+        continuation.finish()
+        continuation2.finish()
     }
 
     @Test("D0 held queue remains held across reopen; cancel marks entries durable")

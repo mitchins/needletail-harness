@@ -741,17 +741,19 @@ struct RunCommand: ParsableCommand {
                     || effective.tools.exec != .denied
                 if !runMayMutate {
                     eprint("note: proceeding read-only with \(heldOpCount) unresolved operation(s) and \(heldQueueCount) uncompleted queued dispatch(es) in session(s) \(namedSessions) (history preserved for future mutating runs)")
-                } else if let determination = acknowledgedDetermination {
+                } else                 if let determination = acknowledgedDetermination {
                     // The RECORD is the decision — the flag alone authorizes
                     // nothing. Append under this run's fenced writer
                     // identity AFTER claim + sessionOpened, verify
                     // persistence, and only then permit dispatch. Original
-                    // unresolved markers are preserved untouched.
+                    // unresolved markers are preserved untouched. Queue
+                    // unknowns are named by entry so the audit covers them.
                     let acknowledgment = Acknowledgment(
                         subjectSessions: holds.map(\.session),
                         operationIDs: holds.flatMap(\.operationIDs),
                         determination: determination,
-                        atMillis: SystemClock().nowMillis())
+                        atMillis: SystemClock().nowMillis(),
+                        queueEntryIDs: holds.flatMap(\.unknownQueueDeliveries).map(\.entryID))
                     do {
                         try CrossRunGate.appendAcknowledgment(
                             store: production, as: runIdentity,
@@ -762,7 +764,7 @@ struct RunCommand: ParsableCommand {
                         eprint("store error: cannot record acknowledgment: \(terminalSafe(String(describing: error)))")
                         throw ExitCode(6)
                     }
-                    eprint("acknowledged \(heldOpCount) unresolved operation(s) in session(s) \(namedSessions) as '\(terminalSafe(determination))' (recorded in session \(state.sessionID.raw); history preserved)")
+                    eprint("acknowledged \(heldOpCount) unresolved operation(s) and \(heldQueueCount) uncompleted queued dispatch(es) in session(s) \(namedSessions) as '\(terminalSafe(determination))' (recorded in session \(state.sessionID.raw); history preserved)")
                 } else {
                     // This gate IS a non-interactive approval check (same
                     // code as approval-required): the invocation is
