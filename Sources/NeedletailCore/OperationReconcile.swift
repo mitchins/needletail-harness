@@ -102,6 +102,15 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
     var pendingMarkers: [OperationID: OperationRef] = [:]
     var pendingMarkerOrder: [OperationID] = []
     var cancelledErrors: [CancelledPendingError] = []
+    // M2-D D3: explicit operator reconciliations discharge recovery
+    // holds. Acknowledged operation IDs stay classified (evidence is
+    // preserved) but never reseed a hold — on this or any reopen.
+    var ackedIDs = Set<OperationID>()
+    for record in records {
+        if case .acknowledgedUnresolved(let ack) = record {
+            ackedIDs.formUnion(ack.operationIDs)
+        }
+    }
     for record in records {
         switch record {
         case .operationIntent(let ref):
@@ -205,9 +214,12 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
         // Admission markers were counted above; they never pair.
         guard intent.callID != nil else { continue }
         if let marker = pendingMarkers[id], results[id] == nil {
-            // Cancelled-pending marker without superseding result: HOLD-equivalent.
+            // Cancelled-pending marker without superseding result: HOLD-equivalent,
+            // unless the operator explicitly reconciled it.
             explicitUnknown.append(marker)
-            held.append(marker)
+            if !ackedIDs.contains(id) {
+                held.append(marker)
+            }
             continue
         }
         guard let result = results[id] else {
@@ -216,7 +228,9 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
                     operationID: id, callID: intent.callID,
                     state: .unknown, mutating: true)
                 unmatchedMutating.append(unknown)
-                held.append(unknown)
+                if !ackedIDs.contains(id) {
+                    held.append(unknown)
+                }
             } else {
                 unmatchedNonMutating.append(id)
             }
@@ -238,9 +252,12 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
         }
         // Only `.unknown` reaches here (`.intent` in a result record is
         // rejected above): durable recovery evidence. Unknown-state always
-        // holds — it is an explicit unknowability claim, not mere absence.
+        // holds — it is an explicit unknowability claim, never mere absence —
+        // unless the operator explicitly reconciled it.
         explicitUnknown.append(result.ref)
-        held.append(result.ref)
+        if !ackedIDs.contains(id) {
+            held.append(result.ref)
+        }
     }
     for id in resultOrder where intents[id] == nil && !denialIDs.contains(id) {
         let result = results[id]!
@@ -248,6 +265,10 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
         // No intent to pair with: the operation may have executed with its
         // intent lost. Unknown-state orphans always hold (explicit claim);
         // done-state orphans hold iff mutating (possible side effect).
+        // Explicitly reconciled operations are classified, never held.
+        if ackedIDs.contains(id) {
+            continue
+        }
         if result.ref.state == .unknown {
             held.append(result.ref)
         } else if result.ref.mutating {
@@ -259,7 +280,9 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
     for id in pendingMarkerOrder where intents[id] == nil {
         guard let marker = pendingMarkers[id] else { continue }
         orphanResults.append(marker)
-        held.append(marker)
+        if !ackedIDs.contains(id) {
+            held.append(marker)
+        }
     }
     // Include cancelledPendingErrors in held reason via count already in held; actual strings aggregated by caller via new field.
     // Hold reason at call sites should append cancelledErrors strings if present.

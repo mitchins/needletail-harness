@@ -20,6 +20,15 @@ public enum SessionEvent: Sendable, Equatable {
     /// delivery (requeue for redispatch, or withdraw to drop). Recorded;
     /// never automatic, never a non-delivery proof.
     case queueReconcile(entryID: String, atMillis: UInt64)
+    /// M2-D D3: explicit operator reconciliation of one unknown mutating
+    /// operation (cancel-ambiguous, inverse-ambiguous, or otherwise
+    /// unknowable). The operator accepts the stated determination and the
+    /// marker is discharged as a RECORDED decision — never silently
+    /// dropped, never auto-retried. The acknowledgment is durable:
+    /// reopen reconciles the same journal without reseeding a hold for an
+    /// acknowledged operation. Unknown DELIVERIES (heldUnknown queue
+    /// entries) are NOT covered — they reconcile via queueReconcile.
+    case acknowledgeUnknown(operationID: OperationID, determination: String, atMillis: UInt64)
     /// M2-D D1: operator input carrying authorized attachment snapshots
     /// (captured by Runtime BEFORE stamping; the transition never parses
     /// `@` text into snapshots). Mirrors operatorInput routing: fresh run

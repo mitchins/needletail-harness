@@ -398,6 +398,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.idle, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (.idle, .acknowledgeUnknown(let operationID, let determination, let at)):
+        return acknowledgeUnknownOp(state, operationID: operationID, determination: determination, atMillis: at, ids: &ids)
     case (.idle, .queueAttachmentReplace(let entryID, let snapshots, let at)):
         return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
     case (.idle, .undoPreview(let group, let preimages, let at)):
@@ -508,6 +510,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.failed, .queueReconcile(let entryID, let at)), (.completed, .queueReconcile(let entryID, let at)), (.interrupted, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (.failed, .acknowledgeUnknown(let operationID, let determination, let at)), (.completed, .acknowledgeUnknown(let operationID, let determination, let at)), (.interrupted, .acknowledgeUnknown(let operationID, let determination, let at)):
+        return acknowledgeUnknownOp(state, operationID: operationID, determination: determination, atMillis: at, ids: &ids)
     case (.failed, .queueAttachmentReplace(let entryID, let snapshots, let at)), (.completed, .queueAttachmentReplace(let entryID, let snapshots, let at)), (.interrupted, .queueAttachmentReplace(let entryID, let snapshots, let at)):
         return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
     case (.failed, .undoPreview(let group, let preimages, let at)), (.completed, .undoPreview(let group, let preimages, let at)), (.interrupted, .undoPreview(let group, let preimages, let at)):
@@ -556,6 +560,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (_, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (_, .acknowledgeUnknown(let operationID, let determination, let at)):
+        return acknowledgeUnknownOp(state, operationID: operationID, determination: determination, atMillis: at, ids: &ids)
     case (_, .queueAttachmentReplace(let entryID, let snapshots, let at)):
         return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
     case (_, .attachmentValidationResult(let entryID, let requested, let observations, let at)):
@@ -1191,6 +1197,46 @@ private func reconcileQueueEntry<I: IDSource>(_ state: SessionState, entryID: St
         state: next,
         effects: [.emitUI(.runUpdate(phase: "queue", detail: "reconciled \(entryID): requeued by explicit operator decision"))],
         records: prefix + [.queueUpdated(queue[position])])
+}
+
+/// M2-D D3: explicit operator reconciliation of one unknown mutating
+/// operation. The determination is recorded (never silent), the recovery
+/// marker is discharged (never retried), and reopen honors the durable
+/// acknowledgment instead of reseeding a hold. Refused when no such
+/// marker exists, when a live run is in flight (the run that produced the
+/// unknown may still be settling it), or mid-undo (exclusive phase).
+/// Unknown DELIVERIES are out of scope — queueReconcile owns those.
+private func acknowledgeUnknownOp<I: IDSource>(
+    _ state: SessionState, operationID: OperationID, determination: String,
+    atMillis: UInt64, ids: inout I
+) -> Transition {
+    _ = atMillis
+    guard !state.phase.hasActiveRun else {
+        let (s1, prefix) = sequenced(state, kind: "unknown-acknowledge-refused", digest: eventDigest("acknowledge", operationID.raw), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "cannot reconcile unknown outcomes while a run is in flight"))],
+            records: prefix)
+    }
+    guard state.unresolvedOperations.contains(where: { $0.operationID == operationID }) else {
+        let (s1, prefix) = sequenced(state, kind: "unknown-acknowledge-unknown", digest: eventDigest("acknowledge", operationID.raw), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "no unresolved operation \(operationID.raw)"))],
+            records: prefix)
+    }
+    let unresolved = state.unresolvedOperations.filter { $0.operationID != operationID }
+    let ack = Acknowledgment(
+        subjectSessions: [state.sessionID], operationIDs: [operationID],
+        determination: determination, atMillis: atMillis)
+    let (s1, prefix) = sequenced(state, kind: "unknown-acknowledged", digest: eventDigest("acknowledge", operationID.raw), ids: &ids)
+    let next = s1.replacing(unresolvedOperations: unresolved)
+    return Transition(
+        state: next,
+        effects: [.emitUI(.runUpdate(
+            phase: "queue",
+            detail: "acknowledged \(operationID.raw): \(terminalSafe(determination)) (recorded; never retried)"))],
+        records: prefix + [.acknowledgedUnresolved(ack)])
 }
 
 // MARK: Model / checkpoint meta-commands
