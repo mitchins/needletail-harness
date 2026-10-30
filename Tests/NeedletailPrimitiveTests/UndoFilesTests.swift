@@ -307,6 +307,61 @@ struct UndoFilesTests {
         #expect(try String(contentsOf: url.appendingPathComponent("f.txt"), encoding: .utf8) == "post\n", "refused inverse mutates nothing")
     }
 
+    @Test("reverifyCommitTarget: re-opened identity and content gate the commit")
+    func reverifyCommitTargetGates() throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try "live\n".write(to: url.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
+        let dirFD = try WorkspaceResolver(workspace: fp, readRoots: []).validatedWorkspaceFD()
+        defer { close(dirFD) }
+        func heldOf(_ name: String) throws -> stat {
+            let fd = name.withCString { openat(dirFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+            guard fd >= 0 else { throw StoreError.integrity("open failed") }
+            defer { close(fd) }
+            var st = stat()
+            guard fstat(fd, &st) == 0 else { throw StoreError.integrity("fstat failed") }
+            return st
+        }
+        let expect = UndoFileState(device: 0, inode: 0, hash: Self.sha("live\n"), mode: "644")
+        // Matching file passes (device/inode filled from the live stat).
+        var held = try heldOf("f.txt")
+        let matching = UndoFileState(
+            device: UInt64(held.st_dev), inode: UInt64(held.st_ino),
+            hash: Self.sha("live\n"), mode: "644")
+        #expect(FilesystemUndoApplier.reverifyCommitTarget(
+            parentFD: dirFD, fileName: "f.txt", held: held, expect: matching) == nil,
+            "identical live file passes the gate")
+        // Swapped-in file (same content, new identity) refuses.
+        try "live\n".write(to: url.appendingPathComponent("g.txt"), atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: url.appendingPathComponent("f.txt"))
+        try FileManager.default.moveItem(at: url.appendingPathComponent("g.txt"), to: url.appendingPathComponent("f.txt"))
+        #expect(FilesystemUndoApplier.reverifyCommitTarget(
+            parentFD: dirFD, fileName: "f.txt", held: held, expect: matching) != nil,
+            "replaced file fails the identity gate even with identical content")
+        // Same inode, changed content refuses (the re-read hash leg).
+        try "changed\n".write(to: url.appendingPathComponent("h.txt"), atomically: true, encoding: .utf8)
+        held = try heldOf("h.txt")
+        let staleExpect = UndoFileState(
+            device: UInt64(held.st_dev), inode: UInt64(held.st_ino),
+            hash: Self.sha("live\n"), mode: "644")
+        #expect(FilesystemUndoApplier.reverifyCommitTarget(
+            parentFD: dirFD, fileName: "h.txt", held: held, expect: staleExpect) != nil,
+            "same-inode content change fails the hash leg")
+        // Symlink and missing paths refuse without following.
+        try FileManager.default.createSymbolicLink(
+            at: url.appendingPathComponent("link.txt"),
+            withDestinationURL: url.appendingPathComponent("h.txt"))
+        held = try heldOf("h.txt")
+        #expect(FilesystemUndoApplier.reverifyCommitTarget(
+            parentFD: dirFD, fileName: "link.txt", held: held, expect: staleExpect) != nil,
+            "symlink refuses (no-follow)")
+        let gone = UndoFileState(device: 1, inode: 2, hash: Self.sha("x"), mode: "644")
+        let missing = stat()
+        #expect(FilesystemUndoApplier.reverifyCommitTarget(
+            parentFD: dirFD, fileName: "absent.txt", held: missing, expect: gone) != nil,
+            "removed file refuses")
+    }
+
     // MARK: - Counterfactual: a repeated inverse never applies twice
     @Test("UX-UNDO-09 counterfactual: applying the same inverse twice refuses the second")
     func UX_UNDO_09_doubleApplyRefuses() async throws {

@@ -164,6 +164,47 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
 
     // MARK: - Restore
 
+    /// Commit gate: re-opens `fileName` under `parentFD` and verifies the
+    /// live file still equals the held-open state (`held`, itself already
+    /// verified against `expect`) in BOTH identity and current content
+    /// hash. Returns nil when the commit may proceed; otherwise returns
+    /// the exact outcome to report. Nothing is mutated on any return path
+    /// (clean failures and refusals alike).
+    ///
+    /// The re-open (never the held fd: an open descriptor keeps its
+    /// inode) closes the replacement/deletion window down to the
+    /// re-read→commit gap, which user space cannot close further; a
+    /// non-cooperating writer racing exactly there is a documented
+    /// residual. O_NONBLOCK throughout so a swapped-in FIFO/special file
+    /// fails closed instead of blocking.
+    static func reverifyCommitTarget(
+        parentFD: Int32, fileName: String, held: stat, expect: UndoFileState
+    ) -> UndoInverseOutcome? {
+        let fd: Int32 = fileName.withCString { name in
+            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard fd >= 0 else {
+            return .refused(reason: "commit revalidation: target unavailable (\(String(cString: strerror(errno)))); refusing")
+        }
+        defer { close(fd) }
+        var fresh = stat()
+        guard fstat(fd, &fresh) == 0,
+              (fresh.st_mode & S_IFMT) == S_IFREG,
+              fresh.st_dev == held.st_dev, fresh.st_ino == held.st_ino else {
+            return .refused(reason: "commit revalidation: target replaced; refusing — no overwrite of later work")
+        }
+        let current: Data
+        do {
+            current = try NativeToolExecutor.readBoundedEdit(fd: fd)
+        } catch {
+            return .failed(error: "commit revalidation read failed: \(error)", possiblyMutated: false)
+        }
+        guard NativeToolExecutor.sha256Hex(current) == expect.hash else {
+            return .refused(reason: "commit revalidation: content changed (hash mismatch); refusing — no overwrite of later work")
+        }
+        return nil
+    }
+
     private func applyRestore(
         inverse: UndoInverse, digest: String, expect: UndoFileState, dirFD: Int32
     ) -> UndoInverseOutcome {
@@ -238,12 +279,13 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
         }
         defer { if ownsParentFD { close(parentFD) } }
         // Same-dir tmp, checked write, mode preserve, fsync — then a final
-        // identity revalidation of the TARGET immediately before rename.
-        // This closes the replacement/deletion window; a same-inode content
-        // swap by a non-cooperating writer inside this window is a
-        // documented residual (single-writer scope per the spec caveat) —
-        // and it surfaces at post-verify as unknown, never as a success
-        // claim.
+        // revalidation of the TARGET NAME immediately before rename (see
+        // reverifyCommitTarget): the path is re-opened and both identity
+        // AND current content hash must still match. This closes the
+        // replacement/deletion window and the same-inode rewrite window
+        // down to the re-read→rename gap (one syscall pair wide, user
+        // space cannot close it further); a non-cooperating writer racing
+        // exactly there is a documented residual.
         let tmpName = "." + UUID().uuidString + ".tmp"
         let tmpFD = tmpName.withCString { name in
             openat(parentFD, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o600))
@@ -283,21 +325,11 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
         // Final revalidation of the TARGET NAME immediately before rename:
         // re-open the path (never trust the held fd — an open descriptor
         // keeps its inode, so fstat on it cannot detect replacement or
-        // deletion) and require the same identity the first revalidation
-        // proved. O_NONBLOCK: a swapped-in FIFO must not block the opener
-        // while the workspace lock is held. Any divergence aborts with the
-        // target untouched.
-        let recheckFD: Int32 = fileName.withCString { name in
-            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        }
-        guard recheckFD >= 0 else {
-            return .failed(error: "target revalidation open failed (\(String(cString: strerror(errno)))); aborting", possiblyMutated: false)
-        }
-        defer { close(recheckFD) }
-        var recheck = stat()
-        guard fstat(recheckFD, &recheck) == 0,
-              recheck.st_dev == st.st_dev, recheck.st_ino == st.st_ino else {
-            return .failed(error: "target replaced during inverse; aborting", possiblyMutated: false)
+        // deletion) and require both the just-verified identity AND the
+        // current content hash. O_NONBLOCK for the swapped-in-FIFO case.
+        // Any divergence aborts with the target untouched.
+        if let stop = Self.reverifyCommitTarget(parentFD: parentFD, fileName: fileName, held: st, expect: expect) {
+            return stop
         }
         let renameRet = fileName.withCString { old in
             tmpName.withCString { tmp in
@@ -389,20 +421,11 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
         }
         defer { if ownsParentFD { close(parentFD) } }
         // Re-check the NAME (not the held fd) one last time before unlink:
-        // re-open with no-follow and require the same identity the first
-        // revalidation proved. O_NONBLOCK for the swapped-in-FIFO case.
-        // Any divergence aborts with nothing unlinked.
-        let recheckFD: Int32 = fileName.withCString { name in
-            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        }
-        guard recheckFD >= 0 else {
-            return .failed(error: "target revalidation open failed (\(String(cString: strerror(errno)))); aborting", possiblyMutated: false)
-        }
-        defer { close(recheckFD) }
-        var recheck = stat()
-        guard fstat(recheckFD, &recheck) == 0,
-              recheck.st_dev == st.st_dev, recheck.st_ino == st.st_ino else {
-            return .failed(error: "target replaced during inverse; aborting", possiblyMutated: false)
+        // re-open with no-follow and require the just-verified identity
+        // AND the current content hash. O_NONBLOCK for the swapped-in-FIFO
+        // case. Any divergence aborts with nothing unlinked.
+        if let stop = Self.reverifyCommitTarget(parentFD: parentFD, fileName: fileName, held: st, expect: expect) {
+            return stop
         }
         guard fileName.withCString({ unlinkat(parentFD, $0, 0) }) == 0 else {
             if errno == ENOENT {

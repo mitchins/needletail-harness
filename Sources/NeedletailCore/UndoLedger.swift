@@ -729,15 +729,18 @@ public func undoInverses(undoCommandID: String, group: ChangeGroup) -> [UndoInve
             kind = .removeCreated(expect: expect)
             restoreMode = nil
         } else if member.emptyOriginal {
+            // Proven-empty original: the empty digest IS the preimage
+            // marker (zero bytes to restore, nothing to fetch).
             kind = .restore(preimageDigest: "", expect: expect)
             restoreMode = member.modeBefore
-        } else if let digest = member.preimageDigest {
+        } else if let digest = member.preimageDigest, !digest.isEmpty {
             kind = .restore(preimageDigest: digest, expect: expect)
             restoreMode = member.modeBefore
         } else {
             // Missing preimage is NEVER encoded as an empty digest (that
-            // is the proven-empty marker): it is its own kind, which the
-            // applier refuses outright.
+            // is the proven-empty marker — an empty string here would
+            // restore zero bytes over unknown originals). It is its own
+            // kind, which the applier refuses outright.
             kind = .restoreMissing(expect: expect)
             restoreMode = member.modeBefore
         }

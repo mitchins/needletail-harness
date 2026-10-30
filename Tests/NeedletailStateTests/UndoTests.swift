@@ -304,6 +304,23 @@ struct UndoTests {
             Issue.record("missing preimage must not encode as an empty restore")
             return
         }
+        // An empty-string digest on a NON-empty original is also missing
+        // (never a proven zero-byte file) — same kind, never a restore.
+        var emptyDigest = missing
+        emptyDigest = ChangeGroupMember(
+            operationID: emptyDigest.operationID, callID: emptyDigest.callID,
+            path: emptyDigest.path, grantedRoot: emptyDigest.grantedRoot,
+            created: false, beforeHash: emptyDigest.beforeHash, afterHash: emptyDigest.afterHash,
+            deviceBefore: emptyDigest.deviceBefore, inodeBefore: emptyDigest.inodeBefore,
+            modeBefore: emptyDigest.modeBefore, preimageDigest: "", emptyOriginal: false,
+            deviceAfter: emptyDigest.deviceAfter, inodeAfter: emptyDigest.inodeAfter,
+            modeAfter: emptyDigest.modeAfter, receiptStatus: emptyDigest.receiptStatus,
+            receiptSummary: emptyDigest.receiptSummary)
+        let emptyDigestInverses = undoInverses(undoCommandID: "undo-1", group: Self.group([emptyDigest]))
+        guard case .restoreMissing = emptyDigestInverses[0].kind else {
+            Issue.record("empty digest without emptyOriginal proof must not restore")
+            return
+        }
         // Proven-empty originals keep the empty digest (restorable).
         let empty = Self.member("e.txt", seed: 2, emptyOriginal: true, preimage: nil)
         let emptyInverses = undoInverses(undoCommandID: "undo-1", group: Self.group([empty]))
@@ -498,7 +515,7 @@ struct UndoTests {
         #expect(t.state.phase == .idle, "duplicate never re-enters the exclusive phase")
     }
 
-    @Test("UX-UNDO-04 partial through the chain: applied then refused is partial")
+    @Test("UX-UNDO-05 partial through the chain: applied then refused is partial")
     func UX_UNDO_05_appliedThenRefusedIsPartial() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1), Self.member("b.txt", seed: 2)])
