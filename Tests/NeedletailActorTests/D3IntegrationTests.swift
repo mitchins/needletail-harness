@@ -57,6 +57,18 @@ struct D3IntegrationTests {
         return page.map(\.record)
     }
 
+    /// Durable dispatch-link count. Asserting no-new-links after an awaited
+    /// actor call is deterministic: the transition commits a dispatch link
+    /// atomically with the decision, before any transport task runs — so
+    /// "no new link" proves no dispatch was decided (a bare invocation
+    /// counter could still be in flight and would prove nothing).
+    private static func dispatchLinkCount(_ store: GRDBSessionStore, _ session: SessionID) throws -> Int {
+        try Self.storeRecords(store, session).filter {
+            if case .queueDispatched = $0 { return true }
+            return false
+        }.count
+    }
+
     private static func undoIntents(_ store: GRDBSessionStore, _ session: SessionID) throws -> [String] {
         try Self.storeRecords(store, session).compactMap { record in
             if case .operationIntent(let ref) = record, ref.operationID.raw.hasPrefix("undo/") {
@@ -237,8 +249,12 @@ struct D3IntegrationTests {
         let held = await actor2.currentState()
         #expect(held.queue.first?.state == .heldUnknown, "q1 held-unknown head")
         #expect(held.queue.dropFirst().allSatisfy({ $0.state == .queued }), "q2+q3 still queued behind")
+        let linksBeforeResume = try Self.dispatchLinkCount(store, session)
         await actor2.resumeQueue()
-        for _ in 0..<2_000 { await Task.yield() }
+        // Deterministic: the resume decision (hold, still) commits before
+        // apply returns; a dispatch would have committed its link in the
+        // same atomic group, so no new link means no resend was decided.
+        #expect(try Self.dispatchLinkCount(store, session) == linksBeforeResume, "resume commits no dispatch")
         #expect(gate2.invocations.isEmpty, "resume never resends an unknown delivery")
         #expect((await actor2.currentState()).queue.dropFirst().allSatisfy({ $0.state == .queued }), "no overtake while the head is held")
         await actor2.reconcileQueue(entryID: held.queue.first!.entryID)
@@ -552,7 +568,6 @@ struct D3IntegrationTests {
         #expect(qaBefore.attachments.first?.contentHash == snap.contentHash, "original snapshot survives reopen byte-identically")
         await actor2.submitText(commandID: CommandID("run-1"), text: "pop", kind: .followUp, sealed: false)
         try await Self.awaitState(actor2, { $0.queueHeld }, "stale head holds")
-        for _ in 0..<2_000 { await Task.yield() }
         let held = await actor2.currentState()
         #expect(held.queue.first(where: { $0.commandID == CommandID("q-a") })?.state == .held, "stale head held")
         #expect(held.queue.first(where: { $0.commandID == CommandID("q-b") })?.state == .queued, "qb queued behind, never overtaking")
@@ -666,7 +681,6 @@ struct D3IntegrationTests {
         let qbID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-b2") })?.entryID)
         await actor2.retargetQueueEntry(entryID: qaID)
         await actor2.retargetQueueEntry(entryID: qbID)
-        for _ in 0..<1_000 { await Task.yield() }
         let retargeted = await actor2.currentState()
         let qaRetargeted = try #require(retargeted.queue.first(where: { $0.commandID == CommandID("q-a2") }))
         #expect(qaRetargeted.attachmentConsentEpoch == EpochID("epoch-2"), "retarget refreshes consent to the live epoch")
@@ -674,7 +688,6 @@ struct D3IntegrationTests {
         #expect(retargeted.queue.first(where: { $0.commandID == CommandID("q-b2") })?.targetEpochID == EpochID("epoch-2"), "follower retargeted too (stale targets never dispatch)")
         #expect(gate2.invocations.isEmpty, "no dispatch during the epoch manoeuvre")
         await actor2.resumeQueue()
-        for _ in 0..<1_000 { await Task.yield() }
         #expect((await actor2.currentState()).queue.first?.state == .heldUnknown, "resume never releases unknowns")
         await actor2.reconcileQueue(entryID: qaID)
         try await Self.awaitState(actor2, { $0.queue.first?.state == .queued }, "reconciled after retarget")
@@ -815,10 +828,11 @@ struct D3IntegrationTests {
             return false
         }), "honest partial notice durable")
         // Duplicate command answers from the reseeded journal, no mutation.
+        // The duplicate path commits no records and stages no effects, so
+        // the post-apply state is already settled when apply returns.
         await actor2.applyExternalEvent(.undoRun(
             undoCommandID: command, group: group,
             preimagesAvailable: preimages, atMillis: 9_000_000))
-        for _ in 0..<2_000 { await Task.yield() }
         #expect(try Self.undoIntents(store, session).count == intentsBefore, "duplicate performs no second inverse")
         try store.close()
         _ = ids1
@@ -933,24 +947,29 @@ struct D3IntegrationTests {
         #expect(report.unknownOperations == 1, "cancel-ambiguous marker reseeded")
         #expect(report.journalsUnrecovered == 1, "settled journal cannot finalize while held")
         #expect(report.queueHeld)
-        // Every bypass attempt fails without external effects.
+        // Every bypass attempt fails without external effects. Refusals
+        // commit only diagnostic markers — a dispatch would have committed
+        // a durable dispatch link in the same atomic group, so an
+        // unchanged link count proves no dispatch was decided (a bare
+        // invocation counter could still be in flight and proves nothing).
+        let linksBlocked = try Self.dispatchLinkCount(store, session)
         await actor2.resumeQueue()
-        for _ in 0..<1_000 { await Task.yield() }
+        #expect(try Self.dispatchLinkCount(store, session) == linksBlocked, "resume commits no dispatch")
         #expect(gate2.invocations.isEmpty, "resume dispatches nothing while blocked")
         let qfID = try #require((await actor2.currentState()).queue.first(where: { $0.commandID == CommandID("q-f") })?.entryID)
         await actor2.retargetQueueEntry(entryID: qfID)
-        for _ in 0..<1_000 { await Task.yield() }
         #expect((await actor2.currentState()).queueHeld, "retarget never releases a hold")
+        #expect(try Self.dispatchLinkCount(store, session) == linksBlocked, "retarget commits no dispatch")
         #expect(gate2.invocations.isEmpty, "retarget dispatches nothing")
         await actor2.requestCheckpoint()
-        for _ in 0..<1_000 { await Task.yield() }
         let afterCheckpoint = await actor2.currentState()
         #expect(afterCheckpoint.unresolvedOperations.count == 1, "checkpoint refused while unknown (markers intact)")
+        #expect(try Self.dispatchLinkCount(store, session) == linksBlocked, "checkpoint commits no dispatch")
         #expect(gate2.invocations.isEmpty, "checkpoint dispatches nothing")
         await actor2.submitText(commandID: CommandID("q-new"), text: "new", kind: .followUp, sealed: false)
-        for _ in 0..<1_000 { await Task.yield() }
         let afterSubmit = await actor2.currentState()
         #expect(afterSubmit.queue.contains(where: { $0.commandID == CommandID("q-new") && $0.state == .held }), "new admission queues held, never dispatched")
+        #expect(try Self.dispatchLinkCount(store, session) == linksBlocked, "held admission commits no dispatch")
         #expect(gate2.invocations.isEmpty, "new admission dispatches nothing while markers stand")
         let zMember = ChangeGroupMember(
             operationID: OperationID("eff-z/c1"), callID: "c1", path: "z.txt",
@@ -964,7 +983,6 @@ struct D3IntegrationTests {
             members: [zMember], hadExecProposals: false, hadReadProposals: false)
         let intentsBefore = try Self.undoIntents(store, session).count
         await actor2.runUndo(group: zGroup, preimagesAvailable: [:])
-        for _ in 0..<1_000 { await Task.yield() }
         #expect((await actor2.currentState()).pendingUndo == nil, "undo refused while markers stand")
         #expect(try Self.undoIntents(store, session).count == intentsBefore, "refused undo stages no inverses")
         // Explicit reconciliation, in order: acknowledge the unknown,

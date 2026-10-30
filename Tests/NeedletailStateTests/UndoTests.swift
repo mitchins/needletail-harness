@@ -104,10 +104,10 @@ struct UndoTests {
         return out
     }
 
-    // MARK: - Change-group recording (UNDO-01)
+    // MARK: - Change-group recording (UX-UNDO-01)
 
-    @Test("UNDO-01: proven native successes record a group; unknowns and non-natives excluded")
-    func groupRecordingExcludesUnproven() throws {
+    @Test("UX-UNDO-01: proven native successes record a group; unknowns and non-natives excluded")
+    func UX_UNDO_01_groupRecordingExcludesUnproven() throws {
         var ids = StateFixtures.ids()
         let batch = ToolBatch([
             ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
@@ -134,8 +134,8 @@ struct UndoTests {
         _ = ids
     }
 
-    @Test("UNDO-01: group records commit atomically with batch results")
-    func groupCommitsWithBatch() throws {
+    @Test("UX-UNDO-01: group records commit atomically with batch results")
+    func UX_UNDO_01_groupCommitsWithBatch() throws {
         var ids = StateFixtures.ids()
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d")])
         var state = try StateFixtures.idle(permissive: true)
@@ -153,8 +153,8 @@ struct UndoTests {
         #expect(groups[0].members[0].preimageDigest == nil, "scripted outcome carries no preimage artifact")
     }
 
-    @Test("UNDO-01/11: out-of-root and identity-less outcomes never become members")
-    func groupRejectsBadMembers() throws {
+    @Test("UX-UNDO-01 + UX-UNDO-11: out-of-root and identity-less outcomes never become members")
+    func UX_UNDO_01_11_groupRejectsBadMembers() throws {
         let batch = ToolBatch([
             ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d"),
             ToolProposal(callID: "c2", tool: "edit", argumentsDigest: "d"),
@@ -171,10 +171,10 @@ struct UndoTests {
         #expect(buildChangeGroup(groupID: "chg-x", runID: RunID("r"), effectID: EffectID("e"), proposals: batch.proposals, outcomes: outcomes, doneCallIDs: ["c1", "c2", "c3"]) == nil, "no member qualifies — no empty group")
     }
 
-    // MARK: - Eligibility preflight (UNDO-02/03/04/10/11)
+    // MARK: - Eligibility preflight (UX-UNDO-02/03/04/10/11)
 
-    @Test("UNDO-02: user edit after the batch refuses the whole group with zero inverses")
-    func userEditRefusesGroup() throws {
+    @Test("UX-UNDO-02: user edit after the batch refuses the whole group with zero inverses")
+    func UX_UNDO_02_userEditRefusesGroup() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1)])
         var state = try StateFixtures.idle()
@@ -196,8 +196,8 @@ struct UndoTests {
         #expect(t.records.contains(where: { if case .transcriptAppended(.workspaceChangeNotice) = $0 { return true } else { return false } }), "refusal still publishes its notice")
     }
 
-    @Test("UNDO-03: created file intact deletes; created file modified refuses")
-    func createdFileRules() throws {
+    @Test("UX-UNDO-03: created file intact deletes; created file modified refuses")
+    func UX_UNDO_03_createdFileRules() throws {
         // Intact: removeCreated applies through the full chain.
         var ids = StateFixtures.ids()
         let created = Self.member("new.txt", seed: 2, created: true)
@@ -229,8 +229,8 @@ struct UndoTests {
         #expect(d2.count == 1 && d2[0].outcome == .refused, "modified create refuses — no wrong-file delete")
     }
 
-    @Test("UNDO-04: three-file group with one conflict performs zero inverses")
-    func threeFileOneConflict() throws {
+    @Test("UX-UNDO-04: three-file group with one conflict performs zero inverses")
+    func UX_UNDO_04_threeFileOneConflict() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([
             Self.member("a.txt", seed: 1),
@@ -256,8 +256,8 @@ struct UndoTests {
         #expect(dispositions[0].reason.contains("b.txt"), "per-file conflict is operator-visible")
     }
 
-    @Test("UNDO-10 asymmetric: missing preimage on the FIRST member refuses despite an eligible create leg (no positional bypass)")
-    func missingPreimageAsymmetricRefuses() throws {
+    @Test("UX-UNDO-10 asymmetric: missing preimage on the FIRST member refuses despite an eligible create leg (no positional bypass)")
+    func UX_UNDO_10_missingPreimageAsymmetricRefuses() throws {
         var ids = StateFixtures.ids()
         // Batch order: [edit a.txt (preimage "before-1"), create b.txt].
         // The inverse list reverses: [removeCreated(b), restore(a)].
@@ -287,8 +287,34 @@ struct UndoTests {
         #expect(dispositions[0].reason.contains("a.txt"), "the conflict names the preimage-less member")
     }
 
-    @Test("UNDO-10: missing preimage fails closed with zero inverses")
-    func missingPreimageFailsClosed() throws {
+    @Test("missing preimage inverse is its own kind, never an empty restore")
+    func missingPreimageKindIsDistinct() {
+        var missing = Self.member("a.txt", seed: 1)
+        missing = ChangeGroupMember(
+            operationID: missing.operationID, callID: missing.callID,
+            path: missing.path, grantedRoot: missing.grantedRoot,
+            created: false, beforeHash: missing.beforeHash, afterHash: missing.afterHash,
+            deviceBefore: missing.deviceBefore, inodeBefore: missing.inodeBefore,
+            modeBefore: missing.modeBefore, preimageDigest: nil, emptyOriginal: false,
+            deviceAfter: missing.deviceAfter, inodeAfter: missing.inodeAfter,
+            modeAfter: missing.modeAfter, receiptStatus: missing.receiptStatus,
+            receiptSummary: missing.receiptSummary)
+        let inverses = undoInverses(undoCommandID: "undo-1", group: Self.group([missing]))
+        guard case .restoreMissing = inverses[0].kind else {
+            Issue.record("missing preimage must not encode as an empty restore")
+            return
+        }
+        // Proven-empty originals keep the empty digest (restorable).
+        let empty = Self.member("e.txt", seed: 2, emptyOriginal: true, preimage: nil)
+        let emptyInverses = undoInverses(undoCommandID: "undo-1", group: Self.group([empty]))
+        guard case .restore(let digest, _) = emptyInverses[0].kind, digest.isEmpty else {
+            Issue.record("proven-empty originals keep the empty-preimage marker")
+            return
+        }
+    }
+
+    @Test("UX-UNDO-10: missing preimage fails closed with zero inverses")
+    func UX_UNDO_10_missingPreimageFailsClosed() throws {
         var ids = StateFixtures.ids()
         var missing = Self.member("a.txt", seed: 1)
         // Strip the preimage: a replace with no proven original.
@@ -316,8 +342,8 @@ struct UndoTests {
         #expect(dispositions[0].reason.contains("preimage"), "missing preimage named in the refusal")
     }
 
-    @Test("UNDO-11: symlink, mode and identity drift all refuse without mutation")
-    func driftRefuses() throws {
+    @Test("UX-UNDO-11: symlink, mode and identity drift all refuse without mutation")
+    func UX_UNDO_11_driftRefuses() throws {
         // Symlink swap: unreadable observation.
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1)])
@@ -347,8 +373,8 @@ struct UndoTests {
         #expect(modeRefused.first?.outcome == .refused, "mode drift refuses")
     }
 
-    @Test("UNDO-02/11: reverse chain rule — broken same-path linkage refuses the group")
-    func brokenChainRefuses() throws {
+    @Test("UX-UNDO-02 + UX-UNDO-11: reverse chain rule — broken same-path linkage refuses the group")
+    func UX_UNDO_02_11_brokenChainRefuses() throws {
         var ids = StateFixtures.ids()
         // Two edits to the same path where the later beforeHash does NOT
         // equal the earlier afterHash: not a provable reverse chain.
@@ -363,8 +389,8 @@ struct UndoTests {
         #expect(dispositions.count == 1 && dispositions[0].outcome == .refused)
     }
 
-    @Test("same-path create+edit refuses the create leg even when hashes link (exact identity)")
-    func samePathCreateEditRefuses() throws {
+    @Test("UX-UNDO-03: same-path create+edit refuses the create leg even when hashes link (exact identity)")
+    func UX_UNDO_03_samePathCreateEditRefuses() throws {
         var ids = StateFixtures.ids()
         // Linked: edit.beforeHash == create.afterHash. The chain rule
         // passes, but the create leg's expected postimage (the created
@@ -414,10 +440,10 @@ struct UndoTests {
         #expect(inverses.count == 2 && inverses[0].path == "a.txt")
     }
 
-    // MARK: - Full compensation chain (UNDO-05 partial, UNDO-09 idempotency)
+    // MARK: - Full compensation chain (UX-UNDO-05 partial, UX-UNDO-09 idempotency)
 
-    @Test("UNDO-05: I/O failure after first applied inverse is partial, never atomic")
-    func appliedThenCleanFailureIsPartial() throws {
+    @Test("UX-UNDO-05: I/O failure after first applied inverse is partial, never atomic")
+    func UX_UNDO_05_appliedThenCleanFailureIsPartial() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1), Self.member("b.txt", seed: 2)])
         let (state, first, _) = try Self.runToFirstInverse(group: group, ids: &ids)
@@ -438,8 +464,8 @@ struct UndoTests {
         _ = first
     }
 
-    @Test("UNDO-05: ambiguous failure holds as unknown with queue barrier")
-    func ambiguousFailureHoldsUnknown() throws {
+    @Test("UX-UNDO-05: ambiguous failure holds as unknown with queue barrier")
+    func UX_UNDO_05_ambiguousFailureHoldsUnknown() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1), Self.member("b.txt", seed: 2)])
         let (state, _, _) = try Self.runToFirstInverse(group: group, ids: &ids)
@@ -454,8 +480,8 @@ struct UndoTests {
         #expect(!t.effects.contains(where: { if case .applyInverse = $0 { return true } else { return false } }), "nothing further runs after an unknown")
     }
 
-    @Test("UNDO-09 core: duplicate undo returns the recorded disposition with no second inverse")
-    func duplicateUndoIsIdempotent() throws {
+    @Test("UX-UNDO-09 core: duplicate undo returns the recorded disposition with no second inverse")
+    func UX_UNDO_09_duplicateUndoIsIdempotent() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1)])
         let (oldState, _, _) = try Self.runToFirstInverse(group: group, ids: &ids)
@@ -472,8 +498,8 @@ struct UndoTests {
         #expect(t.state.phase == .idle, "duplicate never re-enters the exclusive phase")
     }
 
-    @Test("UNDO-04 partial through the chain: applied then refused is partial")
-    func appliedThenRefusedIsPartial() throws {
+    @Test("UX-UNDO-04 partial through the chain: applied then refused is partial")
+    func UX_UNDO_05_appliedThenRefusedIsPartial() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1), Self.member("b.txt", seed: 2)])
         let (state, _, _) = try Self.runToFirstInverse(group: group, ids: &ids)
@@ -554,8 +580,8 @@ struct UndoTests {
 
     // MARK: - Preview (dry run)
 
-    @Test("preview performs no mutation and reports eligibility")
-    func previewIsDryRun() throws {
+    @Test("UX-UNDO-01 preview performs no mutation and reports eligibility")
+    func UX_UNDO_01_previewIsDryRun() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1)])
         var state = try StateFixtures.idle()
@@ -579,10 +605,10 @@ struct UndoTests {
         #expect(previewDetail.contains("a.txt") && previewDetail.contains("before-1") && previewDetail.contains("after-1"), "eligible preview names the exact reversible set, got: \(previewDetail)")
     }
 
-    // MARK: - Notice (UNDO-06) + STATE-05 ordering
+    // MARK: - Notice (UX-UNDO-06) + STATE-05 ordering
 
-    @Test("UNDO-06: exec disclaimer rides every notice; STATE-05 notice precedes the next request")
-    func noticeCarriesDisclaimerAndOrdering() throws {
+    @Test("UX-UNDO-06: exec disclaimer rides every notice; STATE-05 notice precedes the next request")
+    func UX_UNDO_06_noticeCarriesDisclaimerAndOrdering() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1)], exec: true)
         let (state, _, _) = try Self.runToFirstInverse(group: group, ids: &ids)
@@ -595,7 +621,7 @@ struct UndoTests {
         #expect(notices.count == 1)
         #expect(notices[0].hadExecProposals, "exec exclusion is explicit per batch")
         let rendered = renderWorkspaceNotice(notices[0])
-        #expect(rendered.contains("shell-produced effects are never ledger-undoable"), "UNDO-06 disclaimer is literal")
+        #expect(rendered.contains("shell-produced effects are never ledger-undoable"), "UX-UNDO-06 disclaimer is literal")
         #expect(rendered.contains("undo-1"))
         #expect(rendered.contains("before-1") && rendered.contains("after-1"), "notice carries the exact undone hashes (Major 4)")
         // STATE-05: the notice commits atomically WITH its disposition, so
@@ -620,10 +646,10 @@ struct UndoTests {
         #expect(messages[0].text.contains("undo-1"))
     }
 
-    // MARK: - Lineage (UNDO-08)
+    // MARK: - Lineage (UX-UNDO-08)
 
-    @Test("UNDO-08: lineage fork records with boundary checks; parent preserved")
-    func lineageForkRecords() throws {
+    @Test("UX-UNDO-08: lineage fork records with boundary checks; parent preserved")
+    func UX_UNDO_08_lineageForkRecords() throws {
         var ids = StateFixtures.ids()
         var state = try StateFixtures.idle()
         // Advance history so a past boundary exists.
@@ -646,8 +672,8 @@ struct UndoTests {
 
     // MARK: - Crash-boundary journal (boundaries 1-7)
 
-    @Test("journal: intent without result is unknown and held (boundary 2)")
-    func intentWithoutResultIsUnknown() {
+    @Test("UX-UNDO-05 journal: intent without result is unknown and held (crash boundary 2)")
+    func UX_UNDO_05_intentWithoutResultIsUnknown() {
         let inverseID = "undo/undo-1/chg-1/eff-1/c1"
         let intent = OperationRef(operationID: OperationID(inverseID), callID: inverseID, state: .intent, mutating: true)
         let (entries, unknowns) = reconcileUndoJournal([.operationIntent(intent)])
@@ -655,8 +681,8 @@ struct UndoTests {
         #expect(unknowns.count == 1 && unknowns[0].operationID.raw == inverseID && unknowns[0].state == .unknown, "intent-only inverse holds as unknown")
     }
 
-    @Test("journal: settled inverses without disposition recover via finalize (boundary 5)")
-    func settledWithoutDispositionFinalizes() throws {
+    @Test("UX-UNDO-09 journal: settled inverses without disposition recover via finalize (crash boundary 5)")
+    func UX_UNDO_09_settledWithoutDispositionFinalizes() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1)])
         let inverses = undoInverses(undoCommandID: "undo-1", group: group)
@@ -688,8 +714,8 @@ struct UndoTests {
         #expect(dup.records.isEmpty, "finalize after disposition is a pure duplicate answer")
     }
 
-    @Test("journal: partial coverage refuses finalize (missing legs never complete)")
-    func finalizeRequiresFullCoverage() throws {
+    @Test("UX-UNDO-09 journal: partial coverage refuses finalize (missing legs never complete)")
+    func UX_UNDO_09_finalizeRequiresFullCoverage() throws {
         var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1), Self.member("b.txt", seed: 2)])
         let state = try StateFixtures.idle()
@@ -700,8 +726,8 @@ struct UndoTests {
         #expect(!t.records.contains(where: { if case .undoDisposition = $0 { return true } else { return false } }), "partial legs never finalize")
     }
 
-    @Test("journal: duplicate undo after success performs no second mutation (boundary 6)")
-    func journalDuplicateHasDisposition() {
+    @Test("UX-UNDO-09 journal: duplicate undo after success performs no second mutation (crash boundary 6)")
+    func UX_UNDO_09_journalDuplicateHasDisposition() {
         let record = UndoDispositionRecord(
             undoCommandID: "undo-1", groupID: "chg-1", outcome: .completed,
             fileOutcomes: [UndoFileOutcome(inverseID: "i", path: "a.txt", result: "applied", detail: "ok", beforeHash: "bh", afterHash: "ah")],
@@ -748,8 +774,8 @@ struct UndoTests {
         #expect(outcome("applied", "unknown") == .needsReconciliation)
     }
 
-    @Test("UNDO-07: change groups reconcile from the log in first-recorded order")
-    func groupsReconcileInOrder() {
+    @Test("UX-UNDO-07: change groups reconcile from the log in first-recorded order")
+    func UX_UNDO_07_groupsReconcileInOrder() {
         let g1 = Self.group([Self.member("a.txt", seed: 1)], id: "chg-1")
         let g2 = Self.group([Self.member("b.txt", seed: 2)], id: "chg-2")
         let groups = reconcileChangeGroups([.changeGroup(g2), .eventAppended(seq: SequenceNumber(3), kind: "x", digest: "y"), .changeGroup(g1), .changeGroup(g1)])
@@ -770,5 +796,45 @@ struct UndoTests {
         #expect(digest.isEmpty, "empty original carries the empty-preimage marker, not a missing digest")
         let obs = Self.observation(inverses[0].inverseID, member: member)
         #expect(undoPreflight(member: member, observation: obs, preimageAvailable: false) == .eligible)
+    }
+
+    @Test("durableIDHighWater covers every counter-derived ID class")
+    func allocatorWatermarkCoversMintedIDs() {
+        // Envelope/orderKey-only watermarks stop below counter-derived
+        // IDs minted after the last queue admission; a post-reopen mint
+        // would then collide with them. Every minted shape must fold in.
+        let member = Self.member("a.txt", seed: 1)
+        let group = Self.group([member], id: "chg-11")
+        let inverseID = undoInverseID(undoCommandID: "undo-13", groupID: group.groupID, operationID: member.operationID)
+        let marker = OperationRef(operationID: OperationID(inverseID), callID: inverseID, state: .intent, mutating: true)
+        let entry = QueueEntry(
+            entryID: "q-7", commandID: CommandID("cmd-7"), kind: .followUp,
+            state: .queued, revision: 1, text: "x",
+            targetEpochID: EpochID("epoch-1"), orderKey: 7, sealed: false)
+        let fork = LineageFork(
+            forkID: "fork-17", sessionID: SessionID("s-1"),
+            parentEpochID: EpochID("epoch-1"),
+            boundary: LineageBoundary(epochID: EpochID("epoch-1"), throughSequence: 1),
+            divergenceNote: "d", atMillis: 1)
+        let disposition = UndoDispositionRecord(
+            undoCommandID: "undo-13", groupID: group.groupID, outcome: .completed,
+            fileOutcomes: [UndoFileOutcome(
+                inverseID: inverseID, path: "a.txt",
+                result: "applied", detail: "ok",
+                beforeHash: "bh", afterHash: "ah")],
+            reason: "done", atMillis: 1)
+        let junk = QueueEntry(
+            entryID: "q-abc", commandID: CommandID("cmd-x"), kind: .followUp,
+            state: .queued, revision: 1, text: "x",
+            targetEpochID: EpochID("epoch-1"), orderKey: 0, sealed: false)
+        let records: [DurableRecord] = [
+            .eventAppended(seq: SequenceNumber(5), kind: "k", digest: "d"),
+            .queueAdmitted(entry), .queueAdmitted(junk),
+            .changeGroup(group),
+            .operationIntent(marker),
+            .undoDisposition(disposition),
+            .lineageFork(fork),
+        ]
+        #expect(durableIDHighWater(records) == 17, "max over seq/orderKey/entry/group/undo/fork; junk ignored")
     }
 }

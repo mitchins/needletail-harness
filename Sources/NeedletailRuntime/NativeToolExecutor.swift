@@ -2940,14 +2940,16 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         }
         // M2-D D2: post-commit identity captured AT the mutation boundary
         // (never inferred later from a reopened path). The rename installed
-        // the tmp's inode: open the path fresh and fstat it. If this
-        // capture fails the outcome still reports success (the bytes were
-        // verifiably replaced) but carries no identity — the group builder
-        // then excludes the member, so it is never undone on guesswork.
+        // the tmp's inode: open the path fresh and fstat it. O_NONBLOCK for
+        // the swapped-in-FIFO case (same rationale as the commit gate's
+        // checkFD). If this capture fails the outcome still reports success
+        // (the bytes were verifiably replaced) but carries no identity —
+        // the group builder then excludes the member, so it is never undone
+        // on guesswork.
         var deviceAfter: UInt64? = nil
         var inodeAfter: UInt64? = nil
         let verifyFD: Int32 = fileName.withCString { name in
-            openat(parentFD, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         }
         if verifyFD >= 0 {
             defer { close(verifyFD) }

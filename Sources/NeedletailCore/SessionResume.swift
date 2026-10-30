@@ -20,6 +20,46 @@
 ///   (which would fail the next reconcile as duplicates).
 /// - The CLI keeps creating fresh sessions; no CLI resume command is
 ///   required. Cross-session visibility stays with `CrossRunGate`.
+/// Highest counter-derived numeric ID in a session-scoped record
+/// stream: eventAppended sequence numbers, queue orderKeys and entry-ID
+/// suffixes (`q-<n>`), change-group IDs (`chg-<n>`), undo-command sequence
+/// numbers (`undo-<n>`, from derived inverse IDs and dispositions) and
+/// fork IDs (`fork-<n>`). Non-numeric or foreign-prefixed IDs contribute
+/// nothing (never parsed, never minted past — a corrupt shape fails
+/// closed at decode, not here).
+public func durableIDHighWater(_ records: [DurableRecord]) -> UInt64 {
+    var mark: UInt64 = 0
+    func foldPrefixed(_ raw: String, prefix: String) {
+        guard raw.hasPrefix(prefix),
+              let value = UInt64(raw.dropFirst(prefix.count)) else { return }
+        mark = max(mark, value)
+    }
+    for record in records {
+        switch record {
+        case .eventAppended(let seq, _, _):
+            mark = max(mark, seq.value)
+        case .queueAdmitted(let entry), .queueUpdated(let entry):
+            mark = max(mark, entry.orderKey)
+            foldPrefixed(entry.entryID, prefix: "q-")
+        case .operationIntent(let ref),
+             .operationResult(let ref, _),
+             .cancelledPendingMarker(let ref, _):
+            if let parsed = parseUndoInverseID(ref.operationID.raw) {
+                mark = max(mark, undoCommandSequence(parsed.command))
+            }
+        case .undoDisposition(let disposition):
+            mark = max(mark, undoCommandSequence(disposition.undoCommandID))
+        case .changeGroup(let group):
+            foldPrefixed(group.groupID, prefix: "chg-")
+        case .lineageFork(let fork):
+            foldPrefixed(fork.forkID, prefix: "fork-")
+        default:
+            break
+        }
+    }
+    return mark
+}
+
 public func resumeSession<IDs: IDSource>(
     store: any SessionStore,
     session: SessionID,
@@ -46,6 +86,18 @@ public func resumeSession<IDs: IDSource>(
     for entry in recon.entries {
         highWater = max(highWater, entry.orderKey)
     }
+    // M2-D D3 (CodeRabbit): the watermark must cover every
+    // counter-derived identity, not just envelope sequences and queue
+    // order keys. Group ("chg-<n>"), undo-command ("undo-<n>") and fork
+    // ("fork-<n>") IDs all mint from the shared ID counter, as do the
+    // eventAppended sequence numbers — but none of them is an envelope
+    // sequence or an orderKey, so envelope/orderKey alone can reseed the
+    // counter BELOW a durable ID and a post-reopen mint can collide with
+    // it (duplicate group swallowed by first-wins reconcile; duplicate
+    // undo command returning another command's recorded disposition).
+    // Folding every numeric suffix keeps post-reopen mints strictly above
+    // durable ones.
+    highWater = max(highWater, durableIDHighWater(stream))
     // M2-D D2: reseed the bounded live disposition mirror from the durable
     // journal (never deleted from the log — only this mirror prunes) and
     // hold every inverse whose intent committed without a settled result.

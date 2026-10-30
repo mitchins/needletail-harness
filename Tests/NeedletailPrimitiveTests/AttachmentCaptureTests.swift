@@ -103,6 +103,15 @@ struct AttachmentCaptureTests {
         #expect(throws: AttachmentCaptureError.self) {
             try ws.capture("r.txt", range: AttachmentLineRange(start: 1, end: 99))
         }
+        // CRLF files slice on 0x0A exactly like LF files (a range starting
+        // past line 1 must not trap and must not return whole-file bytes).
+        try ws.write("crlf.txt", bytes: Data("a\r\nb\r\nc\r\n".utf8))
+        let crlf = try ws.capture("crlf.txt", range: AttachmentLineRange(start: 2, end: 3))
+        if case .included(let excerpt, _) = crlf.content {
+            #expect(excerpt == "b\r\nc\r\n", "CR bytes ride inside their lines")
+        } else {
+            Issue.record("ranged CRLF text must be included")
+        }
     }
 
     @Test("large file truncates the excerpt to 4 KiB with an explicit flag")

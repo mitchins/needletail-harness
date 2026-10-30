@@ -56,8 +56,8 @@ struct UndoJournalTests {
 
     // MARK: - Crash boundaries through production resume
 
-    @Test("crash boundary 2: intent without result reopens unknown and held, never replayed")
-    func intentWithoutResultReopensUnknown() throws {
+    @Test("UX-UNDO-05 crash boundary 2: intent without result reopens unknown and held, never replayed")
+    func UX_UNDO_05_intentWithoutResultReopensUnknown() throws {
         let (dir, store, session, writer) = try Self.tempStore()
         defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
         let inverseID = "undo/undo-7/chg-3/eff-1/c1"
@@ -77,8 +77,8 @@ struct UndoJournalTests {
         #expect(rebuilt.undoDispositions.isEmpty, "no disposition without one recorded")
     }
 
-    @Test("crash boundary 5/6: settled journal + disposition reseed; reopen replays nothing")
-    func settledJournalReseeds() throws {
+    @Test("UX-UNDO-09 crash boundary 5/6: settled journal + disposition reseed; reopen replays nothing")
+    func UX_UNDO_09_settledJournalReseeds() throws {
         let (dir, store, session, writer) = try Self.tempStore()
         defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
         let member = Self.member("a.txt", seed: 1)
@@ -117,7 +117,7 @@ struct UndoJournalTests {
         #expect(rebuilt.undoDispositions == [disposition], "durable disposition reseeds the live mirror")
         #expect(!rebuilt.queueHeld, "settled journal holds nothing")
         #expect(rebuilt.unresolvedOperations.isEmpty)
-        #expect(reconcileChangeGroups(try Self.records(store, session)).map(\.groupID) == ["chg-1"], "group survives reopen (UNDO-07 ledger leg)")
+        #expect(reconcileChangeGroups(try Self.records(store, session)).map(\.groupID) == ["chg-1"], "group survives reopen (UX-UNDO-07 ledger leg)")
     }
 
     // MARK: - Export projection of every D2 shape
@@ -184,8 +184,8 @@ struct UndoJournalTests {
 
     // MARK: - Blocker 1: ambiguous inverse holds durably across reopen
 
-    @Test("ambiguous inverse (unknown result) reopens held with a recovery marker and no disposition")
-    func ambiguousResultReopensHeld() throws {        let (dir, store, session, writer) = try Self.tempStore()
+    @Test("UX-UNDO-05 ambiguous inverse (unknown result) reopens held with a recovery marker and no disposition")
+    func UX_UNDO_05_ambiguousResultReopensHeld() throws {        let (dir, store, session, writer) = try Self.tempStore()
         defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
         let inverseID = "undo/undo-3/chg-1/eff-1/c1"
         try store.appendBatch([
@@ -214,8 +214,8 @@ struct UndoJournalTests {
         #expect(unknowns.count == 1 && unknowns[0].operationID.raw == inverseID)
     }
 
-    @Test("pre-fix ambiguous rows (done + unknown: outcome) still reopen held")
-    func preFixAmbiguousRowsReopenHeld() throws {
+    @Test("UX-UNDO-05 pre-fix ambiguous rows (done + unknown: outcome) still reopen held")
+    func UX_UNDO_05_preFixAmbiguousRowsReopenHeld() throws {
         // Compatibility (review delta): the parent commit recorded
         // ambiguous inverses as state .done with an "unknown:" outcome
         // string. The outcome string is durable unknowability evidence —

@@ -1828,6 +1828,10 @@ private func preflightPending(
         switch inverse.kind {
         case .restore(let digest, _):
             available = digest.isEmpty || (pending.preimagesAvailable[digest] ?? false)
+        case .restoreMissing:
+            // No bytes exist to restore: fail closed here (the member
+            // check below also conflicts on the missing preimage).
+            available = false
         case .removeCreated:
             available = true
         }

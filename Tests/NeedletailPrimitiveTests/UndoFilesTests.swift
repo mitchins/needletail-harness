@@ -52,10 +52,10 @@ struct UndoFilesTests {
                                 arguments: "{\"path\":\"\(path)\",\"expectedHash\":\"\(expectedHash)\",\"old_string\":\"\(old)\",\"new_string\":\"\(new)\"}")])
     }
 
-    // MARK: - UNDO-01 real: boundary identity + preimage + restore
+    // MARK: - UX-UNDO-01 real: boundary identity + preimage + restore
 
-    @Test("UNDO-01 real: executor captures boundary identity; validator eligible; applier restores")
-    func realEditRestoreRoundTrip() async throws {
+    @Test("UX-UNDO-01 real: executor captures boundary identity; validator eligible; applier restores")
+    func UX_UNDO_01_realEditRestoreRoundTrip() async throws {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let (dir, store, session, writer) = try Self.tempStore()
@@ -98,10 +98,10 @@ struct UndoFilesTests {
         #expect(try String(contentsOf: url.appendingPathComponent("f.txt"), encoding: .utf8) == "original\n", "bytes restored")
     }
 
-    // MARK: - UNDO-02 real (RED): user edit refuses without overwrite
+    // MARK: - UX-UNDO-02 real (RED): user edit refuses without overwrite
 
-    @Test("UNDO-02 real: user edit after the batch refuses; attacker bytes never overwritten")
-    func realUserEditRefuses() async throws {
+    @Test("UX-UNDO-02 real: user edit after the batch refuses; attacker bytes never overwritten")
+    func UX_UNDO_02_realUserEditRefuses() async throws {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let (dir, store, session, writer) = try Self.tempStore()
@@ -132,10 +132,10 @@ struct UndoFilesTests {
         #expect(try String(contentsOf: url.appendingPathComponent("f.txt"), encoding: .utf8) == "vX\n", "user bytes untouched")
     }
 
-    // MARK: - UNDO-03 real: created file deletes; repurposed file refuses
+    // MARK: - UX-UNDO-03 real: created file deletes; repurposed file refuses
 
-    @Test("UNDO-03 real: exact created file deletes; replaced file refuses")
-    func realCreatedFileRules() async throws {
+    @Test("UX-UNDO-03 real: exact created file deletes; replaced file refuses")
+    func UX_UNDO_03_realCreatedFileRules() async throws {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let (dir, store, session, writer) = try Self.tempStore()
@@ -174,10 +174,10 @@ struct UndoFilesTests {
         #expect(try String(contentsOf: url.appendingPathComponent("n.txt"), encoding: .utf8) == "attacker\n", "unrelated bytes never deleted")
     }
 
-    // MARK: - UNDO-11 real: symlink swap, mode change, root mismatch
+    // MARK: - UX-UNDO-11 real: symlink swap, mode change, root mismatch
 
-    @Test("UNDO-11 real: symlink swap refuses without following")
-    func realSymlinkSwapRefuses() async throws {
+    @Test("UX-UNDO-11 real: symlink swap refuses without following")
+    func UX_UNDO_11_realSymlinkSwapRefuses() async throws {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let (dir, store, session, writer) = try Self.tempStore()
@@ -207,8 +207,8 @@ struct UndoFilesTests {
         #expect(try String(contentsOf: url.appendingPathComponent("outside.txt"), encoding: .utf8) == "outside\n", "symlink target never followed or written")
     }
 
-    @Test("UNDO-11 real: mode change refuses; granting-root mismatch refuses")
-    func realModeAndRootRefuse() async throws {
+    @Test("UX-UNDO-11 real: mode change refuses; granting-root mismatch refuses")
+    func UX_UNDO_11_realModeAndRootRefuse() async throws {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let (dir, store, session, writer) = try Self.tempStore()
@@ -247,10 +247,10 @@ struct UndoFilesTests {
         }
     }
 
-    // MARK: - UNDO-10 real: unavailable preimage fails clean, mutates nothing
+    // MARK: - UX-UNDO-10 real: unavailable preimage fails clean, mutates nothing
 
-    @Test("UNDO-10 real: corrupt preimage digest fails clean without mutation")
-    func realMissingPreimageFailsClean() async throws {
+    @Test("UX-UNDO-10 real: corrupt preimage digest fails clean without mutation")
+    func UX_UNDO_10_realMissingPreimageFailsClean() async throws {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let (dir, store, session, writer) = try Self.tempStore()
@@ -284,10 +284,32 @@ struct UndoFilesTests {
         #expect(try String(contentsOf: url.appendingPathComponent("f.txt"), encoding: .utf8) == "v2\n", "postimage untouched")
     }
 
-    // MARK: - Counterfactual: a repeated inverse never applies twice
+    @Test("restoreMissing refuses without touching the file")
+    func restoreMissingRefuses() async throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (dir, store, session, writer) = try Self.tempStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        try "post\n".write(to: url.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let inverse = UndoInverse(
+            inverseID: "undo/undo-1/chg-1/eff-1/c1", undoCommandID: "undo-1",
+            groupID: "chg-1", path: "f.txt", grantedRoot: fp.string,
+            kind: .restoreMissing(expect: UndoFileState(
+                device: 1, inode: 2, hash: Self.sha("post\n"), mode: "644")),
+            restoreMode: "644")
+        let applier = FilesystemUndoApplier(resolver: resolver, store: store, session: session, writer: writer)
+        let outcome = await applier.apply(inverse)
+        guard case .refused = outcome else {
+            Issue.record("missing-preimage inverse must refuse, got \(outcome)")
+            return
+        }
+        #expect(try String(contentsOf: url.appendingPathComponent("f.txt"), encoding: .utf8) == "post\n", "refused inverse mutates nothing")
+    }
 
-    @Test("naive replay counterfactual: applying the same inverse twice refuses the second")
-    func doubleApplyRefuses() async throws {
+    // MARK: - Counterfactual: a repeated inverse never applies twice
+    @Test("UX-UNDO-09 counterfactual: applying the same inverse twice refuses the second")
+    func UX_UNDO_09_doubleApplyRefuses() async throws {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let (dir, store, session, writer) = try Self.tempStore()

@@ -1,4 +1,4 @@
-# M2-D Plan — durable queue, attachments, undo and rewind in virtual/headless form (REV2, planning only)
+# M2-D Plan — durable queue, attachments, undo and rewind in virtual/headless form (REV3, planning only)
 
 - Baseline: `main` @ `6104845` (M2-C merged, PR #7 squash). Local planning branch `m2-d-planning`.
 - Authorization boundary: **planning, local documentation and independent plan review ONLY.** No implementation, no production/runtime behavior change, no live provider traffic, no dependency addition, no push/PR/merge in this session. Implementation slices D0–D3 each require separate authorization and per-slice DeepSeek review.

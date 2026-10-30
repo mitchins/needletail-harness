@@ -194,7 +194,8 @@ struct UndoActorTests {
             undoCommandID: command, group: group,
             preimagesAvailable: try Self.preimages(store, session: session, group: group),
             atMillis: 9_000_000))
-        for _ in 0..<5_000 { await Task.yield() }
+        // apply() runs the transition synchronously to completion — no
+        // wait needed before asserting the duplicate did nothing.
         let after = await actor.currentState()
         #expect(after.undoDispositions.filter({ $0.undoCommandID == command }).count == 1, "no second disposition recorded")
         #expect(try String(contentsOf: url.appendingPathComponent("b.txt"), encoding: .utf8) == "b-user\n", "duplicate performs no second inverse")
@@ -250,7 +251,8 @@ struct UndoActorTests {
         // Drift the file, then preview: dry run stages nothing permanent.
         try "p-user\n".write(to: url.appendingPathComponent("p.txt"), atomically: true, encoding: .utf8)
         await actor.previewUndo(group: group, preimagesAvailable: try Self.preimages(store, session: session, group: group))
-        for _ in 0..<5_000 { await Task.yield() }
+        // The preview round-trip (validate → result) completes inside the
+        // awaited apply — the pending state below is settled, not racing.
         let previewed = await actor.currentState()
         #expect(previewed.pendingUndo == nil, "conflicted preview clears pending")
         #expect(previewed.undoDispositions.isEmpty, "preview records no disposition")

@@ -151,6 +151,12 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
         case .restore(let digest, let expect):
             return applyRestore(
                 inverse: inverse, digest: digest, expect: expect, dirFD: dirFD)
+        case .restoreMissing:
+            // The preimage for this restore does not exist (never a
+            // proven-empty original — that carries an empty digest with
+            // `emptyOriginal`). There are no bytes to restore, so the
+            // inverse never runs: refuse without touching the file.
+            return .refused(reason: "\(inverse.path): preimage missing with no empty-original proof; failing closed")
         case .removeCreated(let expect):
             return applyRemoveCreated(inverse: inverse, expect: expect, dirFD: dirFD)
         }
@@ -274,9 +280,22 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
         guard fchmod(tmpFD, modeBits) == 0, fsync(tmpFD) == 0 else {
             return .failed(error: "tmp mode/sync failed: \(String(cString: strerror(errno)))", possiblyMutated: false)
         }
-        // Final revalidation of the target fd: same inode still, same bytes.
+        // Final revalidation of the TARGET NAME immediately before rename:
+        // re-open the path (never trust the held fd — an open descriptor
+        // keeps its inode, so fstat on it cannot detect replacement or
+        // deletion) and require the same identity the first revalidation
+        // proved. O_NONBLOCK: a swapped-in FIFO must not block the opener
+        // while the workspace lock is held. Any divergence aborts with the
+        // target untouched.
+        let recheckFD: Int32 = fileName.withCString { name in
+            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard recheckFD >= 0 else {
+            return .failed(error: "target revalidation open failed (\(String(cString: strerror(errno)))); aborting", possiblyMutated: false)
+        }
+        defer { close(recheckFD) }
         var recheck = stat()
-        guard fstat(fd, &recheck) == 0,
+        guard fstat(recheckFD, &recheck) == 0,
               recheck.st_dev == st.st_dev, recheck.st_ino == st.st_ino else {
             return .failed(error: "target replaced during inverse; aborting", possiblyMutated: false)
         }
@@ -289,12 +308,19 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
             return .failed(error: "rename failed: \(String(cString: strerror(errno)))", possiblyMutated: false)
         }
         committed = true
-        _ = fsync(parentFD)
+        // Directory sync: the rename entry is durable only after the
+        // parent syncs. A failure here does not undo the rename — it is
+        // reported in the receipt (same contract as the executor), never
+        // hidden, never converted into a false unknown.
+        var durabilityNote = ""
+        if fsync(parentFD) != 0 {
+            durabilityNote = " (directory sync failed: \(String(cString: strerror(errno))); durability weakened)"
+        }
         // Post-verify the installed bytes: open fresh, hash must equal the
         // preimage hash. A post-commit read failure is AMBIGUOUS (the rename
         // succeeded, the proof did not) — unknown, hold, never a claim.
         let verifyFD: Int32 = fileName.withCString { name in
-            openat(parentFD, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         }
         guard verifyFD >= 0 else {
             return .failed(error: "post-commit open failed (rename succeeded, unverifiable)", possiblyMutated: true)
@@ -309,7 +335,7 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
         guard NativeToolExecutor.sha256Hex(installed) == wantHash else {
             return .failed(error: "post-commit hash mismatch (rename succeeded, content unverified)", possiblyMutated: true)
         }
-        return .applied(detail: "restored \(inverse.path) (\(installed.count) bytes)")
+        return .applied(detail: "restored \(inverse.path) (\(installed.count) bytes)\(durabilityNote)")
     }
 
     // MARK: - Remove created
@@ -362,10 +388,19 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
             ownsParentFD = true
         }
         defer { if ownsParentFD { close(parentFD) } }
-        // Re-check the fd identity one last time before unlink (closes the
-        // check-to-unlink window as far as user space can).
+        // Re-check the NAME (not the held fd) one last time before unlink:
+        // re-open with no-follow and require the same identity the first
+        // revalidation proved. O_NONBLOCK for the swapped-in-FIFO case.
+        // Any divergence aborts with nothing unlinked.
+        let recheckFD: Int32 = fileName.withCString { name in
+            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard recheckFD >= 0 else {
+            return .failed(error: "target revalidation open failed (\(String(cString: strerror(errno)))); aborting", possiblyMutated: false)
+        }
+        defer { close(recheckFD) }
         var recheck = stat()
-        guard fstat(fd, &recheck) == 0,
+        guard fstat(recheckFD, &recheck) == 0,
               recheck.st_dev == st.st_dev, recheck.st_ino == st.st_ino else {
             return .failed(error: "target replaced during inverse; aborting", possiblyMutated: false)
         }
@@ -377,13 +412,22 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
         }
         // Verify the unlink landed: the name must be gone. (If it somehow
         // persists, the mutation state is unclear — unknown, hold.)
+        // O_NONBLOCK for the swapped-in-FIFO case.
         let probe: Int32 = fileName.withCString { name in
-            openat(parentFD, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            openat(parentFD, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         }
         if probe >= 0 {
             close(probe)
             return .failed(error: "unlink unverifiable (name persists)", possiblyMutated: true)
         }
-        return .applied(detail: "removed created file \(inverse.path)")
+        // Directory sync: the unlink entry is durable only after the parent
+        // syncs. A failure here does not resurrect the name — it is
+        // reported in the receipt (same contract as the executor), never
+        // hidden, never converted into a false unknown.
+        var detail = "removed created file \(inverse.path)"
+        if fsync(parentFD) != 0 {
+            detail += " (directory sync failed: \(String(cString: strerror(errno))); durability weakened)"
+        }
+        return .applied(detail: detail)
     }
 }

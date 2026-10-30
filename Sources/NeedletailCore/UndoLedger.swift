@@ -158,13 +158,19 @@ public struct ChangeGroup: Sendable, Equatable, Codable {
     }
 }
 
-/// Per-inverse operation: restore a verified preimage, or delete an
-/// exactly-verified created file. Directories are never removed.
+/// Per-inverse operation: restore a verified preimage, delete an
+/// exactly-verified created file, or refuse a restore whose preimage is
+/// missing. Directories are never removed.
 public enum UndoInverseKind: Sendable, Equatable, Codable {
     /// Restore `preimageDigest` bytes over the file at `path`, which must
     /// currently equal `expect` (revalidated at commit, immediately
     /// before the write).
     case restore(preimageDigest: String, expect: UndoFileState)
+    /// The preimage for this restore is missing (never a proven-empty
+    /// original — see `emptyOriginal`): no bytes exist to restore, so the
+    /// inverse can never run. The applier refuses it outright; preflight
+    /// fails the whole group closed before any inverse starts.
+    case restoreMissing(expect: UndoFileState)
     /// Delete the file at `path`, which must currently equal `expect`
     /// (exact created-file identity + content). Never recursive.
     case removeCreated(expect: UndoFileState)
@@ -725,8 +731,14 @@ public func undoInverses(undoCommandID: String, group: ChangeGroup) -> [UndoInve
         } else if member.emptyOriginal {
             kind = .restore(preimageDigest: "", expect: expect)
             restoreMode = member.modeBefore
+        } else if let digest = member.preimageDigest {
+            kind = .restore(preimageDigest: digest, expect: expect)
+            restoreMode = member.modeBefore
         } else {
-            kind = .restore(preimageDigest: member.preimageDigest ?? "", expect: expect)
+            // Missing preimage is NEVER encoded as an empty digest (that
+            // is the proven-empty marker): it is its own kind, which the
+            // applier refuses outright.
+            kind = .restoreMissing(expect: expect)
             restoreMode = member.modeBefore
         }
         return UndoInverse(

@@ -262,16 +262,27 @@ public struct AttachmentCaptureService: Sendable {
     }
 
     public static func sliceLines(_ text: String, range: AttachmentLineRange) -> String {
-        // Newline-preserving split so excerpt bytes stay exact.
-        var lines: [String] = []
-        var current = ""
-        for ch in text {
-            current.append(ch)
-            if ch == "\n" { lines.append(current); current = "" }
+        // Byte-exact 0x0A split (matches countLines): Swift Characters
+        // fuse "\r\n" into one scalar, so Character-wise splitting never
+        // sees the line boundary in CRLF files — the line table then has
+        // one entry and any range past line 1 traps (or silently returns
+        // the whole file). Splitting the UTF-8 bytes keeps the table
+        // byte-exact (CR bytes ride along inside their lines).
+        let bytes = Array(text.utf8)
+        var lines: [[UInt8]] = []
+        var current: [UInt8] = []
+        current.reserveCapacity(256)
+        for byte in bytes {
+            current.append(byte)
+            if byte == 0x0A {
+                lines.append(current)
+                current = []
+                current.reserveCapacity(256)
+            }
         }
         if !current.isEmpty { lines.append(current) }
         let selected = lines[(range.start - 1)..<min(range.end, lines.count)]
-        return selected.joined()
+        return String(decoding: selected.joined(), as: UTF8.self)
     }
 
     /// Bounds to `maxAttachmentExcerptBytes` on character boundaries

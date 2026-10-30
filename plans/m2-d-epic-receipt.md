@@ -39,7 +39,7 @@
   NEEDS_CHANGES: 2 Blockers + 2 Majors, all addressed; re-review
   NEEDS_CHANGES (2 doc-precision Majors), all addressed; final
   **APPROVED**). Delivered: single authoritative reopen sequence,
-  sequence, scenarios A–F with real GRDB + production actor,
+  scenarios A–F with real GRDB + production actor,
   failure-injection legs, bypass counterfactuals, explicit
   unknown-acknowledgment path, M3-B preflight checklist (frozen).
 
@@ -58,7 +58,7 @@
   settled reseed, export redaction, ambiguous reopen, pre-fix rows).
 - D2 `UndoActorTests` 5 pass (full loop, preview conflict, fault
   injection, boundary-5 recovery sweep).
-- D3 `D3IntegrationTests` 13 pass (A: order/IDs/acks/no-duplicates;
+- D3 `D3IntegrationTests` 14 pass (A: order/IDs/acks/no-duplicates;
   B: unknown head, no-resend, reconcile durability, release-only-
   intended; C: stale snapshot across reopen, no overtake, fix +
   reconsent, provider-context proof; C2: epoch switch preserves
