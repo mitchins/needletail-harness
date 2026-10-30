@@ -2897,10 +2897,13 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
     // terminal entries are untouched; heldUnknown entries stay held.
     var queue = state.queue
     for i in queue.indices where queue[i].state == .queued {
+        // M2-D D1: the hold-marking preserves snapshots + consent (a
+        // cancel must never strip the evidence the dispatch gate needs).
         queue[i] = QueueEntry(
             entryID: queue[i].entryID, commandID: queue[i].commandID, kind: queue[i].kind,
             state: .held, revision: queue[i].revision, text: queue[i].text,
-            targetEpochID: queue[i].targetEpochID, orderKey: queue[i].orderKey, sealed: queue[i].sealed)
+            targetEpochID: queue[i].targetEpochID, orderKey: queue[i].orderKey, sealed: queue[i].sealed,
+            attachments: queue[i].attachments, attachmentConsentEpoch: queue[i].attachmentConsentEpoch)
         records.append(.queueUpdated(queue[i]))
     }
     var active: ActiveRequest? = nil

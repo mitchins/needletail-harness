@@ -495,6 +495,36 @@ struct QueueAttachmentTests {
         #expect(state.queue.first?.state == .queued, "entry still queued; next completion revalidates")
     }
 
+    @Test("cancel preserves snapshots and consent; redispatch revalidates")
+    func cancelPreservesSnapshots() throws {
+        var ids = StateFixtures.ids()
+        let snapshot = Self.snap()
+        let (streaming, run) = try Self.streamingWithAttachment(ids: &ids, snapshot: snapshot)
+        let entryID = try #require(streaming.queue.first?.entryID)
+        // Cancel holds the queued entry durably — without stripping it.
+        var state = transition(streaming, .cancelRequested(atMillis: 1005), &ids).state
+        let cancelled = try #require(state.queue.first(where: { $0.entryID == entryID }))
+        #expect(cancelled.state == .held, "cancel holds the queued entry")
+        #expect(cancelled.attachments == [snapshot], "cancel never strips snapshots")
+        #expect(cancelled.attachmentConsentEpoch == streaming.queue.first?.attachmentConsentEpoch,
+                "cancel never strips consent")
+        // The cancel path interrupts; dismiss back to idle, resume, and
+        // complete a fresh run: the pop must revalidate, never dispatch blind.
+        state = transition(state, .tick(nowMillis: 10_000_000), &ids).state
+        state = transition(state, .dismissRun(atMillis: 10_000_001), &ids).state
+        state = transition(state, .queueResume(atMillis: 10_000_002), &ids).state
+        #expect(state.queue.first?.state == .queued, "resume unholds the cancelled entry")
+        #expect(state.queue.first?.attachments == [snapshot], "snapshots survive cancel + resume")
+        state = transition(state, StateFixtures.input("run2", id: "cmd-2", at: 10_000_003), &ids).state
+        let run2 = try #require(state.activeRun)
+        state = transition(state, .requestDispatched(requestID: run2.requestID, atMillis: 10_000_004), &ids).state
+        state = transition(state, .requestStarted(requestID: run2.requestID, generation: run2.revision, atMillis: 10_000_005), &ids).state
+        let completed = transition(state, Self.finalResponse(run2), &ids)
+        #expect(Self.hasEffect(completed.effects) { Self.isValidationRequest($0, entryID: entryID) },
+                "post-cancel dispatch revalidates first")
+        #expect(!Self.hasEffect(completed.effects, where: Self.isProviderRequest), "no blind dispatch after cancel")
+    }
+
     // MARK: - Prompt composition units
 
     @Test("composeDispatchText covers manifest, truncation and metadata")
