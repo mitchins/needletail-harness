@@ -1200,12 +1200,14 @@ private func reconcileQueueEntry<I: IDSource>(_ state: SessionState, entryID: St
 }
 
 /// M2-D D3: explicit operator reconciliation of one unknown mutating
-/// operation. The determination is recorded (never silent), the recovery
-/// marker is discharged (never retried), and reopen honors the durable
-/// acknowledgment instead of reseeding a hold. Refused when no such
-/// marker exists, when a live run is in flight (the run that produced the
-/// unknown may still be settling it), or mid-undo (exclusive phase).
-/// Unknown DELIVERIES are out of scope — queueReconcile owns those.
+/// operation. The determination is recorded (never silent) and the
+/// CURRENT session's recovery marker is discharged (never retried).
+/// Refused when no such marker exists, when a live run is in flight (the
+/// run that produced the unknown may still be settling it), or mid-undo
+/// (exclusive phase). Per the D0 F2B-5 contract the acknowledgment never
+/// converts the uncertainty: every reopen re-derives holds from the
+/// journal, so the operator re-accepts per boot. Unknown DELIVERIES are
+/// out of scope — queueReconcile owns those.
 private func acknowledgeUnknownOp<I: IDSource>(
     _ state: SessionState, operationID: OperationID, determination: String,
     atMillis: UInt64, ids: inout I

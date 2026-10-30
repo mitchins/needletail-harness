@@ -1198,9 +1198,33 @@ struct D3IntegrationTests {
         #expect(!report3.blocked)
     }
 
-    @Test("CF-corrupt: a contradictory journal fails reopen loudly with no actor")
-    func corruptJournalFailsReopen() async throws {
+    @Test("CF-path: reopening a missing store file fails closed without creating one")
+    func missingStoreFileFailsClosed() async throws {
         let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let missing = dir.appendingPathComponent("absent.sqlite").path
+        #expect(!FileManager.default.fileExists(atPath: missing))
+        let session = SessionID("s-d3-cf5")
+        let epoch = try Self.idleState(session: session, mode: .workspace, permissive: true).epoch
+        var ids = DeterministicIDSource(prefix: "cf5")
+        do {
+            _ = try await reopenHeadlessSessionAtPath(
+                storePath: missing, session: session, epoch: epoch,
+                trustMode: .workspace, as: "w-d3", ids: &ids,
+                clock: SystemClock(), transport: ScriptedTransport(),
+                executor: ScriptedExecutor(), approvals: ScriptedApprovals())
+            Issue.record("missing store must fail reopen")
+        } catch let error as StoreError {
+            guard case .integrity = error else {
+                Issue.record("expected integrity, got \(error)")
+                throw ScriptedError.outOfScript
+            }
+        }
+        #expect(!FileManager.default.fileExists(atPath: missing), "failed reopen creates no database file")
+    }
+
+    @Test("CF-corrupt: a contradictory journal fails reopen loudly with no actor")
+    func corruptJournalFailsReopen() async throws {        let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let session = SessionID("s-d3-cf4")
         let writer = WriterIdentity(session: session, writer: "w-d3")
