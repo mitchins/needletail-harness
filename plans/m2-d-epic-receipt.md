@@ -4,8 +4,9 @@
 - Baseline: `main` @ `6104845` (M2-C merged, PR #7)
 - Plan: `plans/m2-d-plan.md` REV3 (planning only; implementation slices
   D0–D3 each separately authorized with per-slice DeepSeek review)
-- Qualified code HEAD: `cd75adc` (this receipt is void if the head moves —
-  re-qualify and re-issue)
+- Qualified code HEAD: `394c07c` (this receipt is void if the code
+  tree moves — re-qualify and re-issue; the issuing commit on top is
+  docs-only and does not affect qualification)
 - Status vocabulary: `cases/catalog.json` is untouched by D0–D3 by
   precedent; the due-milestone flip to IMPLEMENTED with executed
   evidence belongs to the M2-D epic PR (CodeRabbit whole-system review).
@@ -34,9 +35,10 @@
   transcript notices, `LineageFork` records, resume reseeding,
   `recoverUndoJournal` sweep.
 - **D3 — integration, recovery qualification, epic readiness**
-  (`08f0b95` + review fixes in `cd75adc`; DeepSeek NEEDS_CHANGES:
-  2 Blockers + 2 Majors, all addressed below; final confirmation
-  pending at issue time). Delivered: single authoritative reopen
+  (`08f0b95` + review fixes in `cd75adc` + `394c07c`; DeepSeek
+  NEEDS_CHANGES: 2 Blockers + 2 Majors, all addressed; re-review
+  NEEDS_CHANGES (2 doc-precision Majors), all addressed; final
+  **APPROVED**). Delivered: single authoritative reopen sequence,
   sequence, scenarios A–F with real GRDB + production actor,
   failure-injection legs, bypass counterfactuals, explicit
   unknown-acknowledgment path, M3-B preflight checklist (frozen).
@@ -79,7 +81,7 @@
 | D0 | UX-QUEUE-06/09(both)/10(route); STATE-02(durable)/STATE-03 | D0 lanes; D3 A (order/IDs/acks/no-dup), B (linkage/no-resend/durability/release), F (combined) |
 | D1 | UX-QUEUE-08/10(dispatch); UX-MENTION-09/10/11/12 | D1 lanes; D3 C (stale head/no-overtake/fix+reconsent), C2 (epoch switch/retarget/reconsent) |
 | D2 | UX-UNDO-01..05/07/10/11; UNDO-06 notice; UNDO-09 core; UNDO-08 lineage; STATE-05 | D2 49 tests; D3 D (partial across reopen), E (boundary-5 exactly once), F (combined), CF-sweep |
-| D3 | integration (queue+undo+epoch+crash), quiescence gates on M3-B paths, readiness checklist, STATE-05 end-to-end | D3 13 tests; `plans/m2-d-m3-readiness.md` (frozen) |
+| D3 | integration (queue+undo+epoch+crash), quiescence gates on M3-B paths, readiness checklist, STATE-05 end-to-end | D3 14 tests (A, B, C, C2, D, E, E2, F, pure ack, 5 counterfactuals); `plans/m2-d-m3-readiness.md` (frozen) |
 
 Deferred test rows (M4 dues, not exited): QUEUE-01/02/03/04/05/07/11/12
 rows, UNDO-06/08/09 rows, MENTION-01..08 UX rows, `/undo` + `/rewind`
@@ -101,7 +103,9 @@ commands, all RENDER/NAV/PTY/DX-terminal rows.
   still-held semantics; Major 3: missing store file now fails closed;
   Major 4: second sweep executed, C2 epoch-switch/retarget leg,
   provider-context assertions, citation fixes) → all addressed in
-  `cd75adc`; final confirmation review pending at issue time.
+  `cd75adc`; re-review NEEDS_CHANGES (2 doc-precision Majors: stale
+  ack doc, readiness row 8 scope) → all addressed in `394c07c`;
+  final **APPROVED**.
 
 ## Known flakes and remaining limitations
 
