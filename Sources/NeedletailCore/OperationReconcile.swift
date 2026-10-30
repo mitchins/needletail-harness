@@ -445,11 +445,14 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
         // Sent but uncompleted: the delivery is uncertain by construction.
         // Force held-unknown whatever the last recorded state says — a
         // recorded dispatched/history without completion is exactly the
-        // crash window, not evidence of completion.
+        // crash window, not evidence of completion. Snapshots + consent
+        // ride through (provenance survives reopen; revalidation happens
+        // at the next dispatch, never from replayed evidence).
         entries[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .heldUnknown, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+            attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
         unknownLinks.append(link)
         queueHeld = true
     }

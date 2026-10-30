@@ -256,6 +256,56 @@ struct RecordCodecTests {
         #expect(back == .acknowledgedUnresolved(withQ), "queue entry IDs round-trip")
     }
 
+    @Test("pre-D1 queue rows without attachment keys still decode")
+    func decodeLegacyQueueEntryWithoutAttachments() throws {
+        // Backward compatibility: a D0-era row (no `attachments` /
+        // `attachmentConsentEpoch` keys — stripped here to simulate the
+        // old writer) decodes with empty snapshots and nil consent; new
+        // rows round-trip with snapshots preserved.
+        let bare = QueueEntry(
+            entryID: "q-old", commandID: CommandID("cmd-old"), kind: .followUp,
+            state: .queued, revision: 1, text: "old text",
+            targetEpochID: EpochID("epoch-1"), orderKey: 7, sealed: false)
+        let encoded = try RecordCodec.encode(.queueAdmitted(bare))
+        var outer = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        // The associated-value wrapper nests the entry one level deeper.
+        func strip(_ dict: [String: Any]) -> [String: Any] {
+            var dict = dict
+            dict.removeValue(forKey: "attachments")
+            dict.removeValue(forKey: "attachmentConsentEpoch")
+            for (key, value) in dict {
+                if let nested = value as? [String: Any] {
+                    dict[key] = strip(nested)
+                }
+            }
+            return dict
+        }
+        outer["queueAdmitted"] = strip(try #require(outer["queueAdmitted"] as? [String: Any]))
+        let legacy = try JSONSerialization.data(withJSONObject: outer, options: [.sortedKeys])
+        let decoded = try RecordCodec.decode(legacy)
+        guard case .queueAdmitted(let entry) = decoded else {
+            Issue.record("legacy row must decode as queueAdmitted"); return
+        }
+        #expect(entry.attachments.isEmpty, "missing key defaults to no snapshots")
+        #expect(entry.attachmentConsentEpoch == nil, "missing key defaults to no consent")
+        #expect(entry.text == "old text", "other fields intact")
+        // Snapshot-bearing rows round-trip exactly.
+        let snap = AttachmentSnapshot(
+            path: "n.txt", grantedRoot: "workspace", device: 1, inode: 2,
+            size: 3, contentHash: "h", lineRange: AttachmentLineRange(start: 1, end: 1),
+            totalLines: 1, content: .included(excerpt: "x\n", truncated: false),
+            captureEpochID: EpochID("epoch-1"),
+            routeGrant: AttachmentRouteGrant(alias: "a", locality: .local, sealed: false),
+            intent: "mention")
+        let fresh = QueueEntry(
+            entryID: "q-new", commandID: CommandID("cmd-new"), kind: .steer,
+            state: .held, revision: 2, text: "new", targetEpochID: EpochID("epoch-1"),
+            orderKey: 9, sealed: false, attachments: [snap],
+            attachmentConsentEpoch: EpochID("epoch-1"))
+        let back = try RecordCodec.decode(try RecordCodec.encode(.queueUpdated(fresh)))
+        #expect(back == .queueUpdated(fresh), "snapshots + consent round-trip")
+    }
+
     @Test("encoded rows never carry derived origin/pathPrefix; decode re-derives them")
     func derivedFieldsAreNeverEncoded() throws {
         let record = try Self.allCases()[1] // epochOpened with a full snapshot

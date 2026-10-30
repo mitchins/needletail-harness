@@ -61,6 +61,12 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// M2-C C0 (plan REV12 §3.4b.1): the injected identity resolver.
     private let execResolver: (any ExecIdentityResolver)?
 
+    /// M2-D D1: the composed attachment validator (Runtime filesystem
+    /// validator in production; scripted/temp-fs in tests). Nil means
+    /// uncomposed: validation requests stamp empty observations and the
+    /// transition holds fail-closed.
+    private let attachmentValidator: (any AttachmentValidator)?
+
     /// Throws when the fencing claim cannot be established: constructing a
     /// live writer against a session held by a DIFFERENT writer is a loud
     /// failure, never a silently unfenced actor.
@@ -68,7 +74,8 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         state: SessionState, ids: IDs, clock: ClockType,
         transport: Transport, executor: Executor, store: Store, approvals: Approvals,
         sink: any UISink = NoopUISink(), writer: String,
-        execResolver resolver: (any ExecIdentityResolver)? = nil
+        execResolver resolver: (any ExecIdentityResolver)? = nil,
+        attachmentValidator: (any AttachmentValidator)? = nil
     ) throws {
         self.state = state
         self.ids = ids
@@ -80,6 +87,7 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         self.sink = sink
         self.writer = writer
         self.execResolver = resolver
+        self.attachmentValidator = attachmentValidator
         // A2 fencing: this live actor instance establishes its writer
         // identity BEFORE any durable mutation. Idempotent for a same-
         // identity restart; a competing live writer fails here, loudly —
@@ -110,6 +118,19 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         await apply(.operatorInput(
             commandID: commandID, text: text, kind: kind, revision: 1,
             sealed: sealed, atMillis: clock.nowMillis()))
+    }
+
+    /// M2-D D1: operator input carrying authorized attachment snapshots
+    /// (captured by Runtime before stamping — the actor never reads files).
+    public func submitTextWithAttachments(commandID: CommandID, text: String, kind: QueueKind, sealed: Bool, attachments: [AttachmentSnapshot]) async {
+        await apply(.operatorInputAttachments(
+            commandID: commandID, text: text, kind: kind,
+            sealed: sealed, attachments: attachments, atMillis: clock.nowMillis()))
+    }
+
+    /// M2-D D1: explicit operator replacement of an entry's snapshots.
+    public func replaceEntryAttachments(entryID: String, snapshots: [AttachmentSnapshot]) async {
+        await apply(.queueAttachmentReplace(entryID: entryID, snapshots: snapshots, atMillis: clock.nowMillis()))
     }
 
     public func editEntry(entryID: String, newText: String, baseRevision: UInt64) async {
@@ -381,6 +402,16 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             await apply(.execIdentitiesResolved(
                 resolutionID: resolutionID, runID: run.runID, generation: run.revision,
                 identities: identities, atMillis: clock.nowMillis()))
+        case .validateAttachments(let entryID, let snapshots):
+            // M2-D D1: freshness evidence is gathered by the composed
+            // validator (filesystem I/O the pure transition cannot do) and
+            // stamped onto the result event. Uncomposed validator (nil) or
+            // an empty reply stamps empty observations — the transition
+            // holds fail-closed on missing evidence.
+            let observations = await attachmentValidator?.validate(entryID: entryID, snapshots: snapshots) ?? []
+            await apply(.attachmentValidationResult(
+                entryID: entryID, requested: snapshots,
+                observations: observations, atMillis: clock.nowMillis()))
         case .cancelInFlight:
             inFlight?.cancel()
         case .startTimer(let deadlineMillis, let purpose, let runID):

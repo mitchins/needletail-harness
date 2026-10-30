@@ -20,6 +20,20 @@ public enum SessionEvent: Sendable, Equatable {
     /// delivery (requeue for redispatch, or withdraw to drop). Recorded;
     /// never automatic, never a non-delivery proof.
     case queueReconcile(entryID: String, atMillis: UInt64)
+    /// M2-D D1: operator input carrying authorized attachment snapshots
+    /// (captured by Runtime BEFORE stamping; the transition never parses
+    /// `@` text into snapshots). Mirrors operatorInput routing: fresh run
+    /// when idle (capture-fresh, no dwell), queued otherwise. Sealed
+    /// submissions carrying snapshots are refused at admission.
+    case operatorInputAttachments(commandID: CommandID, text: String, kind: QueueKind, sealed: Bool, attachments: [AttachmentSnapshot], atMillis: UInt64)
+    /// M2-D D1: freshness evidence for the snapshots validation was
+    /// requested for (`requested`), gathered by the composed validator.
+    /// Event-scoped: never stored, never replayed.
+    case attachmentValidationResult(entryID: String, requested: [AttachmentSnapshot], observations: [AttachmentObservation], atMillis: UInt64)
+    /// M2-D D1: explicit operator replacement of an entry's snapshots
+    /// (the fix path for stale holds — never automatic, never silent).
+    /// Preserves entry state; resume releases separately.
+    case queueAttachmentReplace(entryID: String, snapshots: [AttachmentSnapshot], atMillis: UInt64)
     case approvalGrant(requestID: RequestID, generation: Revision, atMillis: UInt64)
     case approvalDeny(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
     case approvalUnavailable(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)

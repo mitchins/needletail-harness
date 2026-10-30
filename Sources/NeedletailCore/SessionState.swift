@@ -148,8 +148,18 @@ public struct QueueEntry: Sendable, Equatable, Codable {
     /// Sealing travels WITH the entry (S6): a sealed submission queued
     /// behind a non-sealed run keeps its own flag into its own run.
     public let sealed: Bool
+    /// M2-D D1: immutable structured file-attachment snapshots bound at
+    /// admission. The transition never parses `@` text into snapshots —
+    /// only the authorized capture path creates them.
+    public let attachments: [AttachmentSnapshot]
+    /// M2-D D1: explicit re-consent marker. Set to the live epoch by
+    /// admission and refreshed by retarget (the explicit operator action
+    /// that re-applies route/context consent after an epoch change).
+    /// Dispatch requires each snapshot's capture epoch OR this consent to
+    /// equal the live epoch (plus the local→cloud rule).
+    public let attachmentConsentEpoch: EpochID?
 
-    public init(entryID: String, commandID: CommandID, kind: QueueKind, state: QueueEntryState, revision: UInt64, text: String, targetEpochID: EpochID, orderKey: UInt64, sealed: Bool = false) {
+    public init(entryID: String, commandID: CommandID, kind: QueueKind, state: QueueEntryState, revision: UInt64, text: String, targetEpochID: EpochID, orderKey: UInt64, sealed: Bool = false, attachments: [AttachmentSnapshot] = [], attachmentConsentEpoch: EpochID? = nil) {
         self.entryID = entryID
         self.commandID = commandID
         self.kind = kind
@@ -159,20 +169,51 @@ public struct QueueEntry: Sendable, Equatable, Codable {
         self.targetEpochID = targetEpochID
         self.orderKey = orderKey
         self.sealed = sealed
+        self.attachments = attachments
+        self.attachmentConsentEpoch = attachmentConsentEpoch
+    }
+
+    /// Backward-compatible decode: rows written before D1 carry neither
+    /// key (RecordCodec legacy-row test pins this).
+    private enum CodingKeys: String, CodingKey {
+        case entryID, commandID, kind, state, revision, text
+        case targetEpochID, orderKey, sealed, attachments, attachmentConsentEpoch
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        entryID = try container.decode(String.self, forKey: .entryID)
+        commandID = try container.decode(CommandID.self, forKey: .commandID)
+        kind = try container.decode(QueueKind.self, forKey: .kind)
+        state = try container.decode(QueueEntryState.self, forKey: .state)
+        revision = try container.decode(UInt64.self, forKey: .revision)
+        text = try container.decode(String.self, forKey: .text)
+        targetEpochID = try container.decode(EpochID.self, forKey: .targetEpochID)
+        orderKey = try container.decode(UInt64.self, forKey: .orderKey)
+        sealed = try container.decode(Bool.self, forKey: .sealed)
+        attachments = try container.decodeIfPresent([AttachmentSnapshot].self, forKey: .attachments) ?? []
+        attachmentConsentEpoch = try container.decodeIfPresent(EpochID.self, forKey: .attachmentConsentEpoch)
     }
 
     public func withState(_ state: QueueEntryState) -> QueueEntry {
         QueueEntry(
             entryID: entryID, commandID: commandID, kind: kind,
             state: state, revision: revision, text: text,
-            targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed)
+            targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed,
+            attachments: attachments, attachmentConsentEpoch: attachmentConsentEpoch)
     }
 
     public func withRevision(_ revision: UInt64, text: String) -> QueueEntry {
         QueueEntry(
             entryID: entryID, commandID: commandID, kind: kind,
             state: state, revision: revision, text: text,
-            targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed)
+            targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed,
+            attachments: attachments, attachmentConsentEpoch: attachmentConsentEpoch)
+    }
+
+    /// Excerpt bytes accountable to the queue text budget (I-8/O-4).
+    public var attachmentBytes: Int {
+        attachments.reduce(0) { $0 + $1.content.excerptBytes }
     }
 }
 

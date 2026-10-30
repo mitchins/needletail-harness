@@ -245,12 +245,49 @@ public enum SessionExport {
                                   "revision": entry.revision,
                                   "targetEpochID": entry.targetEpochID.raw,
                                   "orderKey": entry.orderKey,
-                                  "sealed": entry.sealed]
+                                  "sealed": entry.sealed,
+                                  "attachments": entry.attachments.map { attachmentRow($0, includeContent: includeContent) }]
         if includeContent {
             row["text"] = entry.text
             row["redacted"] = false
         } else {
             row["redacted"] = true
+        }
+        return row
+    }
+
+    /// M2-D D1: attachment manifest projection. Structural identity always
+    /// travels (path, device/inode, size, hash, range, provenance); excerpt
+    /// bytes travel only with --include-content (they are content-bearing).
+    /// No snapshot/route/config keys by construction (see the schema test's
+    /// forbidden vocabulary).
+    private static func attachmentRow(_ snapshot: AttachmentSnapshot, includeContent: Bool) -> [String: Any] {
+        var row: [String: Any] = ["path": snapshot.path,
+                                  "grantedRoot": snapshot.grantedRoot,
+                                  "device": snapshot.device,
+                                  "inode": snapshot.inode,
+                                  "size": snapshot.size,
+                                  "contentHash": snapshot.contentHash,
+                                  "totalLines": snapshot.totalLines,
+                                  "intent": snapshot.intent,
+                                  "captureEpochID": snapshot.captureEpochID.raw,
+                                  "alias": snapshot.routeGrant.alias,
+                                  "locality": snapshot.routeGrant.locality.rawValue,
+                                  "admissionSealed": snapshot.routeGrant.sealed]
+        if let range = snapshot.lineRange {
+            row["lineStart"] = range.start
+            row["lineEnd"] = range.end
+        }
+        switch snapshot.content {
+        case .included(let excerpt, let truncated):
+            row["content"] = "included"
+            row["truncated"] = truncated
+            if includeContent {
+                row["excerpt"] = excerpt
+            }
+        case .metadataOnly(let reason):
+            row["content"] = "metadataOnly"
+            row["reason"] = reason
         }
         return row
     }

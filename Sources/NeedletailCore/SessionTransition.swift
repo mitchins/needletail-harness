@@ -32,6 +32,11 @@ public enum Effect: Sendable, Equatable {
     case cancelInFlight(runID: RunID, reason: String)
     case requestApproval(ApprovalRequest)
     case reserveEffect(EffectReservation)
+    /// M2-D D1: freshness validation request for a queued entry's
+    /// snapshots (actor performs via the composed validator, then stamps
+    /// `.attachmentValidationResult`; nil validator stamps empty
+    /// observations and dispatch holds fail-closed).
+    case validateAttachments(entryID: String, snapshots: [AttachmentSnapshot])
     /// M2-C C0 phase 1 (plan REV12 §3.4b).
     case resolveExecIdentities(resolutionID: String, batch: ToolBatch)
 }
@@ -296,9 +301,16 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
     if state.phase.isTerminal, case .operatorInput = event {
         return transition(state.replacing(phase: .idle), event, &ids)
     }
+    // M2-D D1: attachment-carrying input recurses the same way (fresh
+    // admission once idle; the snapshots ride the event).
+    if state.phase.isTerminal, case .operatorInputAttachments = event {
+        return transition(state.replacing(phase: .idle), event, &ids)
+    }
     switch (state.phase, event) {
     case (.idle, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitFreshRun(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
+    case (.idle, .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at)):
+        return admitFreshRun(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
     case (.idle, .queueEdit(let entryID, let newText, let baseRevision, let at)):
         return editEntry(state, entryID: entryID, newText: newText, baseRevision: baseRevision, atMillis: at, ids: &ids)
     case (.idle, .queueWithdraw(let entryID, let at)):
@@ -309,6 +321,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.idle, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (.idle, .queueAttachmentReplace(let entryID, let snapshots, let at)):
+        return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
     case (.idle, .switchModel(let alias, let at)):
         return switchModel(state, alias: alias, atMillis: at, ids: &ids)
     case (.idle, .checkpointRequested(let at)):
@@ -325,6 +339,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return failAdmissionTransport(state, phase: phase, error: error, atMillis: at, ids: &ids)
     case (.admitting, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
+    case (.admitting, .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at)):
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
     case (.checkpointing, .checkpointCommitted(let newEpoch, let at)):
         return commitCheckpoint(state, newEpoch: newEpoch, atMillis: at, ids: &ids)
     case (.checkpointing, .checkpointFailed(let reason, let at)):
@@ -339,6 +355,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return failTransport(state, phase: phase, error: error, atMillis: at, ids: &ids)
     case (.requesting, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
+    case (.requesting, .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at)):
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
     case (.requesting, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.streaming, .providerResponse(_, _, let response, let at)):
@@ -347,12 +365,16 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return failTransport(state, phase: phase, error: error, atMillis: at, ids: &ids)
     case (.streaming, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
+    case (.streaming, .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at)):
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
     case (.streaming, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.validatingTools, .validationCompleted(_, _, let batch, let at)):
         return enterAuthorising(state, batch: batch, atMillis: at, ids: &ids)
     case (.validatingTools, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
+    case (.validatingTools, .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at)):
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
     case (.validatingTools, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.authorising, .approvalGrant(let requestID, _, _)):
@@ -365,8 +387,10 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return execIdentitiesResolved(state, resolutionID: resolutionID, identities: identities, ids: &ids)
     case (.authorising, .execResolutionFailed(let resolutionID, _, _, let status, let summary, _)):
         return execResolutionFailed(state, resolutionID: resolutionID, status: status, summary: summary, ids: &ids)
-    case (.authorising, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
+        case (.authorising, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
+    case (.authorising, .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at)):
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
     case (.authorising, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.executing, .effectCompleted(let effectID, _, _, _, _, let outcome, _)):
@@ -375,6 +399,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return failEffect(state, effectID: effectID, error: error, ids: &ids)
     case (.executing, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
+    case (.executing, .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at)):
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
     case (.executing, .cancelRequested(let at)):
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.cancelling, .effectCompleted(let effectID, _, _, _, _, let outcome, _)):
@@ -397,6 +423,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.failed, .queueReconcile(let entryID, let at)), (.completed, .queueReconcile(let entryID, let at)), (.interrupted, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (.failed, .queueAttachmentReplace(let entryID, let snapshots, let at)), (.completed, .queueAttachmentReplace(let entryID, let snapshots, let at)), (.interrupted, .queueAttachmentReplace(let entryID, let snapshots, let at)):
+        return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
     case (.failed, .queueEdit(let entryID, let newText, let baseRevision, let at)),
          (.completed, .queueEdit(let entryID, let newText, let baseRevision, let at)),
          (.interrupted, .queueEdit(let entryID, let newText, let baseRevision, let at)):
@@ -435,6 +463,10 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (_, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (_, .queueAttachmentReplace(let entryID, let snapshots, let at)):
+        return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
+    case (_, .attachmentValidationResult(let entryID, let requested, let observations, let at)):
+        return handleAttachmentValidationResult(state, entryID: entryID, requested: requested, observations: observations, atMillis: at, ids: &ids)
     case (_, .invalidInput(let fingerprint, let cause, let at)):
         return stepInvalid(state, fingerprint: fingerprint, cause: cause, atMillis: at, ids: &ids)
     default:
@@ -652,7 +684,7 @@ func eventDigest(_ parts: String...) -> String {
 
 private func admitFreshRun<I: IDSource>(
     _ state: SessionState, commandID: CommandID, text: String, kind: QueueKind,
-    sealed: Bool, atMillis: UInt64, ids: inout I
+    sealed: Bool, attachments: [AttachmentSnapshot] = [], atMillis: UInt64, ids: inout I
 ) -> Transition {
     // Sealed admission (C1): denials invalidate; mentions still admit.
     if sealed {
@@ -663,6 +695,12 @@ private func admitFreshRun<I: IDSource>(
             break
         }
     }
+    // M2-D D1 MENTION-10 (sealed half): a sealed submission cannot carry
+    // file attachments — no read tool exists to fetch further content, so
+    // the admission fails explicitly instead of half-admitting bytes.
+    if sealed, !attachments.isEmpty {
+        return refuseCaps(state, commandID: commandID, cause: "sealed submissions cannot carry file attachments; use tool-enabled mode", atMillis: atMillis, ids: &ids)
+    }
     // Blocked automatic continuation: unresolved markers refuse new runs
     // but still admit the text as a HELD queue entry (explicit
     // reconciliation first — POLICY-07 shape, M2 reconciles). Queuing is
@@ -670,7 +708,7 @@ private func admitFreshRun<I: IDSource>(
     if !state.unresolvedOperations.isEmpty {
         let preHeld = state.replacing(
             queueHeld: true, heldReason: .error("unresolved operations block new runs"))
-        let queued = admitToQueueState(preHeld, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: atMillis, ids: &ids)
+        let queued = admitToQueueState(preHeld, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: atMillis, ids: &ids)
         return Transition(
             state: queued.state,
             effects: queued.effects + [.emitUI(.denied(cause: "blocked: reconcile \(state.unresolvedOperations.count) unknown outcome(s) first"))],
@@ -692,10 +730,13 @@ private func admitFreshRun<I: IDSource>(
     guard liveCount < maxQueueEntries else {
         return refuseCaps(state, commandID: commandID, cause: "queue full (\(maxQueueEntries) entries)", atMillis: atMillis, ids: &ids)
     }
+    // M2-D D1 (O-4/I-8): admitted excerpts count toward the queue text
+    // budget alongside entry text.
+    let newAttachmentBytes = attachments.reduce(0) { $0 + $1.content.excerptBytes }
     let undispatchedBytes = state.queue
         .filter { $0.state == .queued || $0.state == .held }
-        .reduce(0) { $0 + $1.text.utf8.count }
-    guard undispatchedBytes + text.utf8.count <= maxQueueTextBytes else {
+        .reduce(0) { $0 + $1.text.utf8.count + $1.attachmentBytes }
+    guard undispatchedBytes + text.utf8.count + newAttachmentBytes <= maxQueueTextBytes else {
         return refuseCaps(state, commandID: commandID, cause: "queue text budget exceeded", atMillis: atMillis, ids: &ids)
     }
     // Reserve the new run (generation+1; run-scoped counters reset — M1B3-6).
@@ -739,8 +780,10 @@ private func admitFreshRun<I: IDSource>(
         records: [
             .eventAppended(seq: seq, kind: "run-admitted", digest: eventDigest("admit", commandID.raw)),
             .operationIntent(OperationRef(operationID: ids.nextOperationID(), state: .intent, mutating: false)),
-            // The dispatched operator text opens the transcript (D1).
-            .transcriptAppended(.user(text)),
+            // The dispatched operator text opens the transcript (D1):
+            // capture-fresh snapshots compose their manifest + excerpts
+            // inline (no dwell, no revalidation needed at this point).
+            .transcriptAppended(.user(composeDispatchText(text: text, attachments: attachments))),
         ])
 }
 
@@ -759,7 +802,7 @@ private func refuseCaps<I: IDSource>(
 
 private func admitToQueueState<I: IDSource>(
     _ state: SessionState, commandID: CommandID, text: String, kind: QueueKind,
-    sealed: Bool, atMillis: UInt64, ids: inout I
+    sealed: Bool, attachments: [AttachmentSnapshot] = [], atMillis: UInt64, ids: inout I
 ) -> Transition {
     _ = atMillis
     // S6: the EVENT's sealed flag governs (a sealed submission queued
@@ -772,6 +815,11 @@ private func admitToQueueState<I: IDSource>(
             break
         }
     }
+    // M2-D D1 MENTION-10 (sealed half): sealed context or sealed
+    // submission carrying snapshots is refused explicitly.
+    if !attachments.isEmpty, sealed || sealedContext(state) {
+        return refuseCaps(state, commandID: commandID, cause: "sealed sessions cannot carry file attachments; use tool-enabled mode", atMillis: atMillis, ids: &ids)
+    }
     if let prior = state.admittedCommands[commandID] {
         return Transition(state: state, effects: [.emitUI(.admitted(commandID: commandID, revision: prior.revision))], records: [])
     }
@@ -779,10 +827,13 @@ private func admitToQueueState<I: IDSource>(
     guard liveCount < maxQueueEntries else {
         return refuseCaps(state, commandID: commandID, cause: "queue full (\(maxQueueEntries) entries)", atMillis: atMillis, ids: &ids)
     }
+    // M2-D D1 (O-4/I-8): admitted excerpts count toward the queue text
+    // budget alongside entry text.
+    let newAttachmentBytes = attachments.reduce(0) { $0 + $1.content.excerptBytes }
     let undispatchedBytes = state.queue
         .filter { $0.state == .queued || $0.state == .held }
-        .reduce(0) { $0 + $1.text.utf8.count }
-    guard undispatchedBytes + text.utf8.count <= maxQueueTextBytes else {
+        .reduce(0) { $0 + $1.text.utf8.count + $1.attachmentBytes }
+    guard undispatchedBytes + text.utf8.count + newAttachmentBytes <= maxQueueTextBytes else {
         return refuseCaps(state, commandID: commandID, cause: "queue text budget exceeded", atMillis: atMillis, ids: &ids)
     }
     var index = state.admittedCommands
@@ -797,7 +848,8 @@ private func admitToQueueState<I: IDSource>(
     let entry = QueueEntry(
         entryID: "q-\(seq.value)", commandID: commandID, kind: kind,
         state: state.queueHeld ? .held : .queued, revision: 1, text: text,
-        targetEpochID: state.epoch.epochID, orderKey: seq.value, sealed: sealed)
+        targetEpochID: state.epoch.epochID, orderKey: seq.value, sealed: sealed,
+        attachments: attachments, attachmentConsentEpoch: attachments.isEmpty ? nil : state.epoch.epochID)
     let ack = QueueAck(commandID: commandID, entryID: entry.entryID, sequence: seq, revision: 1, state: entry.state)
     index[commandID] = ack
     let next = state.replacing(
@@ -839,10 +891,9 @@ private func editEntry<I: IDSource>(
             records: prefix)
     }
     var queue = state.queue
-    let updated = QueueEntry(
-        entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
-        state: entry.state, revision: entry.revision + 1, text: newText,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+    // withRevision preserves attachments + consent (edit changes text, not
+    // the bound snapshots; staleness is decided at dispatch, not here).
+    let updated = entry.withRevision(entry.revision + 1, text: newText)
     queue[position] = updated
     var index = state.admittedCommands
     let priorSequence = index[entry.commandID]?.sequence ?? SequenceNumber(0)
@@ -872,10 +923,13 @@ private func withdrawEntry<I: IDSource>(_ state: SessionState, entryID: String, 
         return Transition(state: s1, effects: [.emitUI(.denied(cause: "dispatched entries are history, not editable"))], records: prefix)
     }
     var queue = state.queue
+    // The tombstone keeps the snapshots (provenance survives withdrawal
+    // and reopen; a withdrawn entry never dispatches).
     let tombstone = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .withdrawn, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
     queue[position] = tombstone
     // S5: the ack index tracks the tombstone (a retry replays the withdrawn
     // ack — same entryID/sequence — instead of a stale queued one).
@@ -926,7 +980,8 @@ private func resumeQueue<I: IDSource>(_ state: SessionState, atMillis: UInt64, i
         queue[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .queued, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+            attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
         unholds.append(.queueUpdated(queue[i]))
     }
     let (s1, prefix) = sequenced(state, kind: "queue-resumed", digest: "resumed", ids: &ids)
@@ -985,10 +1040,15 @@ private func retargetQueueEntry<I: IDSource>(_ state: SessionState, entryID: Str
         return Transition(state: s1, effects: [.emitUI(.denied(cause: "retarget refused: route \(denial.message)"))], records: prefix)
     }
     var queue = state.queue
+    // Retarget is the explicit operator re-consent (D1 MENTION-12): the
+    // entry binds to the current epoch AND refreshes the attachment
+    // consent to it. It never releases a hold and never touches snapshots.
     queue[position] = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: entry.state, revision: entry.revision, text: entry.text,
-        targetEpochID: state.epoch.epochID, orderKey: entry.orderKey, sealed: entry.sealed)
+        targetEpochID: state.epoch.epochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        attachments: entry.attachments,
+        attachmentConsentEpoch: entry.attachments.isEmpty ? entry.attachmentConsentEpoch : state.epoch.epochID)
     let (s1, prefix) = sequenced(state, kind: "queue-retargeted", digest: eventDigest("retarget", entryID), ids: &ids)
     let next = s1.replacing(queue: queue)
     return Transition(
@@ -1018,7 +1078,8 @@ private func reconcileQueueEntry<I: IDSource>(_ state: SessionState, entryID: St
     queue[position] = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .queued, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
     let (s1, prefix) = sequenced(state, kind: "queue-reconciled", digest: eventDigest("reconcile", entryID), ids: &ids)
     let next = s1.replacing(queue: queue)
     return Transition(
@@ -1060,7 +1121,8 @@ private func switchModel<I: IDSource>(_ state: SessionState, alias: String, atMi
         queue[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .held, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+            attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
         // M2-D D0: the stale-epoch hold is durable AND holds the queue —
         // retarget or withdraw is required before anything dispatches
         // past these entries (the head barrier re-trips otherwise).
@@ -1214,7 +1276,8 @@ private func handleProviderResponse<I: IDSource>(
 /// a fresh run, else land completed. Holds and stale/foreign-epoch entries
 /// never auto-dispatch.
 private func finishRunWithQueue<I: IDSource>(
-    _ state: SessionState, receipt: (RunDescriptor, UInt64) -> RunReceipt, atMillis: UInt64, ids: inout I
+    _ state: SessionState, receipt: (RunDescriptor, UInt64) -> RunReceipt, atMillis: UInt64,
+    observations: [String: [AttachmentObservation]] = [:], ids: inout I
 ) -> Transition {
     guard let run = state.activeRun else {
         let (s1, prefix) = sequenced(state, kind: "completed-no-run", digest: "completed", ids: &ids)
@@ -1232,74 +1295,294 @@ private func finishRunWithQueue<I: IDSource>(
             effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished; queue held"))],
             records: prefix)
     }
+    let completedPhase = SessionPhase.completed(receiptValue)
+    switch classifyQueuePop(state, observations: observations) {
+    case .none:
+        let (s1, prefix) = sequenced(state, kind: "completed", digest: eventDigest("completed", run.runID.raw), ids: &ids)
+        let next = s1.replacing(
+            phase: completedPhase, activeRun: .some(nil), activeRequest: .some(nil),
+            pendingApproval: .some(nil), pendingBatch: .some(nil),
+            pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
+        return Transition(
+            state: next,
+            effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished"))],
+            records: prefix)
+    case .barrierHold(let head, let reason):
+        return landQueueBarrier(state, head: head, reason: reason, completedPhase: completedPhase, digest: eventDigest("completed", run.runID.raw), ids: &ids)
+    case .needsValidation(let entry):
+        // The entry dwelled with snapshots: dispatch waits for same-event
+        // freshness evidence. The run still lands completed; the validator
+        // result re-enters the pop. Nothing is marked, nothing held.
+        let (s1, prefix) = sequenced(state, kind: "attachment-validation-requested", digest: eventDigest("validate", entry.entryID), ids: &ids)
+        let next = s1.replacing(
+            phase: completedPhase, activeRun: .some(nil), activeRequest: .some(nil),
+            pendingApproval: .some(nil), pendingBatch: .some(nil),
+            pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
+        return Transition(
+            state: next,
+            effects: [.validateAttachments(entryID: entry.entryID, snapshots: entry.attachments),
+                      .emitUI(.runUpdate(phase: "completed", detail: "run finished; validating attachments for \(entry.entryID)"))],
+            records: prefix)
+    case .dispatch(let position):
+        return dispatchQueuePosition(state, position: position, completedPhase: completedPhase, digest: eventDigest("completed", run.runID.raw), atMillis: atMillis, ids: &ids)
+    case .staleHold(let position, let fileStale, let reason):
+        return holdStaleQueuePosition(state, position: position, fileStale: fileStale, reason: reason, completedPhase: completedPhase, digest: eventDigest("completed", run.runID.raw), ids: &ids)
+    }
+}
+
+/// M2-D D1 pop classification shared by run completion and the
+/// validation-result event. The barrier runs first (D0); only a
+/// barrier-clear candidate with snapshots reaches the validation gate.
+private enum QueuePop: Sendable, Equatable {
+    /// Nothing dispatchable (empty queue or phase-busy guards upstream).
+    case none
+    /// A non-terminal predecessor blocks the candidate (D0 head barrier).
+    case barrierHold(head: QueueEntry, reason: HoldReason)
+    /// Barrier-clear candidate carrying snapshots but no same-event
+    /// evidence: request validation, dispatch nothing.
+    case needsValidation(entry: QueueEntry)
+    /// Barrier-clear candidate ready to dispatch (no snapshots, or every
+    /// snapshot fresh under same-event evidence).
+    case dispatch(position: Int)
+    /// Barrier-clear candidate with a refused snapshot: mark held (durable)
+    /// and hold the queue; never dispatch, never refresh.
+    case staleHold(position: Int, fileStale: Bool, reason: String)
+}
+
+private func classifyQueuePop(_ state: SessionState, observations: [String: [AttachmentObservation]]) -> QueuePop {
     let order: [QueueKind] = [.steer, .followUp]
     for kind in order {
-        if let position = state.queue.firstIndex(where: {
+        guard let position = state.queue.firstIndex(where: {
             $0.kind == kind && $0.state == .queued && $0.targetEpochID == state.epoch.epochID
-        }) {
-            // M2-D D0 head barrier: a non-terminal entry ahead of the
-            // candidate that is not dispatchable (held for any reason, or
-            // targeting a stale epoch) blocks the whole queue — later
-            // entries never overtake a held head, and a stale head never
-            // silently skips. The queue holds with an explicit reason
-            // until the operator resolves, retargets, or withdraws.
-            let blocked = state.queue[..<position].first(where: { entry in
-                switch entry.state {
-                case .withdrawn, .admittedToHistory:
-                    return false
-                case .queued:
-                    return entry.targetEpochID != state.epoch.epochID
-                case .held, .heldUnknown, .dispatched:
-                    return true
-                }
-            })
-            if let head = blocked {
-                let reason: HoldReason
-                if head.targetEpochID != state.epoch.epochID {
-                    reason = .error("queue head targets a stale epoch; retarget or withdraw \(head.entryID)")
-                } else {
-                    reason = .error("queue head held; resolve, reconcile, or withdraw \(head.entryID)")
-                }
-                let (s1, prefix) = sequenced(state, kind: "completed-barred", digest: eventDigest("completed", run.runID.raw), ids: &ids)
-                let next = s1.replacing(
-                    phase: .completed(receiptValue), activeRun: .some(nil), activeRequest: .some(nil),
-                    pendingApproval: .some(nil), pendingBatch: .some(nil),
-                    pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
-                let held = next.replacing(queueHeld: true, heldReason: .some(reason))
-                return Transition(
-                    state: held,
-                    effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished; queue held at \(head.entryID)"))],
-                    records: prefix)
+        }) else { continue }
+        // M2-D D0 head barrier: a non-terminal entry ahead of the
+        // candidate that is not dispatchable (held for any reason, or
+        // targeting a stale epoch) blocks the whole queue — later
+        // entries never overtake a held head, and a stale head never
+        // silently skips. The queue holds with an explicit reason
+        // until the operator resolves, retargets, or withdraws.
+        let blocked = state.queue[..<position].first(where: { entry in
+            switch entry.state {
+            case .withdrawn, .admittedToHistory:
+                return false
+            case .queued:
+                return entry.targetEpochID != state.epoch.epochID
+            case .held, .heldUnknown, .dispatched:
+                return true
             }
-            var queue = state.queue
-            let entry = queue[position]
-            let dispatched = QueueEntry(
-                entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
-                state: .dispatched, revision: entry.revision, text: entry.text,
-                targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
-            queue[position] = dispatched
-            let mid = state.replacing(
-                phase: .completed(receiptValue), activeRun: .some(nil), activeRequest: .some(nil),
-                queue: queue, pendingApproval: .some(nil), pendingBatch: .some(nil),
-                pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
-            let (s1, prefix) = sequenced(mid, kind: "completed-dispatched", digest: eventDigest("completed", run.runID.raw), ids: &ids)
-            // New run, same text: reserve inline (generation+1, counters reset).
-            let next = admitReservedRun(s1, entry: dispatched, atMillis: atMillis, ids: &ids)
-            return Transition(
-                state: next.state,
-                effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished; next queued entry dispatched"))] + next.effects,
-                records: prefix + [.queueUpdated(dispatched)] + next.records)
+        })
+        if let head = blocked {
+            let reason: HoldReason
+            if head.targetEpochID != state.epoch.epochID {
+                reason = .error("queue head targets a stale epoch; retarget or withdraw \(head.entryID)")
+            } else {
+                reason = .error("queue head held; resolve, reconcile, or withdraw \(head.entryID)")
+            }
+            return .barrierHold(head: head, reason: reason)
         }
+        let entry = state.queue[position]
+        guard !entry.attachments.isEmpty else {
+            return .dispatch(position: position)
+        }
+        guard let entryObservations = observations[entry.entryID] else {
+            return .needsValidation(entry: entry)
+        }
+        let route = selectRoute(
+            snapshot: state.epoch.configSnapshot,
+            requestedAlias: state.epoch.profile.alias, sealed: entry.sealed)
+        for snapshot in entry.attachments {
+            let observation = entryObservations.first(where: { $0.snapshotHash == snapshot.contentHash })
+            let verdict = attachmentVerdict(
+                snapshot: snapshot, observation: observation,
+                currentEpochID: state.epoch.epochID, currentLocality: state.epoch.profile.locality,
+                route: route, consentEpochID: entry.attachmentConsentEpoch, entrySealed: entry.sealed)
+            if case .stale(let fileStale, let reason) = verdict {
+                return .staleHold(position: position, fileStale: fileStale, reason: reason)
+            }
+        }
+        return .dispatch(position: position)
     }
-    let (s1, prefix) = sequenced(state, kind: "completed", digest: eventDigest("completed", run.runID.raw), ids: &ids)
+    return .none
+}
+
+/// D0 barrier landing, extracted verbatim (completed + hold at the head).
+private func landQueueBarrier<I: IDSource>(
+    _ state: SessionState, head: QueueEntry, reason: HoldReason,
+    completedPhase: SessionPhase, digest: String, ids: inout I
+) -> Transition {
+    let (s1, prefix) = sequenced(state, kind: "completed-barred", digest: digest, ids: &ids)
     let next = s1.replacing(
-        phase: .completed(receiptValue), activeRun: .some(nil), activeRequest: .some(nil),
+        phase: completedPhase, activeRun: .some(nil), activeRequest: .some(nil),
         pendingApproval: .some(nil), pendingBatch: .some(nil),
         pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
+    let held = next.replacing(queueHeld: true, heldReason: .some(reason))
+    return Transition(
+        state: held,
+        effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished; queue held at \(head.entryID)"))],
+        records: prefix)
+}
+
+/// D0 dispatch landing, extracted verbatim (mark dispatched + reserve),
+/// with the D1 transcript composition (validated excerpts inline).
+private func dispatchQueuePosition<I: IDSource>(
+    _ state: SessionState, position: Int, completedPhase: SessionPhase,
+    digest: String, atMillis: UInt64, ids: inout I
+) -> Transition {
+    var queue = state.queue
+    let entry = queue[position]
+    let dispatched = QueueEntry(
+        entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
+        state: .dispatched, revision: entry.revision, text: entry.text,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
+    queue[position] = dispatched
+    let mid = state.replacing(
+        phase: completedPhase, activeRun: .some(nil), activeRequest: .some(nil),
+        queue: queue, pendingApproval: .some(nil), pendingBatch: .some(nil),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
+    let (s1, prefix) = sequenced(mid, kind: "completed-dispatched", digest: digest, ids: &ids)
+    // New run, same text: reserve inline (generation+1, counters reset).
+    let next = admitReservedRun(s1, entry: dispatched, atMillis: atMillis, ids: &ids)
+    return Transition(
+        state: next.state,
+        effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished; next queued entry dispatched"))] + next.effects,
+        records: prefix + [.queueUpdated(dispatched)] + next.records)
+}
+
+/// M2-D D1 stale landing: the refused entry is marked `.held` durably
+/// (external fixes must NOT auto-dispatch — explicit replace + resume is
+/// the only release), the queue holds with the specific reason, and the
+/// entries behind are preserved untouched. File staleness raises
+/// `.staleAttachment`; route/consent/sealed refusals raise queue errors.
+private func holdStaleQueuePosition<I: IDSource>(
+    _ state: SessionState, position: Int, fileStale: Bool, reason: String,
+    completedPhase: SessionPhase, digest: String, ids: inout I
+) -> Transition {
+    var queue = state.queue
+    let entry = queue[position]
+    let heldEntry = QueueEntry(
+        entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
+        state: .held, revision: entry.revision, text: entry.text,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
+    queue[position] = heldEntry
+    let (s1, prefix) = sequenced(state, kind: "completed-stale-attachment", digest: digest, ids: &ids)
+    let next = s1.replacing(
+        phase: completedPhase, activeRun: .some(nil), activeRequest: .some(nil),
+        queue: queue, pendingApproval: .some(nil), pendingBatch: .some(nil),
+        pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
+    let heldReason: HoldReason = fileStale ? .staleAttachment : .error(reason)
+    let held = next.replacing(queueHeld: true, heldReason: .some(heldReason))
+    return Transition(
+        state: held,
+        effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished; queue held: \(reason)"))],
+        records: prefix + [.queueUpdated(heldEntry)])
+}
+
+/// M2-D D1: the validator's verdict re-enters the pop. Dispatch happens
+/// only from `.completed` with no live run; any intervening state change
+/// (fresh run, cancel path, new hold) drops the evidence with a receipt —
+/// the next completion revalidates. Snapshot mismatch against the request
+/// (explicit replace in flight) re-requests for the current snapshots.
+private func handleAttachmentValidationResult<I: IDSource>(
+    _ state: SessionState, entryID: String, requested: [AttachmentSnapshot],
+    observations: [AttachmentObservation], atMillis: UInt64, ids: inout I
+) -> Transition {
+    _ = atMillis
+    func drop(_ state: SessionState, detail: String, ids: inout I) -> Transition {
+        let (s1, prefix) = sequenced(state, kind: "attachment-validation-dropped", digest: eventDigest("validate", entryID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.runUpdate(phase: "queue", detail: detail))],
+            records: prefix)
+    }
+    guard let entry = state.queue.first(where: { $0.entryID == entryID }),
+          entry.state == .queued else {
+        return drop(state, detail: "validation result superseded (entry no longer queued)", ids: &ids)
+    }
+    guard case .completed(let receiptValue) = state.phase, state.activeRun == nil else {
+        return drop(state, detail: "validation result superseded (run state changed)", ids: &ids)
+    }
+    guard !state.queueHeld, state.unresolvedOperations.isEmpty else {
+        return drop(state, detail: "validation result superseded (queue held)", ids: &ids)
+    }
+    if entry.attachments != requested {
+        // Explicit replace landed while validation was in flight: judge
+        // the CURRENT snapshots, never the superseded request.
+        let (s1, prefix) = sequenced(state, kind: "attachment-validation-rerequested", digest: eventDigest("validate", entryID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.validateAttachments(entryID: entryID, snapshots: entry.attachments),
+                      .emitUI(.runUpdate(phase: "queue", detail: "snapshots replaced; revalidating \(entryID)"))],
+            records: prefix)
+    }
+    switch classifyQueuePop(state, observations: [entryID: observations]) {
+    case .none:
+        return drop(state, detail: "validation result superseded (nothing dispatchable)", ids: &ids)
+    case .barrierHold(let head, let reason):
+        return landQueueBarrier(state, head: head, reason: reason, completedPhase: .completed(receiptValue), digest: eventDigest("completed", entryID), ids: &ids)
+    case .needsValidation(let candidate):
+        // The evidence belongs to a different entry than the current
+        // head (e.g. a steer queued after the validated follow-up):
+        // validate the head instead of judging anything by it.
+        let (s1, prefix) = sequenced(state, kind: "attachment-validation-rerequested", digest: eventDigest("validate", candidate.entryID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.validateAttachments(entryID: candidate.entryID, snapshots: candidate.attachments),
+                      .emitUI(.runUpdate(phase: "queue", detail: "validating \(candidate.entryID)"))],
+            records: prefix)
+    case .dispatch(let position):
+        return dispatchQueuePosition(state, position: position, completedPhase: .completed(receiptValue), digest: eventDigest("completed", entryID), atMillis: atMillis, ids: &ids)
+    case .staleHold(let position, let fileStale, let reason):
+        return holdStaleQueuePosition(state, position: position, fileStale: fileStale, reason: reason, completedPhase: .completed(receiptValue), digest: eventDigest("completed", entryID), ids: &ids)
+    }
+}
+
+/// M2-D D1: explicit operator replacement of an entry's snapshots (the
+/// fix path for stale holds). Queued or held entries only; preserves
+/// state (a stale hold still needs resume to release — replace alone
+/// never dispatches); refreshes consent to the live epoch (explicit
+/// re-consent by the replacing action); re-checks the text budget with
+/// the new excerpts (fail closed on overflow).
+private func replaceEntryAttachments<I: IDSource>(
+    _ state: SessionState, entryID: String, snapshots: [AttachmentSnapshot],
+    atMillis: UInt64, ids: inout I
+) -> Transition {
+    _ = atMillis
+    guard let position = state.queue.firstIndex(where: { $0.entryID == entryID }) else {
+        let (s1, prefix) = sequenced(state, kind: "queue-replace-unknown", digest: eventDigest("replace", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "unknown queue entry"))], records: prefix)
+    }
+    let entry = state.queue[position]
+    guard entry.state == .queued || entry.state == .held else {
+        let (s1, prefix) = sequenced(state, kind: "queue-replace-refused", digest: eventDigest("replace", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "entry already dispatched; replace applies to undispatched items only"))], records: prefix)
+    }
+    if entry.sealed, !snapshots.isEmpty {
+        let (s1, prefix) = sequenced(state, kind: "queue-replace-denied", digest: eventDigest("replace", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "sealed entries cannot carry file attachments"))], records: prefix)
+    }
+    let newBytes = snapshots.reduce(0) { $0 + $1.content.excerptBytes }
+    let othersBytes = state.queue
+        .filter { $0.entryID != entryID && ($0.state == .queued || $0.state == .held) }
+        .reduce(0) { $0 + $1.text.utf8.count + $1.attachmentBytes }
+    guard othersBytes + entry.text.utf8.count + newBytes <= maxQueueTextBytes else {
+        let (s1, prefix) = sequenced(state, kind: "queue-replace-denied", digest: eventDigest("replace", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "queue text budget exceeded"))], records: prefix)
+    }
+    var queue = state.queue
+    queue[position] = QueueEntry(
+        entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
+        state: entry.state, revision: entry.revision, text: entry.text,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        attachments: snapshots,
+        attachmentConsentEpoch: snapshots.isEmpty ? entry.attachmentConsentEpoch : state.epoch.epochID)
+    let (s1, prefix) = sequenced(state, kind: "queue-replaced", digest: eventDigest("replace", entryID), ids: &ids)
+    let next = s1.replacing(queue: queue)
     return Transition(
         state: next,
-        effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished"))],
-        records: prefix)
+        effects: [.emitUI(.runUpdate(phase: "queue", detail: "replaced attachments for \(entryID)"))],
+        records: prefix + [.queueUpdated(queue[position])])
 }
 
 /// Reserves a follow-up run from an already-dispatched queue entry (used by
@@ -1323,7 +1606,8 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
     let history = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .admittedToHistory, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed)
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
     var queue = state.queue
     if let position = queue.firstIndex(where: { $0.entryID == entry.entryID }) {
         queue[position] = history
@@ -1357,8 +1641,9 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
             .operationIntent(OperationRef(operationID: ids.nextOperationID(), state: .intent, mutating: false)),
             .queueDispatched(link),
             .queueUpdated(history),
-            // The dispatched queued text opens the transcript (D1).
-            .transcriptAppended(.user(entry.text)),
+            // The dispatched queued text opens the transcript (D1):
+            // validated snapshots compose their manifest + excerpts inline.
+            .transcriptAppended(.user(composeDispatchText(text: entry.text, attachments: entry.attachments))),
         ])
 }
 
