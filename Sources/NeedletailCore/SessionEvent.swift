@@ -23,11 +23,13 @@ public enum SessionEvent: Sendable, Equatable {
     /// M2-D D3: explicit operator reconciliation of one unknown mutating
     /// operation (cancel-ambiguous, inverse-ambiguous, or otherwise
     /// unknowable). The operator accepts the stated determination and the
-    /// marker is discharged as a RECORDED decision — never silently
-    /// dropped, never auto-retried. The acknowledgment is durable:
-    /// reopen reconciles the same journal without reseeding a hold for an
-    /// acknowledged operation. Unknown DELIVERIES (heldUnknown queue
-    /// entries) are NOT covered — they reconcile via queueReconcile.
+    /// CURRENT session's marker is discharged — never silently dropped,
+    /// never auto-retried, never converted to success. The acknowledgment
+    /// is durable, but per the D0 F2B-5 contract it does not convert
+    /// uncertainty: every reopen re-derives holds from the journal, so a
+    /// fresh explicit acceptance is required per boot. Unknown DELIVERIES
+    /// (heldUnknown queue entries) are NOT covered — reconcile those via
+    /// queueReconcile.
     case acknowledgeUnknown(operationID: OperationID, determination: String, atMillis: UInt64)
     /// M2-D D1: operator input carrying authorized attachment snapshots
     /// (captured by Runtime BEFORE stamping; the transition never parses

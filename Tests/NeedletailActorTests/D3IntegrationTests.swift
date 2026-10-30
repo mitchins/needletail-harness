@@ -352,12 +352,28 @@ struct D3IntegrationTests {
             return false
         })
         #expect(noticeIdx != nil && run2Idx != nil && noticeIdx! < run2Idx!, "recovered notice precedes the next request")
-        // Exactly-once: a second sweep finds nothing pending.
+        // Exactly-once: a second sweep through the production entry point
+        // finds nothing pending and commits nothing new.
         let journaled = try Self.storeRecords(store, session).filter {
             if case .undoDisposition(let d) = $0 { return d.undoCommandID == "undo-9" }
             return false
         }
         #expect(journaled.count == 1, "exactly one disposition committed")
+        let (actorSweep, _) = try await reopenHeadlessSession(
+            store: store, session: session, epoch: epoch, trustMode: .trustedExec,
+            as: writer.writer, ids: &ids, clock: SystemClock(),
+            transport: ScriptedTransport(), executor: ScriptedExecutor(),
+            approvals: ScriptedApprovals())
+        let resweep = try await actorSweep.recoverUndoJournal()
+        #expect(resweep.recovered.isEmpty && resweep.unrecovered.isEmpty, "second sweep finds nothing pending")
+        #expect(try Self.storeRecords(store, session).filter({
+            if case .undoDisposition(let d) = $0 { return d.undoCommandID == "undo-9" }
+            return false
+        }).count == 1, "second sweep commits no duplicate")
+        #expect(try Self.storeRecords(store, session).filter({
+            if case .transcriptAppended(.workspaceChangeNotice(let n)) = $0 { return n.undoCommandID == "undo-9" }
+            return false
+        }).count == 1, "second sweep publishes no duplicate notice")
         try store.close()
     }
 
@@ -563,6 +579,136 @@ struct D3IntegrationTests {
         #expect(transport2.invocations.count == 4, "run-1, run-2, qa, qb each sent exactly once, got \(transport2.invocations.count)")
         let drained = await actor2.currentState()
         #expect(drained.queue.allSatisfy({ $0.state == .admittedToHistory }), "fixed head and follower both complete")
+        // Provider context: the fixed dispatch carries the NEW bytes; the
+        // stale bytes never entered model context (held, never dispatched).
+        let users = try Self.storeRecords(store, session).compactMap { record -> String? in
+            if case .transcriptAppended(.user(let text)) = record { return text }
+            return nil
+        }
+        #expect(users.contains(where: { $0.contains("v2\n") }), "new excerpt enters context")
+        #expect(!users.contains(where: { $0.contains("v1\n") }), "stale bytes never entered context")
+        try store.close()
+        _ = ids1
+    }
+
+    @Test("C2: epoch switch preserves the unknown head; retarget refreshes consent without release; drain carries new bytes")
+    func epochSwitchRetargetReconsent() async throws {
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let session = SessionID("s-d3-c2")
+        let writer = WriterIdentity(session: session, writer: "w-d3")
+        let idle = try Self.idleState(session: session, mode: .workspace, permissive: true)
+        let epoch1 = idle.epoch
+        let epoch2 = EpochDescriptor(
+            epochID: EpochID("epoch-2"), parentEpochID: epoch1.epochID,
+            configSnapshot: epoch1.configSnapshot, profile: epoch1.profile,
+            effectiveCaps: epoch1.effectiveCaps, route: epoch1.route)
+        var store = try Self.tempStore(at: dir)
+        try store.claimWriterOwnership(session: session, writer: writer.writer)
+        let resolver = try WorkspaceResolver(workspace: FilePath(dir.path), readRoots: [])
+        try "w2\n".write(to: dir.appendingPathComponent("g.txt"), atomically: true, encoding: .utf8)
+        let capture = AttachmentCaptureService(resolver: resolver)
+        let grant = AttachmentRouteGrant(alias: "local-coder", locality: .local, sealed: false)
+        let snap = try capture.capture(
+            relativePath: "g.txt", lineRange: nil, intent: "mention",
+            epochID: epoch1.epochID, routeGrant: grant)
+        // Generation 1: run-x gated in flight; qa2 + qb2 queued behind it.
+        // Releasing run-x pops qa2, whose dispatch stays gated (link L1).
+        let gate1 = GatedTransport()
+        let (stream1, cont1) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        gate1.gate = stream1
+        var ids1 = DeterministicIDSource(prefix: "c2a")
+        let actor1 = try SessionActor(
+            state: try Self.idleState(session: session, mode: .workspace, permissive: true),
+            ids: ids1, clock: SystemClock(), transport: gate1,
+            executor: ScriptedExecutor(), store: store,
+            approvals: ScriptedApprovals(), writer: writer.writer,
+            attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
+        await actor1.submitText(commandID: CommandID("run-x"), text: "hold", kind: .followUp, sealed: false)
+        try await Self.awaitState(actor1, { $0.activeRequest != nil }, "run-x requesting")
+        await actor1.submitTextWithAttachments(commandID: CommandID("q-a2"), text: "with file", kind: .followUp, sealed: false, attachments: [snap])
+        await actor1.submitText(commandID: CommandID("q-b2"), text: "behind", kind: .followUp, sealed: false)
+        try await Self.awaitState(actor1, { $0.queue.count == 2 }, "qa2+qb2 queued")
+        cont1.yield(.respond(ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0))))
+        for _ in 0..<20_000 {
+            if gate1.invocations.count == 2 { break }
+            await Task.yield()
+        }
+        #expect(gate1.invocations.count == 2, "run-x sent, then qa2 sent (link commits, delivery never confirmed)")
+        try store.close()
+        // Generation 2: qa2 held-unknown under epoch-1. Checkpoint to
+        // epoch-2 (orthogonal to queue holds — it proceeds), which makes
+        // both entries stale-target. Retarget refreshes qa2's consent to
+        // epoch-2 (observable: was epoch-1) without releasing anything.
+        store = try Self.tempStore(at: dir)
+        let gate2 = GatedTransport()
+        let (stream2, _) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        gate2.gate = stream2
+        var ids2 = DeterministicIDSource(prefix: "c2b")
+        let (actor2, _) = try await reopenHeadlessSession(
+            store: store, session: session, epoch: epoch1, trustMode: .workspace,
+            as: writer.writer, ids: &ids2, clock: SystemClock(),
+            transport: gate2, executor: ScriptedExecutor(),
+            approvals: ScriptedApprovals(),
+            attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
+        let held = await actor2.currentState()
+        #expect(held.queue.first?.state == .heldUnknown, "link crash holds the head across reopen")
+        await actor2.requestCheckpoint()
+        try await Self.awaitState(actor2, {
+            if case .checkpointing = $0.phase { return true }
+            return false
+        }, "checkpoint proceeds (orthogonal to queue holds)")
+        await actor2.applyExternalEvent(.checkpointCommitted(newEpoch: epoch2, atMillis: 9_000_000))
+        let switched = await actor2.currentState()
+        #expect(switched.epoch.epochID == EpochID("epoch-2"), "epoch switched")
+        #expect(switched.admittedCommands.isEmpty, "acks pruned at epoch switch")
+        let qaID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-a2") })?.entryID)
+        let qbID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-b2") })?.entryID)
+        await actor2.retargetQueueEntry(entryID: qaID)
+        await actor2.retargetQueueEntry(entryID: qbID)
+        for _ in 0..<1_000 { await Task.yield() }
+        let retargeted = await actor2.currentState()
+        let qaRetargeted = try #require(retargeted.queue.first(where: { $0.commandID == CommandID("q-a2") }))
+        #expect(qaRetargeted.attachmentConsentEpoch == EpochID("epoch-2"), "retarget refreshes consent to the live epoch")
+        #expect(qaRetargeted.state == .heldUnknown, "retarget never releases the unknown head")
+        #expect(retargeted.queue.first(where: { $0.commandID == CommandID("q-b2") })?.targetEpochID == EpochID("epoch-2"), "follower retargeted too (stale targets never dispatch)")
+        #expect(gate2.invocations.isEmpty, "no dispatch during the epoch manoeuvre")
+        await actor2.resumeQueue()
+        for _ in 0..<1_000 { await Task.yield() }
+        #expect((await actor2.currentState()).queue.first?.state == .heldUnknown, "resume never releases unknowns")
+        await actor2.reconcileQueue(entryID: qaID)
+        try await Self.awaitState(actor2, { $0.queue.first?.state == .queued }, "reconciled after retarget")
+        try store.close()
+        // Generation 3: the reconciled, reconsented entry dispatches under
+        // the new epoch; the dispatch carries the new bytes.
+        store = try Self.tempStore(at: dir)
+        let transport3 = ScriptedTransport()
+        transport3.script = [
+            ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
+            ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
+            ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
+        ]
+        var ids3 = DeterministicIDSource(prefix: "c2c")
+        let (actor3, report3) = try await reopenHeadlessSession(
+            store: store, session: session, epoch: epoch2, trustMode: .workspace,
+            as: writer.writer, ids: &ids3, clock: SystemClock(),
+            transport: transport3, executor: ScriptedExecutor(),
+            approvals: ScriptedApprovals(),
+            attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
+        #expect(!report3.blocked, "reconciled + reconsented session dispatches")
+        await actor3.submitText(commandID: CommandID("run-n"), text: "next", kind: .followUp, sealed: false)
+        try await Self.awaitState(actor3, {
+            if case .completed = $0.phase, transport3.invocations.count == 3,
+               $0.queue.allSatisfy({ $0.state == .admittedToHistory }) { return true }
+            return false
+        }, "drained under the new epoch")
+        let drained = await actor3.currentState()
+        #expect(drained.queue.first(where: { $0.commandID == CommandID("q-a2") })?.attachmentConsentEpoch == EpochID("epoch-2"), "dispatched entry carries reconsented snapshot")
+        let users = try Self.storeRecords(store, session).compactMap { record -> String? in
+            if case .transcriptAppended(.user(let text)) = record { return text }
+            return nil
+        }
+        #expect(users.contains(where: { $0.contains("w2\n") }), "current bytes enter context after reconsent")
         try store.close()
         _ = ids1
     }
@@ -840,7 +986,9 @@ struct D3IntegrationTests {
         await actor2.resumeQueue()
         try await Self.awaitState(actor2, { !$0.queueHeld }, "holds released in order")
         try store.close()
-        // Final generation: exactly one next action proceeds, no duplicates.
+        // Final generation: the settled journal stays settled, but risk
+        // acceptance does not persist across restarts (D0 never-converts):
+        // the unknown marker re-holds until explicitly re-accepted.
         store = try Self.tempStore(at: dir)
         let transport3 = ScriptedTransport()
         transport3.script = [
@@ -856,7 +1004,16 @@ struct D3IntegrationTests {
             transport: transport3, executor: ScriptedExecutor(),
             approvals: ScriptedApprovals(),
             attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
-        #expect(!report3.blocked, "reconciled session is dispatchable")
+        #expect(report3.blocked && report3.unknownOperations == 1, "reopen re-holds the ambiguous operation: acceptance is per boot")
+        #expect(report3.journalsUnrecovered == 0, "no pending journal left behind")
+        #expect(report3.dispositionsReseeded == 1, "settled journal stays settled")
+        let unknownOp3 = try #require((await actor3.currentState()).unresolvedOperations.first?.operationID)
+        await actor3.acknowledgeUnknown(operationID: unknownOp3, determination: "operator-accepted-risk: re-accepted after reopen")
+        try await Self.awaitState(actor3, { $0.unresolvedOperations.isEmpty }, "re-accepted")
+        // The acknowledgment discharges the marker; resume releases the
+        // recomputed hold (separate judgment, separate release).
+        await actor3.resumeQueue()
+        try await Self.awaitState(actor3, { !$0.queueHeld }, "hold released after re-acceptance")
         await actor3.submitText(commandID: CommandID("run-n"), text: "next", kind: .followUp, sealed: false)
         try await Self.awaitState(actor3, {
             if case .completed = $0.phase, transport3.invocations.count == 4,
@@ -871,7 +1028,7 @@ struct D3IntegrationTests {
 
     // MARK: - Counterfactuals: each recovery step is load-bearing
 
-    @Test("acknowledgeUnknown discharges the marker, records the decision, and reopen reseeds no hold")
+    @Test("acknowledgeUnknown discharges the live marker and records the decision; reopen still holds (D0 never-converts)")
     func acknowledgeUnknownPure() throws {
         var ids = DeterministicIDSource(prefix: "ak")
         let op = OperationID("eff-9/c9")
@@ -893,8 +1050,10 @@ struct D3IntegrationTests {
         #expect(t.state.unresolvedOperations.isEmpty, "marker discharged")
         let acks = t.records.compactMap { if case .acknowledgedUnresolved(let a) = $0 { return a } else { return nil } }
         #expect(acks.count == 1 && acks[0].operationIDs == [op], "exactly one durable decision")
-        // Reopen with intent + cancelled-pending marker + ack: the marker
-        // is classified as explicit-unknown but reseeds NO hold.
+        // Reopen with intent + cancelled-pending marker + ack: the D0
+        // F2B-5 contract pins that an acknowledgment never converts
+        // uncertainty — the marker is classified explicit-unknown AND
+        // reseeds its hold. Fresh explicit acceptance is required per boot.
         let report = try reconcileOperations([
             .operationIntent(OperationRef(operationID: op, callID: "c9", state: .intent, mutating: true)),
             .cancelledPendingMarker(
@@ -902,8 +1061,8 @@ struct D3IntegrationTests {
                 outcome: "cancelled: pending"),
             .acknowledgedUnresolved(acks[0]),
         ])
-        #expect(report.heldOperations.isEmpty, "acknowledged markers never reseed holds, got \(report.heldOperations)")
-        #expect(report.explicitUnknown.count == 1, "evidence preserved without the hold")
+        #expect(report.heldOperations.map(\.operationID) == [op], "ack records the decision without converting it: still held")
+        #expect(report.explicitUnknown.count == 1, "evidence preserved with the hold")
         // Without the acknowledgment the same journal holds.
         let unacked = try reconcileOperations([
             .operationIntent(OperationRef(operationID: op, callID: "c9", state: .intent, mutating: true)),

@@ -1,4 +1,5 @@
 import Foundation
+import Foundation
 import NeedletailCore
 
 /// M2-D D3: the single authoritative headless reopening sequence.
@@ -127,8 +128,10 @@ public func reopenHeadlessSession<
 
 /// GRDB convenience: opens (and shape-validates) the store at `storePath`,
 /// then runs the single authoritative sequence above. A missing store
-/// file, corrupt store, foreign schema or future version fails closed at
-/// open — never created over, never silently replaced with memory.
+/// file fails closed here — `DatabaseQueue` would otherwise CREATE an
+/// empty database, letting a "reopen" silently start from nothing. A
+/// corrupt/foreign/future store fails closed at open, never overwritten,
+/// never silently replaced with memory.
 public func reopenHeadlessSessionAtPath<
     Transport: ModelTransport, Executor: ToolExecutor,
     Approvals: ApprovalGateway, ClockType: Clock, IDs: IDSource
@@ -152,6 +155,9 @@ public func reopenHeadlessSessionAtPath<
     actor: SessionActor<Transport, Executor, GRDBSessionStore, Approvals, ClockType, IDs>,
     report: HeadlessReopenReport
 ) {
+    guard FileManager.default.fileExists(atPath: storePath) else {
+        throw StoreError.integrity("no store at \(storePath): reopen refuses to create one")
+    }
     let store = try GRDBSessionStore(path: storePath)
     return try await reopenHeadlessSession(
         store: store, session: session, epoch: epoch, trustMode: trustMode,
