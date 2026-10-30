@@ -46,10 +46,29 @@ public func resumeSession<IDs: IDSource>(
     for entry in recon.entries {
         highWater = max(highWater, entry.orderKey)
     }
+    // M2-D D2: reseed the bounded live disposition mirror from the durable
+    // journal (never deleted from the log — only this mirror prunes) and
+    // hold every inverse whose intent committed without a settled result.
+    // No inverse ever re-executes on reopen: unknown refs hold the queue
+    // until explicit reconciliation.
+    let (undoEntries, unknownInverses) = reconcileUndoJournal(stream)
+    var dispositions = undoEntries.values.compactMap(\.disposition)
+        .sorted { $0.undoCommandID < $1.undoCommandID }
+    if dispositions.count > maxUndoDispositions {
+        dispositions.removeFirst(dispositions.count - maxUndoDispositions)
+    }
+    var heldOperations = report.heldOperations
+    for ref in unknownInverses {
+        guard heldOperations.count < maxUnresolvedOperations else {
+            throw StoreError.integrity(
+                "reopen: unknown inverse backlog exceeds unresolved bound")
+        }
+        heldOperations.append(ref)
+    }
     ids.advance(past: highWater)
     var state = SessionState.resumedAfterReopen(
         sessionID: session, epoch: epoch, trustMode: trustMode,
-        heldOperations: report.heldOperations)
+        heldOperations: heldOperations)
     // Hold reason: an existing unresolved-operations reason wins (more
     // urgent); otherwise a queue hold gets an explicit reopen reason.
     // (Tested: `state.heldReason` here is `HoldReason?`, so a plain nil
@@ -57,11 +76,15 @@ public func resumeSession<IDs: IDSource>(
     // would make a `case .none` match unreachable.)
     var heldReason: HoldReason? = state.heldReason
     if heldReason == nil, recon.queueHeld {
-        let held = recon.entries.filter { $0.state == .held }.count
-        heldReason = .error("reopen: \(recon.unknownLinks.count) uncompleted dispatch(es), \(recon.failedLinks.count) failed, \(held) held")
+        heldReason = .error("reopen: \(recon.unknownLinks.count) uncompleted dispatch(es), \(recon.failedLinks.count) failed, \(recon.entries.filter { $0.state == .held }.count) held")
+    }
+    if heldReason == nil, !unknownInverses.isEmpty {
+        heldReason = .error("reopen: \(unknownInverses.count) unsettled undo inverse(s); reconcile before dispatch")
     }
     return state.replacing(
         queue: recon.entries,
-        queueHeld: state.queueHeld || recon.queueHeld, heldReason: heldReason,
-        admittedCommands: recon.acks)
+        queueHeld: state.queueHeld || recon.queueHeld || !unknownInverses.isEmpty,
+        heldReason: heldReason,
+        admittedCommands: recon.acks,
+        undoDispositions: dispositions)
 }

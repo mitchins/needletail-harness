@@ -34,6 +34,32 @@ public enum SessionEvent: Sendable, Equatable {
     /// (the fix path for stale holds — never automatic, never silent).
     /// Preserves entry state; resume releases separately.
     case queueAttachmentReplace(entryID: String, snapshots: [AttachmentSnapshot], atMillis: UInt64)
+    /// M2-D D2: explicit undo preview (dry run — performs no mutation).
+    /// The driver reconciles the group from the durable log and attaches
+    /// preimage availability; the transition runs pure preflight against
+    /// validator evidence and reports eligibility.
+    case undoPreview(group: ChangeGroup, preimagesAvailable: [String: Bool], atMillis: UInt64)
+    /// M2-D D2: explicit undo run. `undoCommandID` is the stable O-2
+    /// command key (`undo-<seq>`); duplicates return the recorded
+    /// disposition, never a second inverse.
+    case undoRun(undoCommandID: String, group: ChangeGroup, preimagesAvailable: [String: Bool], atMillis: UInt64)
+    /// M2-D D2: validator evidence for a preview or run (event-scoped,
+    /// never stored). The actor echoes the request context so the
+    /// transition can bind evidence to the pending undo.
+    case undoValidationResult(undoCommandID: String, isPreview: Bool, requested: [UndoValidationNeed], observations: [UndoFileObservation], atMillis: UInt64)
+    /// M2-D D2: one inverse's settled outcome from the applier. The
+    /// transition commits the durable inverse result and advances the
+    /// chain (or halts it on unknown).
+    case inverseCompleted(undoCommandID: String, inverseID: String, outcome: UndoInverseOutcome, atMillis: UInt64)
+    /// M2-D D2: driver-stamped recovery for a journal whose inverses are
+    /// all settled but whose disposition was never committed (crash
+    /// between last result and disposition). Outcomes come reconciled
+    /// from the durable log; the transition commits disposition + notice
+    /// atomically (idempotent — an existing disposition wins).
+    case undoFinalize(undoCommandID: String, group: ChangeGroup, fileOutcomes: [UndoFileOutcome], atMillis: UInt64)
+    /// M2-D D2: rewind lineage fork request (record only). The boundary
+    /// must lie in the past of the live epoch; nothing is mutated.
+    case lineageForkRequest(boundary: LineageBoundary, atMillis: UInt64)
     case approvalGrant(requestID: RequestID, generation: Revision, atMillis: UInt64)
     case approvalDeny(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
     case approvalUnavailable(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)

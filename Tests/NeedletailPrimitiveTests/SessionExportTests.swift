@@ -183,6 +183,16 @@ struct SessionExportTests {
             "artifactKind", "size", "relativePath", "digest",
             "effectID", "operationIDs", "error", "determination", "subjectSessions",
         "runID", "requestID", "queueEntryIDs",
+            // M2-D D2: change groups, undo dispositions, lineage forks and
+            // workspace notices (structural IDs + paths travel; free-text
+            // reason/detail/summary only with content).
+            "groupID", "undoCommandID", "forkID", "members", "files",
+            "hadExecProposals", "hadReadProposals", "created",
+            "beforeHash", "afterHash", "deviceBefore", "inodeBefore",
+            "deviceAfter", "inodeAfter", "modeBefore", "modeAfter",
+            "preimageDigest", "emptyOriginal", "receiptStatus", "receiptSummary",
+            "result", "detail", "boundaryEpochID", "throughSequence",
+            "divergenceNote",
             "complete", "recordCount",
             "operations", "completed", "held", "unstarted", "orphaned",
         ]

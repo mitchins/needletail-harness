@@ -172,7 +172,13 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
             toolIDs.insert(ref.operationID)
         case .cancelledPendingError(let err):
             cancelledErrors.append(err)
-        case .acknowledgedUnresolved, .artifactPublished, .transcriptAppended, .eventAppended, .queueAdmitted, .queueUpdated, .queueDispatched, .checkpointCommitted, .writerRecovered, .sessionOpened, .epochOpened:
+        case .acknowledgedUnresolved, .artifactPublished, .transcriptAppended, .eventAppended, .queueAdmitted, .queueUpdated, .queueDispatched, .checkpointCommitted, .writerRecovered, .sessionOpened, .epochOpened,
+             // M2-D D2: group/disposition/lineage records are journal
+             // metadata, not operation outcomes — the journal reconciler
+             // (reconcileUndoJournal) classifies them separately. Inverse
+             // intents/results reuse operation records and classify inline
+             // above (intent-only mutating ⇒ unknown + held).
+             .changeGroup, .undoDisposition, .lineageFork:
             continue
         }
     }

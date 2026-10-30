@@ -82,6 +82,30 @@ struct RecordCodecTests {
             .cancelledPendingMarker(OperationRef(operationID: opID, callID: "call-1", state: .unknown, mutating: true), outcome: "cancelled: pending"),
             .cancelledPendingError(CancelledPendingError(effectID: EffectID("eff-1"), operationIDs: [opID], error: "cancelled", atMillis: 8000)),
             .acknowledgedUnresolved(Acknowledgment(subjectSessions: [SessionID("s-1")], operationIDs: [opID], determination: "operator-accepted-risk", atMillis: 9000)),
+            .changeGroup(ChangeGroup(
+                groupID: "chg-1", runID: RunID("r-1"), effectID: EffectID("eff-1"),
+                members: [ChangeGroupMember(
+                    operationID: opID, callID: "call-1", path: "notes/plan.txt",
+                    grantedRoot: "/tmp/ws", created: false,
+                    beforeHash: String(repeating: "b", count: 64),
+                    afterHash: String(repeating: "a", count: 64),
+                    deviceBefore: 11, inodeBefore: 22, modeBefore: "644",
+                    preimageDigest: String(repeating: "b", count: 64), emptyOriginal: false,
+                    deviceAfter: 11, inodeAfter: 23, modeAfter: "644",
+                    receiptStatus: "success", receiptSummary: "edited notes/plan.txt")],
+                hadExecProposals: false, hadReadProposals: true)),
+            .undoDisposition(UndoDispositionRecord(
+                undoCommandID: "undo-1", groupID: "chg-1",
+                outcome: .completed,
+                fileOutcomes: [UndoFileOutcome(
+                    inverseID: "undo/undo-1/chg-1/\(opID.raw)", path: "notes/plan.txt",
+                    result: "applied", detail: "restored notes/plan.txt")],
+                reason: "all 1 inverse(s) applied", atMillis: 9500)),
+            .lineageFork(LineageFork(
+                forkID: "fork-1", sessionID: SessionID("s-1"),
+                parentEpochID: EpochID("epoch-1"),
+                boundary: LineageBoundary(epochID: EpochID("epoch-1"), throughSequence: 7),
+                divergenceNote: "history preserved; workspace NOT restored", atMillis: 9600)),
         ]
     }
 
@@ -104,6 +128,9 @@ struct RecordCodecTests {
         case .cancelledPendingMarker: return "cancelledPendingMarker"
         case .cancelledPendingError: return "cancelledPendingError"
         case .acknowledgedUnresolved: return "acknowledgedUnresolved"
+        case .changeGroup: return "changeGroup"
+        case .undoDisposition: return "undoDisposition"
+        case .lineageFork: return "lineageFork"
         }
     }
 
@@ -112,7 +139,7 @@ struct RecordCodecTests {
         "operationResult", "queueAdmitted", "queueUpdated", "queueDispatched",
         "checkpointCommitted", "transcriptAppended", "writerRecovered",
         "artifactPublished", "cancelledPendingMarker", "cancelledPendingError",
-        "acknowledgedUnresolved",
+        "acknowledgedUnresolved", "changeGroup", "undoDisposition", "lineageFork",
     ]
 
     /// The transcript shapes ride DurableRecord.transcriptAppended; every
@@ -124,6 +151,12 @@ struct RecordCodecTests {
             .assistantText("hi there"),
             .toolCall(NativeToolCall(callID: "c-1", tool: "read", arguments: #"{"path":"f"}"#)),
             .toolResponse(callID: "c-1", text: "file body"),
+            .workspaceChangeNotice(WorkspaceChangeNotice(
+                undoCommandID: "undo-1", groupID: "chg-1", outcome: .completed,
+                files: [UndoFileOutcome(
+                    inverseID: "undo/undo-1/chg-1/op-1", path: "notes/plan.txt",
+                    result: "applied", detail: "restored")],
+                hadExecProposals: false, reason: "all 1 inverse(s) applied")),
         ]
     }
 
@@ -142,7 +175,7 @@ struct RecordCodecTests {
         // The table must have exercised every case exactly by name; a new
         // case without a fixture fails here even before the build break.
         #expect(covered == Self.expectedCaseNames,
-                "fixture table must cover all fifteen cases, covered=\(covered.sorted())")
+                "fixture table must cover all eighteen cases, covered=\(covered.sorted())")
     }
 
     @Test("record codec round-trips every TranscriptEntry case losslessly")

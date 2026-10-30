@@ -49,15 +49,23 @@ public enum SessionPhase: Sendable, Equatable {
     case failed(RunFailure)
     case completed(RunReceipt)
     case checkpointing
+    /// M2-D D2: exclusive compensation phase (one undo command at a time).
+    /// No provider requests, tool batches, approvals or queue dispatches
+    /// may start while set; entered only through the quiescence gate,
+    /// exited only by disposition/reconciliation/failure records.
+    case undoing(commandID: String)
 }
 
 extension SessionPhase {
     /// Phases with a live run that cancellation, holds and stale rules apply to.
+    /// `undoing` is NOT a live run: inverses are executor work gated by the
+    /// phase match itself, never by run identity — and no provider stream
+    /// exists to cancel.
     public var hasActiveRun: Bool {
         switch self {
         case .requesting, .streaming, .validatingTools, .authorising, .executing, .cancelling:
             return true
-        case .idle, .admitting, .checkpointing, .interrupted, .failed, .completed:
+        case .idle, .admitting, .checkpointing, .interrupted, .failed, .completed, .undoing:
             return false
         }
     }
@@ -388,6 +396,8 @@ extension SessionState {
         liveReservations: [EffectReservation]? = nil,
         cancelledPendingReservations: [EffectReservation]? = nil, generation: UInt64? = nil,
         unresolvedOperations: [OperationRef]? = nil,
+        undoDispositions: [UndoDispositionRecord]? = nil,
+        pendingUndo: PendingUndo?? = nil,
         droppedStaleCount: Int? = nil, lastSequence: UInt64? = nil
     ) -> SessionState {
         SessionState(
@@ -412,6 +422,8 @@ extension SessionState {
             cancelledPendingReservations: cancelledPendingReservations ?? self.cancelledPendingReservations,
             generation: generation ?? self.generation,
             unresolvedOperations: unresolvedOperations ?? self.unresolvedOperations,
+            undoDispositions: undoDispositions ?? self.undoDispositions,
+            pendingUndo: pendingUndo ?? self.pendingUndo,
             droppedStaleCount: droppedStaleCount ?? self.droppedStaleCount,
             lastSequence: lastSequence ?? self.lastSequence)
     }
@@ -507,6 +519,18 @@ public struct SessionState: Sendable, Equatable {
     /// Current generation. Bumped on every new run admission and every
     /// cancel; completions must match it (I21).
     public let generation: UInt64
+    /// M2-D D2: recorded undo dispositions, oldest-first, bounded
+    /// (`maxUndoDispositions`). Duplicate undo commands return the recorded
+    /// disposition instead of a second inverse; resume reseeds this from
+    /// the durable journal. Successful journals are never deleted from the
+    /// log — only this bounded live mirror prunes.
+    public let undoDispositions: [UndoDispositionRecord]
+    /// M2-D D2: in-flight undo command (live only — never persisted). Set
+    /// while a preview awaits validation or while inverses run under the
+    /// exclusive `undoing` phase; cleared by disposition, refusal or
+    /// failure records. A crash drops this with the process — recovery
+    /// rebuilds authority from the durable journal, never from memory.
+    public let pendingUndo: PendingUndo?
     /// Recovery markers, bounded at 64 — overflow is a visible integrity
     /// stop, never silent loss (R19). M2 reconciles; M1-B records + blocks.
     public let unresolvedOperations: [OperationRef]
@@ -526,6 +550,8 @@ public struct SessionState: Sendable, Equatable {
         liveReservations: [EffectReservation] = [],
         cancelledPendingReservations: [EffectReservation] = [],
         generation: UInt64 = 0, unresolvedOperations: [OperationRef] = [],
+        undoDispositions: [UndoDispositionRecord] = [],
+        pendingUndo: PendingUndo? = nil,
         droppedStaleCount: Int = 0, lastSequence: UInt64 = 0
     ) {
         self.sessionID = sessionID
@@ -553,6 +579,8 @@ public struct SessionState: Sendable, Equatable {
         self.cancelledPendingReservations = cancelledPendingReservations
         self.generation = generation
         self.unresolvedOperations = unresolvedOperations
+        self.undoDispositions = undoDispositions
+        self.pendingUndo = pendingUndo
         self.droppedStaleCount = droppedStaleCount
         self.lastSequence = lastSequence
     }

@@ -167,7 +167,14 @@ let package = Package(
         // seam). Runs under `test case` + `test offline`, not quick.
         .testTarget(
             name: "NeedletailActorTests",
-            dependencies: ["NeedletailCore", "NeedletailTestSupport"]
+            dependencies: [
+                "NeedletailCore",
+                "NeedletailTestSupport",
+                // M2-D D2: actor-tier undo proofs run the production
+                // executor + validator/applier over real temp workspaces
+                // through the real SessionActor (scripted provider only).
+                "NeedletailRuntime",
+            ]
         ),
         // M1-B: pure reducer/render/golden suites (Crypto for golden
         // manifest hashes only — never in product targets).

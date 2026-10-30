@@ -37,6 +37,16 @@ public enum Effect: Sendable, Equatable {
     /// `.attachmentValidationResult`; nil validator stamps empty
     /// observations and dispatch holds fail-closed).
     case validateAttachments(entryID: String, snapshots: [AttachmentSnapshot])
+    /// M2-D D2: current-file evidence request for an undo preview or run
+    /// (actor performs via the composed undo validator, then stamps
+    /// `.undoValidationResult`; nil validator stamps empty observations
+    /// and preflight refuses fail-closed).
+    case validateUndo(undoCommandID: String, isPreview: Bool, members: [UndoValidationNeed])
+    /// M2-D D2: perform ONE filesystem inverse (actor performs via the
+    /// composed inverse applier, then stamps `.inverseCompleted`). In
+    /// flight at most one inverse at a time; each result commits before
+    /// the next inverse starts.
+    case applyInverse(undoCommandID: String, inverse: UndoInverse)
     /// M2-C C0 phase 1 (plan REV12 §3.4b).
     case resolveExecIdentities(resolutionID: String, batch: ToolBatch)
 }
@@ -146,6 +156,24 @@ public struct ToolCallOutcome: Sendable, Equatable, Codable {
     public let beforeHash: String?
     public let afterHash: String?
     public let started: Bool?
+    /// M2-D D2: original file identity at commit (edit/replace only; nil
+    /// for creates). Captured at the native mutation boundary — never
+    /// inferred later from a reopened path.
+    public let deviceBefore: UInt64?
+    public let inodeBefore: UInt64?
+    /// M2-D D2: post-commit file identity (edit/replace/create). The
+    /// eligibility gate compares the live file against exactly this.
+    public let deviceAfter: UInt64?
+    public let inodeAfter: UInt64?
+    /// M2-D D2: create versus replacement. True when the mutation created
+    /// a file that did not exist (create inverse = exact-identity delete;
+    /// no preimage exists by construction). Nil = legacy/scripted (the
+    /// group builder treats nil as replace and requires beforeHash).
+    public let created: Bool?
+    /// M2-D D2: granting root identity (workspace-root path string) bound
+    /// at the mutation boundary. The inverse applier refuses when its own
+    /// pinned root disagrees — a cross-workspace inverse never runs.
+    public let grantedRoot: String?
     /// B4 per-call result classification: the executor's attestation of
     /// whether THIS call mutates. Nil = legacy/scripted (the reducer falls
     /// back to the proposal-derived classification); non-nil MUST agree
@@ -154,7 +182,7 @@ public struct ToolCallOutcome: Sendable, Equatable, Codable {
     /// requires done results to agree with their intent on this flag.
     public let mutating: Bool?
 
-    public init(callID: String, status: String, summary: String, data: String, artifactID: String? = nil, secondaryArtifactIDs: [String] = [], truncated: Bool = false, warnings: [String] = [], error: String? = nil, path: String? = nil, mode: String? = nil, beforeHash: String? = nil, afterHash: String? = nil, started: Bool? = nil, mutating: Bool? = nil) {
+    public init(callID: String, status: String, summary: String, data: String, artifactID: String? = nil, secondaryArtifactIDs: [String] = [], truncated: Bool = false, warnings: [String] = [], error: String? = nil, path: String? = nil, mode: String? = nil, beforeHash: String? = nil, afterHash: String? = nil, started: Bool? = nil, mutating: Bool? = nil, deviceBefore: UInt64? = nil, inodeBefore: UInt64? = nil, deviceAfter: UInt64? = nil, inodeAfter: UInt64? = nil, created: Bool? = nil, grantedRoot: String? = nil) {
         self.callID = callID
         self.status = status
         self.summary = summary
@@ -170,6 +198,47 @@ public struct ToolCallOutcome: Sendable, Equatable, Codable {
         self.afterHash = afterHash
         self.started = started
         self.mutating = mutating
+        self.deviceBefore = deviceBefore
+        self.inodeBefore = inodeBefore
+        self.deviceAfter = deviceAfter
+        self.inodeAfter = inodeAfter
+        self.created = created
+        self.grantedRoot = grantedRoot
+    }
+
+    /// Backward-compatible decode: rows/data written before D2 carry none
+    /// of the identity keys (outcomes are ephemeral, but fixtures and
+    /// golden data decode them — absent keys default to nil, never fail).
+    private enum CodingKeys: String, CodingKey {
+        case callID, status, summary, data, artifactID, secondaryArtifactIDs
+        case truncated, warnings, error, path, mode, beforeHash, afterHash
+        case started, mutating, deviceBefore, inodeBefore, deviceAfter, inodeAfter
+        case created, grantedRoot
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        callID = try container.decode(String.self, forKey: .callID)
+        status = try container.decode(String.self, forKey: .status)
+        summary = try container.decode(String.self, forKey: .summary)
+        data = try container.decode(String.self, forKey: .data)
+        artifactID = try container.decodeIfPresent(String.self, forKey: .artifactID)
+        secondaryArtifactIDs = try container.decodeIfPresent([String].self, forKey: .secondaryArtifactIDs) ?? []
+        truncated = try container.decode(Bool.self, forKey: .truncated)
+        warnings = try container.decodeIfPresent([String].self, forKey: .warnings) ?? []
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        path = try container.decodeIfPresent(String.self, forKey: .path)
+        mode = try container.decodeIfPresent(String.self, forKey: .mode)
+        beforeHash = try container.decodeIfPresent(String.self, forKey: .beforeHash)
+        afterHash = try container.decodeIfPresent(String.self, forKey: .afterHash)
+        started = try container.decodeIfPresent(Bool.self, forKey: .started)
+        mutating = try container.decodeIfPresent(Bool.self, forKey: .mutating)
+        deviceBefore = try container.decodeIfPresent(UInt64.self, forKey: .deviceBefore)
+        inodeBefore = try container.decodeIfPresent(UInt64.self, forKey: .inodeBefore)
+        deviceAfter = try container.decodeIfPresent(UInt64.self, forKey: .deviceAfter)
+        inodeAfter = try container.decodeIfPresent(UInt64.self, forKey: .inodeAfter)
+        created = try container.decodeIfPresent(Bool.self, forKey: .created)
+        grantedRoot = try container.decodeIfPresent(String.self, forKey: .grantedRoot)
     }
 }
 
@@ -301,10 +370,18 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
     if state.phase.isTerminal, case .operatorInput = event {
         return transition(state.replacing(phase: .idle), event, &ids)
     }
-    // M2-D D1: attachment-carrying input recurses the same way (fresh
+    // M2-D D2: attachment-carrying input recurses the same way (fresh
     // admission once idle; the snapshots ride the event).
     if state.phase.isTerminal, case .operatorInputAttachments = event {
         return transition(state.replacing(phase: .idle), event, &ids)
+    }
+    // M2-D D2: exclusive compensation phase. While an undo command owns
+    // the session, dispatch-adjacent and meta work is refused loudly;
+    // only queue accumulation (which cannot dispatch until undo exits),
+    // ticks and input validation proceed. The undo lifecycle events
+    // below bypass this guard via their own phase-matched handlers.
+    if case .undoing(let activeCommand) = state.phase, !isUndoLifecycleEvent(event) {
+        return holdDuringUndo(state, event: event, activeCommand: activeCommand, ids: &ids)
     }
     switch (state.phase, event) {
     case (.idle, .operatorInput(let commandID, let text, let kind, _, let sealed, let at)):
@@ -323,6 +400,14 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.idle, .queueAttachmentReplace(let entryID, let snapshots, let at)):
         return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
+    case (.idle, .undoPreview(let group, let preimages, let at)):
+        return handleUndoPreview(state, group: group, preimagesAvailable: preimages, atMillis: at, ids: &ids)
+    case (.idle, .undoRun(let commandID, let group, let preimages, let at)):
+        return handleUndoRun(state, commandID: commandID, group: group, preimagesAvailable: preimages, atMillis: at, ids: &ids)
+    case (.idle, .undoFinalize(let commandID, let group, let fileOutcomes, let at)):
+        return handleUndoFinalize(state, commandID: commandID, group: group, fileOutcomes: fileOutcomes, atMillis: at, ids: &ids)
+    case (.idle, .lineageForkRequest(let boundary, let at)):
+        return handleLineageFork(state, boundary: boundary, atMillis: at, ids: &ids)
     case (.idle, .switchModel(let alias, let at)):
         return switchModel(state, alias: alias, atMillis: at, ids: &ids)
     case (.idle, .checkpointRequested(let at)):
@@ -425,6 +510,14 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.failed, .queueAttachmentReplace(let entryID, let snapshots, let at)), (.completed, .queueAttachmentReplace(let entryID, let snapshots, let at)), (.interrupted, .queueAttachmentReplace(let entryID, let snapshots, let at)):
         return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
+    case (.failed, .undoPreview(let group, let preimages, let at)), (.completed, .undoPreview(let group, let preimages, let at)), (.interrupted, .undoPreview(let group, let preimages, let at)):
+        return handleUndoPreview(state, group: group, preimagesAvailable: preimages, atMillis: at, ids: &ids)
+    case (.failed, .undoRun(let commandID, let group, let preimages, let at)), (.completed, .undoRun(let commandID, let group, let preimages, let at)), (.interrupted, .undoRun(let commandID, let group, let preimages, let at)):
+        return handleUndoRun(state, commandID: commandID, group: group, preimagesAvailable: preimages, atMillis: at, ids: &ids)
+    case (.failed, .undoFinalize(let commandID, let group, let fileOutcomes, let at)), (.completed, .undoFinalize(let commandID, let group, let fileOutcomes, let at)), (.interrupted, .undoFinalize(let commandID, let group, let fileOutcomes, let at)):
+        return handleUndoFinalize(state, commandID: commandID, group: group, fileOutcomes: fileOutcomes, atMillis: at, ids: &ids)
+    case (.failed, .lineageForkRequest(let boundary, let at)), (.completed, .lineageForkRequest(let boundary, let at)), (.interrupted, .lineageForkRequest(let boundary, let at)):
+        return handleLineageFork(state, boundary: boundary, atMillis: at, ids: &ids)
     case (.failed, .queueEdit(let entryID, let newText, let baseRevision, let at)),
          (.completed, .queueEdit(let entryID, let newText, let baseRevision, let at)),
          (.interrupted, .queueEdit(let entryID, let newText, let baseRevision, let at)):
@@ -467,6 +560,18 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return replaceEntryAttachments(state, entryID: entryID, snapshots: snapshots, atMillis: at, ids: &ids)
     case (_, .attachmentValidationResult(let entryID, let requested, let observations, let at)):
         return handleAttachmentValidationResult(state, entryID: entryID, requested: requested, observations: observations, atMillis: at, ids: &ids)
+    case (_, .undoPreview(let group, let preimages, let at)):
+        return handleUndoPreview(state, group: group, preimagesAvailable: preimages, atMillis: at, ids: &ids)
+    case (_, .undoRun(let commandID, let group, let preimages, let at)):
+        return handleUndoRun(state, commandID: commandID, group: group, preimagesAvailable: preimages, atMillis: at, ids: &ids)
+    case (_, .undoValidationResult(let commandID, let isPreview, let requested, let observations, let at)):
+        return handleUndoValidationResult(state, commandID: commandID, isPreview: isPreview, requested: requested, observations: observations, atMillis: at, ids: &ids)
+    case (_, .inverseCompleted(let commandID, let inverseID, let outcome, let at)):
+        return handleInverseCompleted(state, commandID: commandID, inverseID: inverseID, outcome: outcome, atMillis: at, ids: &ids)
+    case (_, .undoFinalize(let commandID, let group, let fileOutcomes, let at)):
+        return handleUndoFinalize(state, commandID: commandID, group: group, fileOutcomes: fileOutcomes, atMillis: at, ids: &ids)
+    case (_, .lineageForkRequest(let boundary, let at)):
+        return handleLineageFork(state, boundary: boundary, atMillis: at, ids: &ids)
     case (_, .invalidInput(let fingerprint, let cause, let at)):
         return stepInvalid(state, fingerprint: fingerprint, cause: cause, atMillis: at, ids: &ids)
     default:
@@ -1585,6 +1690,555 @@ private func replaceEntryAttachments<I: IDSource>(
         records: prefix + [.queueUpdated(queue[position])])
 }
 
+/// M2-D D2: undo lifecycle + lineage handlers (O-2 journal, O-3 notice).
+///
+/// Authority rules (never re-decided at review):
+/// - Exactly one inverse is ever in flight: each `inverseCompleted` commits
+///   its durable result BEFORE the next intent commits.
+/// - Duplicates return the recorded disposition with no new records and no
+///   second inverse (the journal is append-only; the live mirror is only
+///   a bounded idempotency index).
+/// - Preflight covers the WHOLE group: one conflict ⇒ zero inverses, and
+///   the refusal is itself a durable disposition + notice (audit trail —
+///   never a silent deny, never a success claim).
+/// - Crash recovery never replays from memory: `pendingUndo` is live-only
+///   and dies with the process; `undoFinalize` + `reconcileUndoJournal`
+///   rebuild authority from durable records + filesystem evidence.
+
+/// True for the events the exclusive `undoing` phase still accepts. Every
+/// other event during `undoing` is held off by `holdDuringUndo`.
+private func isUndoLifecycleEvent(_ event: SessionEvent) -> Bool {
+    switch event {
+    case .undoPreview, .undoRun, .undoValidationResult, .inverseCompleted, .undoFinalize:
+        return true
+    default:
+        return false
+    }
+}
+
+/// Exclusive-phase hold: while an undo command owns the session, only
+/// queue accumulation (undispatchable until undo exits), ticks and input
+/// validation proceed. Dispatch-adjacent and meta work is refused loudly
+/// — never queued behind the compensation, never run through it.
+private func holdDuringUndo<I: IDSource>(
+    _ state: SessionState, event: SessionEvent, activeCommand: String, ids: inout I
+) -> Transition {
+    switch event {
+    case .tick(let now):
+        return checkDeadline(state, nowMillis: now, ids: &ids)
+    case .operatorInput(let commandID, let text, let kind, _, let sealed, let at):
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
+    case .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at):
+        return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
+    case .queueEdit(let entryID, let newText, let baseRevision, let at):
+        return editEntry(state, entryID: entryID, newText: newText, baseRevision: baseRevision, atMillis: at, ids: &ids)
+    case .queueWithdraw(let entryID, let at):
+        return withdrawEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case .invalidInput(let fingerprint, let cause, let at):
+        return stepInvalid(state, fingerprint: fingerprint, cause: cause, atMillis: at, ids: &ids)
+    case .cancelRequested:
+        let (s1, prefix) = sequenced(state, kind: "undo-cancel-ignored", digest: eventDigest("undo", activeCommand), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "undo \(activeCommand) in progress; cancel ignored"))],
+            records: prefix)
+    default:
+        let (s1, prefix) = sequenced(state, kind: "undo-held", digest: eventDigest("undo", activeCommand), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "undo \(activeCommand) in progress; request held off"))],
+            records: prefix)
+    }
+}
+
+/// Runs pure preflight over every member against bound observations.
+/// Returns the unanimous verdict plus per-member conflict reasons (empty
+/// when eligible). Missing evidence fails closed, never assumed.
+private func preflightPending(
+    _ pending: PendingUndo, observations: [UndoFileObservation]
+) -> (eligible: Bool, conflicts: [String]) {
+    var byInverse: [String: UndoFileObservation] = [:]
+    for observation in observations {
+        byInverse[observation.inverseID] = observation
+    }
+    var conflicts: [String] = []
+    let inverses = pending.inverses
+    for (index, member) in pending.group.members.enumerated() {
+        guard index < inverses.count else {
+            conflicts.append("\(member.path): no inverse planned; refusing")
+            continue
+        }
+        let available: Bool
+        switch inverses[index].kind {
+        case .restore(let digest, _):
+            available = digest.isEmpty || (pending.preimagesAvailable[digest] ?? false)
+        case .removeCreated:
+            available = true
+        }
+        switch undoPreflight(member: member, observation: byInverse[inverses[index].inverseID], preimageAvailable: available) {
+        case .eligible:
+            break
+        case .conflict(let reason):
+            conflicts.append(reason)
+        }
+    }
+    return (conflicts.isEmpty, conflicts)
+}
+
+private func handleUndoPreview<I: IDSource>(
+    _ state: SessionState, group: ChangeGroup,
+    preimagesAvailable: [String: Bool], atMillis _: UInt64, ids: inout I
+) -> Transition {
+    guard undoQuiescent(state) else {
+        let (s1, prefix) = sequenced(state, kind: "undo-preview-refused", digest: eventDigest("undo-preview", group.groupID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "undo preview refused: session not quiescent"))],
+            records: prefix)
+    }
+    guard undoChainLinks(members: group.members) else {
+        let (s1, prefix) = sequenced(state, kind: "undo-preview-refused", digest: eventDigest("undo-preview", group.groupID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "undo preview refused: chained edits to the same path do not link (group \(group.groupID))"))],
+            records: prefix)
+    }
+    let needs = group.members.map {
+        UndoValidationNeed(
+            inverseID: undoInverseID(
+                undoCommandID: "preview", groupID: group.groupID,
+                operationID: $0.operationID),
+            path: $0.path)
+    }
+    let pending = PendingUndo(
+        commandID: "preview", group: group, preimagesAvailable: preimagesAvailable,
+        inverses: undoInverses(undoCommandID: "preview", group: group),
+        entryPhase: state.phase, isPreview: true)
+    let (s1, prefix) = sequenced(state, kind: "undo-preview", digest: eventDigest("undo-preview", group.groupID), ids: &ids)
+    let next = s1.replacing(pendingUndo: .some(pending))
+    return Transition(
+        state: next,
+        effects: [.validateUndo(undoCommandID: "preview", isPreview: true, members: needs)],
+        records: prefix)
+}
+
+private func handleUndoRun<I: IDSource>(
+    _ state: SessionState, commandID: String, group: ChangeGroup,
+    preimagesAvailable: [String: Bool], atMillis: UInt64, ids: inout I
+) -> Transition {
+    // O-2 idempotency: a recorded disposition answers duplicates — no new
+    // records, no second inverse, ever.
+    if let recorded = state.undoDispositions.first(where: { $0.undoCommandID == commandID }) {
+        return Transition(
+            state: state,
+            effects: [.emitUI(.runUpdate(
+                phase: "undo",
+                detail: "duplicate undo \(commandID): \(recorded.outcome.rawValue) (no second inverse)"))],
+            records: [])
+    }
+    guard undoQuiescent(state) else {
+        let (s1, prefix) = sequenced(state, kind: "undo-run-refused", digest: eventDigest("undo", commandID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "undo \(commandID) refused: session not quiescent"))],
+            records: prefix)
+    }
+    guard !group.members.isEmpty else {
+        let (s1, prefix) = sequenced(state, kind: "undo-run-refused", digest: eventDigest("undo", commandID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "undo \(commandID) refused: empty change group"))],
+            records: prefix)
+    }
+    // Reverse-chain rule first: a broken same-path chain refuses the whole
+    // group as a durable disposition (audit trail, never silent).
+    guard undoChainLinks(members: group.members) else {
+        return commitUndoDisposition(
+            state, commandID: commandID, group: group, fileOutcomes: [],
+            outcome: .refused,
+            reason: "chained edits to the same path do not link; refusing the group",
+            entryPhase: state.phase, atMillis: atMillis, ids: &ids)
+    }
+    let inverses = undoInverses(undoCommandID: commandID, group: group)
+    let needs = group.members.enumerated().map { (index, member) in
+        UndoValidationNeed(inverseID: inverses[index].inverseID, path: member.path)
+    }
+    let pending = PendingUndo(
+        commandID: commandID, group: group, preimagesAvailable: preimagesAvailable,
+        inverses: inverses, entryPhase: state.phase, isPreview: false)
+    let (s1, prefix) = sequenced(state, kind: "undo-run", digest: eventDigest("undo", commandID), ids: &ids)
+    let next = s1.replacing(phase: .undoing(commandID: commandID), pendingUndo: .some(pending))
+    return Transition(
+        state: next,
+        effects: [.validateUndo(undoCommandID: commandID, isPreview: false, members: needs)],
+        records: prefix)
+}
+
+private func handleUndoValidationResult<I: IDSource>(
+    _ state: SessionState, commandID: String, isPreview: Bool,
+    requested: [UndoValidationNeed], observations: [UndoFileObservation],
+    atMillis: UInt64, ids: inout I
+) -> Transition {
+    guard let pending = state.pendingUndo,
+          pending.commandID == commandID, pending.isPreview == isPreview
+    else {
+        let (s1, prefix) = sequenced(state, kind: "undo-validation-superseded", digest: eventDigest("undo", commandID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.runUpdate(phase: "undo", detail: "validation superseded (no matching pending undo)"))],
+            records: prefix)
+    }
+    let requestedIDs = Set(requested.map(\.inverseID))
+    let pendingIDs = Set(pending.inverses.map(\.inverseID))
+    guard requestedIDs == pendingIDs else {
+        let (s1, prefix) = sequenced(state, kind: "undo-validation-superseded", digest: eventDigest("undo", commandID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.runUpdate(phase: "undo", detail: "validation superseded (evidence request mismatch)"))],
+            records: prefix)
+    }
+    let (eligible, conflicts) = preflightPending(pending, observations: observations)
+    if isPreview {
+        let (s1, prefix) = sequenced(state, kind: "undo-previewed", digest: eventDigest("undo-preview", pending.group.groupID), ids: &ids)
+        let next = s1.replacing(pendingUndo: .some(nil))
+        if eligible {
+            return Transition(
+                state: next,
+                effects: [.emitUI(.runUpdate(
+                    phase: "undo",
+                    detail: "undo preview: \(pending.group.members.count) file(s) eligible, no mutation"))],
+                records: prefix)
+        }
+        return Transition(
+            state: next,
+            effects: [.emitUI(.denied(
+                cause: "undo preview: \(conflicts.count) conflict(s): \(conflicts.joined(separator: "; "))"))],
+            records: prefix)
+    }
+    // Run path: the exclusive phase must still hold AND the session must
+    // still be quiescent (re-checked before each commit per the plan).
+    guard case .undoing(let active) = state.phase, active == commandID,
+          undoQuiescentIgnoringPhase(state)
+    else {
+        return commitUndoDisposition(
+            state, commandID: commandID, group: pending.group, fileOutcomes: [],
+            outcome: .refused,
+            reason: "session left quiescence during validation; refusing the group",
+            entryPhase: pending.entryPhase, atMillis: atMillis, ids: &ids)
+    }
+    guard eligible else {
+        return commitUndoDisposition(
+            state, commandID: commandID, group: pending.group, fileOutcomes: [],
+            outcome: .refused,
+            reason: "preflight conflict (\(conflicts.count)): \(conflicts.joined(separator: "; "))",
+            entryPhase: pending.entryPhase, atMillis: atMillis, ids: &ids)
+    }
+    guard let first = pending.inverses.first else {
+        return commitUndoDisposition(
+            state, commandID: commandID, group: pending.group, fileOutcomes: [],
+            outcome: .refused, reason: "no inverses planned",
+            entryPhase: pending.entryPhase, atMillis: atMillis, ids: &ids)
+    }
+    let (s1, prefix) = sequenced(state, kind: "undo-inverse-intent", digest: eventDigest("undo", first.inverseID), ids: &ids)
+    let ref = OperationRef(
+        operationID: OperationID(first.inverseID), callID: first.inverseID,
+        state: .intent, mutating: true)
+    return Transition(
+        state: s1,
+        effects: [
+            .applyInverse(undoCommandID: commandID, inverse: first),
+            .emitUI(.runUpdate(phase: "undo", detail: "undo \(commandID): inverting \(first.path)")),
+        ],
+        records: prefix + [.operationIntent(ref)])
+}
+
+private func handleInverseCompleted<I: IDSource>(
+    _ state: SessionState,     commandID: String, inverseID: String,
+    outcome: UndoInverseOutcome, atMillis: UInt64, ids: inout I
+) -> Transition {
+    guard let pending = state.pendingUndo,
+          pending.commandID == commandID, !pending.isPreview,
+          case .undoing(let active) = state.phase, active == commandID,
+          pending.nextIndex < pending.inverses.count,
+          pending.inverses[pending.nextIndex].inverseID == inverseID
+    else {
+        let (s1, prefix) = sequenced(state, kind: "undo-inverse-superseded", digest: eventDigest("undo", inverseID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.runUpdate(phase: "undo", detail: "inverse result superseded (\(inverseID))"))],
+            records: prefix)
+    }
+    let inverse = pending.inverses[pending.nextIndex]
+    let resultRef = OperationRef(
+        operationID: OperationID(inverseID), callID: inverseID,
+        state: .done, mutating: true)
+    switch outcome {
+    case .applied(let detail):
+        let file = UndoFileOutcome(
+            inverseID: inverseID, path: inverse.path,
+            result: "applied", detail: detail)
+        let advanced = pending.advancing(outcome: file)
+        return continueUndoChain(
+            state, pending: advanced, resultRef: resultRef,
+            outcomeText: "applied: \(detail)", atMillis: atMillis, ids: &ids)
+    case .refused(let reason):
+        // A refused inverse mutates nothing: the chain continues past it
+        // (UNDO-05 legs pin the partial shape at the END of the chain).
+        let file = UndoFileOutcome(
+            inverseID: inverseID, path: inverse.path,
+            result: "refused", detail: reason)
+        let advanced = pending.advancing(outcome: file)
+        return continueUndoChain(
+            state, pending: advanced, resultRef: resultRef,
+            outcomeText: "refused: \(reason)", atMillis: atMillis, ids: &ids)
+    case .failed(let error, let possiblyMutated):
+        if possiblyMutated {
+            // Unknown mutation state: NOTHING further runs; the inverse
+            // holds as unknown and the queue holds with it.
+            let file = UndoFileOutcome(
+                inverseID: inverseID, path: inverse.path,
+                result: "unknown", detail: "failed: \(error) (may have mutated; holding)")
+            let files = pending.fileOutcomes + [file]
+            return commitUndoDisposition(
+                state, commandID: commandID, group: pending.group,
+                fileOutcomes: files, outcome: undoDispositionOutcome(for: files),
+                reason: "inverse \(inverse.path) failed ambiguously; holding for reconciliation",
+                entryPhase: pending.entryPhase, atMillis: atMillis, ids: &ids,
+                extraRecords: [.operationResult(resultRef, outcome: "unknown: \(error)")])
+        }
+        // Clean failure (the applier attests nothing mutated): the chain
+        // HALTS (a failed leg is never stepped over silently) and the
+        // disposition records the partial truth.
+        let file = UndoFileOutcome(
+            inverseID: inverseID, path: inverse.path,
+            result: "failed", detail: "failed: \(error) (nothing mutated)")
+        let files = pending.fileOutcomes + [file]
+        return commitUndoDisposition(
+            state, commandID: commandID, group: pending.group,
+            fileOutcomes: files, outcome: undoDispositionOutcome(for: files),
+            reason: "inverse \(inverse.path) failed cleanly; halting the chain",
+            entryPhase: pending.entryPhase, atMillis: atMillis, ids: &ids,
+            extraRecords: [.operationResult(resultRef, outcome: "failed: \(error)")])
+    }
+}
+
+/// Advances a settled (applied/refused) inverse: commits its durable result
+/// and either starts the next inverse or commits the final disposition.
+/// The result commits BEFORE the next intent — crash boundaries hold.
+private func continueUndoChain<I: IDSource>(
+    _ state: SessionState,     pending: PendingUndo, resultRef: OperationRef,
+    outcomeText: String, atMillis: UInt64, ids: inout I
+) -> Transition {
+    let (s1, prefix) = sequenced(state, kind: "undo-inverse-result", digest: eventDigest("undo", resultRef.operationID.raw), ids: &ids)
+    let carried = s1.replacing(pendingUndo: .some(pending))
+    if pending.nextIndex < pending.inverses.count {
+        let inverse = pending.inverses[pending.nextIndex]
+        let (s2, intentPrefix) = sequenced(carried, kind: "undo-inverse-intent", digest: eventDigest("undo", inverse.inverseID), ids: &ids)
+        let intentRef = OperationRef(
+            operationID: OperationID(inverse.inverseID), callID: inverse.inverseID,
+            state: .intent, mutating: true)
+        return Transition(
+            state: s2,
+            effects: [
+                .applyInverse(undoCommandID: pending.commandID, inverse: inverse),
+                .emitUI(.runUpdate(
+                    phase: "undo",
+                    detail: "undo \(pending.commandID): \(outcomeText); inverting \(inverse.path)")),
+            ],
+            records: prefix + [.operationResult(resultRef, outcome: outcomeText)]
+                + intentPrefix + [.operationIntent(intentRef)])
+    }
+    let outcome = undoDispositionOutcome(for: pending.fileOutcomes)
+    let reason: String
+    switch outcome {
+    case .completed:
+        reason = "all \(pending.fileOutcomes.count) inverse(s) applied"
+    case .partial:
+        reason = "partial compensation: \(pending.fileOutcomes.filter { $0.result == "applied" }.count) applied, \(pending.fileOutcomes.filter { $0.result != "applied" }.count) refused/failed (never an atomic rollback)"
+    case .refused:
+        reason = "all inverses refused; nothing mutated"
+    case .needsReconciliation:
+        reason = "unknown inverse outcome; holding for reconciliation"
+    }
+    return commitUndoDisposition(
+        carried, commandID: pending.commandID, group: pending.group,
+        fileOutcomes: pending.fileOutcomes, outcome: outcome, reason: reason,
+        entryPhase: pending.entryPhase, atMillis: atMillis, ids: &ids,
+        extraRecords: [.operationResult(resultRef, outcome: outcomeText)])
+}
+
+/// Driver-stamped recovery for crash boundary 5: every inverse is settled
+/// in the durable log but the disposition was never committed (crash
+/// between the last result and the disposition). Outcomes arrive
+/// reconciled from the log; the disposition + notice commit atomically.
+/// Idempotent: an existing disposition wins immediately.
+private func handleUndoFinalize<I: IDSource>(
+    _ state: SessionState, commandID: String, group: ChangeGroup,
+    fileOutcomes: [UndoFileOutcome], atMillis: UInt64, ids: inout I
+) -> Transition {
+    if let recorded = state.undoDispositions.first(where: { $0.undoCommandID == commandID }) {
+        return Transition(
+            state: state,
+            effects: [.emitUI(.runUpdate(
+                phase: "undo",
+                detail: "duplicate undo \(commandID): \(recorded.outcome.rawValue) (no second inverse)"))],
+            records: [])
+    }
+    let expected = undoInverses(undoCommandID: commandID, group: group)
+    guard fileOutcomes.count == expected.count,
+          Set(fileOutcomes.map(\.inverseID)) == Set(expected.map(\.inverseID))
+    else {
+        let (s1, prefix) = sequenced(state, kind: "undo-finalize-refused", digest: eventDigest("undo", commandID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(
+                cause: "undo finalize refused: settled outcomes do not cover every inverse"))],
+            records: prefix)
+    }
+    guard undoQuiescent(state) || state.phase == .undoing(commandID: commandID) else {
+        let (s1, prefix) = sequenced(state, kind: "undo-finalize-refused", digest: eventDigest("undo", commandID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "undo finalize refused: session not quiescent"))],
+            records: prefix)
+    }
+    let outcome = undoDispositionOutcome(for: fileOutcomes)
+    let reason: String
+    switch outcome {
+    case .completed:
+        reason = "all \(fileOutcomes.count) inverse(s) applied (recovered)"
+    case .partial:
+        reason = "partial compensation (recovered)"
+    case .refused:
+        reason = "all inverses refused (recovered)"
+    case .needsReconciliation:
+        reason = "unknown inverse outcome (recovered); holding for reconciliation"
+    }
+    return commitUndoDisposition(
+        state, commandID: commandID, group: group, fileOutcomes: fileOutcomes,
+        outcome: outcome, reason: reason,
+        entryPhase: state.phase == .undoing(commandID: commandID)
+            ? (state.pendingUndo?.entryPhase ?? .idle) : state.phase,
+        atMillis: atMillis, ids: &ids)
+}
+
+/// Record-only rewind lineage fork (UNDO-08 mechanism): selects an existing
+/// turn/epoch boundary, retains parent/fork/boundary identities with an
+/// honest workspace-divergence warning. No file mutation, no branch
+/// switch, no history rewrite — the parent conversation is preserved.
+private func handleLineageFork<I: IDSource>(
+    _ state: SessionState, boundary: LineageBoundary,
+    atMillis: UInt64, ids: inout I
+) -> Transition {
+    guard undoQuiescent(state) else {
+        let (s1, prefix) = sequenced(state, kind: "lineage-fork-refused", digest: eventDigest("fork", "\(boundary.epochID.raw)"), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "rewind fork refused: session not quiescent"))],
+            records: prefix)
+    }
+    guard boundary.epochID == state.epoch.epochID else {
+        let (s1, prefix) = sequenced(state, kind: "lineage-fork-refused", digest: eventDigest("fork", "\(boundary.epochID.raw)"), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "rewind fork refused: boundary epoch is not the live epoch"))],
+            records: prefix)
+    }
+    guard boundary.throughSequence <= state.lastSequence else {
+        let (s1, prefix) = sequenced(state, kind: "lineage-fork-refused", digest: eventDigest("fork", "\(boundary.epochID.raw)"), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.denied(cause: "rewind fork refused: boundary lies beyond live history"))],
+            records: prefix)
+    }
+    let seq = ids.nextSequence()
+    let fork = LineageFork(
+        forkID: "fork-\(seq.value)", sessionID: state.sessionID,
+        parentEpochID: state.epoch.epochID, boundary: boundary,
+        divergenceNote: "rewound-fork of epoch \(state.epoch.epochID.raw) at sequence \(boundary.throughSequence): history preserved; workspace NOT restored and unverified against the boundary",
+        atMillis: atMillis)
+    let (s1, prefix) = sequenced(state, kind: "lineage-fork", digest: eventDigest("fork", fork.forkID), ids: &ids)
+    return Transition(
+        state: s1,
+        effects: [.emitUI(.runUpdate(
+            phase: "rewind",
+            detail: "lineage fork \(fork.forkID) at sequence \(boundary.throughSequence) (record only; worktree untouched)"))],
+        records: prefix + [.lineageFork(fork)])
+}
+
+/// Commits an authoritative disposition + its model-visible notice
+/// atomically (O-3: the notice never precedes its results, never follows
+/// without them). Restores the entry phase, clears the pending command,
+/// and bounds the live disposition mirror (the log itself is append-only).
+/// A needsReconciliation disposition additionally holds the queue and
+/// records bounded unknown markers for every unknown inverse — explicit
+/// reconciliation (not another inverse) releases them.
+private func commitUndoDisposition<I: IDSource>(
+    _ state: SessionState, commandID: String, group: ChangeGroup,
+    fileOutcomes: [UndoFileOutcome], outcome: UndoDispositionOutcome,
+    reason: String, entryPhase: SessionPhase, atMillis: UInt64, ids: inout I,
+    extraRecords: [DurableRecord] = []
+) -> Transition {
+    let record = UndoDispositionRecord(
+        undoCommandID: commandID, groupID: group.groupID,
+        outcome: outcome, fileOutcomes: fileOutcomes, reason: reason,
+        atMillis: atMillis)
+    let notice = WorkspaceChangeNotice(
+        undoCommandID: commandID, groupID: group.groupID,
+        outcome: outcome, files: fileOutcomes,
+        hadExecProposals: group.hadExecProposals, reason: reason)
+    var dispositions = state.undoDispositions.filter { $0.undoCommandID != commandID } + [record]
+    if dispositions.count > maxUndoDispositions {
+        dispositions.removeFirst(dispositions.count - maxUndoDispositions)
+    }
+    var unresolved = state.unresolvedOperations
+    if outcome == .needsReconciliation {
+        for file in fileOutcomes where file.result == "unknown" {
+            let (markers, overflow) = appendUnresolved(
+                unresolved,
+                OperationRef(
+                    operationID: OperationID(file.inverseID), callID: file.inverseID,
+                    state: .unknown, mutating: true))
+            unresolved = markers
+            if overflow { return integrityStop(state, ids: &ids) }
+        }
+    }
+    let (s1, prefix) = sequenced(state, kind: "undo-disposition", digest: eventDigest("undo", commandID), ids: &ids)
+    var next = s1.replacing(
+        phase: entryPhase, unresolvedOperations: unresolved,
+        undoDispositions: dispositions, pendingUndo: .some(nil))
+    if outcome == .needsReconciliation {
+        next = next.replacing(
+            queueHeld: true,
+            heldReason: .error("undo \(commandID): \(reason)"))
+    }
+    return Transition(
+        state: next,
+        effects: [.emitUI(.runUpdate(
+            phase: "undo",
+            detail: "undo \(commandID): \(outcome.rawValue) — \(reason)"))],
+        records: prefix + extraRecords + [.undoDisposition(record),
+                                          .transcriptAppended(.workspaceChangeNotice(notice))])
+}
+
+/// Quiescence re-check that tolerates the exclusive phase itself: the
+/// transition enters `undoing` through the gate, so steady-state checks
+/// inside the phase must not trip on the phase they own.
+private func undoQuiescentIgnoringPhase(_ state: SessionState) -> Bool {
+    guard !state.phase.hasActiveRun else { return false }
+    switch state.phase {
+    case .idle, .failed, .completed, .interrupted, .undoing:
+        break
+    case .admitting, .requesting, .streaming, .validatingTools, .authorising,
+         .executing, .cancelling, .checkpointing:
+        return false
+    }
+    guard state.unresolvedOperations.isEmpty else { return false }
+    guard state.pendingApproval == nil else { return false }
+    guard state.activeRequest == nil else { return false }
+    return true
+}
+
 /// Reserves a follow-up run from an already-dispatched queue entry (used by
 /// the auto-continue path). Mirrors admitFreshRun without re-admission.
 private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEntry, atMillis: UInt64, ids: inout I) -> Transition {
@@ -2163,7 +2817,7 @@ private func execReceiptText(callID: String, op: OperationID, status: String, st
 /// and replays derive identical IDs. `"/"` cannot collide with minted IDs
 /// (minted IDs never contain it) nor across proposals (callIDs are unique
 /// per batch, enforced at admission) nor across effects (effectIDs unique).
-private func operationID(effectID: EffectID, callID: String) -> OperationID {
+func operationID(effectID: EffectID, callID: String) -> OperationID {
     OperationID("\(effectID.raw)/\(callID)")
 }
 
@@ -2416,6 +3070,12 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
     consumed.insert(effectID)
     var live = state.liveReservations.filter { $0.effectID != effectID }
     var unresolved = state.unresolvedOperations
+    // M2-D D2: proven-done per-call outcomes accumulate here for change-
+    // group recording below. Only done-classified results land in this map
+    // (unknown/held/tainted/mismatched results never do); the builder
+    // additionally requires native edit/write success with full mutation-
+    // boundary identity, so partial batches contribute only proven members.
+    var doneOutcomes: [String: ToolCallOutcome] = [:]
 
     // F5: duplicate callIDs fail closed before mapping — track tainted IDs
     var seenCallIDs: Set<String> = []
@@ -2618,6 +3278,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             records.append(.operationResult(ref, outcome: "unknown: \(outcomeText)"))
         } else {
             records.append(.operationResult(ref, outcome: outcomeText))
+            doneOutcomes[proposal.callID] = outcome
         }
         // M2-C C3 (NC-9): exec calls carry an operator-visible receipt into
         // the provider continuation AND the terminal/JSONL sink. The receipt
@@ -2665,9 +3326,26 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         return Transition(state: next, effects: uiEffects + [.reserveEffect(nextReservation), .requestProvider(invocation: invocation)], records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", effectID.raw))] + newRecords)
     }
 
-    let allRecords = records + transcript
     // F1: continuation policy — if unresolved (unknown) exists, hold; else continue to next turn
     var interimState = state.replacing(consumedEffects: consumed, liveReservations: live, unresolvedOperations: unresolved)
+    // M2-D D2: one change group per dispatched mutating batch, committed
+    // atomically with the batch's operation results. Only proven-done
+    // native mutations become members; unmatched, unknown, tainted or
+    // identity-less results are excluded (held by the classifier above).
+    // No qualifying member ⇒ no group record (never an empty group).
+    let allRecords: [DurableRecord]
+    let groupSeq = ids.nextSequence()
+    if let runID = interimState.activeRun?.runID,
+       let group = buildChangeGroup(
+           groupID: "chg-\(groupSeq.value)", runID: runID, effectID: effectID,
+           proposals: proposals, outcomes: doneOutcomes,
+           doneCallIDs: Set(doneOutcomes.keys)) {
+        allRecords = records + transcript + [.changeGroup(group)]
+    } else {
+        // The sequence still advances (deterministic replay carries the
+        // counter): a deterministic no-group run consumes one ID.
+        allRecords = records + transcript
+    }
     if !unresolved.isEmpty {
         let (s1, prefix) = sequenced(interimState, kind: "continuation-blocked", digest: "markers", ids: &ids)
         let next = s1.replacing(queueHeld: true, heldReason: .error("unresolved operations block continuation"))

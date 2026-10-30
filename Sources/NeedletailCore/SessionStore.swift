@@ -16,6 +16,17 @@ public enum DurableRecord: Sendable, Equatable, Codable {
     /// atomically with the dispatch group (history admission + intent +
     /// transcript); replay joins it against run-completion events.
     case queueDispatched(QueueDispatchLink)
+    /// M2-D D2: one ordered native change group per applicable tool batch
+    /// (see ChangeGroup). Committed atomically with the batch's operation
+    /// results — only proven-done native mutations become members.
+    case changeGroup(ChangeGroup)
+    /// M2-D D2: authoritative final disposition of one undo command (see
+    /// UndoDispositionRecord, O-2). Committed atomically with the
+    /// workspace notice; never removed (duplicates return this).
+    case undoDisposition(UndoDispositionRecord)
+    /// M2-D D2: rewind lineage fork (see LineageFork). Record only — no
+    /// file mutation, no branch switch, no history rewrite.
+    case lineageFork(LineageFork)
     case checkpointCommitted(EpochDescriptor)
     /// Authoritative conversation element (M1-D transcript, ARCH §1).
     case transcriptAppended(TranscriptEntry)

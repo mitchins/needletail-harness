@@ -488,7 +488,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// per-call result carries the executor's attestation (the reducer
     /// verifies agreement with the dispatch-time intent).
     private func stamped(_ outcome: ToolCallOutcome, isMutating: Bool) -> ToolCallOutcome {
-        ToolCallOutcome(callID: outcome.callID, status: outcome.status, summary: outcome.summary, data: outcome.data, artifactID: outcome.artifactID, secondaryArtifactIDs: outcome.secondaryArtifactIDs, truncated: outcome.truncated, warnings: outcome.warnings, error: outcome.error, path: outcome.path, mode: outcome.mode, beforeHash: outcome.beforeHash, afterHash: outcome.afterHash, started: outcome.started, mutating: isMutating)
+        ToolCallOutcome(callID: outcome.callID, status: outcome.status, summary: outcome.summary, data: outcome.data, artifactID: outcome.artifactID, secondaryArtifactIDs: outcome.secondaryArtifactIDs, truncated: outcome.truncated, warnings: outcome.warnings, error: outcome.error, path: outcome.path, mode: outcome.mode, beforeHash: outcome.beforeHash, afterHash: outcome.afterHash, started: outcome.started, mutating: isMutating, deviceBefore: outcome.deviceBefore, inodeBefore: outcome.inodeBefore, deviceAfter: outcome.deviceAfter, inodeAfter: outcome.inodeAfter, created: outcome.created, grantedRoot: outcome.grantedRoot)
     }
 
     public func describe(batch: ToolBatch) -> String {
@@ -2634,6 +2634,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "not a regular file", data: "", error: "not a regular file", started: true)
         }
         let fileMode = st.st_mode & 0o7777
+        // M2-D D2: original identity at the mutation boundary (compared by
+        // the commit gate AND recorded on the success receipt for the undo
+        // eligibility gate — never inferred later from a reopened path).
+        let deviceBefore = UInt64(st.st_dev)
+        let inodeBefore = UInt64(st.st_ino)
         // Bounded read: post-fstat growth cannot blow memory (same bound as
         // the read path). Quota errors are size errors; anything else is a
         // read failure (never conflated).
@@ -2685,7 +2690,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             ownsParentFD = true
         }
         defer { if ownsParentFD { close(parentFD) } }
-        return commitReplacement(callID: callID, path: path, fileFD: fd, current: current, expectedHash: expectedHash, newData: newData, fileMode: fileMode, parentFD: parentFD, fileName: fileName, verb: "edited")
+        return commitReplacement(callID: callID, path: path, fileFD: fd, current: current, expectedHash: expectedHash, newData: newData, fileMode: fileMode, parentFD: parentFD, fileName: fileName, verb: "edited", created: false, deviceBefore: deviceBefore, inodeBefore: inodeBefore, grantedRoot: resolver.workspaceRoot?.path.string ?? "")
     }
 
     /// Bounded file read for the edit path (32 MiB cap, growth-safe loop).
@@ -2779,14 +2784,14 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// phase-level tests can inject filesystem changes deterministically
     /// between them; production always runs both back-to-back with the
     /// workspace lock held.
-    private func commitReplacement(callID: String, path: String, fileFD: Int32, current: Data, expectedHash: String, newData: Data, fileMode: mode_t, parentFD: Int32, fileName: String, verb: String) -> ToolCallOutcome {
+    private     func commitReplacement(callID: String, path: String, fileFD: Int32, current: Data, expectedHash: String, newData: Data, fileMode: mode_t, parentFD: Int32, fileName: String, verb: String, created: Bool = false, deviceBefore: UInt64? = nil, inodeBefore: UInt64? = nil, grantedRoot: String = "") -> ToolCallOutcome {
         let tmpName: String
         do {
             tmpName = try prepareCommitTmp(newData: newData, fileMode: fileMode, parentFD: parentFD)
         } catch {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "commit prepare failed: \(error)", data: "", error: "\(error)", path: path, beforeHash: expectedHash, started: true)
         }
-        return finalizeCommit(callID: callID, path: path, fileFD: fileFD, current: current, expectedHash: expectedHash, newData: newData, fileMode: fileMode, parentFD: parentFD, fileName: fileName, tmpName: tmpName, verb: verb)
+        return finalizeCommit(callID: callID, path: path, fileFD: fileFD, current: current, expectedHash: expectedHash, newData: newData, fileMode: fileMode, parentFD: parentFD, fileName: fileName, tmpName: tmpName, verb: verb, created: created, deviceBefore: deviceBefore, inodeBefore: inodeBefore, grantedRoot: grantedRoot)
     }
 
     /// Commit phase 1 (internal for phase-level tests): exclusive same-dir
@@ -2848,7 +2853,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// the target untouched with no preimage. Rename failure removes the tmp
     /// with the target untouched; a published preimage remains committed
     /// (recoverable by design — it describes bytes that verifiably existed).
-    func finalizeCommit(callID: String, path: String, fileFD: Int32, current: Data, expectedHash: String, newData: Data, fileMode: mode_t, parentFD: Int32, fileName: String, tmpName: String, verb: String) -> ToolCallOutcome {
+    func finalizeCommit(callID: String, path: String, fileFD: Int32, current: Data, expectedHash: String, newData: Data, fileMode: mode_t, parentFD: Int32, fileName: String, tmpName: String, verb: String, created: Bool = false, deviceBefore: UInt64? = nil, inodeBefore: UInt64? = nil, grantedRoot: String = "") -> ToolCallOutcome {
         func fail(_ summary: String, _ error: String, beforeHash: String) -> ToolCallOutcome {
             _ = tmpName.withCString { unlinkat(parentFD, $0, 0) }
             return ToolCallOutcome(callID: callID, status: "failed", summary: summary, data: "", error: error, path: path, beforeHash: beforeHash, started: true)
@@ -2933,7 +2938,26 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         if fsync(parentFD) != 0 {
             warnings = ["directory sync failed: \(String(cString: strerror(errno)))"]
         }
-        return ToolCallOutcome(callID: callID, status: "success", summary: "\(verb) \(path)", data: verb, artifactID: preimageDigest, warnings: warnings, path: path, mode: Self.modeOctal(fileMode), beforeHash: expectedHash, afterHash: afterHash, started: true)
+        // M2-D D2: post-commit identity captured AT the mutation boundary
+        // (never inferred later from a reopened path). The rename installed
+        // the tmp's inode: open the path fresh and fstat it. If this
+        // capture fails the outcome still reports success (the bytes were
+        // verifiably replaced) but carries no identity — the group builder
+        // then excludes the member, so it is never undone on guesswork.
+        var deviceAfter: UInt64? = nil
+        var inodeAfter: UInt64? = nil
+        let verifyFD: Int32 = fileName.withCString { name in
+            openat(parentFD, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        if verifyFD >= 0 {
+            defer { close(verifyFD) }
+            var vst = stat()
+            if fstat(verifyFD, &vst) == 0, (vst.st_mode & S_IFMT) == S_IFREG {
+                deviceAfter = UInt64(vst.st_dev)
+                inodeAfter = UInt64(vst.st_ino)
+            }
+        }
+        return ToolCallOutcome(callID: callID, status: "success", summary: "\(verb) \(path)", data: verb, artifactID: preimageDigest, warnings: warnings, path: path, mode: Self.modeOctal(fileMode), beforeHash: expectedHash, afterHash: afterHash, started: true, deviceBefore: deviceBefore, inodeBefore: inodeBefore, deviceAfter: deviceAfter, inodeAfter: inodeAfter, created: created, grantedRoot: grantedRoot)
     }
 
     // B3 write: create_new is exclusive and never silently overwrites.
@@ -3050,12 +3074,19 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         } else {
             createdMode = "600"
         }
+        // M2-D D2: created-file identity at the mutation boundary. A
+        // create carries no before-identity by construction (nothing
+        // existed); the removeCreated inverse compares exactly this.
+        let createdDeviceAfter: UInt64? =
+            (createdST.st_mode & S_IFMT) == S_IFREG ? UInt64(createdST.st_dev) : nil
+        let createdInodeAfter: UInt64? =
+            (createdST.st_mode & S_IFMT) == S_IFREG ? UInt64(createdST.st_ino) : nil
         var warnings: [String] = []
         if fsync(parentFD) != 0 {
             warnings = ["directory sync failed: \(String(cString: strerror(errno)))"]
         }
         let hash = Self.sha256Hex(content)
-        return ToolCallOutcome(callID: callID, status: "success", summary: "write \(path)", data: "written", warnings: warnings, path: path, mode: createdMode, afterHash: hash, started: true)
+        return ToolCallOutcome(callID: callID, status: "success", summary: "write \(path)", data: "written", warnings: warnings, path: path, mode: createdMode, afterHash: hash, started: true, deviceAfter: createdDeviceAfter, inodeAfter: createdInodeAfter, created: true, grantedRoot: resolver.workspaceRoot?.path.string ?? "")
     }
 
     /// Authorized write-replacement: the file must exist and hash exactly to
@@ -3080,6 +3111,9 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             return ToolCallOutcome(callID: callID, status: "failed", summary: "not a regular file", data: "", error: "not a regular file", path: path, started: true)
         }
         let fileMode = st.st_mode & 0o7777
+        // M2-D D2: original identity at the mutation boundary (see edit).
+        let replDeviceBefore = UInt64(st.st_dev)
+        let replInodeBefore = UInt64(st.st_ino)
         let current: Data
         do {
             current = try Self.readBoundedEdit(fd: fd)
@@ -3112,7 +3146,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             ownsParentFD = true
         }
         defer { if ownsParentFD { close(parentFD) } }
-        return commitReplacement(callID: callID, path: path, fileFD: fd, current: current, expectedHash: expectedHash, newData: content, fileMode: fileMode, parentFD: parentFD, fileName: fileName, verb: "replaced")
+        return commitReplacement(callID: callID, path: path, fileFD: fd, current: current, expectedHash: expectedHash, newData: content, fileMode: fileMode, parentFD: parentFD, fileName: fileName, verb: "replaced", created: false, deviceBefore: replDeviceBefore, inodeBefore: replInodeBefore, grantedRoot: resolver.workspaceRoot?.path.string ?? "")
     }
 
     private static func mkdirs(_ dirPath: String, from dirFD: Int32) throws {
