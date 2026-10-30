@@ -178,19 +178,26 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// session's durable log, finds settled-but-undispositioned journals
     /// (`pendingUndoFinalizations`), and stamps one `undoFinalize` per
     /// journal — each committing disposition + notice atomically, each
-    /// idempotent against an existing disposition. Returns the
-    /// dispositions that now answer every recovered command.
+    /// idempotent against an existing disposition.
+    ///
+    /// Returns which journals recovered and which did not. A journal lands
+    /// in `unrecovered` when the finalize is refused (e.g. the session is
+    /// not quiescent because an unrelated unknown holds it) — the caller
+    /// distinguishes that from "nothing pending" and must NOT advance a
+    /// provider continuation past an unrecovered journal whose notice is
+    /// still unpublished. Store read failures throw (same rule: never
+    /// advance startup on a recovery failure).
     ///
     /// The production run startup calls this after `resumeSession` and
     /// before any provider continuation, so a recovered notice always
     /// precedes the next model request (STATE-05). Unknown-result journals
     /// are never finalized here (they need reconciliation, not a
     /// disposition); they keep holding the queue.
-    public func recoverUndoJournal() async -> [UndoDispositionRecord] {
+    public func recoverUndoJournal() async throws -> UndoRecoveryReport {
         var cursor: UInt64 = 0
         var stream: [DurableRecord] = []
         while true {
-            guard let (page, next) = try? store.records(session: state.sessionID, since: cursor, limit: 500) else { break }
+            let (page, next) = try store.records(session: state.sessionID, since: cursor, limit: 500)
             for rec in page {
                 stream.append(rec.record)
             }
@@ -198,14 +205,19 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             cursor = advanced
         }
         let pending = pendingUndoFinalizations(stream)
+        var recovered: [UndoDispositionRecord] = []
+        var unrecovered: [PendingUndoFinalize] = []
         for item in pending {
             await apply(.undoFinalize(
                 undoCommandID: item.undoCommandID, group: item.group,
                 fileOutcomes: item.fileOutcomes, atMillis: clock.nowMillis()))
+            if let disposition = state.undoDispositions.first(where: { $0.undoCommandID == item.undoCommandID }) {
+                recovered.append(disposition)
+            } else {
+                unrecovered.append(item)
+            }
         }
-        return pending.compactMap { item in
-            state.undoDispositions.first(where: { $0.undoCommandID == item.undoCommandID })
-        }
+        return UndoRecoveryReport(recovered: recovered, unrecovered: unrecovered)
     }
 
     /// M2-D D2: rewind lineage fork request (record only — no file

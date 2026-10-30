@@ -343,6 +343,46 @@ struct RecordCodecTests {
         #expect(back == .queueUpdated(fresh), "snapshots + consent round-trip")
     }
 
+    @Test("pre-hash file-outcome rows without before/afterHash still decode")
+    func decodeLegacyFileOutcomeWithoutHashes() throws {
+        // Backward compatibility (review delta): the parent commit wrote
+        // file outcomes with no hash keys. Stripping both keys must decode
+        // with an empty after-image and no before-image — never integrity.
+        let disposition = UndoDispositionRecord(
+            undoCommandID: "undo-old", groupID: "chg-old",
+            outcome: .completed,
+            fileOutcomes: [UndoFileOutcome(
+                inverseID: "undo/undo-old/chg-old/eff-1/c1", path: "old.txt",
+                result: "applied", detail: "restored",
+                beforeHash: String(repeating: "b", count: 64),
+                afterHash: String(repeating: "a", count: 64))],
+            reason: "done", atMillis: 1)
+        let encoded = try RecordCodec.encode(.undoDisposition(disposition))
+        var outer = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        func strip(_ dict: [String: Any]) -> [String: Any] {
+            var dict = dict
+            dict.removeValue(forKey: "beforeHash")
+            dict.removeValue(forKey: "afterHash")
+            for (key, value) in dict {
+                if let nested = value as? [String: Any] {
+                    dict[key] = strip(nested)
+                } else if let array = value as? [[String: Any]] {
+                    dict[key] = array.map(strip)
+                }
+            }
+            return dict
+        }
+        outer["undoDisposition"] = strip(try #require(outer["undoDisposition"] as? [String: Any]))
+        let legacy = try JSONSerialization.data(withJSONObject: outer, options: [.sortedKeys])
+        guard case .undoDisposition(let back) = try RecordCodec.decode(legacy) else {
+            Issue.record("legacy row must decode as undoDisposition"); return
+        }
+        #expect(back.fileOutcomes.count == 1)
+        #expect(back.fileOutcomes[0].beforeHash == nil, "missing key defaults to no before-image")
+        #expect(back.fileOutcomes[0].afterHash.isEmpty, "missing key defaults to empty after-image")
+        #expect(back.fileOutcomes[0].result == "applied" && back.fileOutcomes[0].path == "old.txt", "other fields intact")
+    }
+
     @Test("encoded rows never carry derived origin/pathPrefix; decode re-derives them")
     func derivedFieldsAreNeverEncoded() throws {
         let record = try Self.allCases()[1] // epochOpened with a full snapshot

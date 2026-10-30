@@ -230,6 +230,24 @@ public struct UndoFileOutcome: Sendable, Equatable, Codable {
         self.beforeHash = beforeHash
         self.afterHash = afterHash
     }
+
+    /// Backward-compatible decode: rows written before hashes were
+    /// recorded (D2 review delta) carry neither key — they decode with an
+    /// empty after-image and no before-image, never fail (RecordCodecTests
+    /// pins this with a stripped legacy row).
+    private enum CodingKeys: String, CodingKey {
+        case inverseID, path, result, detail, beforeHash, afterHash
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        inverseID = try container.decode(String.self, forKey: .inverseID)
+        path = try container.decode(String.self, forKey: .path)
+        result = try container.decode(String.self, forKey: .result)
+        detail = try container.decode(String.self, forKey: .detail)
+        beforeHash = try container.decodeIfPresent(String.self, forKey: .beforeHash)
+        afterHash = try container.decodeIfPresent(String.self, forKey: .afterHash) ?? ""
+    }
 }
 
 public enum UndoDispositionOutcome: String, Sendable, Equatable, Codable {
@@ -834,13 +852,25 @@ public func reconcileUndoJournal(_ records: [DurableRecord]) -> (entries: [Strin
             disposition: dispositions[cmd])
     }
     // Unknown inverses: intent without a done result (durable recovery
-    // evidence — the inverse may have executed).
+    // evidence — the inverse may have executed). A result in `.unknown`
+    // state is unknown; so is a MUTATING result whose outcome string is an
+    // explicit unknowability claim (`unknown: …`) even when recorded done —
+    // pre-fix rows wrote exactly that shape, and the string is durable
+    // evidence no state enum can overrule.
     var unknownInverses: [OperationRef] = []
     for entry in entries.values {
         for intent in entry.intents {
             if let result = entry.results[intent.operationID.raw] {
                 if result.ref.state == .unknown {
                     unknownInverses.append(result.ref)
+                } else if result.ref.mutating && result.outcome.hasPrefix("unknown:") {
+                    // Pre-fix / writer-bug shape: the outcome string claims
+                    // unknowability the state enum does not. The recovery
+                    // marker claims unknown (it is), keyed by the same ID
+                    // resume dedupes against.
+                    unknownInverses.append(OperationRef(
+                        operationID: result.ref.operationID, callID: result.ref.callID,
+                        state: .unknown, mutating: true))
                 }
             } else {
                 unknownInverses.append(OperationRef(
@@ -881,6 +911,20 @@ public struct PendingUndoFinalize: Sendable, Equatable {
         self.undoCommandID = undoCommandID
         self.group = group
         self.fileOutcomes = fileOutcomes
+    }
+}
+
+/// What one `recoverUndoJournal` sweep settled: recovered journals now
+/// have a durable disposition + notice; unrecovered journals were found
+/// but their finalize was refused (or the sweep could not run them) —
+/// they must not be mistaken for "nothing pending."
+public struct UndoRecoveryReport: Sendable, Equatable {
+    public let recovered: [UndoDispositionRecord]
+    public let unrecovered: [PendingUndoFinalize]
+
+    public init(recovered: [UndoDispositionRecord], unrecovered: [PendingUndoFinalize]) {
+        self.recovered = recovered
+        self.unrecovered = unrecovered
     }
 }
 

@@ -376,11 +376,12 @@ struct UndoActorTests {
                 store: store, sessionID: session, writer: writer),
             approvals: ScriptedApprovals(), session: session,
             writer: writer, ids: rids)
-        let recovered = await actor.recoverUndoJournal()
-        #expect(recovered.count == 1 && recovered[0].outcome == .completed, "sweep recovers the completed journal, got \(recovered)")
-        #expect(recovered[0].fileOutcomes.first?.afterHash == "a0", "recovered outcomes carry the exact hashes")
-        let again = await actor.recoverUndoJournal()
-        #expect(again.isEmpty, "second sweep finds nothing pending (idempotent)")
+        let recovered = try await actor.recoverUndoJournal()
+        #expect(recovered.recovered.count == 1 && recovered.recovered[0].outcome == .completed, "sweep recovers the completed journal, got \(recovered)")
+        #expect(recovered.unrecovered.isEmpty)
+        #expect(recovered.recovered[0].fileOutcomes.first?.afterHash == "a0", "recovered outcomes carry the exact hashes")
+        let again = try await actor.recoverUndoJournal()
+        #expect(again.recovered.isEmpty && again.unrecovered.isEmpty, "second sweep finds nothing pending (idempotent)")
         // STATE-05: the recovered notice precedes the next provider request.
         await actor.submitText(commandID: CommandID("run-2"), text: "continue", kind: .followUp, sealed: false)
         for _ in 0..<20_000 {
@@ -402,5 +403,66 @@ struct UndoActorTests {
             return false
         })
         #expect(noticeIdx != nil && run2Idx != nil && noticeIdx! < run2Idx!, "recovered notice precedes the next request")
+    }
+
+    @Test("recovery sweep surfaces unrecovered journals instead of reporting nothing pending")
+    func recoverySweepSurfacesUnrecovered() async throws {
+        let store = InMemorySessionStore()
+        let session = SessionID("s-undo-r6")
+        let writer = WriterIdentity(session: session, writer: "w-undo")
+        try store.claimWriterOwnership(session: session, writer: writer.writer)
+        let idle = try ActorFixtures.idleState(mode: .workspace, permissive: true)
+        // Same settled-without-disposition shape as boundary5RecoverySweep.
+        let member = ChangeGroupMember(
+            operationID: OperationID("eff-9/c1"), callID: "c1",
+            path: "r6.txt", grantedRoot: "/tmp/ws",
+            created: false, beforeHash: "b0", afterHash: "a0",
+            deviceBefore: 1, inodeBefore: 2, modeBefore: "644",
+            preimageDigest: "b0", emptyOriginal: false,
+            deviceAfter: 1, inodeAfter: 3, modeAfter: "644",
+            receiptStatus: "success", receiptSummary: "edited r6.txt")
+        let group = ChangeGroup(
+            groupID: "chg-9", runID: RunID("run-9"), effectID: EffectID("eff-9"),
+            members: [member], hadExecProposals: false, hadReadProposals: false)
+        let inverseID = undoInverseID(undoCommandID: "undo-9", groupID: group.groupID, operationID: member.operationID)
+        try store.appendBatch([
+            .changeGroup(group),
+            .operationIntent(OperationRef(
+                operationID: OperationID(inverseID), callID: inverseID,
+                state: .intent, mutating: true)),
+            .operationResult(
+                OperationRef(
+                    operationID: OperationID(inverseID), callID: inverseID,
+                    state: .done, mutating: true),
+                outcome: "applied: restored r6.txt"),
+        ], as: writer)
+        // But the session is NOT quiescent: an unrelated unknown holds it,
+        // so the finalize refuses — and the sweep must say so.
+        let held = SessionState(
+            sessionID: session, epoch: idle.epoch, trustMode: idle.trustMode,
+            phase: .idle,
+            unresolvedOperations: [OperationRef(
+                operationID: OperationID("eff-0/c0"), callID: "c0",
+                state: .unknown, mutating: true)])
+        let actor = try Self.makeActor(
+            dir: FilePath("/tmp"), store: store, state: held,
+            transport: ScriptedTransport(),
+            executor: NativeToolExecutor(
+                resolver: try WorkspaceResolver(workspace: nil, readRoots: []),
+                store: store, sessionID: session, writer: writer),
+            approvals: ScriptedApprovals(), session: session,
+            writer: writer, ids: DeterministicIDSource(prefix: "r6"))
+        let report = try await actor.recoverUndoJournal()
+        #expect(report.recovered.isEmpty, "nothing recovered while held")
+        #expect(report.unrecovered.count == 1 && report.unrecovered[0].undoCommandID == "undo-9", "refused journal surfaces as unrecovered, got \(report)")
+        let log = try Self.records(store)
+        #expect(!log.contains(where: {
+            if case .undoDisposition(let d) = $0 { return d.undoCommandID == "undo-9" }
+            return false
+        }), "refused finalize commits no disposition")
+        #expect(!log.contains(where: {
+            if case .transcriptAppended(.workspaceChangeNotice(let n)) = $0 { return n.undoCommandID == "undo-9" }
+            return false
+        }), "refused finalize publishes no notice")
     }
 }

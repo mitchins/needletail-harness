@@ -185,8 +185,7 @@ struct UndoJournalTests {
     // MARK: - Blocker 1: ambiguous inverse holds durably across reopen
 
     @Test("ambiguous inverse (unknown result) reopens held with a recovery marker and no disposition")
-    func ambiguousResultReopensHeld() throws {
-        let (dir, store, session, writer) = try Self.tempStore()
+    func ambiguousResultReopensHeld() throws {        let (dir, store, session, writer) = try Self.tempStore()
         defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
         let inverseID = "undo/undo-3/chg-1/eff-1/c1"
         try store.appendBatch([
@@ -213,5 +212,46 @@ struct UndoJournalTests {
         let (entries, unknowns) = reconcileUndoJournal(try Self.records(store, session))
         #expect(entries["undo-3"]?.disposition == nil)
         #expect(unknowns.count == 1 && unknowns[0].operationID.raw == inverseID)
+    }
+
+    @Test("pre-fix ambiguous rows (done + unknown: outcome) still reopen held")
+    func preFixAmbiguousRowsReopenHeld() throws {
+        // Compatibility (review delta): the parent commit recorded
+        // ambiguous inverses as state .done with an "unknown:" outcome
+        // string. The outcome string is durable unknowability evidence —
+        // reopen must hold even though the state enum says done.
+        let (dir, store, session, writer) = try Self.tempStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let inverseID = "undo/undo-4/chg-1/eff-1/c1"
+        let disposition = UndoDispositionRecord(
+            undoCommandID: "undo-4", groupID: "chg-1",
+            outcome: .needsReconciliation,
+            fileOutcomes: [UndoFileOutcome(
+                inverseID: inverseID, path: "a.txt",
+                result: "unknown", detail: "failed (may have mutated)",
+                beforeHash: "b0", afterHash: "a0")],
+            reason: "inverse a.txt failed ambiguously", atMillis: 9000)
+        try store.appendBatch([
+            .operationIntent(OperationRef(
+                operationID: OperationID(inverseID), callID: inverseID,
+                state: .intent, mutating: true)),
+            .operationResult(
+                OperationRef(
+                    operationID: OperationID(inverseID), callID: inverseID,
+                    state: .done, mutating: true),
+                outcome: "unknown: post-commit read failed"),
+            .undoDisposition(disposition),
+        ], as: writer)
+        var ids = DeterministicIDSource(prefix: "rj")
+        let rebuilt = try resumeSession(
+            store: store, session: session, epoch: try Self.epoch(),
+            trustMode: .workspace, as: "w-undo-j", ids: &ids)
+        #expect(rebuilt.queueHeld, "pre-fix ambiguous journal holds the queue")
+        #expect(rebuilt.unresolvedOperations.count == 1, "exactly one marker, got \(rebuilt.unresolvedOperations)")
+        #expect(rebuilt.unresolvedOperations.first?.operationID.raw == inverseID)
+        #expect(rebuilt.unresolvedOperations.first?.state == .unknown)
+        #expect(rebuilt.undoDispositions == [disposition], "recorded disposition still reseeds")
+        let (_, unknowns) = reconcileUndoJournal(try Self.records(store, session))
+        #expect(unknowns.count == 1 && unknowns[0].operationID.raw == inverseID, "journal classifies done+unknown: as unknown")
     }
 }
