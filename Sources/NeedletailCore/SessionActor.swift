@@ -174,6 +174,40 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         await apply(.undoFinalize(undoCommandID: undoCommandID, group: group, fileOutcomes: fileOutcomes, atMillis: clock.nowMillis()))
     }
 
+    /// M2-D D2: crash-boundary-5 recovery sweep (Major 2). Pages the
+    /// session's durable log, finds settled-but-undispositioned journals
+    /// (`pendingUndoFinalizations`), and stamps one `undoFinalize` per
+    /// journal — each committing disposition + notice atomically, each
+    /// idempotent against an existing disposition. Returns the
+    /// dispositions that now answer every recovered command.
+    ///
+    /// The production run startup calls this after `resumeSession` and
+    /// before any provider continuation, so a recovered notice always
+    /// precedes the next model request (STATE-05). Unknown-result journals
+    /// are never finalized here (they need reconciliation, not a
+    /// disposition); they keep holding the queue.
+    public func recoverUndoJournal() async -> [UndoDispositionRecord] {
+        var cursor: UInt64 = 0
+        var stream: [DurableRecord] = []
+        while true {
+            guard let (page, next) = try? store.records(session: state.sessionID, since: cursor, limit: 500) else { break }
+            for rec in page {
+                stream.append(rec.record)
+            }
+            guard let advanced = next else { break }
+            cursor = advanced
+        }
+        let pending = pendingUndoFinalizations(stream)
+        for item in pending {
+            await apply(.undoFinalize(
+                undoCommandID: item.undoCommandID, group: item.group,
+                fileOutcomes: item.fileOutcomes, atMillis: clock.nowMillis()))
+        }
+        return pending.compactMap { item in
+            state.undoDispositions.first(where: { $0.undoCommandID == item.undoCommandID })
+        }
+    }
+
     /// M2-D D2: rewind lineage fork request (record only — no file
     /// mutation, no branch switch).
     public func requestLineageFork(boundary: LineageBoundary) async {

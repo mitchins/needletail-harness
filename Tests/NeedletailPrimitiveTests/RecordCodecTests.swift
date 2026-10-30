@@ -99,7 +99,9 @@ struct RecordCodecTests {
                 outcome: .completed,
                 fileOutcomes: [UndoFileOutcome(
                     inverseID: "undo/undo-1/chg-1/\(opID.raw)", path: "notes/plan.txt",
-                    result: "applied", detail: "restored notes/plan.txt")],
+                    result: "applied", detail: "restored notes/plan.txt",
+                    beforeHash: String(repeating: "b", count: 64),
+                    afterHash: String(repeating: "a", count: 64))],
                 reason: "all 1 inverse(s) applied", atMillis: 9500)),
             .lineageFork(LineageFork(
                 forkID: "fork-1", sessionID: SessionID("s-1"),
@@ -155,7 +157,9 @@ struct RecordCodecTests {
                 undoCommandID: "undo-1", groupID: "chg-1", outcome: .completed,
                 files: [UndoFileOutcome(
                     inverseID: "undo/undo-1/chg-1/op-1", path: "notes/plan.txt",
-                    result: "applied", detail: "restored")],
+                    result: "applied", detail: "restored",
+                    beforeHash: String(repeating: "b", count: 64),
+                    afterHash: String(repeating: "a", count: 64))],
                 hadExecProposals: false, reason: "all 1 inverse(s) applied")),
         ]
     }

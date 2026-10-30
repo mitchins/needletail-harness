@@ -50,17 +50,18 @@ struct UndoTests {
     }
 
     static func needs(_ command: String, _ group: ChangeGroup) -> [UndoValidationNeed] {
-        undoInverses(undoCommandID: command, group: group).map {
-            UndoValidationNeed(inverseID: $0.inverseID, path: $0.path)
-        }
+        undoValidationNeeds(undoCommandID: command, group: group)
     }
 
     static func observations(
         _ command: String, _ group: ChangeGroup, mutate: (UndoFileObservation) -> UndoFileObservation = { $0 }
     ) -> [UndoFileObservation] {
-        let inverses = undoInverses(undoCommandID: command, group: group)
-        return group.members.enumerated().map { (index, member) in
-            mutate(Self.observation(inverses[index].inverseID, member: member))
+        // Keyed by each member's OWN inverse ID (needs are member-ordered):
+        // positional pairing with the reversed inverse list is the Major 1
+        // trap, so this helper goes through undoValidationNeeds.
+        let needs = undoValidationNeeds(undoCommandID: command, group: group)
+        return zip(needs, group.members).map { (need, member) in
+            mutate(Self.observation(need.inverseID, member: member))
         }
     }
 
@@ -253,6 +254,37 @@ struct UndoTests {
         let dispositions = t.records.compactMap { if case .undoDisposition(let d) = $0 { return d } else { return nil } }
         #expect(dispositions.count == 1 && dispositions[0].outcome == .refused)
         #expect(dispositions[0].reason.contains("b.txt"), "per-file conflict is operator-visible")
+    }
+
+    @Test("UNDO-10 asymmetric: missing preimage on the FIRST member refuses despite an eligible create leg (no positional bypass)")
+    func missingPreimageAsymmetricRefuses() throws {
+        var ids = StateFixtures.ids()
+        // Batch order: [edit a.txt (preimage "before-1"), create b.txt].
+        // The inverse list reverses: [removeCreated(b), restore(a)].
+        let group = Self.group([
+            Self.member("a.txt", seed: 1),
+            Self.member("b.txt", seed: 2, created: true),
+        ])
+        let inverses = undoInverses(undoCommandID: "undo-1", group: group)
+        let needs = undoValidationNeeds(undoCommandID: "undo-1", group: group)
+        #expect(needs[0].inverseID != inverses[0].inverseID, "need/member order is NOT inverse order (the Major 1 trap)")
+        #expect(needs[0].inverseID == inverses[1].inverseID, "each need names its own member's inverse")
+        #expect(needs[0].path == "a.txt" && needs[1].path == "b.txt")
+        // dA unavailable: the edit leg fails closed even though the create
+        // leg needs no preimage. Under the old positional bug the edit leg
+        // read the create leg's (vacuous) availability and the group passed.
+        var state = try StateFixtures.idle()
+        var t = transition(state, .undoRun(undoCommandID: "undo-1", group: group, preimagesAvailable: [:], atMillis: 1000), &ids)
+        state = t.state
+        t = transition(state, .undoValidationResult(
+            undoCommandID: "undo-1", isPreview: false,
+            requested: needs,
+            observations: Self.observations("undo-1", group),
+            atMillis: 1001), &ids)
+        #expect(!t.effects.contains(where: { if case .applyInverse = $0 { return true } else { return false } }), "missing preimage refuses the whole group — b.txt is never deleted")
+        let dispositions = t.records.compactMap { if case .undoDisposition(let d) = $0 { return d } else { return nil } }
+        #expect(dispositions.count == 1 && dispositions[0].outcome == UndoDispositionOutcome.refused)
+        #expect(dispositions[0].reason.contains("a.txt"), "the conflict names the preimage-less member")
     }
 
     @Test("UNDO-10: missing preimage fails closed with zero inverses")
@@ -460,9 +492,8 @@ struct UndoTests {
 
     // MARK: - Quiescence + exclusivity (spec §6 ¶924)
 
-    @Test("quiescence: undo refused with an active run, an approval, or unknown markers")
-    func quiescenceRefusals() throws {
-        var ids = StateFixtures.ids()
+        @Test("quiescence: undo refused with an active run, an approval, or unknown markers")
+    func quiescenceRefusals() throws {        var ids = StateFixtures.ids()
         let group = Self.group([Self.member("a.txt", seed: 1)])
         // Active run: use an executing state.
         var executing = try StateFixtures.idle()
@@ -482,6 +513,33 @@ struct UndoTests {
         #expect(!undoQuiescent(undoing))
         let second = transition(undoing, .undoRun(undoCommandID: "undo-2", group: group, preimagesAvailable: [:], atMillis: 1), &ids)
         #expect(second.state.phase == .undoing(commandID: "undo-1"), "second command never preempts the first")
+    }
+
+    @Test("quiescence: reconstructed unknown delivery (heldUnknown) blocks undo entry")
+    func unknownDeliveryBlocksUndo() throws {
+        var ids = StateFixtures.ids()
+        let group = Self.group([Self.member("a.txt", seed: 1)])
+        // Reconstructed after kill-before-terminal: idle, no markers, but
+        // the queue holds an unknown delivery (Major 3).
+        let unknownEntry = QueueEntry(
+            entryID: "q-9", commandID: CommandID("cmd-9"), kind: .followUp,
+            state: .heldUnknown, revision: 2, text: "maybe sent",
+            targetEpochID: EpochID("epoch-1"), orderKey: 9, sealed: false)
+        let idle = try StateFixtures.idle()
+        let held = idle.replacing(queue: [unknownEntry], queueHeld: true)
+        #expect(!undoQuiescent(held), "heldUnknown is a deliveryUnknown leg")
+        let refused = transition(held, .undoRun(undoCommandID: "undo-9", group: group, preimagesAvailable: [:], atMillis: 1), &ids)
+        #expect(refused.records.count == 1, "unknown delivery refuses with only its marker")
+        #expect(!refused.effects.contains(where: { if case .validateUndo = $0 { return true } else { return false } }))
+        #expect(refused.state.phase == .idle, "no phase change on quiescence refusal")
+        // Other holds (stale attachment) do NOT block undo: undo dispatches
+        // nothing, so only unknown deliveries gate it.
+        let stale = QueueEntry(
+            entryID: "q-8", commandID: CommandID("cmd-8"), kind: .followUp,
+            state: .held, revision: 2, text: "stale",
+            targetEpochID: EpochID("epoch-1"), orderKey: 8, sealed: false)
+        let staleHeld = idle.replacing(queue: [stale], queueHeld: true)
+        #expect(undoQuiescent(staleHeld), "non-delivery holds do not gate undo")
     }
 
     @Test("exclusive phase: dispatch-adjacent work is held off while undo owns the session")
@@ -514,6 +572,11 @@ struct UndoTests {
         #expect(t.state.pendingUndo == nil, "preview clears pending")
         #expect(!t.records.contains(where: { if case .undoDisposition = $0 { return true } else { return false } }), "preview records no disposition")
         #expect(!t.records.contains(where: { if case .operationIntent = $0 { return true } else { return false } }), "preview commits no intents")
+        let previewDetail = t.effects.compactMap { effect -> String? in
+            if case .emitUI(let projection) = effect, projection.kind == "run:undo" { return projection.detail }
+            return nil
+        }.joined(separator: "\n")
+        #expect(previewDetail.contains("a.txt") && previewDetail.contains("before-1") && previewDetail.contains("after-1"), "eligible preview names the exact reversible set, got: \(previewDetail)")
     }
 
     // MARK: - Notice (UNDO-06) + STATE-05 ordering
@@ -534,6 +597,7 @@ struct UndoTests {
         let rendered = renderWorkspaceNotice(notices[0])
         #expect(rendered.contains("shell-produced effects are never ledger-undoable"), "UNDO-06 disclaimer is literal")
         #expect(rendered.contains("undo-1"))
+        #expect(rendered.contains("before-1") && rendered.contains("after-1"), "notice carries the exact undone hashes (Major 4)")
         // STATE-05: the notice commits atomically WITH its disposition, so
         // any later provider request necessarily carries it.
         let indices = t.records.enumerated().compactMap { (index, record) -> (Int, String)? in
@@ -611,7 +675,8 @@ struct UndoTests {
             undoCommandID: "undo-1", group: group,
             fileOutcomes: [UndoFileOutcome(
                 inverseID: inverses[0].inverseID, path: "a.txt",
-                result: "applied", detail: "restored a.txt (recovered)")],
+                result: "applied", detail: "restored a.txt (recovered)",
+                beforeHash: "before-1", afterHash: "after-1")],
             atMillis: 2000), &ids)
         let dispositions = t.records.compactMap { if case .undoDisposition(let d) = $0 { return d } else { return nil } }
         #expect(dispositions.count == 1 && dispositions[0].outcome == .completed, "recovery completes the journal")
@@ -630,7 +695,7 @@ struct UndoTests {
         let state = try StateFixtures.idle()
         let t = transition(state, .undoFinalize(
             undoCommandID: "undo-1", group: group,
-            fileOutcomes: [UndoFileOutcome(inverseID: "x", path: "a.txt", result: "applied", detail: "half")],
+            fileOutcomes: [UndoFileOutcome(inverseID: "x", path: "a.txt", result: "applied", detail: "half", beforeHash: "bh", afterHash: "ah")],
             atMillis: 2000), &ids)
         #expect(!t.records.contains(where: { if case .undoDisposition = $0 { return true } else { return false } }), "partial legs never finalize")
     }
@@ -639,7 +704,7 @@ struct UndoTests {
     func journalDuplicateHasDisposition() {
         let record = UndoDispositionRecord(
             undoCommandID: "undo-1", groupID: "chg-1", outcome: .completed,
-            fileOutcomes: [UndoFileOutcome(inverseID: "i", path: "a.txt", result: "applied", detail: "ok")],
+            fileOutcomes: [UndoFileOutcome(inverseID: "i", path: "a.txt", result: "applied", detail: "ok", beforeHash: "bh", afterHash: "ah")],
             reason: "done", atMillis: 1)
         let (entries, _) = reconcileUndoJournal([.undoDisposition(record)])
         #expect(entries["undo-1"]?.disposition == record, "recorded disposition answers duplicates")
@@ -672,7 +737,7 @@ struct UndoTests {
     @Test("undoDispositionOutcome maps settled files to completed/partial/refused/needsReconciliation")
     func dispositionMapping() {
         func outcome(_ results: String...) -> UndoDispositionOutcome {
-            undoDispositionOutcome(for: results.map { UndoFileOutcome(inverseID: "i", path: "p", result: $0, detail: "d") })
+            undoDispositionOutcome(for: results.map { UndoFileOutcome(inverseID: "i", path: "p", result: $0, detail: "d", beforeHash: nil, afterHash: "ah") })
         }
         #expect(outcome() == .refused, "empty is refused, never completed")
         #expect(outcome("applied") == .completed)

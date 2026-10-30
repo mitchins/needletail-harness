@@ -164,7 +164,11 @@ public enum SessionExport {
             var files: [[String: Any]] = []
             for file in disposition.fileOutcomes {
                 var frow: [String: Any] = ["operationID": file.inverseID,
-                                           "path": file.path, "result": file.result]
+                                           "path": file.path, "result": file.result,
+                                           "afterHash": file.afterHash]
+                if let beforeHash = file.beforeHash {
+                    frow["beforeHash"] = beforeHash
+                }
                 if includeContent {
                     frow["detail"] = file.detail
                     frow["redacted"] = false
@@ -394,7 +398,13 @@ public enum SessionExport {
                                       "hadExecProposals": notice.hadExecProposals]
             var files: [[String: Any]] = []
             for file in notice.files {
-                files.append(["path": file.path, "result": file.result])
+                var frow: [String: Any] = ["path": file.path,
+                                           "result": file.result,
+                                           "afterHash": file.afterHash]
+                if let beforeHash = file.beforeHash {
+                    frow["beforeHash"] = beforeHash
+                }
+                files.append(frow)
             }
             row["files"] = files
             if includeContent {

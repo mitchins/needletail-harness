@@ -90,7 +90,8 @@ struct UndoJournalTests {
             undoCommandID: "undo-1", groupID: group.groupID, outcome: .completed,
             fileOutcomes: [UndoFileOutcome(
                 inverseID: inverseID, path: "a.txt",
-                result: "applied", detail: "restored a.txt")],
+                result: "applied", detail: "restored a.txt",
+                beforeHash: "before-1", afterHash: "after-1")],
             reason: "all 1 inverse(s) applied", atMillis: 9000)
         try store.appendBatch([
             .changeGroup(group),
@@ -133,7 +134,9 @@ struct UndoJournalTests {
             undoCommandID: "undo-1", groupID: group.groupID,
             outcome: .completed, files: [UndoFileOutcome(
                 inverseID: "i", path: "notes/plan.txt",
-                result: "applied", detail: "restored SECRET-BYTES")],
+                result: "applied", detail: "restored SECRET-BYTES",
+                beforeHash: String(repeating: "b", count: 64),
+                afterHash: String(repeating: "a", count: 64))],
             hadExecProposals: true, reason: "all applied SECRET-REASON")
         try store.appendBatch([
             .sessionOpened(session: session, atMillis: 1000),
@@ -163,6 +166,11 @@ struct UndoJournalTests {
             #expect(kinds.contains("lineage-fork"), "fork projects (content=\(includeContent))")
             let noticeRows = objects.filter { ($0["role"] as? String) == "notice" }
             #expect(noticeRows.count == 1, "notice projects as transcript (content=\(includeContent))")
+            // Major 4: hashes are structural — present with AND without
+            // content (only free-text reason/detail gate on content).
+            let flat = lines.joined()
+            #expect(flat.contains("\"afterHash\""), "after hashes project structurally")
+            #expect(flat.contains("\"beforeHash\""), "before hashes project structurally")
             let blob = lines.joined()
             if includeContent {
                 #expect(blob.contains("SECRET-REASON"), "content mode carries the reason")
@@ -172,5 +180,38 @@ struct UndoJournalTests {
                 #expect(blob.contains("notes/plan.txt"), "paths stay structural without content")
             }
         }
+    }
+
+    // MARK: - Blocker 1: ambiguous inverse holds durably across reopen
+
+    @Test("ambiguous inverse (unknown result) reopens held with a recovery marker and no disposition")
+    func ambiguousResultReopensHeld() throws {
+        let (dir, store, session, writer) = try Self.tempStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        let inverseID = "undo/undo-3/chg-1/eff-1/c1"
+        try store.appendBatch([
+            .operationIntent(OperationRef(
+                operationID: OperationID(inverseID), callID: inverseID,
+                state: .intent, mutating: true)),
+            // Ambiguous outcome commits state .unknown (Blocker 1): a .done
+            // result would pair complete and drop the hold on reopen.
+            .operationResult(
+                OperationRef(
+                    operationID: OperationID(inverseID), callID: inverseID,
+                    state: .unknown, mutating: true),
+                outcome: "unknown: post-commit read failed"),
+        ], as: writer)
+        var ids = DeterministicIDSource(prefix: "rj")
+        let rebuilt = try resumeSession(
+            store: store, session: session, epoch: try Self.epoch(),
+            trustMode: .workspace, as: "w-undo-j", ids: &ids)
+        #expect(rebuilt.queueHeld, "ambiguous inverse holds the queue across reopen")
+        #expect(rebuilt.unresolvedOperations.count == 1, "exactly one recovery marker (deduplicated), got \(rebuilt.unresolvedOperations)")
+        #expect(rebuilt.unresolvedOperations.first?.operationID.raw == inverseID)
+        #expect(rebuilt.undoDispositions.isEmpty, "no disposition invented by recovery")
+        // And the journal still classifies it unknown (no silent settle).
+        let (entries, unknowns) = reconcileUndoJournal(try Self.records(store, session))
+        #expect(entries["undo-3"]?.disposition == nil)
+        #expect(unknowns.count == 1 && unknowns[0].operationID.raw == inverseID)
     }
 }

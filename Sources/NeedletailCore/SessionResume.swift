@@ -53,17 +53,29 @@ public func resumeSession<IDs: IDSource>(
     // until explicit reconciliation.
     let (undoEntries, unknownInverses) = reconcileUndoJournal(stream)
     var dispositions = undoEntries.values.compactMap(\.disposition)
-        .sorted { $0.undoCommandID < $1.undoCommandID }
+    // Prune by numeric command suffix (undo-<n> mints from the shared
+    // sequence counter, so higher is newer), never lexicographically
+    // ("undo-10" sorts before "undo-9" as strings).
+    dispositions.sort {
+        undoCommandSequence($0.undoCommandID) < undoCommandSequence($1.undoCommandID)
+    }
     if dispositions.count > maxUndoDispositions {
         dispositions.removeFirst(dispositions.count - maxUndoDispositions)
     }
     var heldOperations = report.heldOperations
+    // Dedupe by operation ID: an intent-only mutating inverse is held by
+    // BOTH the durable classifier (unmatched mutating) and the journal
+    // (intent without result) — one marker, never two, and the bound
+    // counts distinct operations only.
+    var heldIDs = Set(heldOperations.map(\.operationID))
     for ref in unknownInverses {
+        guard !heldIDs.contains(ref.operationID) else { continue }
         guard heldOperations.count < maxUnresolvedOperations else {
             throw StoreError.integrity(
                 "reopen: unknown inverse backlog exceeds unresolved bound")
         }
         heldOperations.append(ref)
+        heldIDs.insert(ref.operationID)
     }
     ids.advance(past: highWater)
     var state = SessionState.resumedAfterReopen(

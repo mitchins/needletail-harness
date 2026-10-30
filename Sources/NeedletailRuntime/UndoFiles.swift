@@ -232,9 +232,12 @@ public struct FilesystemUndoApplier: UndoInverseApplier, Sendable {
         }
         defer { if ownsParentFD { close(parentFD) } }
         // Same-dir tmp, checked write, mode preserve, fsync — then a final
-        // revalidation of the TARGET immediately before rename (the window
-        // between the first revalidation and this commit is one syscall
-        // wide, and this closes it as far as user space can).
+        // identity revalidation of the TARGET immediately before rename.
+        // This closes the replacement/deletion window; a same-inode content
+        // swap by a non-cooperating writer inside this window is a
+        // documented residual (single-writer scope per the spec caveat) —
+        // and it surfaces at post-verify as unknown, never as a success
+        // claim.
         let tmpName = "." + UUID().uuidString + ".tmp"
         let tmpFD = tmpName.withCString { name in
             openat(parentFD, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o600))

@@ -216,12 +216,19 @@ public struct UndoFileOutcome: Sendable, Equatable, Codable {
     /// applied | refused | failed | unknown
     public let result: String
     public let detail: String
+    /// Content hashes of the undone mutation (Major 4): the notice and
+    /// export carry the exact reversible set — `beforeHash` nil means the
+    /// member created the file (no before image exists).
+    public let beforeHash: String?
+    public let afterHash: String
 
-    public init(inverseID: String, path: String, result: String, detail: String) {
+    public init(inverseID: String, path: String, result: String, detail: String, beforeHash: String?, afterHash: String) {
         self.inverseID = inverseID
         self.path = path
         self.result = result
         self.detail = detail
+        self.beforeHash = beforeHash
+        self.afterHash = afterHash
     }
 }
 
@@ -352,6 +359,14 @@ public func undoPreflight(
 /// each inverse's output satisfies the next inverse's expectation).
 /// Otherwise the group refuses (never treat intermediate postimages as
 /// independent current states).
+///
+/// Scope note (plan REV3 §D2: "or refuse the group"): the chain rule is a
+/// structural gate, not a success promise. Preflight compares EVERY
+/// member against the single live file, so same-path multi-touch groups
+/// refuse on exact-identity divergence even when hashes link — no due row
+/// (UNDO-01..05/07/10/11) requires same-path multi-touch to succeed, and
+/// refusal beats a guessed-overwrite every time. Pinned by
+/// `samePathCreateEditRefuses` (State) at the transition tier.
 public func undoChainLinks(members: [ChangeGroupMember]) -> Bool {
     var byPath: [String: [ChangeGroupMember]] = [:]
     for member in members {
@@ -373,6 +388,14 @@ public func undoChainLinks(members: [ChangeGroupMember]) -> Bool {
 /// cancellation cleanup AND no admission/checkpoint in flight AND no undo
 /// already active. Queued (held or not) operator work is allowed — it
 /// simply cannot dispatch while undo is active.
+///
+/// The deliveryUnknown leg has two shapes: a live `activeRequest` (any
+/// non-nil request blocks) and a RECONSTRUCTED unknown delivery (a queue
+/// entry in `.heldUnknown` — a dispatch whose outcome never arrived).
+/// The latter carries no unresolved marker (the dispatch intent is
+/// non-mutating and callID-less by design), so it is checked explicitly:
+/// a possibly-live remote turn may still produce tool effects, and undo
+/// never compensates underneath one.
 public func undoQuiescent(_ state: SessionState) -> Bool {
     guard !state.phase.hasActiveRun else { return false }
     switch state.phase {
@@ -385,6 +408,7 @@ public func undoQuiescent(_ state: SessionState) -> Bool {
     guard state.unresolvedOperations.isEmpty else { return false }
     guard state.pendingApproval == nil else { return false }
     guard state.activeRequest == nil else { return false }
+    guard !state.queue.contains(where: { $0.state == .heldUnknown }) else { return false }
     return true
 }
 
@@ -422,6 +446,17 @@ public let maxNoticeFiles = 20
 /// The durable log is never pruned — only this in-memory projection caps
 /// length, oldest-first, so duplicate detection stays bounded.
 public let maxUndoDispositions = 64
+
+/// Numeric suffix of a minted undo command ID (`undo-<n>` → n, else 0).
+/// Reseed pruning keeps the highest (newest) commands; lexicographic
+/// order would drop `undo-9` before `undo-10`.
+public func undoCommandSequence(_ commandID: String) -> UInt64 {
+    guard commandID.hasPrefix("undo-"),
+          let n = UInt64(commandID.dropFirst("undo-".count)) else {
+        return 0
+    }
+    return n
+}
 
 /// Workspace-relative path containment for undo membership and inverse
 /// commit. The ledger never touches absolute paths, parent escapes, NUL
@@ -561,13 +596,15 @@ public func undoDispositionOutcome(for fileOutcomes: [UndoFileOutcome]) -> UndoD
     return .partial
 }
 
-/// Renders the notice for model context: outcome, per-file results
-/// (bounded), and the exec-exclusion disclaimer. No credentials, no raw
+/// Renders the notice for model context: outcome, per-file results with
+/// the exact before/after hashes undone (the reversible set, Major 4),
+/// bounded, and the exec-exclusion disclaimer. No credentials, no raw
 /// payloads — paths are workspace-relative by construction.
 public func renderWorkspaceNotice(_ notice: WorkspaceChangeNotice) -> String {
     var lines = ["[workspace notice: undo \(notice.undoCommandID) \(notice.outcome.rawValue)]"]
     for file in notice.files.prefix(maxNoticeFiles) {
-        lines.append("\(file.result): \(file.path)")
+        let before = file.beforeHash ?? "none(created)"
+        lines.append("\(file.result): \(file.path) before=\(before) after=\(file.afterHash)")
     }
     if notice.files.count > maxNoticeFiles {
         lines.append("…and \(notice.files.count - maxNoticeFiles) more files")
@@ -682,6 +719,28 @@ public func undoInverses(undoCommandID: String, group: ChangeGroup) -> [UndoInve
             path: member.path, grantedRoot: member.grantedRoot,
             kind: kind, restoreMode: restoreMode)
     }
+}
+
+/// Canonical validator needs for a group, in MEMBER order: each need/// carries the exact inverse ID that undoes its member (derived
+/// deterministically, never positionally). Positional pairing of the
+/// reversed inverse list against member order is a proven bug shape
+/// (Major 1): member `i` is undone by `inverses[n-1-i]`, so every lookup
+/// goes through this ID, never an index.
+public func undoValidationNeeds(undoCommandID: String, group: ChangeGroup) -> [UndoValidationNeed] {
+    group.members.map { member in
+        UndoValidationNeed(
+            inverseID: undoInverseID(
+                undoCommandID: undoCommandID, groupID: group.groupID,
+                operationID: member.operationID),
+            path: member.path)
+    }
+}
+
+/// Resolves the group member an inverse undoes, via the derived operation
+/// ID (never positionally — see undoValidationNeeds).
+public func memberForInverse(group: ChangeGroup, inverseID: String) -> ChangeGroupMember? {
+    guard let parsed = parseUndoInverseID(inverseID) else { return nil }
+    return group.members.first(where: { $0.operationID.raw == parsed.original })
 }
 
 // MARK: - Durable journal reconciliation (pure)
@@ -805,4 +864,72 @@ public func reconcileChangeGroups(_ records: [DurableRecord]) -> [ChangeGroup] {
         }
     }
     return groups
+}
+
+/// A settled-but-undispositioned journal awaiting driver-stamped recovery
+/// (crash boundary 5: every inverse has a durable result, but the
+/// disposition + notice were never committed). The file outcomes rebuild
+/// deterministically from the durable results + group members — the same
+/// mapping `handleUndoFinalize` enforces, so recovery and the transition
+/// can never disagree on what settled.
+public struct PendingUndoFinalize: Sendable, Equatable {
+    public let undoCommandID: String
+    public let group: ChangeGroup
+    public let fileOutcomes: [UndoFileOutcome]
+
+    public init(undoCommandID: String, group: ChangeGroup, fileOutcomes: [UndoFileOutcome]) {
+        self.undoCommandID = undoCommandID
+        self.group = group
+        self.fileOutcomes = fileOutcomes
+    }
+}
+
+/// Finds crash-boundary-5 journals in a session-scoped record stream:
+/// entries with at least one intent, every intent settled with a
+/// non-unknown result, and no disposition recorded. Entries with unknown
+/// results are NOT finalizable (they need reconciliation, not a
+/// disposition); entries with a disposition are already answered.
+public func pendingUndoFinalizations(_ records: [DurableRecord]) -> [PendingUndoFinalize] {
+    let (entries, _) = reconcileUndoJournal(records)
+    let groups = reconcileChangeGroups(records)
+    var groupsByID: [String: ChangeGroup] = [:]
+    for group in groups {
+        groupsByID[group.groupID] = group
+    }
+    var pending: [PendingUndoFinalize] = []
+    for entry in entries.values.sorted(by: { $0.undoCommandID < $1.undoCommandID }) {
+        guard entry.disposition == nil, !entry.intents.isEmpty else { continue }
+        guard let group = groupsByID[entry.groupID] else { continue }
+        var outcomes: [UndoFileOutcome] = []
+        var complete = true
+        for member in group.members {
+            let inverseID = undoInverseID(
+                undoCommandID: entry.undoCommandID, groupID: group.groupID,
+                operationID: member.operationID)
+            guard let result = entry.results[inverseID], result.ref.state == .done else {
+                complete = false
+                break
+            }
+            let outcome = result.outcome
+            let status: String
+            if outcome.hasPrefix("applied:") {
+                status = "applied"
+            } else if outcome.hasPrefix("refused:") {
+                status = "refused"
+            } else if outcome.hasPrefix("failed:") {
+                status = "failed"
+            } else {
+                complete = false
+                break
+            }
+            outcomes.append(UndoFileOutcome(
+                inverseID: inverseID, path: member.path,
+                result: status, detail: outcome,
+                beforeHash: member.beforeHash, afterHash: member.afterHash))
+        }
+        guard complete, !outcomes.isEmpty else { continue }
+        pending.append(PendingUndoFinalize(
+            undoCommandID: entry.undoCommandID, group: group, fileOutcomes: outcomes))
+    }
+    return pending
 }

@@ -1753,7 +1753,9 @@ private func holdDuringUndo<I: IDSource>(
 
 /// Runs pure preflight over every member against bound observations.
 /// Returns the unanimous verdict plus per-member conflict reasons (empty
-/// when eligible). Missing evidence fails closed, never assumed.
+/// when eligible). Missing evidence fails closed, never assumed. Pairing
+/// is by derived inverse ID (Major 1): member order and inverse order are
+/// reverses of each other, so indices never align them.
 private func preflightPending(
     _ pending: PendingUndo, observations: [UndoFileObservation]
 ) -> (eligible: Bool, conflicts: [String]) {
@@ -1761,21 +1763,27 @@ private func preflightPending(
     for observation in observations {
         byInverse[observation.inverseID] = observation
     }
+    var inverseByID: [String: UndoInverse] = [:]
+    for inverse in pending.inverses {
+        inverseByID[inverse.inverseID] = inverse
+    }
     var conflicts: [String] = []
-    let inverses = pending.inverses
-    for (index, member) in pending.group.members.enumerated() {
-        guard index < inverses.count else {
+    for member in pending.group.members {
+        let inverseID = undoInverseID(
+            undoCommandID: pending.commandID, groupID: pending.group.groupID,
+            operationID: member.operationID)
+        guard let inverse = inverseByID[inverseID] else {
             conflicts.append("\(member.path): no inverse planned; refusing")
             continue
         }
         let available: Bool
-        switch inverses[index].kind {
+        switch inverse.kind {
         case .restore(let digest, _):
             available = digest.isEmpty || (pending.preimagesAvailable[digest] ?? false)
         case .removeCreated:
             available = true
         }
-        switch undoPreflight(member: member, observation: byInverse[inverses[index].inverseID], preimageAvailable: available) {
+        switch undoPreflight(member: member, observation: byInverse[inverseID], preimageAvailable: available) {
         case .eligible:
             break
         case .conflict(let reason):
@@ -1803,13 +1811,7 @@ private func handleUndoPreview<I: IDSource>(
             effects: [.emitUI(.denied(cause: "undo preview refused: chained edits to the same path do not link (group \(group.groupID))"))],
             records: prefix)
     }
-    let needs = group.members.map {
-        UndoValidationNeed(
-            inverseID: undoInverseID(
-                undoCommandID: "preview", groupID: group.groupID,
-                operationID: $0.operationID),
-            path: $0.path)
-    }
+    let needs = undoValidationNeeds(undoCommandID: "preview", group: group)
     let pending = PendingUndo(
         commandID: "preview", group: group, preimagesAvailable: preimagesAvailable,
         inverses: undoInverses(undoCommandID: "preview", group: group),
@@ -1860,9 +1862,7 @@ private func handleUndoRun<I: IDSource>(
             entryPhase: state.phase, atMillis: atMillis, ids: &ids)
     }
     let inverses = undoInverses(undoCommandID: commandID, group: group)
-    let needs = group.members.enumerated().map { (index, member) in
-        UndoValidationNeed(inverseID: inverses[index].inverseID, path: member.path)
-    }
+    let needs = undoValidationNeeds(undoCommandID: commandID, group: group)
     let pending = PendingUndo(
         commandID: commandID, group: group, preimagesAvailable: preimagesAvailable,
         inverses: inverses, entryPhase: state.phase, isPreview: false)
@@ -1902,11 +1902,18 @@ private func handleUndoValidationResult<I: IDSource>(
         let (s1, prefix) = sequenced(state, kind: "undo-previewed", digest: eventDigest("undo-preview", pending.group.groupID), ids: &ids)
         let next = s1.replacing(pendingUndo: .some(nil))
         if eligible {
+            // The eligible preview names the exact reversible set
+            // (path + before/after hashes per member, Major 4) — the
+            // driver needs no second query to show what would run.
+            let listed = pending.group.members.map { member in
+                let before = member.beforeHash ?? "none(created)"
+                return "\(member.path) before=\(before) after=\(member.afterHash)"
+            }.joined(separator: "; ")
             return Transition(
                 state: next,
                 effects: [.emitUI(.runUpdate(
                     phase: "undo",
-                    detail: "undo preview: \(pending.group.members.count) file(s) eligible, no mutation"))],
+                    detail: "undo preview: \(pending.group.members.count) file(s) eligible, no mutation: \(listed)"))],
                 records: prefix)
         }
         return Transition(
@@ -1969,14 +1976,21 @@ private func handleInverseCompleted<I: IDSource>(
             records: prefix)
     }
     let inverse = pending.inverses[pending.nextIndex]
-    let resultRef = OperationRef(
-        operationID: OperationID(inverseID), callID: inverseID,
-        state: .done, mutating: true)
+    // The durable result state is chosen per branch (Blocker 1): settled
+    // inverses (applied/refused/clean-failed) commit `.done` so the
+    // journal pairs them complete; an ambiguous inverse commits `.unknown`
+    // so BOTH reconcilers hold it — the live queue hold alone would vanish
+    // on reopen, but the durable unknown never does.
     switch outcome {
     case .applied(let detail):
+        let resultRef = OperationRef(
+            operationID: OperationID(inverseID), callID: inverseID,
+            state: .done, mutating: true)
+        let member = memberForInverse(group: pending.group, inverseID: inverseID)
         let file = UndoFileOutcome(
             inverseID: inverseID, path: inverse.path,
-            result: "applied", detail: detail)
+            result: "applied", detail: detail,
+            beforeHash: member?.beforeHash, afterHash: member?.afterHash ?? "")
         let advanced = pending.advancing(outcome: file)
         return continueUndoChain(
             state, pending: advanced, resultRef: resultRef,
@@ -1984,20 +1998,30 @@ private func handleInverseCompleted<I: IDSource>(
     case .refused(let reason):
         // A refused inverse mutates nothing: the chain continues past it
         // (UNDO-05 legs pin the partial shape at the END of the chain).
+        let resultRef = OperationRef(
+            operationID: OperationID(inverseID), callID: inverseID,
+            state: .done, mutating: true)
+        let member = memberForInverse(group: pending.group, inverseID: inverseID)
         let file = UndoFileOutcome(
             inverseID: inverseID, path: inverse.path,
-            result: "refused", detail: reason)
+            result: "refused", detail: reason,
+            beforeHash: member?.beforeHash, afterHash: member?.afterHash ?? "")
         let advanced = pending.advancing(outcome: file)
         return continueUndoChain(
             state, pending: advanced, resultRef: resultRef,
             outcomeText: "refused: \(reason)", atMillis: atMillis, ids: &ids)
     case .failed(let error, let possiblyMutated):
+        let resultRef = OperationRef(
+            operationID: OperationID(inverseID), callID: inverseID,
+            state: possiblyMutated ? .unknown : .done, mutating: true)
         if possiblyMutated {
             // Unknown mutation state: NOTHING further runs; the inverse
             // holds as unknown and the queue holds with it.
+            let member = memberForInverse(group: pending.group, inverseID: inverseID)
             let file = UndoFileOutcome(
                 inverseID: inverseID, path: inverse.path,
-                result: "unknown", detail: "failed: \(error) (may have mutated; holding)")
+                result: "unknown", detail: "failed: \(error) (may have mutated; holding)",
+                beforeHash: member?.beforeHash, afterHash: member?.afterHash ?? "")
             let files = pending.fileOutcomes + [file]
             return commitUndoDisposition(
                 state, commandID: commandID, group: pending.group,
@@ -2009,9 +2033,11 @@ private func handleInverseCompleted<I: IDSource>(
         // Clean failure (the applier attests nothing mutated): the chain
         // HALTS (a failed leg is never stepped over silently) and the
         // disposition records the partial truth.
+        let member = memberForInverse(group: pending.group, inverseID: inverseID)
         let file = UndoFileOutcome(
             inverseID: inverseID, path: inverse.path,
-            result: "failed", detail: "failed: \(error) (nothing mutated)")
+            result: "failed", detail: "failed: \(error) (nothing mutated)",
+            beforeHash: member?.beforeHash, afterHash: member?.afterHash ?? "")
         let files = pending.fileOutcomes + [file]
         return commitUndoDisposition(
             state, commandID: commandID, group: pending.group,
@@ -2236,6 +2262,10 @@ private func undoQuiescentIgnoringPhase(_ state: SessionState) -> Bool {
     guard state.unresolvedOperations.isEmpty else { return false }
     guard state.pendingApproval == nil else { return false }
     guard state.activeRequest == nil else { return false }
+    // Same reconstructed-deliveryUnknown leg as undoQuiescent (Major 3):
+    // a heldUnknown queue entry means a dispatch whose outcome never
+    // arrived, and undo never compensates underneath one.
+    guard !state.queue.contains(where: { $0.state == .heldUnknown }) else { return false }
     return true
 }
 
