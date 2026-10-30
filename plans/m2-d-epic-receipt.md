@@ -50,10 +50,11 @@
 - `B3EditWriteTests` 31 pass (executor boundary identity, preimages).
 - `C2ExecDurableTests` 41 pass, `C3ExecQualificationTests` 18 pass
   (M2-C lanes preserved after the D2 executor changes).
-- `NeedletailStateTests` 178 pass (includes 31 D2 `UndoTests`).
-- D2 `UndoFilesTests` 8 pass (real FS + real GRDB: restore, user-edit
+- `NeedletailStateTests` 180 pass (includes 33 D2 `UndoTests`).
+- D2 `UndoFilesTests` 9 pass (real FS + real GRDB: restore, user-edit
   refusal, create/delete/repurpose, symlink/mode/root refusal, missing
-  preimage, empty-original restore, double-apply counterfactual).
+  preimage (incl. distinct restoreMissing kind), empty-original restore,
+  double-apply counterfactual).
 - D2 `UndoJournalTests` 5 pass (real GRDB resume: unknown hold,
   settled reseed, export redaction, ambiguous reopen, pre-fix rows).
 - D2 `UndoActorTests` 5 pass (full loop, preview conflict, fault
