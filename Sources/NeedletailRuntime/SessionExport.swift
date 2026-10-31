@@ -163,19 +163,7 @@ public enum SessionExport {
                                       "atMillis": disposition.atMillis]
             var files: [[String: Any]] = []
             for file in disposition.fileOutcomes {
-                var frow: [String: Any] = ["operationID": file.inverseID,
-                                           "path": file.path, "result": file.result,
-                                           "afterHash": file.afterHash]
-                if let beforeHash = file.beforeHash {
-                    frow["beforeHash"] = beforeHash
-                }
-                if includeContent {
-                    frow["detail"] = file.detail
-                    frow["redacted"] = false
-                } else {
-                    frow["redacted"] = true
-                }
-                files.append(frow)
+                files.append(Self.undoFileRow(file, includeContent: includeContent))
             }
             row["files"] = files
             if includeContent {
@@ -398,19 +386,7 @@ public enum SessionExport {
                                       "hadExecProposals": notice.hadExecProposals]
         var files: [[String: Any]] = []
         for file in notice.files {
-            var frow: [String: Any] = ["operationID": file.inverseID,
-                                       "path": file.path,
-                                       "result": file.result,
-                                       "afterHash": file.afterHash]
-            if let beforeHash = file.beforeHash {
-                frow["beforeHash"] = beforeHash
-            }
-            // The per-file detail is operator prose (like the notice
-            // reason): content-gated, never in redacted exports.
-            if includeContent {
-                frow["detail"] = file.detail
-            }
-            files.append(frow)
+            files.append(Self.undoFileRow(file, includeContent: includeContent))
         }
             row["files"] = files
             if includeContent {
@@ -421,6 +397,27 @@ public enum SessionExport {
             }
             return row
         }
+    }
+
+    /// M2-D D2/D3: one settled file-result projection, shared by the
+    /// undo-disposition and workspace-notice rows. The inverse operation
+    /// ID, path, result and hashes are structural; the per-file detail is
+    /// operator prose and travels only with content.
+    private static func undoFileRow(_ file: UndoFileOutcome, includeContent: Bool) -> [String: Any] {
+        var row: [String: Any] = ["operationID": file.inverseID,
+                                  "path": file.path,
+                                  "result": file.result,
+                                  "afterHash": file.afterHash]
+        if let beforeHash = file.beforeHash {
+            row["beforeHash"] = beforeHash
+        }
+        if includeContent {
+            row["detail"] = file.detail
+            row["redacted"] = false
+        } else {
+            row["redacted"] = true
+        }
+        return row
     }
 
     /// M2-D D2: one change-group member projection. Hashes, identity,

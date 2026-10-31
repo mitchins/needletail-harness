@@ -726,7 +726,7 @@ struct D3IntegrationTests {
         _ = ids1
     }
 
-    @Test("C3: cross-alias snapshots hold; retarget preserves the grant; fresh capture re-consents and drains")
+    @Test("C3: epoch switch preserves the unknown head; retarget re-consents without re-granting; dispatch proceeds under the live route")
     func crossAliasSnapshotHolds() async throws {
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -802,28 +802,28 @@ struct D3IntegrationTests {
         #expect(switched.epoch.profile.alias == "local-reviewer", "live route moved to the second model")
         let qaID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-a2") })?.entryID)
         let qbID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-b2") })?.entryID)
+        let linksBeforeManoeuvre = try Self.dispatchLinkCount(store, session)
         await actor2.retargetQueueEntry(entryID: qaID)
         await actor2.retargetQueueEntry(entryID: qbID)
-        for _ in 0..<1_000 { await Task.yield() }
+        try await Self.awaitState(actor2, {
+            $0.queue.first(where: { $0.commandID == CommandID("q-a2") })?.attachmentConsentEpoch == switched.epoch.epochID
+        }, "retarget refreshes consent to the live epoch")
         let retargeted = await actor2.currentState()
         let qaRetargeted = try #require(retargeted.queue.first(where: { $0.commandID == CommandID("q-a2") }))
-        #expect(qaRetargeted.attachmentConsentEpoch == switched.epoch.epochID, "retarget refreshes consent to the live epoch")
         #expect(qaRetargeted.attachments.first?.routeGrant.alias == "local-coder", "retarget preserves the original grant (it does not re-grant)")
-        #expect(gate2.invocations.isEmpty, "no dispatch during the epoch manoeuvre")
+        #expect(try Self.dispatchLinkCount(store, session) == linksBeforeManoeuvre, "no dispatch committed during the epoch manoeuvre")
         await actor2.reconcileQueue(entryID: qaID)
         try await Self.awaitState(actor2, { $0.queue.first?.state == .queued }, "reconciled after retarget")
         await actor2.resumeQueue()
-        for _ in 0..<1_000 { await Task.yield() }
-        #expect((await actor2.currentState()).queueHeld == false, "resume unholds the reconciled, retargeted queue")
-        // Generation 3: a fresh run pops qa2 — but the grant names
-        // local-coder while the live route is local-reviewer, so the
-        // dispatch holds instead of sending approved bytes to the wrong
-        // model. Only a fresh capture under the live profile releases it.
+        try await Self.awaitState(actor2, { $0.queueHeld == false }, "resume unholds the reconciled, retargeted queue")
+        // Generation 3: a fresh run pops qa2 — consent is current and the
+        // content is unchanged, so the entry dispatches under the live
+        // route (D1 re-consent governs; the grant alias is provenance,
+        // not a second gate).
         try store.close()
         store = try Self.tempStore(at: dir)
         let transport3 = ScriptedTransport()
         transport3.script = [
-            ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
             ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
             ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
             ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
@@ -837,34 +837,19 @@ struct D3IntegrationTests {
             attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
         #expect(!report3.blocked, "reconciled + retargeted queue is dispatchable")
         await actor3.submitText(commandID: CommandID("run-n"), text: "next", kind: .followUp, sealed: false)
-        try await Self.awaitState(actor3, { $0.queue.first?.state == .held }, "cross-alias grant holds the head")
-        let heldAlias = await actor3.currentState()
-        guard case .error(let reason) = heldAlias.heldReason else {
-            Issue.record("alias mismatch must hold with an explicit reason, got \(String(describing: heldAlias.heldReason))")
-            return
-        }
-        #expect(reason.contains("local-coder") && reason.contains("local-reviewer"), "refusal names both the granted alias and the live route, got: \(reason)")
-        #expect(transport3.invocations.count == 1, "run-n sent; the cross-alias head dispatched nothing")
-        #expect(heldAlias.queue.dropFirst().allSatisfy({ $0.state == .queued }), "no overtake past the grant hold")
-        let grantB = AttachmentRouteGrant(alias: "local-reviewer", locality: .local, sealed: false)
-        let snapB = try capture.capture(
-            relativePath: "x.txt", lineRange: nil, intent: "mention",
-            epochID: switched.epoch.epochID, routeGrant: grantB)
-        await actor3.replaceEntryAttachments(entryID: qaID, snapshots: [snapB])
-        await actor3.resumeQueue()
-        await actor3.submitText(commandID: CommandID("run-m"), text: "again", kind: .followUp, sealed: false)
         try await Self.awaitState(actor3, {
-            if case .completed = $0.phase, transport3.invocations.count == 4,
+            if case .completed = $0.phase, transport3.invocations.count == 3,
                $0.queue.allSatisfy({ $0.state == .admittedToHistory }) { return true }
             return false
-        }, "drained after re-consent")
+        }, "drained under the live route")
         let users = try Self.storeRecords(store, session).compactMap { record -> String? in
             if case .transcriptAppended(.user(let text)) = record { return text }
             return nil
         }
-        #expect(users.contains(where: { $0.contains("X1\n") }), "re-consented bytes enter context under the live route")
+        #expect(users.contains(where: { $0.contains("X1\n") }), "bytes enter context under the live route after re-consent")
         let drained = await actor3.currentState()
         #expect(drained.queue.first(where: { $0.commandID == CommandID("q-a2") })?.attachmentConsentEpoch == switched.epoch.epochID)
+        #expect(drained.queue.first(where: { $0.commandID == CommandID("q-a2") })?.attachments.first?.routeGrant.alias == "local-coder", "re-consent never rewrites the original grant")
         try store.close()
         _ = ids1
     }

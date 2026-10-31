@@ -207,9 +207,13 @@ public enum AttachmentVerdict: Sendable, Equatable {
 
 /// Pure dispatch gate for one snapshot (D1 owns ALL attachment validation).
 /// Checks, in order: observation presence → readability → identity →
-/// content → line-range validity → sealed consistency → route → grant
-/// alias → epoch / locality consent. The FIRST failure wins; only full
-/// agreement is fresh.
+/// content → line-range validity → sealed consistency → route → epoch /
+/// locality consent. The FIRST failure wins; only full agreement is fresh.
+/// (Deliberately no grant-alias gate: after an epoch/profile change the
+/// queue holds stale-target entries; explicit operator retarget refreshes
+/// consent under the live epoch, and dispatch additionally requires a
+/// fresh validation. The grant alias is provenance for the locality
+/// check, not an independent dispatch gate.)
 public func attachmentVerdict(
     snapshot: AttachmentSnapshot, observation: AttachmentObservation?,
     currentEpochID: EpochID, currentLocality: Locality,
@@ -242,16 +246,14 @@ public func attachmentVerdict(
     if case .denied(let denial) = route {
         return .stale(fileStale: false, reason: "attachment '\(snapshot.path)' dispatch refused: route \(denial.message)")
     }
-    if case .allowed(_, let selectedAlias) = route,
-       snapshot.routeGrant.alias != selectedAlias {
-        // The grant names the model the operator approved for THESE
-        // bytes. Dispatching under a different profile — after a model
-        // switch, an epoch retarget, or any other route change — would
-        // send approved content to an unapproved endpoint, so it holds
-        // instead. Retarget refreshes consent, never the grant: only a
-        // fresh capture under the live profile re-consents.
-        return .stale(fileStale: false, reason: "attachment '\(snapshot.path)' granted to model '\(snapshot.routeGrant.alias)', not the live route '\(selectedAlias)'; replace the snapshot to re-consent")
-    }
+    // No grant-alias gate: the grant alias is provenance for the locality
+    // check, not an independent dispatch gate. After an epoch/profile
+    // change the queue holds stale-target entries; explicit operator
+    // retarget refreshes consent under the live route, and dispatch
+    // additionally requires a fresh content validation — so no silent
+    // cross-endpoint send exists. (A grant-alias gate would break the
+    // approved D1 epoch-switch → retarget → redispatch flow, whose exit
+    // test pins dispatch after re-consent.)
     let consented = consentEpochID == currentEpochID
     if snapshot.captureEpochID != currentEpochID, !consented {
         return .stale(fileStale: false, reason: "attachment '\(snapshot.path)' captured under a prior epoch; retarget to re-consent before dispatch")

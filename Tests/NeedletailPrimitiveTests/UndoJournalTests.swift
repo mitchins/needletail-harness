@@ -174,6 +174,7 @@ struct UndoJournalTests {
             // Notice file rows carry the inverse journal key in both
             // modes; the per-file detail travels only with content.
             let noticeFiles = noticeRows.compactMap { $0["files"] as? [[String: Any]] }.flatMap { $0 }
+            #expect(noticeFiles.count == 1, "notice projects exactly one file row (content=\(includeContent))")
             #expect(noticeFiles.allSatisfy({ ($0["operationID"] as? String) == "i" }), "inverse identity travels structurally")
             if includeContent {
                 #expect(noticeFiles.contains(where: { ($0["detail"] as? String) == "restored SECRET-BYTES" }), "file detail travels with content")

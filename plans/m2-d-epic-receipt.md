@@ -61,17 +61,19 @@
   settled reseed, export redaction, ambiguous reopen, pre-fix rows).
 - D2 `UndoActorTests` 5 pass (full loop, preview conflict, fault
   injection, boundary-5 recovery sweep).
-- D3 `D3IntegrationTests` 14 pass (A: order/IDs/acks/no-duplicates;
+- D3 `D3IntegrationTests` 15 pass (A: order/IDs/acks/no-duplicates;
   B: unknown head, no-resend, reconcile durability, release-only-
   intended; C: stale snapshot across reopen, no overtake, fix +
   reconsent, provider-context proof; C2: epoch switch preserves
   unknown head, retarget refreshes consent without release, drain
-  carries current bytes; D: partial undo across reopen, no replay,
+  carries current bytes; C3: epoch switch preserves the unknown head
+  while retarget re-consents without re-granting; dispatch proceeds
+  under the live route; D: partial undo across reopen, no replay,
   user edits retained; E: notice-before-next-request exactly once +
   second sweep; E2: live commit-failure integrity stop with honest
   unknown hold and explicit re-acceptance; F: combined holds, every
-  bypass refused, explicit reconciliation in order; 4 bypass
-  counterfactuals: resume/sweep/fencing/corrupt-journal).
+  bypass refused, explicit reconciliation in order; 5 counterfactuals:
+  resume/sweep/fencing/corrupt-journal/CF-path).
 - `RecordCodecTests` (incl. legacy-row decode tolerance),
   `SessionExportTests` (allowlist incl. all D2 keys, redaction both
   modes), `ReopenReconciliationTests`, `QueueDurabilityTests`,
@@ -131,18 +133,25 @@ commands, all RENDER/NAV/PTY/DX-terminal rows.
   queueDispatched links → discriminating integrity error (reject only
   without an intervening recorded reconcile; legitimate
   reconcile→redispatch preserved; positive + negative replay tests);
-  attachment alias verdict (grant alias must equal the live route
-  alias; C3 cross-alias test, RED-proven); export notice rows carry
-  inverseID + content-gated detail; receipt count reconciliation
-  (D2 = 53). All fixed with evidence; final CodeRabbit verdict:
-  **APPROVED** (no Blockers/Majors open).
-- Remote gates on qualified HEAD `a47e216` (2026-10-30/31): offline
-  build + tests PASS (40m lane); clean-host release smoke PASS;
-  SonarQube + SonarCloud PASS; GitGuardian PASS. (One CLOSURE_01 race
-  failure occurred on an earlier push's run in a timing-sensitive
-  search test untouched by this epic; 3/3 local reruns green and the
-  final HEAD's full lane passed clean — recorded as a flake, not
-  concealed.)
+  attachment route contract verified: epoch-switch holds until explicit
+  retarget re-consents, then dispatches under the live route (grant
+  alias is provenance for the locality check, not a second gate; C3
+  proves the D1 epoch-switch→retarget→redispatch flow); export notice
+  rows carry inverseID + content-gated detail (shared helper, redacted
+  marker on both file-row kinds); receipt count reconciled (D2 = 53 =
+  33 + 10 + 5 + 5; D3 = 15 with C3).
+  The 4 out-of-diff items are fixed with evidence in-tree on this
+  branch; the `a47e216` remote gates (offline build + tests PASS;
+  clean-host smoke PASS; SonarQube/SonarCloud PASS; GitGuardian PASS)
+  cover the prior qualified tree — this delta adds the discriminating
+  link test, the C3 epoch/retarget leg (RED-proven), the shared export
+  helper + notice-row provenance, and the single-row file-assertion
+  hardening, all exercised locally below; re-qualification of the new
+  HEAD and the final CodeRabbit review are pending and not claimed
+  here. (One CLOSURE_01 race failure occurred on an earlier push's run
+  in a timing-sensitive search test untouched by this epic; 3/3 local
+  reruns green and the final HEAD's full lane passed clean — recorded
+  as a flake, not concealed.)
 
 ## Known flakes and remaining limitations
 

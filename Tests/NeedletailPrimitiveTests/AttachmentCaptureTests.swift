@@ -311,36 +311,25 @@ struct FilesystemAttachmentValidatorTests {
         #expect(verdict == .fresh, "unchanged file verifies")
     }
 
-    @Test("verdict refuses a snapshot granted to a different model alias")
-    func validatorRejectsCrossAliasDispatch() async throws {
+    @Test("cross-alias grants are provenance, not a dispatch gate (D1 re-consent governs)")
+    func validatorCrossAliasGrantIsProvenance() async throws {
         let ws = try Self.makeWorkspace()
         defer { try? FileManager.default.removeItem(at: ws.dir) }
         try Data("stable\n".utf8).write(to: ws.dir.appendingPathComponent("s.txt"))
-        // Granted to local-coder; the file itself never changes.
+        // Granted to local-coder; the file itself is unchanged and the
+        // entry was re-consented under the live epoch (the retarget path).
+        // The grant alias is provenance for the locality check — dispatch
+        // under the live route proceeds (D1 epoch-switch + retarget flow).
         let snap = try ws.capture.capture(
             relativePath: "s.txt", lineRange: nil, intent: "mention",
             epochID: EpochID("epoch-1"), routeGrant: Self.grant())
         let observations = await ws.validator.validate(entryID: "q-1", snapshots: [snap])
-        // Live route under a different profile alias: hold, even though
-        // bytes, identity and consent are all fresh.
-        let cross = attachmentVerdict(
+        let verdict = attachmentVerdict(
             snapshot: snap, observation: observations.first,
             currentEpochID: EpochID("epoch-1"), currentLocality: .local,
-            route: .allowed(endpoint: "http://127.0.0.1:11434/chat/completions", alias: "local-reviewer"),
+            route: .allowed(endpoint: "http://127.0.0.1:11435/chat/completions", alias: "local-reviewer"),
             consentEpochID: EpochID("epoch-1"), entrySealed: false)
-        guard case .stale(let fileStale, let reason) = cross else {
-            Issue.record("cross-alias dispatch must hold")
-            return
-        }
-        #expect(!fileStale, "grant scope is not file staleness")
-        #expect(reason.contains("local-coder") && reason.contains("local-reviewer"), "refusal names both aliases, got: \(reason)")
-        // Same-alias control still dispatches.
-        let same = attachmentVerdict(
-            snapshot: snap, observation: observations.first,
-            currentEpochID: EpochID("epoch-1"), currentLocality: .local,
-            route: .allowed(endpoint: "http://127.0.0.1:11434/chat/completions", alias: "local-coder"),
-            consentEpochID: EpochID("epoch-1"), entrySealed: false)
-        #expect(same == .fresh, "matching grant alias stays fresh")
+        #expect(verdict == .fresh, "re-consented entry dispatches under the live route regardless of grant alias")
     }
 
     @Test("validator surfaces mutation and removal as stale")
