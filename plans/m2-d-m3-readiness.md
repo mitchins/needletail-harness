@@ -2,7 +2,8 @@
 
 Baseline: `main` @ `6104845` + M2-D D0 (`75c0187` series incl. D0
 review fixes) + D1 (`c9cd23c`, `04a2a1d`) + D2 (`e0f3491`, `b04fc91`,
-`c152865`) + D3 (`08f0b95`, `cd75adc`; qualified code HEAD `394c07c`).
+`c152865`) + D3 (`08f0b95`, `cd75adc`, CodeRabbit fixes; qualified
+code HEAD `a47e216`).
 
 Status vocabulary (this document only):
 

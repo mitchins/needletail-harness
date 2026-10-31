@@ -4,9 +4,11 @@
 - Baseline: `main` @ `6104845` (M2-C merged, PR #7)
 - Plan: `plans/m2-d-plan.md` REV3 (planning only; implementation slices
   D0–D3 each separately authorized with per-slice DeepSeek review)
-- Qualified code HEAD: `394c07c` (this receipt is void if the code
-  tree moves — re-qualify and re-issue; the issuing commit on top is
-  docs-only and does not affect qualification)
+- Qualified code HEAD: `a47e216` (this receipt is void if the code
+  tree moves — re-qualify and re-issue. Prior qualification
+  checkpoints: D2 `c152865` (DeepSeek APPROVED), D3 `394c07c`
+  (DeepSeek APPROVED); subsequent deltas are covered by the
+  whole-system review below.)
 - Status vocabulary: `cases/catalog.json` is untouched by D0–D3 by
   precedent; the due-milestone flip to IMPLEMENTED with executed
   evidence belongs to the M2-D epic PR (CodeRabbit whole-system review).
@@ -107,14 +109,42 @@ commands, all RENDER/NAV/PTY/DX-terminal rows.
   `cd75adc`; re-review NEEDS_CHANGES (2 doc-precision Majors: stale
   ack doc, readiness row 8 scope) → all addressed in `394c07c`;
   final **APPROVED**.
+- Epic (whole-system, PR #8): CodeRabbit CHANGES_REQUESTED with 15
+  findings (verified 2026-10-30) → all reconciled in `ba1fccb` +
+  `a47e216`: 13 fixed in-tree (allocator watermark vs post-reopen ID
+  collision; commit-gate re-open + content re-hash with unit tests;
+  CRLF sliceLines trap + fixture test; missing-preimage distinct kind;
+  O_NONBLOCK post-commit verify; fsync-dir outcome reporting;
+  no-op yield-loop removal; case-ID test naming incl. `dev test case`
+  resolution; doc corrections for counts/plan-title/STATUS), 1
+  explicitly rejected with evidence (fresh-run durable ack records:
+  contradicts the settled D0 REV3 design — no queue records for
+  fresh admissions by design; no defect demonstrated), 1
+  superseded-by-revert (ack honoring already removed per F2B-5).
+  Round 2 (3 findings on the fixed tree): empty-digest sentinel,
+  commit-gate re-read + WorkspaceLock question, display-name fix →
+  all fixed; WorkspaceLock declined with evidence (exclusive
+  `undoing` phase admits no cooperating contender). Final
+  CodeRabbit check: PASS, all threads resolved (2 findings withdrawn
+  by the reviewer).
+- Remote gates on qualified HEAD `a47e216` (2026-10-30/31): offline
+  build + tests PASS (40m lane); clean-host release smoke PASS;
+  SonarQube + SonarCloud PASS; GitGuardian PASS. (One CLOSURE_01 race
+  failure occurred on an earlier push's run in a timing-sensitive
+  search test untouched by this epic; 3/3 local reruns green and the
+  final HEAD's full lane passed clean — recorded as a flake, not
+  concealed.)
 
 ## Known flakes and remaining limitations
 
-- Timing-sensitive actor suites (`OperationIntentActorTests`,
-  `ToolAdvertisementRoundTripTests`) flake under full-parallel load
-  (20k-yield barriers); they pass in isolation and fail identically on
-  pristine `04a2a1d` — pre-existing, unrelated to D2/D3 (D3 suites
-  await durable state, not timing, and pass consistently).
+- Timing-sensitive suites flake under load: `OperationIntentActorTests` /
+  `ToolAdvertisementRoundTripTests` (20k-yield barriers) fail
+  identically on pristine `04a2a1d` — pre-existing and unrelated to
+  D2/D3 (D3 suites await durable state, not timing, and pass
+  consistently); `CLOSURE_01_explicitRootRace` (search root-swap
+  timing) failed once on CI and passed 3/3 locally plus clean on the
+  final HEAD's full lane — pre-existing race shape in code untouched
+  by this epic, recorded, not concealed.
 - Subprocess/network lanes (C1 reap 18 s timeouts, WIRE-02 loopback,
   CLI end-to-end) are sandbox-load sensitive; C1/C2/C3 re-verified
   green in isolation during D2.
