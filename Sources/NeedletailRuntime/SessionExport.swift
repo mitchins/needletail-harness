@@ -134,6 +134,56 @@ public enum SessionExport {
             return queueRow(seq: seq, action: "admitted", entry: entry, includeContent: includeContent)
         case .queueUpdated(let entry):
             return queueRow(seq: seq, action: "updated", entry: entry, includeContent: includeContent)
+        case .queueDispatched(let link):
+            // Linkage is identity only (entry/run/request/effect/epoch
+            // IDs) — no prompt text, safe to export with or without content.
+            return ["seq": seq, "kind": "queue", "action": "dispatched",
+                    "entryID": link.entryID, "commandID": link.commandID.raw,
+                    "runID": link.runID.raw, "requestID": link.requestID.raw,
+                    "effectID": link.effectID.raw, "epochID": link.epochID.raw]
+        case .changeGroup(let group):
+            // M2-D D2: structural ledger identity (paths are workspace-
+            // relative by construction; hashes/modes/identity are not
+            // content). Per-member receipt summaries are free text —
+            // content-gated like every other receipt.
+            return ["seq": seq, "kind": "change-group",
+                    "groupID": group.groupID,
+                    "runID": group.runID.raw, "effectID": group.effectID.raw,
+                    "members": group.members.map { Self.changeMemberRow($0, includeContent: includeContent) },
+                    "hadExecProposals": group.hadExecProposals,
+                    "hadReadProposals": group.hadReadProposals]
+        case .undoDisposition(let disposition):
+            // M2-D D2: authoritative undo outcome. Paths + per-file results
+            // are structural; the reason and per-file details are operator
+            // prose — content-gated.
+            var row: [String: Any] = ["seq": seq, "kind": "undo-disposition",
+                                      "undoCommandID": disposition.undoCommandID,
+                                      "groupID": disposition.groupID,
+                                      "outcome": disposition.outcome.rawValue,
+                                      "atMillis": disposition.atMillis]
+            var files: [[String: Any]] = []
+            for file in disposition.fileOutcomes {
+                files.append(Self.undoFileRow(file, includeContent: includeContent))
+            }
+            row["files"] = files
+            if includeContent {
+                row["reason"] = disposition.reason
+                row["redacted"] = false
+            } else {
+                row["redacted"] = true
+            }
+            return row
+        case .lineageFork(let fork):
+            // M2-D D2: lineage is identity + a fixed-template divergence
+            // note (no free operator text, no file content) — safe to
+            // project with or without content.
+            return ["seq": seq, "kind": "lineage-fork",
+                    "forkID": fork.forkID,
+                    "parentEpochID": fork.parentEpochID.raw,
+                    "boundaryEpochID": fork.boundary.epochID.raw,
+                    "throughSequence": fork.boundary.throughSequence,
+                    "divergenceNote": fork.divergenceNote,
+                    "atMillis": fork.atMillis]
         case .checkpointCommitted(let epoch):
             var row: [String: Any] = ["seq": seq, "kind": "checkpoint",
                                       "epochID": epoch.epochID.raw,
@@ -217,6 +267,7 @@ public enum SessionExport {
             var row: [String: Any] = ["seq": seq, "kind": "acknowledgedUnresolved",
                                       "subjectSessions": ack.subjectSessions.map(\.raw),
                                       "operationIDs": ack.operationIDs.map(\.raw),
+                                      "queueEntryIDs": ack.queueEntryIDs ?? [],
                                       "atMillis": ack.atMillis]
             if includeContent {
                 row["determination"] = ack.determination
@@ -237,12 +288,49 @@ public enum SessionExport {
                                   "revision": entry.revision,
                                   "targetEpochID": entry.targetEpochID.raw,
                                   "orderKey": entry.orderKey,
-                                  "sealed": entry.sealed]
+                                  "sealed": entry.sealed,
+                                  "attachments": entry.attachments.map { attachmentRow($0, includeContent: includeContent) }]
         if includeContent {
             row["text"] = entry.text
             row["redacted"] = false
         } else {
             row["redacted"] = true
+        }
+        return row
+    }
+
+    /// M2-D D1: attachment manifest projection. Structural identity always
+    /// travels (path, device/inode, size, hash, range, provenance); excerpt
+    /// bytes travel only with --include-content (they are content-bearing).
+    /// No snapshot/route/config keys by construction (see the schema test's
+    /// forbidden vocabulary).
+    private static func attachmentRow(_ snapshot: AttachmentSnapshot, includeContent: Bool) -> [String: Any] {
+        var row: [String: Any] = ["path": snapshot.path,
+                                  "grantedRoot": snapshot.grantedRoot,
+                                  "device": snapshot.device,
+                                  "inode": snapshot.inode,
+                                  "size": snapshot.size,
+                                  "contentHash": snapshot.contentHash,
+                                  "totalLines": snapshot.totalLines,
+                                  "intent": snapshot.intent,
+                                  "captureEpochID": snapshot.captureEpochID.raw,
+                                  "alias": snapshot.routeGrant.alias,
+                                  "locality": snapshot.routeGrant.locality.rawValue,
+                                  "admissionSealed": snapshot.routeGrant.sealed]
+        if let range = snapshot.lineRange {
+            row["lineStart"] = range.start
+            row["lineEnd"] = range.end
+        }
+        switch snapshot.content {
+        case .included(let excerpt, let truncated):
+            row["content"] = "included"
+            row["truncated"] = truncated
+            if includeContent {
+                row["excerpt"] = excerpt
+            }
+        case .metadataOnly(let reason):
+            row["content"] = "metadataOnly"
+            row["reason"] = reason
         }
         return row
     }
@@ -287,7 +375,88 @@ public enum SessionExport {
                 row["redacted"] = true
             }
             return row
+        case .workspaceChangeNotice(let notice):
+            // M2-D D2 (O-3): undo outcome as model context. Paths +
+            // per-file results are structural; the reason is operator
+            // prose — content-gated like every other receipt.
+            var row: [String: Any] = ["seq": seq, "kind": "transcript", "role": "notice",
+                                      "undoCommandID": notice.undoCommandID,
+                                      "groupID": notice.groupID,
+                                      "outcome": notice.outcome.rawValue,
+                                      "hadExecProposals": notice.hadExecProposals]
+        var files: [[String: Any]] = []
+        for file in notice.files {
+            files.append(Self.undoFileRow(file, includeContent: includeContent))
         }
+            row["files"] = files
+            if includeContent {
+                row["reason"] = notice.reason
+                row["redacted"] = false
+            } else {
+                row["redacted"] = true
+            }
+            return row
+        }
+    }
+
+    /// M2-D D2/D3: one settled file-result projection, shared by the
+    /// undo-disposition and workspace-notice rows. The inverse operation
+    /// ID, path, result and hashes are structural; the per-file detail is
+    /// operator prose and travels only with content.
+    private static func undoFileRow(_ file: UndoFileOutcome, includeContent: Bool) -> [String: Any] {
+        var row: [String: Any] = ["operationID": file.inverseID,
+                                  "path": file.path,
+                                  "result": file.result,
+                                  "afterHash": file.afterHash]
+        if let beforeHash = file.beforeHash {
+            row["beforeHash"] = beforeHash
+        }
+        if includeContent {
+            row["detail"] = file.detail
+            row["redacted"] = false
+        } else {
+            row["redacted"] = true
+        }
+        return row
+    }
+
+    /// M2-D D2: one change-group member projection. Hashes, identity,
+    /// modes, flags and paths are structural; the receipt summary is
+    /// free text and travels only with content.
+    private static func changeMemberRow(_ member: ChangeGroupMember, includeContent: Bool) -> [String: Any] {
+        var row: [String: Any] = ["operationID": member.operationID.raw,
+                                  "callID": member.callID,
+                                  "path": member.path,
+                                  "grantedRoot": member.grantedRoot,
+                                  "created": member.created,
+                                  "afterHash": member.afterHash,
+                                  "deviceAfter": member.deviceAfter,
+                                  "inodeAfter": member.inodeAfter,
+                                  "modeAfter": member.modeAfter,
+                                  "emptyOriginal": member.emptyOriginal,
+                                  "receiptStatus": member.receiptStatus]
+        if let beforeHash = member.beforeHash {
+            row["beforeHash"] = beforeHash
+        }
+        if let deviceBefore = member.deviceBefore {
+            row["deviceBefore"] = deviceBefore
+        }
+        if let inodeBefore = member.inodeBefore {
+            row["inodeBefore"] = inodeBefore
+        }
+        if let modeBefore = member.modeBefore {
+            row["modeBefore"] = modeBefore
+        }
+        if let preimageDigest = member.preimageDigest {
+            row["preimageDigest"] = preimageDigest
+        }
+        if includeContent {
+            row["receiptSummary"] = member.receiptSummary
+            row["redacted"] = false
+        } else {
+            row["redacted"] = true
+        }
+        return row
     }
 
     // MARK: - Session stream export (read-only)

@@ -84,10 +84,25 @@ struct SessionExportTests {
             Self.toolResult("ghost/r1", call: "gr", mutating: false, state: .done, outcome: "read it"),
             .queueAdmitted(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .followUp,
                                       state: .queued, revision: 3, text: "fix QUEUED-111",
-                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false)),
+                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false,
+                                      attachments: [AttachmentSnapshot(
+                                        path: "notes/plan.txt", grantedRoot: "workspace",
+                                        device: 11, inode: 22, size: 19,
+                                        contentHash: String(repeating: "b", count: 64),
+                                        lineRange: AttachmentLineRange(start: 1, end: 2),
+                                        totalLines: 2,
+                                        content: .included(excerpt: "line one\nline two\n", truncated: false),
+                                        captureEpochID: EpochID("epoch-1"),
+                                        routeGrant: AttachmentRouteGrant(alias: "local-coder", locality: .local, sealed: false),
+                                        intent: "mention")],
+                                      attachmentConsentEpoch: EpochID("epoch-1"))),
             .queueUpdated(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .followUp,
                                      state: .dispatched, revision: 4, text: "fix QUEUED-111 now",
                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false)),
+            .queueDispatched(QueueDispatchLink(
+                entryID: "q-1", commandID: CommandID("cmd-1"),
+                runID: RunID("r-1"), requestID: RequestID("req-1"),
+                effectID: EffectID("eff-1"), epochID: EpochID("epoch-1"))),
             .eventAppended(seq: SequenceNumber(77), kind: "requesting", digest: "d1e2"),
             .artifactPublished(ArtifactRef(
                 digest: String(repeating: "a", count: 64), size: 4, kind: "exec-output",
@@ -158,11 +173,26 @@ struct SessionExportTests {
             "operationID", "callID", "state", "mutating", "outcome",
             "action", "entryID", "commandID", "queueKind", "state", "revision",
             "targetEpochID", "orderKey", "sealed", "redacted", "text",
+            "attachments", "path", "grantedRoot", "device", "inode", "size",
+            "contentHash", "totalLines", "intent", "captureEpochID", "alias",
+            "locality", "admissionSealed", "lineStart", "lineEnd", "content",
+            "truncated", "excerpt", "reason",
             "role", "tool", "arguments",
             "previousWriterHash", "newWriterHash", "reason", "operatorID",
             "reference", "unresolved",
             "artifactKind", "size", "relativePath", "digest",
             "effectID", "operationIDs", "error", "determination", "subjectSessions",
+        "runID", "requestID", "queueEntryIDs",
+            // M2-D D2: change groups, undo dispositions, lineage forks and
+            // workspace notices (structural IDs + paths travel; free-text
+            // reason/detail/summary only with content).
+            "groupID", "undoCommandID", "forkID", "members", "files",
+            "hadExecProposals", "hadReadProposals", "created",
+            "beforeHash", "afterHash", "deviceBefore", "inodeBefore",
+            "deviceAfter", "inodeAfter", "modeBefore", "modeAfter",
+            "preimageDigest", "emptyOriginal", "receiptStatus", "receiptSummary",
+            "result", "detail", "boundaryEpochID", "throughSequence",
+            "divergenceNote",
             "complete", "recordCount",
             "operations", "completed", "held", "unstarted", "orphaned",
         ]
@@ -663,7 +693,8 @@ struct SessionExportTests {
         let ack = Acknowledgment(
             subjectSessions: [SessionID("s-old")],
             operationIDs: [OperationID("eo/c1")],
-            determination: "manually-reconciled:SECRET-NOTE-777", atMillis: 4242)
+            determination: "manually-reconciled:SECRET-NOTE-777", atMillis: 4242,
+            queueEntryIDs: ["q-9"])
         try store.appendBatch([
             .sessionOpened(session: session, atMillis: 1000),
             .acknowledgedUnresolved(ack),
@@ -680,6 +711,7 @@ struct SessionExportTests {
         // Exact structural identity survives redaction.
         #expect(row["subjectSessions"] as? [String] == ["s-old"])
         #expect(row["operationIDs"] as? [String] == ["eo/c1"])
+        #expect(row["queueEntryIDs"] as? [String] == ["q-9"], "queue unknowns named in the audit")
         #expect(row["atMillis"] as? Int == 4242)
         #expect(row["redacted"] as? Bool == true)
         #expect(row["determination"] == nil, "determination key absent without --include-content")

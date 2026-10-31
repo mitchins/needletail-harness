@@ -61,6 +61,22 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// M2-C C0 (plan REV12 §3.4b.1): the injected identity resolver.
     private let execResolver: (any ExecIdentityResolver)?
 
+    /// M2-D D1: the composed attachment validator (Runtime filesystem
+    /// validator in production; scripted/temp-fs in tests). Nil means
+    /// uncomposed: validation requests stamp empty observations and the
+    /// transition holds fail-closed.
+    private let attachmentValidator: (any AttachmentValidator)?
+    /// M2-D D2: the composed undo file validator (Runtime filesystem
+    /// validator in production; scripted in tests). Nil means uncomposed:
+    /// validation requests stamp empty observations and preflight refuses
+    /// fail-closed.
+    private let undoValidator: (any UndoFileValidator)?
+    /// M2-D D2: the composed inverse applier (Runtime filesystem applier
+    /// in production; scripted/fault-injecting in tests). Nil means
+    /// uncomposed: apply requests stamp a failed outcome (nothing ran)
+    /// and the transition records the failure without mutating.
+    private let inverseApplier: (any UndoInverseApplier)?
+
     /// Throws when the fencing claim cannot be established: constructing a
     /// live writer against a session held by a DIFFERENT writer is a loud
     /// failure, never a silently unfenced actor.
@@ -68,7 +84,10 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         state: SessionState, ids: IDs, clock: ClockType,
         transport: Transport, executor: Executor, store: Store, approvals: Approvals,
         sink: any UISink = NoopUISink(), writer: String,
-        execResolver resolver: (any ExecIdentityResolver)? = nil
+        execResolver resolver: (any ExecIdentityResolver)? = nil,
+        attachmentValidator: (any AttachmentValidator)? = nil,
+        undoValidator: (any UndoFileValidator)? = nil,
+        inverseApplier: (any UndoInverseApplier)? = nil
     ) throws {
         self.state = state
         self.ids = ids
@@ -80,6 +99,9 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         self.sink = sink
         self.writer = writer
         self.execResolver = resolver
+        self.attachmentValidator = attachmentValidator
+        self.undoValidator = undoValidator
+        self.inverseApplier = inverseApplier
         // A2 fencing: this live actor instance establishes its writer
         // identity BEFORE any durable mutation. Idempotent for a same-
         // identity restart; a competing live writer fails here, loudly —
@@ -112,6 +134,98 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             sealed: sealed, atMillis: clock.nowMillis()))
     }
 
+    /// M2-D D1: operator input carrying authorized attachment snapshots
+    /// (captured by Runtime before stamping — the actor never reads files).
+    public func submitTextWithAttachments(commandID: CommandID, text: String, kind: QueueKind, sealed: Bool, attachments: [AttachmentSnapshot]) async {
+        await apply(.operatorInputAttachments(
+            commandID: commandID, text: text, kind: kind,
+            sealed: sealed, attachments: attachments, atMillis: clock.nowMillis()))
+    }
+
+    /// M2-D D1: explicit operator replacement of an entry's snapshots.
+    public func replaceEntryAttachments(entryID: String, snapshots: [AttachmentSnapshot]) async {
+        await apply(.queueAttachmentReplace(entryID: entryID, snapshots: snapshots, atMillis: clock.nowMillis()))
+    }
+
+    /// M2-D D2: explicit undo preview (dry run — performs no mutation).
+    /// The driver reconciles the group from the durable log; preimage
+    /// availability travels alongside (digest → available).
+    public func previewUndo(group: ChangeGroup, preimagesAvailable: [String: Bool]) async {
+        await apply(.undoPreview(group: group, preimagesAvailable: preimagesAvailable, atMillis: clock.nowMillis()))
+    }
+
+    /// M2-D D2: explicit undo run under a stable command ID (O-2).
+    /// The ID is minted here from the actor's sequence counter (stable,
+    /// resume-safe: reopen advances the counter past every durable
+    /// sequence) and returned so the driver can correlate the disposition
+    /// — and so a retry can resubmit the SAME command ID, which returns
+    /// the recorded disposition instead of a second inverse.
+    /// Duplicates return the recorded disposition, never a second inverse.
+    public func runUndo(group: ChangeGroup, preimagesAvailable: [String: Bool]) async -> String {
+        let commandID = "undo-\(ids.nextSequence().value)"
+        await apply(.undoRun(undoCommandID: commandID, group: group, preimagesAvailable: preimagesAvailable, atMillis: clock.nowMillis()))
+        return commandID
+    }
+
+    /// M2-D D2: driver-stamped recovery for a journal whose inverses are
+    /// all settled but whose disposition was never committed. Outcomes
+    /// come reconciled from the durable log.
+    public func finalizeUndo(undoCommandID: String, group: ChangeGroup, fileOutcomes: [UndoFileOutcome]) async {
+        await apply(.undoFinalize(undoCommandID: undoCommandID, group: group, fileOutcomes: fileOutcomes, atMillis: clock.nowMillis()))
+    }
+
+    /// M2-D D2: crash-boundary-5 recovery sweep (Major 2). Pages the
+    /// session's durable log, finds settled-but-undispositioned journals
+    /// (`pendingUndoFinalizations`), and stamps one `undoFinalize` per
+    /// journal — each committing disposition + notice atomically, each
+    /// idempotent against an existing disposition.
+    ///
+    /// Returns which journals recovered and which did not. A journal lands
+    /// in `unrecovered` when the finalize is refused (e.g. the session is
+    /// not quiescent because an unrelated unknown holds it) — the caller
+    /// distinguishes that from "nothing pending" and must NOT advance a
+    /// provider continuation past an unrecovered journal whose notice is
+    /// still unpublished. Store read failures throw (same rule: never
+    /// advance startup on a recovery failure).
+    ///
+    /// The production run startup calls this after `resumeSession` and
+    /// before any provider continuation, so a recovered notice always
+    /// precedes the next model request (STATE-05). Unknown-result journals
+    /// are never finalized here (they need reconciliation, not a
+    /// disposition); they keep holding the queue.
+    public func recoverUndoJournal() async throws -> UndoRecoveryReport {
+        var cursor: UInt64 = 0
+        var stream: [DurableRecord] = []
+        while true {
+            let (page, next) = try store.records(session: state.sessionID, since: cursor, limit: 500)
+            for rec in page {
+                stream.append(rec.record)
+            }
+            guard let advanced = next else { break }
+            cursor = advanced
+        }
+        let pending = pendingUndoFinalizations(stream)
+        var recovered: [UndoDispositionRecord] = []
+        var unrecovered: [PendingUndoFinalize] = []
+        for item in pending {
+            await apply(.undoFinalize(
+                undoCommandID: item.undoCommandID, group: item.group,
+                fileOutcomes: item.fileOutcomes, atMillis: clock.nowMillis()))
+            if let disposition = state.undoDispositions.first(where: { $0.undoCommandID == item.undoCommandID }) {
+                recovered.append(disposition)
+            } else {
+                unrecovered.append(item)
+            }
+        }
+        return UndoRecoveryReport(recovered: recovered, unrecovered: unrecovered)
+    }
+
+    /// M2-D D2: rewind lineage fork request (record only — no file
+    /// mutation, no branch switch).
+    public func requestLineageFork(boundary: LineageBoundary) async {
+        await apply(.lineageForkRequest(boundary: boundary, atMillis: clock.nowMillis()))
+    }
+
     public func editEntry(entryID: String, newText: String, baseRevision: UInt64) async {
         await apply(.queueEdit(entryID: entryID, newText: newText, baseRevision: baseRevision, atMillis: clock.nowMillis()))
     }
@@ -122,6 +236,22 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
 
     public func resumeQueue() async {
         await apply(.queueResume(atMillis: clock.nowMillis()))
+    }
+
+    public func retargetQueueEntry(entryID: String) async {
+        await apply(.queueRetarget(entryID: entryID, atMillis: clock.nowMillis()))
+    }
+
+    public func reconcileQueue(entryID: String) async {
+        await apply(.queueReconcile(entryID: entryID, atMillis: clock.nowMillis()))
+    }
+
+    /// M2-D D3: explicit operator reconciliation of one unknown mutating
+    /// operation. Records the determination and discharges the recovery
+    /// marker (never a silent drop, never a retry). Unknown deliveries
+    /// are out of scope — reconcile those via `reconcileQueue`.
+    public func acknowledgeUnknown(operationID: OperationID, determination: String) async {
+        await apply(.acknowledgeUnknown(operationID: operationID, determination: determination, atMillis: clock.nowMillis()))
     }
 
     public func cancel() async {
@@ -373,6 +503,34 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             await apply(.execIdentitiesResolved(
                 resolutionID: resolutionID, runID: run.runID, generation: run.revision,
                 identities: identities, atMillis: clock.nowMillis()))
+        case .validateAttachments(let entryID, let snapshots):
+            // M2-D D1: freshness evidence is gathered by the composed
+            // validator (filesystem I/O the pure transition cannot do) and
+            // stamped onto the result event. Uncomposed validator (nil) or
+            // an empty reply stamps empty observations — the transition
+            // holds fail-closed on missing evidence.
+            let observations = await attachmentValidator?.validate(entryID: entryID, snapshots: snapshots) ?? []
+            await apply(.attachmentValidationResult(
+                entryID: entryID, requested: snapshots,
+                observations: observations, atMillis: clock.nowMillis()))
+        case .validateUndo(let undoCommandID, let isPreview, let members):
+            // M2-D D2: current-file evidence for an undo preview or run.
+            // Nil validator stamps empty observations — preflight refuses
+            // fail-closed on missing evidence.
+            let observations = await undoValidator?.validate(members: members) ?? []
+            await apply(.undoValidationResult(
+                undoCommandID: undoCommandID, isPreview: isPreview, requested: members,
+                observations: observations, atMillis: clock.nowMillis()))
+        case .applyInverse(let undoCommandID, let inverse):
+            // M2-D D2: exactly one filesystem inverse, performed by the
+            // composed applier with commit-time revalidation. Nil applier
+            // stamps a clean failure (nothing ran) — the transition
+            // records it without mutating.
+            let outcome = await inverseApplier?.apply(inverse)
+                ?? .failed(error: "no inverse applier composed", possiblyMutated: false)
+            await apply(.inverseCompleted(
+                undoCommandID: undoCommandID, inverseID: inverse.inverseID,
+                outcome: outcome, atMillis: clock.nowMillis()))
         case .cancelInFlight:
             inFlight?.cancel()
         case .startTimer(let deadlineMillis, let purpose, let runID):

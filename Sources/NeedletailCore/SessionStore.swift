@@ -12,6 +12,21 @@ public enum DurableRecord: Sendable, Equatable, Codable {
     case operationResult(OperationRef, outcome: String)
     case queueAdmitted(QueueEntry)
     case queueUpdated(QueueEntry)
+    /// M2-D D0: dispatch linkage (see QueueDispatchLink). Committed
+    /// atomically with the dispatch group (history admission + intent +
+    /// transcript); replay joins it against run-completion events.
+    case queueDispatched(QueueDispatchLink)
+    /// M2-D D2: one ordered native change group per applicable tool batch
+    /// (see ChangeGroup). Committed atomically with the batch's operation
+    /// results — only proven-done native mutations become members.
+    case changeGroup(ChangeGroup)
+    /// M2-D D2: authoritative final disposition of one undo command (see
+    /// UndoDispositionRecord, O-2). Committed atomically with the
+    /// workspace notice; never removed (duplicates return this).
+    case undoDisposition(UndoDispositionRecord)
+    /// M2-D D2: rewind lineage fork (see LineageFork). Record only — no
+    /// file mutation, no branch switch, no history rewrite.
+    case lineageFork(LineageFork)
     case checkpointCommitted(EpochDescriptor)
     /// Authoritative conversation element (M1-D transcript, ARCH §1).
     case transcriptAppended(TranscriptEntry)
@@ -210,13 +225,18 @@ public struct CancelledPendingError: Sendable, Equatable, Codable {
 public struct Acknowledgment: Sendable, Equatable, Codable {
     public let subjectSessions: [SessionID]
     public let operationIDs: [OperationID]
+    /// M2-D D0: queued dispatches covered by this decision (entry IDs of
+    /// held-unknown deliveries). Optional so pre-D0 rows (no key) still
+    /// decode; new rows always write it (possibly empty).
+    public let queueEntryIDs: [String]?
     public let determination: String
     public let atMillis: UInt64
-    public init(subjectSessions: [SessionID], operationIDs: [OperationID], determination: String, atMillis: UInt64) {
+    public init(subjectSessions: [SessionID], operationIDs: [OperationID], determination: String, atMillis: UInt64, queueEntryIDs: [String]? = nil) {
         self.subjectSessions = subjectSessions
         self.operationIDs = operationIDs
         self.determination = determination
         self.atMillis = atMillis
+        self.queueEntryIDs = queueEntryIDs
     }
 }
 

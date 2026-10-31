@@ -12,6 +12,65 @@ public enum SessionEvent: Sendable, Equatable {
     case queueEdit(entryID: String, newText: String, baseRevision: UInt64, atMillis: UInt64)
     case queueWithdraw(entryID: String, atMillis: UInt64)
     case queueResume(atMillis: UInt64)
+    /// M2-D D0: retarget a stale-epoch entry to the current epoch (with
+    /// route/consent re-validation). Recorded; the hold is NOT released —
+    /// resume (or reconcile, for unknown deliveries) releases separately.
+    case queueRetarget(entryID: String, atMillis: UInt64)
+    /// M2-D D0: explicit operator reconciliation of a held-unknown
+    /// delivery (requeue for redispatch, or withdraw to drop). Recorded;
+    /// never automatic, never a non-delivery proof.
+    case queueReconcile(entryID: String, atMillis: UInt64)
+    /// M2-D D3: explicit operator reconciliation of one unknown mutating
+    /// operation (cancel-ambiguous, inverse-ambiguous, or otherwise
+    /// unknowable). The operator accepts the stated determination and the
+    /// CURRENT session's marker is discharged — never silently dropped,
+    /// never auto-retried, never converted to success. The acknowledgment
+    /// is durable, but per the D0 F2B-5 contract it does not convert
+    /// uncertainty: every reopen re-derives holds from the journal, so a
+    /// fresh explicit acceptance is required per boot. Unknown DELIVERIES
+    /// (heldUnknown queue entries) are NOT covered — reconcile those via
+    /// queueReconcile.
+    case acknowledgeUnknown(operationID: OperationID, determination: String, atMillis: UInt64)
+    /// M2-D D1: operator input carrying authorized attachment snapshots
+    /// (captured by Runtime BEFORE stamping; the transition never parses
+    /// `@` text into snapshots). Mirrors operatorInput routing: fresh run
+    /// when idle (capture-fresh, no dwell), queued otherwise. Sealed
+    /// submissions carrying snapshots are refused at admission.
+    case operatorInputAttachments(commandID: CommandID, text: String, kind: QueueKind, sealed: Bool, attachments: [AttachmentSnapshot], atMillis: UInt64)
+    /// M2-D D1: freshness evidence for the snapshots validation was
+    /// requested for (`requested`), gathered by the composed validator.
+    /// Event-scoped: never stored, never replayed.
+    case attachmentValidationResult(entryID: String, requested: [AttachmentSnapshot], observations: [AttachmentObservation], atMillis: UInt64)
+    /// M2-D D1: explicit operator replacement of an entry's snapshots
+    /// (the fix path for stale holds — never automatic, never silent).
+    /// Preserves entry state; resume releases separately.
+    case queueAttachmentReplace(entryID: String, snapshots: [AttachmentSnapshot], atMillis: UInt64)
+    /// M2-D D2: explicit undo preview (dry run — performs no mutation).
+    /// The driver reconciles the group from the durable log and attaches
+    /// preimage availability; the transition runs pure preflight against
+    /// validator evidence and reports eligibility.
+    case undoPreview(group: ChangeGroup, preimagesAvailable: [String: Bool], atMillis: UInt64)
+    /// M2-D D2: explicit undo run. `undoCommandID` is the stable O-2
+    /// command key (`undo-<seq>`); duplicates return the recorded
+    /// disposition, never a second inverse.
+    case undoRun(undoCommandID: String, group: ChangeGroup, preimagesAvailable: [String: Bool], atMillis: UInt64)
+    /// M2-D D2: validator evidence for a preview or run (event-scoped,
+    /// never stored). The actor echoes the request context so the
+    /// transition can bind evidence to the pending undo.
+    case undoValidationResult(undoCommandID: String, isPreview: Bool, requested: [UndoValidationNeed], observations: [UndoFileObservation], atMillis: UInt64)
+    /// M2-D D2: one inverse's settled outcome from the applier. The
+    /// transition commits the durable inverse result and advances the
+    /// chain (or halts it on unknown).
+    case inverseCompleted(undoCommandID: String, inverseID: String, outcome: UndoInverseOutcome, atMillis: UInt64)
+    /// M2-D D2: driver-stamped recovery for a journal whose inverses are
+    /// all settled but whose disposition was never committed (crash
+    /// between last result and disposition). Outcomes come reconciled
+    /// from the durable log; the transition commits disposition + notice
+    /// atomically (idempotent — an existing disposition wins).
+    case undoFinalize(undoCommandID: String, group: ChangeGroup, fileOutcomes: [UndoFileOutcome], atMillis: UInt64)
+    /// M2-D D2: rewind lineage fork request (record only). The boundary
+    /// must lie in the past of the live epoch; nothing is mutated.
+    case lineageForkRequest(boundary: LineageBoundary, atMillis: UInt64)
     case approvalGrant(requestID: RequestID, generation: Revision, atMillis: UInt64)
     case approvalDeny(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
     case approvalUnavailable(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
