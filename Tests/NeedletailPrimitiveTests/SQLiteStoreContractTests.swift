@@ -24,6 +24,10 @@ private struct TranscriptPayload: Codable {
             self.init(kind: "toolCall", callID: call.callID, tool: call.tool, arguments: call.arguments)
         case .toolResponse(let callID, let text):
             self.init(kind: "toolResponse", text: text, callID: callID)
+        case .workspaceChangeNotice(let notice):
+            // M2-D D2: notices are structural (IDs + paths + results); the
+            // probe carries the stable projection, never free text.
+            self.init(kind: "notice", text: notice.undoCommandID, callID: notice.groupID, tool: notice.outcome.rawValue)
         }
     }
 

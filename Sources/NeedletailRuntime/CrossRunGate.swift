@@ -16,23 +16,31 @@ public struct CrossSessionHold: Sendable, Equatable {
     /// The dirty session.
     public let session: SessionID
     /// Unknown-state refs seeding the hold: explicit unknowns, unmatched
-    /// mutating intents (synthesized unknown refs), held orphans, and
-    /// unsuperseded cancelled-pending markers.
+    /// mutating intents, held orphans, and unsuperseded cancelled-pending
+    /// markers.
     public let heldOperations: [OperationRef]
     /// Subset view: intent-only crashes on mutating operations.
     public let unmatchedMutating: [OperationRef]
     /// `heldOperations` operation IDs, first-seen order, deduped — the
     /// audit subject list recorded on acknowledgment.
     public let operationIDs: [OperationID]
+    /// M2-D D0: queued entries with dispatch linkage but no run
+    /// completion (possible in-flight provider delivery). A new mutating
+    /// run must not proceed until the owning session reconciles them —
+    /// never auto-resent, never silently dropped. Never-sent queued
+    /// entries do NOT hold: nothing was sent, so nothing is uncertain.
+    public let unknownQueueDeliveries: [QueueDispatchLink]
 
     public init(
         session: SessionID, heldOperations: [OperationRef],
-        unmatchedMutating: [OperationRef], operationIDs: [OperationID]
+        unmatchedMutating: [OperationRef], operationIDs: [OperationID],
+        unknownQueueDeliveries: [QueueDispatchLink] = []
     ) {
         self.session = session
         self.heldOperations = heldOperations
         self.unmatchedMutating = unmatchedMutating
         self.operationIDs = operationIDs
+        self.unknownQueueDeliveries = unknownQueueDeliveries
     }
 }
 
@@ -63,7 +71,14 @@ public enum CrossRunGate {
                 cursor = advanced
             }
             let report = try reconcileOperations(stream)
-            guard !report.heldOperations.isEmpty || !report.unmatchedMutating.isEmpty else {
+            // M2-D D0: queued dispatches with linkage but no run
+            // completion hold too (possible in-flight provider delivery).
+            // Never-sent queued entries do not hold (nothing sent, nothing
+            // uncertain) — see reconcileQueue.
+            let queueRecon = try reconcileQueue(stream)
+            guard !report.heldOperations.isEmpty || !report.unmatchedMutating.isEmpty
+                || !queueRecon.unknownLinks.isEmpty
+            else {
                 continue
             }
             var seen = Set<OperationID>()
@@ -73,7 +88,8 @@ public enum CrossRunGate {
             }
             holds.append(CrossSessionHold(
                 session: session, heldOperations: report.heldOperations,
-                unmatchedMutating: report.unmatchedMutating, operationIDs: opIDs))
+                unmatchedMutating: report.unmatchedMutating, operationIDs: opIDs,
+                unknownQueueDeliveries: queueRecon.unknownLinks))
         }
         return holds
     }

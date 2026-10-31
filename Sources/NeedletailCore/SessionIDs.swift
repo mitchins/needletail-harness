@@ -85,6 +85,11 @@ public protocol IDSource: Sendable {
     mutating func nextEpochID() -> EpochID
     mutating func nextOperationID() -> OperationID
     mutating func nextSequence() -> SequenceNumber
+    /// M2-D D0: advance the sequence counter past a durable high-water
+    /// mark (reopen replay). A resumed session must never mint IDs its
+    /// own log already contains — duplicate queue admissions fail the
+    /// reconcile closed. No-op when already past the mark.
+    mutating func advance(past watermark: UInt64)
 }
 
 /// Production source (UUID-backed). Randomness never leaks into state
@@ -100,6 +105,9 @@ public struct RandomIDSource: IDSource, Sendable {
     public mutating func nextSequence() -> SequenceNumber {
         sequence += 1
         return SequenceNumber(sequence)
+    }
+    public mutating func advance(past watermark: UInt64) {
+        if sequence < watermark { sequence = watermark }
     }
 }
 
@@ -124,6 +132,9 @@ public struct DeterministicIDSource: IDSource, Sendable {
     public mutating func nextSequence() -> SequenceNumber {
         counter += 1
         return SequenceNumber(counter)
+    }
+    public mutating func advance(past watermark: UInt64) {
+        if counter < watermark { counter = watermark }
     }
 }
 

@@ -727,6 +727,10 @@ struct RunCommand: ParsableCommand {
             if !holds.isEmpty {
                 let namedSessions = holds.map(\.session.raw).sorted().map { terminalSafe($0) }.joined(separator: ", ")
                 let heldOpCount = holds.reduce(0) { $0 + $1.operationIDs.count }
+                // M2-D D0: queued dispatches with linkage but no run
+                // completion hold like unresolved operations (possible
+                // in-flight provider delivery — never auto-resent).
+                let heldQueueCount = holds.reduce(0) { $0 + $1.unknownQueueDeliveries.count }
                 // B5-C read-only carve-out: the gate protects MUTATING
                 // execution. A run that cannot mutate (read/search/consult
                 // only, exec denied — enforced by caps at admission AND by
@@ -736,18 +740,20 @@ struct RunCommand: ParsableCommand {
                 let runMayMutate = effective.tools.edit || effective.tools.write
                     || effective.tools.exec != .denied
                 if !runMayMutate {
-                    eprint("note: proceeding read-only with \(heldOpCount) unresolved operation(s) in session(s) \(namedSessions) (history preserved for future mutating runs)")
-                } else if let determination = acknowledgedDetermination {
+                    eprint("note: proceeding read-only with \(heldOpCount) unresolved operation(s) and \(heldQueueCount) uncompleted queued dispatch(es) in session(s) \(namedSessions) (history preserved for future mutating runs)")
+                } else                 if let determination = acknowledgedDetermination {
                     // The RECORD is the decision — the flag alone authorizes
                     // nothing. Append under this run's fenced writer
                     // identity AFTER claim + sessionOpened, verify
                     // persistence, and only then permit dispatch. Original
-                    // unresolved markers are preserved untouched.
+                    // unresolved markers are preserved untouched. Queue
+                    // unknowns are named by entry so the audit covers them.
                     let acknowledgment = Acknowledgment(
                         subjectSessions: holds.map(\.session),
                         operationIDs: holds.flatMap(\.operationIDs),
                         determination: determination,
-                        atMillis: SystemClock().nowMillis())
+                        atMillis: SystemClock().nowMillis(),
+                        queueEntryIDs: holds.flatMap(\.unknownQueueDeliveries).map(\.entryID))
                     do {
                         try CrossRunGate.appendAcknowledgment(
                             store: production, as: runIdentity,
@@ -758,7 +764,7 @@ struct RunCommand: ParsableCommand {
                         eprint("store error: cannot record acknowledgment: \(terminalSafe(String(describing: error)))")
                         throw ExitCode(6)
                     }
-                    eprint("acknowledged \(heldOpCount) unresolved operation(s) in session(s) \(namedSessions) as '\(terminalSafe(determination))' (recorded in session \(state.sessionID.raw); history preserved)")
+                    eprint("acknowledged \(heldOpCount) unresolved operation(s) and \(heldQueueCount) uncompleted queued dispatch(es) in session(s) \(namedSessions) as '\(terminalSafe(determination))' (recorded in session \(state.sessionID.raw); history preserved)")
                 } else {
                     // This gate IS a non-interactive approval check (same
                     // code as approval-required): the invocation is
@@ -766,7 +772,7 @@ struct RunCommand: ParsableCommand {
                     // only the explicit flag. NOT exit 4 (no run/ambiguous
                     // delivery occurred) and NOT exit 6 (the ledgers are
                     // readable; their outcomes are unknown, not corrupt).
-                    eprint("blocked: unresolved mutating outcomes in session(s) \(namedSessions) (\(heldOpCount) operation(s)) — an explicit operator decision is required before mutating work. Inspect with `needletail session export SESSION --output FILE`, then re-run with --acknowledge-unresolved-outcomes 'operator-accepted-risk' (or 'manually-reconciled:<note>').")
+                    eprint("blocked: unresolved mutating outcomes (\(heldOpCount) operation(s)) and uncompleted queued dispatches (\(heldQueueCount)) in session(s) \(namedSessions) — an explicit operator decision is required before mutating work. Inspect with `needletail session export SESSION --output FILE`, then re-run with --acknowledge-unresolved-outcomes 'operator-accepted-risk' (or 'manually-reconciled:<note>').")
                     throw ExitCode(3)
                 }
             }

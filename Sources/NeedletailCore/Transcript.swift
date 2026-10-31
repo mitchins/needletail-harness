@@ -12,6 +12,10 @@ public enum TranscriptEntry: Sendable, Equatable, Codable {
     case assistantText(String)
     case toolCall(NativeToolCall)
     case toolResponse(callID: String, text: String)
+    /// M2-D D2: model-visible workspace-change notice (see
+    /// WorkspaceChangeNotice, O-3). Committed atomically with the undo
+    /// disposition it reports — a notice never precedes its results.
+    case workspaceChangeNotice(WorkspaceChangeNotice)
 }
 
 public enum TranscriptError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -55,6 +59,13 @@ public func transcriptMessages(_ records: [SequencedRecord]) throws -> [ChatMess
         case .toolResponse(let callID, let text):
             flushAssistant()
             messages.append(ChatMessage(role: .tool, text: text, toolCallID: callID))
+        case .workspaceChangeNotice(let notice):
+            // O-3: the notice is model context, not user or tool text — an
+            // assistant-role message carrying the bounded rendered notice.
+            // It is committed with the disposition, so replay carries it
+            // exactly once and it always precedes the next provider request.
+            flushAssistant()
+            messages.append(ChatMessage(role: .assistant, text: renderWorkspaceNotice(notice)))
         }
     }
     flushAssistant()

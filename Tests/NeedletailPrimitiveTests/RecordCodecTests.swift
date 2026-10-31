@@ -63,6 +63,10 @@ struct RecordCodecTests {
             .queueUpdated(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .steer,
                                      state: .dispatched, revision: 4, text: "fix the bug NOW",
                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false)),
+            .queueDispatched(QueueDispatchLink(
+                entryID: "q-1", commandID: CommandID("cmd-1"),
+                runID: RunID("r-1"), requestID: RequestID("req-1"),
+                effectID: EffectID("eff-1"), epochID: EpochID("epoch-1"))),
             .checkpointCommitted(try epoch(id: "epoch-3", parent: EpochID("epoch-1"),
                                            route: .allowed(endpoint: "http://127.0.0.1:11434/v1", alias: "local-coder"))),
             .transcriptAppended(.assistantText("covered here too, not only in the sibling test")),
@@ -78,6 +82,32 @@ struct RecordCodecTests {
             .cancelledPendingMarker(OperationRef(operationID: opID, callID: "call-1", state: .unknown, mutating: true), outcome: "cancelled: pending"),
             .cancelledPendingError(CancelledPendingError(effectID: EffectID("eff-1"), operationIDs: [opID], error: "cancelled", atMillis: 8000)),
             .acknowledgedUnresolved(Acknowledgment(subjectSessions: [SessionID("s-1")], operationIDs: [opID], determination: "operator-accepted-risk", atMillis: 9000)),
+            .changeGroup(ChangeGroup(
+                groupID: "chg-1", runID: RunID("r-1"), effectID: EffectID("eff-1"),
+                members: [ChangeGroupMember(
+                    operationID: opID, callID: "call-1", path: "notes/plan.txt",
+                    grantedRoot: "/tmp/ws", created: false,
+                    beforeHash: String(repeating: "b", count: 64),
+                    afterHash: String(repeating: "a", count: 64),
+                    deviceBefore: 11, inodeBefore: 22, modeBefore: "644",
+                    preimageDigest: String(repeating: "b", count: 64), emptyOriginal: false,
+                    deviceAfter: 11, inodeAfter: 23, modeAfter: "644",
+                    receiptStatus: "success", receiptSummary: "edited notes/plan.txt")],
+                hadExecProposals: false, hadReadProposals: true)),
+            .undoDisposition(UndoDispositionRecord(
+                undoCommandID: "undo-1", groupID: "chg-1",
+                outcome: .completed,
+                fileOutcomes: [UndoFileOutcome(
+                    inverseID: "undo/undo-1/chg-1/\(opID.raw)", path: "notes/plan.txt",
+                    result: "applied", detail: "restored notes/plan.txt",
+                    beforeHash: String(repeating: "b", count: 64),
+                    afterHash: String(repeating: "a", count: 64))],
+                reason: "all 1 inverse(s) applied", atMillis: 9500)),
+            .lineageFork(LineageFork(
+                forkID: "fork-1", sessionID: SessionID("s-1"),
+                parentEpochID: EpochID("epoch-1"),
+                boundary: LineageBoundary(epochID: EpochID("epoch-1"), throughSequence: 7),
+                divergenceNote: "history preserved; workspace NOT restored", atMillis: 9600)),
         ]
     }
 
@@ -92,6 +122,7 @@ struct RecordCodecTests {
         case .operationResult: return "operationResult"
         case .queueAdmitted: return "queueAdmitted"
         case .queueUpdated: return "queueUpdated"
+        case .queueDispatched: return "queueDispatched"
         case .checkpointCommitted: return "checkpointCommitted"
         case .transcriptAppended: return "transcriptAppended"
         case .writerRecovered: return "writerRecovered"
@@ -99,15 +130,18 @@ struct RecordCodecTests {
         case .cancelledPendingMarker: return "cancelledPendingMarker"
         case .cancelledPendingError: return "cancelledPendingError"
         case .acknowledgedUnresolved: return "acknowledgedUnresolved"
+        case .changeGroup: return "changeGroup"
+        case .undoDisposition: return "undoDisposition"
+        case .lineageFork: return "lineageFork"
         }
     }
 
     private static let expectedCaseNames: Set<String> = [
         "sessionOpened", "epochOpened", "eventAppended", "operationIntent",
-        "operationResult", "queueAdmitted", "queueUpdated",
+        "operationResult", "queueAdmitted", "queueUpdated", "queueDispatched",
         "checkpointCommitted", "transcriptAppended", "writerRecovered",
         "artifactPublished", "cancelledPendingMarker", "cancelledPendingError",
-        "acknowledgedUnresolved",
+        "acknowledgedUnresolved", "changeGroup", "undoDisposition", "lineageFork",
     ]
 
     /// The transcript shapes ride DurableRecord.transcriptAppended; every
@@ -119,6 +153,14 @@ struct RecordCodecTests {
             .assistantText("hi there"),
             .toolCall(NativeToolCall(callID: "c-1", tool: "read", arguments: #"{"path":"f"}"#)),
             .toolResponse(callID: "c-1", text: "file body"),
+            .workspaceChangeNotice(WorkspaceChangeNotice(
+                undoCommandID: "undo-1", groupID: "chg-1", outcome: .completed,
+                files: [UndoFileOutcome(
+                    inverseID: "undo/undo-1/chg-1/op-1", path: "notes/plan.txt",
+                    result: "applied", detail: "restored",
+                    beforeHash: String(repeating: "b", count: 64),
+                    afterHash: String(repeating: "a", count: 64))],
+                hadExecProposals: false, reason: "all 1 inverse(s) applied")),
         ]
     }
 
@@ -137,7 +179,7 @@ struct RecordCodecTests {
         // The table must have exercised every case exactly by name; a new
         // case without a fixture fails here even before the build break.
         #expect(covered == Self.expectedCaseNames,
-                "fixture table must cover all fourteen cases, covered=\(covered.sorted())")
+                "fixture table must cover all eighteen cases, covered=\(covered.sorted())")
     }
 
     @Test("record codec round-trips every TranscriptEntry case losslessly")
@@ -226,6 +268,119 @@ struct RecordCodecTests {
         // Truncated / non-JSON garbage must throw .integrity, never a value.
         assertIntegrityFailure(data.prefix(data.count / 2))
         assertIntegrityFailure(Data("not json".utf8))
+    }
+
+    @Test("pre-D0 acknowledgment rows without queueEntryIDs still decode")
+    func decodeLegacyAcknowledgmentWithoutQueueEntryIDs() throws {
+        // Backward compatibility: synthesized Codable omits nil optionals,
+        // so a pre-D0 row (no such key) is byte-identical to a new row
+        // with nil queueEntryIDs — decoding either must yield nil.
+        let ack = Acknowledgment(
+            subjectSessions: [SessionID("s-old")],
+            operationIDs: [OperationID("eo/c1")],
+            determination: "operator-accepted-risk", atMillis: 4242)
+        let full = String(decoding: try RecordCodec.encode(.acknowledgedUnresolved(ack)), as: UTF8.self)
+        #expect(!full.contains("queueEntryIDs"), "nil queueEntryIDs writes no key — old and new rows match")
+        let decoded = try RecordCodec.decode(Data(full.utf8))
+        #expect(decoded == .acknowledgedUnresolved(ack), "nil round-trips losslessly")
+        // Non-nil values round-trip with the key present.
+        let withQ = Acknowledgment(
+            subjectSessions: [SessionID("s-old")],
+            operationIDs: [OperationID("eo/c1")],
+            determination: "operator-accepted-risk", atMillis: 4242,
+            queueEntryIDs: ["q-9"])
+        let back = try RecordCodec.decode(try RecordCodec.encode(.acknowledgedUnresolved(withQ)))
+        #expect(back == .acknowledgedUnresolved(withQ), "queue entry IDs round-trip")
+    }
+
+    @Test("pre-D1 queue rows without attachment keys still decode")
+    func decodeLegacyQueueEntryWithoutAttachments() throws {
+        // Backward compatibility: a D0-era row (no `attachments` /
+        // `attachmentConsentEpoch` keys — stripped here to simulate the
+        // old writer) decodes with empty snapshots and nil consent; new
+        // rows round-trip with snapshots preserved.
+        let bare = QueueEntry(
+            entryID: "q-old", commandID: CommandID("cmd-old"), kind: .followUp,
+            state: .queued, revision: 1, text: "old text",
+            targetEpochID: EpochID("epoch-1"), orderKey: 7, sealed: false)
+        let encoded = try RecordCodec.encode(.queueAdmitted(bare))
+        var outer = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        // The associated-value wrapper nests the entry one level deeper.
+        func strip(_ dict: [String: Any]) -> [String: Any] {
+            var dict = dict
+            dict.removeValue(forKey: "attachments")
+            dict.removeValue(forKey: "attachmentConsentEpoch")
+            for (key, value) in dict {
+                if let nested = value as? [String: Any] {
+                    dict[key] = strip(nested)
+                }
+            }
+            return dict
+        }
+        outer["queueAdmitted"] = strip(try #require(outer["queueAdmitted"] as? [String: Any]))
+        let legacy = try JSONSerialization.data(withJSONObject: outer, options: [.sortedKeys])
+        let decoded = try RecordCodec.decode(legacy)
+        guard case .queueAdmitted(let entry) = decoded else {
+            Issue.record("legacy row must decode as queueAdmitted"); return
+        }
+        #expect(entry.attachments.isEmpty, "missing key defaults to no snapshots")
+        #expect(entry.attachmentConsentEpoch == nil, "missing key defaults to no consent")
+        #expect(entry.text == "old text", "other fields intact")
+        // Snapshot-bearing rows round-trip exactly.
+        let snap = AttachmentSnapshot(
+            path: "n.txt", grantedRoot: "workspace", device: 1, inode: 2,
+            size: 3, contentHash: "h", lineRange: AttachmentLineRange(start: 1, end: 1),
+            totalLines: 1, content: .included(excerpt: "x\n", truncated: false),
+            captureEpochID: EpochID("epoch-1"),
+            routeGrant: AttachmentRouteGrant(alias: "a", locality: .local, sealed: false),
+            intent: "mention")
+        let fresh = QueueEntry(
+            entryID: "q-new", commandID: CommandID("cmd-new"), kind: .steer,
+            state: .held, revision: 2, text: "new", targetEpochID: EpochID("epoch-1"),
+            orderKey: 9, sealed: false, attachments: [snap],
+            attachmentConsentEpoch: EpochID("epoch-1"))
+        let back = try RecordCodec.decode(try RecordCodec.encode(.queueUpdated(fresh)))
+        #expect(back == .queueUpdated(fresh), "snapshots + consent round-trip")
+    }
+
+    @Test("pre-hash file-outcome rows without before/afterHash still decode")
+    func decodeLegacyFileOutcomeWithoutHashes() throws {
+        // Backward compatibility (review delta): the parent commit wrote
+        // file outcomes with no hash keys. Stripping both keys must decode
+        // with an empty after-image and no before-image — never integrity.
+        let disposition = UndoDispositionRecord(
+            undoCommandID: "undo-old", groupID: "chg-old",
+            outcome: .completed,
+            fileOutcomes: [UndoFileOutcome(
+                inverseID: "undo/undo-old/chg-old/eff-1/c1", path: "old.txt",
+                result: "applied", detail: "restored",
+                beforeHash: String(repeating: "b", count: 64),
+                afterHash: String(repeating: "a", count: 64))],
+            reason: "done", atMillis: 1)
+        let encoded = try RecordCodec.encode(.undoDisposition(disposition))
+        var outer = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        func strip(_ dict: [String: Any]) -> [String: Any] {
+            var dict = dict
+            dict.removeValue(forKey: "beforeHash")
+            dict.removeValue(forKey: "afterHash")
+            for (key, value) in dict {
+                if let nested = value as? [String: Any] {
+                    dict[key] = strip(nested)
+                } else if let array = value as? [[String: Any]] {
+                    dict[key] = array.map(strip)
+                }
+            }
+            return dict
+        }
+        outer["undoDisposition"] = strip(try #require(outer["undoDisposition"] as? [String: Any]))
+        let legacy = try JSONSerialization.data(withJSONObject: outer, options: [.sortedKeys])
+        guard case .undoDisposition(let back) = try RecordCodec.decode(legacy) else {
+            Issue.record("legacy row must decode as undoDisposition"); return
+        }
+        #expect(back.fileOutcomes.count == 1)
+        #expect(back.fileOutcomes[0].beforeHash == nil, "missing key defaults to no before-image")
+        #expect(back.fileOutcomes[0].afterHash.isEmpty, "missing key defaults to empty after-image")
+        #expect(back.fileOutcomes[0].result == "applied" && back.fileOutcomes[0].path == "old.txt", "other fields intact")
     }
 
     @Test("encoded rows never carry derived origin/pathPrefix; decode re-derives them")
