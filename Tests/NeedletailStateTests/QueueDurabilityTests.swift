@@ -313,6 +313,43 @@ struct QueueDurabilityTests {
         #expect(recon2.unknownLinks.count == 1 && recon2.unknownLinks.first?.runID == RunID("r-10"), "only the latest link is unknown")
     }
 
+    @Test("D3 replay: second link without intervening reconcile fails closed, never re-resolves the first")
+    func replayDuplicateLinkWithoutReconcileFailsClosed() throws {
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let link1 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
+        let link2 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-10"), requestID: RequestID("req-10"), effectID: EffectID("eff-10"), epochID: EpochID("e-1"))
+        // No production transition can dispatch a heldUnknown head without
+        // an explicit recorded reconciliation — a bare second link would
+        // reconcile (or misattribute) the first link's fate against the
+        // wrong run, so replay fails closed instead of overwriting it.
+        #expect(throws: StoreError.self) {
+            try reconcileQueue([
+                .queueAdmitted(entry),
+                .queueUpdated(dispatched),
+                .queueDispatched(link1),
+                .queueDispatched(link2),
+            ])
+        }
+    }
+
+    @Test("D3 replay: second link after a completed run fails closed (completed entries never redispatch)")
+    func replayLinkAfterCompletionFailsClosed() throws {
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let link1 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
+        let link2 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-10"), requestID: RequestID("req-10"), effectID: EffectID("eff-10"), epochID: EpochID("e-1"))
+        #expect(throws: StoreError.self) {
+            try reconcileQueue([
+                .queueAdmitted(entry),
+                .queueDispatched(link1),
+                .queueUpdated(history),
+                .eventAppended(seq: SequenceNumber(99), kind: "completed", digest: eventDigest("completed", "r-9")),
+                .queueDispatched(link2),
+            ])
+        }
+    }
+
     @Test("D0 replay: legacy history without link keeps recorded state")
     func replayLegacyHistoryStands() throws {
         let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)

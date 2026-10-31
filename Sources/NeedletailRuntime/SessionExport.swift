@@ -396,16 +396,22 @@ public enum SessionExport {
                                       "groupID": notice.groupID,
                                       "outcome": notice.outcome.rawValue,
                                       "hadExecProposals": notice.hadExecProposals]
-            var files: [[String: Any]] = []
-            for file in notice.files {
-                var frow: [String: Any] = ["path": file.path,
-                                           "result": file.result,
-                                           "afterHash": file.afterHash]
-                if let beforeHash = file.beforeHash {
-                    frow["beforeHash"] = beforeHash
-                }
-                files.append(frow)
+        var files: [[String: Any]] = []
+        for file in notice.files {
+            var frow: [String: Any] = ["operationID": file.inverseID,
+                                       "path": file.path,
+                                       "result": file.result,
+                                       "afterHash": file.afterHash]
+            if let beforeHash = file.beforeHash {
+                frow["beforeHash"] = beforeHash
             }
+            // The per-file detail is operator prose (like the notice
+            // reason): content-gated, never in redacted exports.
+            if includeContent {
+                frow["detail"] = file.detail
+            }
+            files.append(frow)
+        }
             row["files"] = files
             if includeContent {
                 row["reason"] = notice.reason

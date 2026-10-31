@@ -171,6 +171,15 @@ struct UndoJournalTests {
             let flat = lines.joined()
             #expect(flat.contains("\"afterHash\""), "after hashes project structurally")
             #expect(flat.contains("\"beforeHash\""), "before hashes project structurally")
+            // Notice file rows carry the inverse journal key in both
+            // modes; the per-file detail travels only with content.
+            let noticeFiles = noticeRows.compactMap { $0["files"] as? [[String: Any]] }.flatMap { $0 }
+            #expect(noticeFiles.allSatisfy({ ($0["operationID"] as? String) == "i" }), "inverse identity travels structurally")
+            if includeContent {
+                #expect(noticeFiles.contains(where: { ($0["detail"] as? String) == "restored SECRET-BYTES" }), "file detail travels with content")
+            } else {
+                #expect(!noticeFiles.contains(where: { $0["detail"] != nil }), "redacted exports carry no per-file detail")
+            }
             let blob = lines.joined()
             if includeContent {
                 #expect(blob.contains("SECRET-REASON"), "content mode carries the reason")
@@ -185,7 +194,8 @@ struct UndoJournalTests {
     // MARK: - Blocker 1: ambiguous inverse holds durably across reopen
 
     @Test("UX-UNDO-05 ambiguous inverse (unknown result) reopens held with a recovery marker and no disposition")
-    func UX_UNDO_05_ambiguousResultReopensHeld() throws {        let (dir, store, session, writer) = try Self.tempStore()
+    func UX_UNDO_05_ambiguousResultReopensHeld() throws {
+        let (dir, store, session, writer) = try Self.tempStore()
         defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
         let inverseID = "undo/undo-3/chg-1/eff-1/c1"
         try store.appendBatch([

@@ -311,9 +311,40 @@ struct FilesystemAttachmentValidatorTests {
         #expect(verdict == .fresh, "unchanged file verifies")
     }
 
-    @Test("validator surfaces mutation and removal as stale")
-    func validatorStaleAndRemoved() async throws {
+    @Test("verdict refuses a snapshot granted to a different model alias")
+    func validatorRejectsCrossAliasDispatch() async throws {
         let ws = try Self.makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws.dir) }
+        try Data("stable\n".utf8).write(to: ws.dir.appendingPathComponent("s.txt"))
+        // Granted to local-coder; the file itself never changes.
+        let snap = try ws.capture.capture(
+            relativePath: "s.txt", lineRange: nil, intent: "mention",
+            epochID: EpochID("epoch-1"), routeGrant: Self.grant())
+        let observations = await ws.validator.validate(entryID: "q-1", snapshots: [snap])
+        // Live route under a different profile alias: hold, even though
+        // bytes, identity and consent are all fresh.
+        let cross = attachmentVerdict(
+            snapshot: snap, observation: observations.first,
+            currentEpochID: EpochID("epoch-1"), currentLocality: .local,
+            route: .allowed(endpoint: "http://127.0.0.1:11434/chat/completions", alias: "local-reviewer"),
+            consentEpochID: EpochID("epoch-1"), entrySealed: false)
+        guard case .stale(let fileStale, let reason) = cross else {
+            Issue.record("cross-alias dispatch must hold")
+            return
+        }
+        #expect(!fileStale, "grant scope is not file staleness")
+        #expect(reason.contains("local-coder") && reason.contains("local-reviewer"), "refusal names both aliases, got: \(reason)")
+        // Same-alias control still dispatches.
+        let same = attachmentVerdict(
+            snapshot: snap, observation: observations.first,
+            currentEpochID: EpochID("epoch-1"), currentLocality: .local,
+            route: .allowed(endpoint: "http://127.0.0.1:11434/chat/completions", alias: "local-coder"),
+            consentEpochID: EpochID("epoch-1"), entrySealed: false)
+        #expect(same == .fresh, "matching grant alias stays fresh")
+    }
+
+    @Test("validator surfaces mutation and removal as stale")
+    func validatorStaleAndRemoved() async throws {        let ws = try Self.makeWorkspace()
         defer { try? FileManager.default.removeItem(at: ws.dir) }
         try Data("before\n".utf8).write(to: ws.dir.appendingPathComponent("m.txt"))
         let snap = try ws.capture.capture(

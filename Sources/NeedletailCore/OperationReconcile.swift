@@ -394,6 +394,22 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
             guard positions[link.entryID] != nil else {
                 throw StoreError.integrity("dispatch linkage for unknown entry \(link.entryID)")
             }
+            // A second dispatch of one entry is legitimate ONLY after an
+            // explicit recorded reconciliation superseded the first link
+            // (requeue for redispatch): the head barrier holds unknowns
+            // until reconcileQueueEntry requeues them, and no production
+            // transition moves a terminal or unknown entry back to queued
+            // otherwise. A bare second link — no reconcile after the
+            // first — cannot have been dispatched legally; resolving the
+            // first link's fate against the wrong run/request/epoch would
+            // silently misattribute it, so fail closed instead of
+            // overwriting.
+            if let firstAt = linkPositions[link.entryID] {
+                let reconciledAt = reconcilePositions[link.entryID]
+                guard let r = reconciledAt, r > firstAt else {
+                    throw StoreError.integrity("duplicate dispatch linkage for entry \(link.entryID) without intervening reconciliation")
+                }
+            }
             links[link.entryID] = link
             linkPositions[link.entryID] = index
         case .eventAppended(let seq, let kind, let digest):

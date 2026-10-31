@@ -726,6 +726,149 @@ struct D3IntegrationTests {
         _ = ids1
     }
 
+    @Test("C3: cross-alias snapshots hold; retarget preserves the grant; fresh capture re-consents and drains")
+    func crossAliasSnapshotHolds() async throws {
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let session = SessionID("s-d3-c3")
+        let writer = WriterIdentity(session: session, writer: "w-d3")
+        // Two local models: the grant names one endpoint, the live route
+        // may name the other.
+        let configJSON = """
+        {"version":1,"default_model":"local-coder","allow_http_origins":["http://127.0.0.1:11434","http://127.0.0.1:11435"],"models":[{"alias":"local-coder","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11434","model":"qwen","context_window":262144,"max_output":4096,"locality":"local","credential":{"env":"NT_M2_X_KEY"},"connect_timeout_s":10,"read_idle_timeout_s":300,"request_timeout_s":1800,"max_in_flight":1},{"alias":"local-reviewer","protocol":"openai-chat-completions","base_url":"http://127.0.0.1:11435","model":"qwen","context_window":262144,"max_output":4096,"locality":"local","credential":{"env":"NT_M2_X_KEY"},"connect_timeout_s":10,"read_idle_timeout_s":300,"request_timeout_s":1800,"max_in_flight":1}],"tools":{"read":true,"search":true,"edit":true,"write":true,"exec":"ask","consult":false}}
+        """
+        let snapshot = try validateConfig(Data(configJSON.utf8))
+        let profile = try #require(snapshot.profiles["local-coder"])
+        let caps = effectiveCapabilities(
+            build: .allAllowed, userConfig: snapshot.tools,
+            workspaceGrant: .allAllowed, invocationMask: .allAllowed,
+            sealed: SealedRestrictions(sealed: false))
+        let route = selectRoute(snapshot: snapshot, requestedAlias: "local-coder", sealed: false)
+        let epochA = EpochDescriptor(
+            epochID: EpochID("epoch-a"), parentEpochID: nil,
+            configSnapshot: snapshot, profile: profile,
+            effectiveCaps: caps, route: route)
+        let idleA = SessionState(sessionID: session, epoch: epochA, trustMode: .workspace, phase: .idle)
+        var store = try Self.tempStore(at: dir)
+        try store.claimWriterOwnership(session: session, writer: writer.writer)
+        let resolver = try WorkspaceResolver(workspace: FilePath(dir.path), readRoots: [])
+        try "X1\n".write(to: dir.appendingPathComponent("x.txt"), atomically: true, encoding: .utf8)
+        let capture = AttachmentCaptureService(resolver: resolver)
+        let grantA = AttachmentRouteGrant(alias: "local-coder", locality: .local, sealed: false)
+        let snapA = try capture.capture(
+            relativePath: "x.txt", lineRange: nil, intent: "mention",
+            epochID: epochA.epochID, routeGrant: grantA)
+        // Generation 1: run-x gated in flight; qa (grant: local-coder) +
+        // qb queued. Releasing run-x dispatches qa (link commits, delivery
+        // never confirmed).
+        let gate1 = GatedTransport()
+        let (stream1, cont1) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        gate1.gate = stream1
+        var ids1 = DeterministicIDSource(prefix: "c3a")
+        let actor1 = try SessionActor(
+            state: idleA, ids: ids1, clock: SystemClock(), transport: gate1,
+            executor: ScriptedExecutor(), store: store,
+            approvals: ScriptedApprovals(), writer: writer.writer,
+            attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
+        await actor1.submitText(commandID: CommandID("run-x"), text: "hold", kind: .followUp, sealed: false)
+        try await Self.awaitState(actor1, { $0.activeRequest != nil }, "run-x requesting")
+        await actor1.submitTextWithAttachments(commandID: CommandID("q-a2"), text: "with file", kind: .followUp, sealed: false, attachments: [snapA])
+        await actor1.submitText(commandID: CommandID("q-b2"), text: "behind", kind: .followUp, sealed: false)
+        try await Self.awaitState(actor1, { $0.queue.count == 2 }, "qa2+qb2 queued")
+        cont1.yield(.respond(ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0))))
+        for _ in 0..<20_000 {
+            if gate1.invocations.count == 2 { break }
+            await Task.yield()
+        }
+        #expect(gate1.invocations.count == 2, "run-x sent, then qa2 sent")
+        try store.close()
+        // Generation 2: qa2 held-unknown under epoch-A. Switch to the
+        // second model: queued entries go stale-target held. Retarget
+        // refreshes target + consent but preserves the GRANT (still
+        // local-coder) — and never releases anything.
+        store = try Self.tempStore(at: dir)
+        let gate2 = GatedTransport()
+        let (stream2, _) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        gate2.gate = stream2
+        var ids2 = DeterministicIDSource(prefix: "c3b")
+        let (actor2, _) = try await reopenHeadlessSession(
+            store: store, session: session, epoch: epochA, trustMode: .workspace,
+            as: writer.writer, ids: &ids2, clock: SystemClock(),
+            transport: gate2, executor: ScriptedExecutor(),
+            approvals: ScriptedApprovals(),
+            attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
+        await actor2.switchModel(alias: "local-reviewer")
+        let switched = await actor2.currentState()
+        #expect(switched.epoch.profile.alias == "local-reviewer", "live route moved to the second model")
+        let qaID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-a2") })?.entryID)
+        let qbID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-b2") })?.entryID)
+        await actor2.retargetQueueEntry(entryID: qaID)
+        await actor2.retargetQueueEntry(entryID: qbID)
+        for _ in 0..<1_000 { await Task.yield() }
+        let retargeted = await actor2.currentState()
+        let qaRetargeted = try #require(retargeted.queue.first(where: { $0.commandID == CommandID("q-a2") }))
+        #expect(qaRetargeted.attachmentConsentEpoch == switched.epoch.epochID, "retarget refreshes consent to the live epoch")
+        #expect(qaRetargeted.attachments.first?.routeGrant.alias == "local-coder", "retarget preserves the original grant (it does not re-grant)")
+        #expect(gate2.invocations.isEmpty, "no dispatch during the epoch manoeuvre")
+        await actor2.reconcileQueue(entryID: qaID)
+        try await Self.awaitState(actor2, { $0.queue.first?.state == .queued }, "reconciled after retarget")
+        await actor2.resumeQueue()
+        for _ in 0..<1_000 { await Task.yield() }
+        #expect((await actor2.currentState()).queueHeld == false, "resume unholds the reconciled, retargeted queue")
+        // Generation 3: a fresh run pops qa2 — but the grant names
+        // local-coder while the live route is local-reviewer, so the
+        // dispatch holds instead of sending approved bytes to the wrong
+        // model. Only a fresh capture under the live profile releases it.
+        try store.close()
+        store = try Self.tempStore(at: dir)
+        let transport3 = ScriptedTransport()
+        transport3.script = [
+            ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
+            ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
+            ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
+            ActorFixtures.finalResponse(requestID: RequestID("s"), generation: Revision(0)),
+        ]
+        var ids3 = DeterministicIDSource(prefix: "c3c")
+        let (actor3, report3) = try await reopenHeadlessSession(
+            store: store, session: session, epoch: switched.epoch, trustMode: .workspace,
+            as: writer.writer, ids: &ids3, clock: SystemClock(),
+            transport: transport3, executor: ScriptedExecutor(),
+            approvals: ScriptedApprovals(),
+            attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
+        #expect(!report3.blocked, "reconciled + retargeted queue is dispatchable")
+        await actor3.submitText(commandID: CommandID("run-n"), text: "next", kind: .followUp, sealed: false)
+        try await Self.awaitState(actor3, { $0.queue.first?.state == .held }, "cross-alias grant holds the head")
+        let heldAlias = await actor3.currentState()
+        guard case .error(let reason) = heldAlias.heldReason else {
+            Issue.record("alias mismatch must hold with an explicit reason, got \(String(describing: heldAlias.heldReason))")
+            return
+        }
+        #expect(reason.contains("local-coder") && reason.contains("local-reviewer"), "refusal names both the granted alias and the live route, got: \(reason)")
+        #expect(transport3.invocations.count == 1, "run-n sent; the cross-alias head dispatched nothing")
+        #expect(heldAlias.queue.dropFirst().allSatisfy({ $0.state == .queued }), "no overtake past the grant hold")
+        let grantB = AttachmentRouteGrant(alias: "local-reviewer", locality: .local, sealed: false)
+        let snapB = try capture.capture(
+            relativePath: "x.txt", lineRange: nil, intent: "mention",
+            epochID: switched.epoch.epochID, routeGrant: grantB)
+        await actor3.replaceEntryAttachments(entryID: qaID, snapshots: [snapB])
+        await actor3.resumeQueue()
+        await actor3.submitText(commandID: CommandID("run-m"), text: "again", kind: .followUp, sealed: false)
+        try await Self.awaitState(actor3, {
+            if case .completed = $0.phase, transport3.invocations.count == 4,
+               $0.queue.allSatisfy({ $0.state == .admittedToHistory }) { return true }
+            return false
+        }, "drained after re-consent")
+        let users = try Self.storeRecords(store, session).compactMap { record -> String? in
+            if case .transcriptAppended(.user(let text)) = record { return text }
+            return nil
+        }
+        #expect(users.contains(where: { $0.contains("X1\n") }), "re-consented bytes enter context under the live route")
+        let drained = await actor3.currentState()
+        #expect(drained.queue.first(where: { $0.commandID == CommandID("q-a2") })?.attachmentConsentEpoch == switched.epoch.epochID)
+        try store.close()
+        _ = ids1
+    }
+
     // MARK: - Scenario D: partial native undo across reopen
 
     @Test("D: partial native undo reopens with exact partial disposition, no repeated inverses, user edits retained")
