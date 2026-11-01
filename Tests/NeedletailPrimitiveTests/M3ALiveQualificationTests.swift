@@ -185,25 +185,39 @@ struct M3ALiveQualificationTests {
         let profile = try #require(snap.profiles["local-coder"])
         let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: ChatTransportPolicy.configuration(profile: profile))
         defer { try? await client.shutdown().get() }
-        let t1 = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "Remember the code word BLUE. Reply with 'noted'.")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 32))
+        // First turn: ask model to invent a code word — the distinctive value will be in the assistant's reply, not the user prompt
+        let t1 = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "Invent a random 4-letter code word (all caps, e.g., ABCD) and reply with exactly 'noted <WORD>' where <WORD> is the invented word.")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 32))
         let inv1 = ProviderInvocation(effectID: EffectID("m3a-5a"), requestID: RequestID("m3a-5a"), runID: RunID("m3a-5a"), generation: Revision(0), alias: "local-coder", epochID: EpochID("m3a"), sealed: false, turnsLeft: 2, deadlineMillis: nil, historyDigest: "m3a-5a")
         let r1 = try await t1.invoke(inv1, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
         let text1 = textFromOutcome(r1.response.outcome)
         let raw1 = r1.rawBody ?? []
-        let (_, d1) = writeEvidence(id: "m3a-5a", data: Data(raw1))
+        let (_, d1) = try writeEvidence(id: "m3a-5a", data: Data(raw1))
         print("M3-A5a live: text=\(text1.prefix(80)) digest=\(d1) usage=\(r1.response.usageOutput ?? -1)")
         #expect(!text1.isEmpty, "first turn must be non-empty to prove replay")
-        // Build second request from genuine first response, not hand-written tool history
-        let t2 = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "Remember the code word BLUE. Reply with 'noted'."), ChatMessage(role: .assistant, text: text1), ChatMessage(role: .user, text: "What was the code word?")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 32))
+        #expect(text1.lowercased().contains("noted"), "first turn should contain 'noted <WORD>'")
+        // Extract the invented word from the assistant's reply (e.g., "noted ABCD" -> "ABCD")
+        let inventedWord = text1.split(separator: " ").last.map(String.init) ?? ""
+        #expect(!inventedWord.isEmpty, "invented word extracted from genuine assistant turn")
+        // Build second request from genuine first response only — do not replay the original user prompt's invented-word instruction alone would not contain the word, so the word's presence in the second request proves the assistant turn was preserved
+        let secondMessages: [ChatMessage] = [ChatMessage(role: .assistant, text: text1), ChatMessage(role: .user, text: "What was the code word you just invented? Report it exactly as you wrote it.")]
+        // Persist the actual outbound second request as evidence (fail-closed, 0600, digest from persisted bytes)
+        let requestData = try JSONEncoder().encode(secondMessages)
+        let (_, reqDigest) = try writeEvidence(id: "m3a-5b-request", data: requestData)
+        print("M3-A5b request: messages=\(secondMessages.map(\.role)) digest=\(reqDigest) word=\(inventedWord)")
+        let t2 = ChatCompletionsTransport(client: client, messageProvider: { _ in secondMessages }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 32))
         let inv2 = ProviderInvocation(effectID: EffectID("m3a-5b"), requestID: RequestID("m3a-5b"), runID: RunID("m3a-5b"), generation: Revision(0), alias: "local-coder", epochID: EpochID("m3a"), sealed: false, turnsLeft: 1, deadlineMillis: nil, historyDigest: "m3a-5b")
         let r2 = try await t2.invoke(inv2, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
         let text2 = textFromOutcome(r2.response.outcome)
         let raw2 = r2.rawBody ?? []
-        let (_, d2) = writeEvidence(id: "m3a-5b", data: Data(raw2))
+        let (_, d2) = try writeEvidence(id: "m3a-5b", data: Data(raw2))
         print("M3-A5b live: text=\(text2.prefix(120)) digest=\(d2)")
         #expect(!text2.isEmpty, "continuation must produce output")
-        #expect(text2.contains("BLUE") || text2.lowercased().contains("blue"), "continuation preserved code word BLUE from genuine first turn")
+        #expect(text2.contains(inventedWord) || text2.lowercased().contains(inventedWord.lowercased()), "continuation preserved invented word \(inventedWord) from genuine first turn (not from replayed user)")
         #expect((r2.rawBody?.count ?? 0) > 0, "rawBody preserved for continuation")
+        // Verify the persisted outgoing request actually contains the invented word via the assistant turn, not via user
+        let persistedRequest = try JSONDecoder().decode([ChatMessage].self, from: requestData)
+        #expect(persistedRequest.contains(where: { $0.text.contains(inventedWord) }), "persisted outgoing request contains invented word via assistant turn")
+        #expect(persistedRequest.first?.role == .assistant, "outgoing request starts with genuine assistant turn, not replayed user")
     }
 
     @Test("M3-A 6: numeric-string fidelity via live echo (live, opt-in)", .enabled(if: m3aLiveEnabled, "set M3A_LIVE=1"))

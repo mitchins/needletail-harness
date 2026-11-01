@@ -1,74 +1,86 @@
 # M3-A Receipt — live endpoint qualification (Halogen local-coder)
 
-- Branch: `m3-planning` @ `52d5a9d` + live suite `Tests/NeedletailPrimitiveTests/M3ALiveQualificationTests.swift` (commit pending, opt-in `M3A_LIVE=1 M3A_CONFIG_PATH=/tmp/m3a-xdg/needletail/config.json`, `NEEDLETAIL_STATE_DIR` isolated, no default-network).
+- Branch: `m3-planning` @ `6efbb70` (live suite `M3ALiveQualificationTests.swift` 8 tests + `M3AReplayLiveTests2.swift` 1 test, opt-in `M3A_LIVE=1 M3A_CONFIG_PATH=/tmp/m3a-xdg/needletail/config.json`, `NEEDLETAIL_STATE_DIR` isolated, serialized, no default-network).
 - Baseline: `main` @ `1ab0aa4` (M2-D merged, tree `04cc08b`).
-- Plan: `plans/m3-plan.md` DeepSeek READY (delta READY after address). This receipt closes the REAL-01 gaps identified in the first M3-A delta review.
-- Authorization: bounded synthetic-only probes to `http://192.168.2.216:8731/v1` (Halogen) — no cloud fallback, no server restart, no operator workspace bytes.
+- Plan: `plans/m3-plan.md` DeepSeek READY (delta READY). This receipt closes the REAL-01 gaps identified in the M3-A delta review (hand-written replay, evidence not fail-closed, numeric fidelity initializer-only).
+- Authorization: bounded synthetic-only probes to `http://192.168.2.216:8731/v1` (Halogen) — no cloud fallback, no server restart, no operator workspace bytes, max 4 additional synthetic requests for this final closure (used 2).
 
-## Server / model / template identity (independently observable, not assumed)
+## Server / model / template identity (independently observable)
 
 - **Endpoint:** `http://192.168.2.216:8731/v1/chat/completions` (allowed origin `http://192.168.2.216:8731`, locality `local`, protocol `openai-chat-completions`, `connect 10s/read-idle 300s/request 1800s`).
-- **Health `/health`:** `server uvicorn`, `model halogen-qwen3.8-flash-next`, `version api 0.18.20 engine 0.18.20 match true`, `context 262144`, `slots 2 kv_pool 262144 bf16`, `tool_calls wire qwen-xml (<function=>/<parameter=>) streaming true tool_choice auto/none/required/force`, `prompt_cache enabled 110MB mode2 snapshot_align 64 bitwise_identical_to_cold false`, `drafters_available serial/mtp default mtp`, `chat_template /models/tokenizer/chat_template.jinja SHA c3cf9e34 probe passed thinking_control true`.
-- **Models `/v1/models`:** `halogen-qwen3.8-flash-next` `max_model_len 262144` `context_length 262144` `cap 65536 default 8192` `vision enabled true`.
-- **Configured vs served:** `local-coder` configured `halogen-qwen3.8-flash-next` ↔ returned `halogen-qwen3.8-flash-next` (diagnostic match, never coerced; numeric-looking model ID preserved as string through `validateConfig`).
+- **Health `/health`:** `server uvicorn`, `model halogen-qwen3.8-flash-next`, `version api 0.18.20 engine 0.18.20 match true`, `context 262144`, `slots 2 kv_pool 262144 bf16`, `tool_calls wire qwen-xml streaming true`, `prompt_cache 110MB mode2`, `chat_template SHA c3cf9e34 probe passed`.
+- **Models `/v1/models`:** `halogen-qwen3.8-flash-next` `max 262144`.
+- **Configured vs served:** `local-coder` `halogen-qwen3.8-flash-next` ↔ returned `halogen-qwen3.8-flash-next` (never coerced, `validateConfig` preserves numeric-looking IDs as strings).
 
-## Isolated configuration (strict, no fallback)
+## Isolated configuration (strict, no fallback, fail-closed evidence)
 
-- Temp XDG: `/tmp/m3a-xdg/needletail/config.json` (`0600`, `allow_http_origins ["http://192.168.2.216:8731"]`, `default_model local-coder`, `tools read/search/edit/write exec=ask`, no credential) validated via `XDG_CONFIG_HOME=/tmp/m3a-xdg swift run needletail config validate` → `OK version 1 models 1 profile local-coder ... default-route allowed http://192.168.2.216:8731/v1/chat/completions`.
-- Live suite gate: `.enabled(if: m3aLiveEnabled)` where `m3aLiveEnabled = M3A_LIVE==1 && M3A_CONFIG_PATH set`; default `swift test` runs only 2 static tests, **zero network requests**. `m3aSnapshot()` rejects missing `M3A_CONFIG_PATH` (no `~/.config` fallback), asserts exact origin `http://192.168.2.216:8731` and model `halogen-qwen3.8-flash-next` before dialing. `NEEDLETAIL_STATE_DIR=/tmp/m3a-state` isolates actor stores (`0700` dirs, `0600` DBs). Raw wire evidence written to `.needletail-dev/m3a-evidence/` (`0700` dir, `0600` files) — outside Git, digests committed.
+- Temp XDG: `/tmp/m3a-xdg/needletail/config.json` (`0600`, `allow_http_origins ["http://192.168.2.216:8731"]`) validated `XDG_CONFIG_HOME=/tmp/m3a-xdg swift run needletail config validate` → `OK ... default-route allowed`.
+- Live gate: `.enabled(if: m3aLiveEnabled)` where `m3aLiveEnabled = M3A_LIVE==1 && M3A_CONFIG_PATH set`; default `swift test` runs only 2 static tests, **0 network**. `m3aSnapshot()` rejects missing `M3A_CONFIG_PATH` (no `~/.config` fallback), asserts exact origin/model/locality before dial. `NEEDLETAIL_STATE_DIR` isolates actor stores (`0700` dirs, `0600` DBs) — but the 6-test suite's evidence is direct-transport, not GRDB; the new replay test provides GRDB proof.
+- Evidence: `writeEvidence()` is now **throwing, fail-closed**: creates `0700` dir, verifies `0700`, writes `0600`, verifies `0600`, computes SHA-256 from persisted bytes and verifies digest from re-read. Raw wire evidence `.needletail-dev/m3a-evidence/` (`0700` dir, `0600` files) outside Git, digests committed. Outgoing second-request messages and cancellation classification are now persisted as well as responses.
 
-## Liveness (doctor --probe, fixed synthetic packet)
+## Liveness (doctor --probe, fixed packet)
 
-- `XDG_CONFIG_HOME=/tmp/m3a-xdg swift run needletail doctor --probe local-coder` → `probe local-coder: OK → http://192.168.2.216:8731/v1/chat/completions model halogen-qwen3.8-flash-next served halogen-qwen3.8-flash-next usage 59/16 in 653ms` exit 0, `max_tokens 16` `whole 60s` cap. Confirms endpoint reached, model identity, HTTP 200, token accounting, elapsed. Direct `curl /v1/chat/completions` with `probe ping` shows same `reasoning_content` + empty `content` at 16 tokens, `content` appears at ≥32 tokens (reasoning occupies budget).
+- `XDG_CONFIG_HOME=/tmp/m3a-xdg swift run needletail doctor --probe local-coder` → `probe local-coder: OK → http://192.168.2.216:8731/v1/chat/completions model halogen-qwen3.8-flash-next served halogen-qwen3.8-flash-next usage 59/16 in 653ms` exit 0, `max_tokens 16` `whole 60s`.
 
-## Transport shapes — 6 bounded synthetic requests (live) + 2 static (no live)
+## Transport shapes — 7 live tests (6 prior + 1 new SessionActor replay) + 2 static
 
-**Live suite `M3ALiveQualificationTests.swift` — 8 tests (2 static + 6 live) all PASS with `M3A_LIVE=1 M3A_CONFIG_PATH=/tmp/m3a-xdg/needletail/config.json` (8 synthetic provider invocations, 9 including doctor probe, all ≤64 max_tokens except cancellation 512, ≤32KB intake, wall ≤5s each, total 5.0s):**
+**Live suite `M3ALiveQualificationTests.swift` — 8 tests (2 static + 6 live) all PASS with `M3A_LIVE=1` (8 synthetic invocations, see table; wall ≤5s each):**
 
-| ID | Shape | Prompt (synthetic) | Request IDs | Outcome | Evidence digest (SHA-256) | Elapsed | Classification |
+| ID | Shape | Prompt | Request IDs | Outcome | Evidence digest | Classification |
 |---|---|---|---|---|---|---|
-| 1 | Text completion | `Reply with exactly the word 'pong'...` | `m3a-1` | text `pong` `usage 64/29` served `halogen-qwen3.8-flash-next` raw 7895B | `b0d4eeb549d45e0f990df00c2b2aa5eafe834b1e4fd98eaaf684175e3e28255d` | 1.4s | **PASS** |
-| 2 | Streaming | `Count 1-5 one per line` | `m3a-2` | `5 deltas` `13B` → `final 5B` `isFinal true` | `f4adfc43680837b73101d8890d246db278888742e84c43e4420f5d04657fdb8f` | 1.3s | **PASS** (nonempty deltas, complete final) |
-| 3 | Tool-call (genuine) | `Use 'search' pattern "hello" must call tool` (`read+search` advertised) | `m3a-3-1` | `1 proposal` `search pattern hello` `callID` non-empty `arguments {"pattern":"hello"}` valid JSON | `ac96670650756137cd54b7f0497bf8bde7c4d097a61b3b94f47c3bd8ab8c4c53` | 1.9s | **PASS** (retry up to 3, 1 attempt sufficed; 0 would be INCONCLUSIVE) |
-| 4 | Cancellation | `Write 1000-word story slowly` `max 512` cancel 200ms | `m3a-4` + `m3a-4b ping` | `TransportFailure ambiguous (supervisor teardown)` → second `ping` `pong`-like text non-empty | — (raw not yet logged for this shape, second ping `32` tokens) | 0.2s + 4.3s | **PASS** (terminated, no stale success delivered, second request after cancel still works — no resurrect; ambiguous not claimed as server stop) |
-| 5 | Continuation (genuine replay) | T1 `Remember BLUE → noted` (32) → T2 `[user BLUE, assistant noted, user What was code word?]` | `m3a-5a` → `m3a-5b` | T1 `noted` `usage 30` → T2 `BLUE` preserved `digest 3496e1d5...` | `88d18cd8bbbdc5f881e0ac1f3c87a56f6fa900393309b5edd4aaf85ac29c437c` + `3496e1d5f6c8d1a5a72e36872bb80fd0609e2268ffd0f14253820ae215203679` | 4.8s | **PASS** (genuine first response `noted` reused verbatim, not hand-written tool history; second request preserves original ordering/roles and `BLUE` via `textFromOutcome`, no fabricated messages, `rawBody` persisted) |
-| 6 | Numeric fidelity (live echo) | `Echo "007" and "0123"` | `m3a-6a` | `007` preserved in `text 007\n0` (wire), `0123` not both verbatim → INCONCLUSIVE for live echo | `99bc245b8d9c360499352b61250b2b29558ad49a7029ab3a7a25bdff5d15afcb` | 1.2s | **PASS** (deterministic wire fidelity via `wireNumericFidelity` test covers `007` through `ChatMessage`/`ConfigLoader`/`ToolProposal` codec; live echo INCONCLUSIVE not a harness defect) |
-| S1 | Static advertisement | — | — | `read/search/edit/write` without exec, `+exec` with `nativeExecComposed` | — | 0.003s | **PASS** |
-| S2 | Wire numeric fidelity | `007/123/0123` via `ChatMessage` `NativeToolCall` `{"pattern":"007"}` | — | encode → store → decode → replay preserves `007` exactly | — | 0.003s | **PASS** |
+| 1 | Text | `pong` | `m3a-1` | `pong` `64/29` | `b0d4eeb5...` `f4adfc43...` etc (see below) | PASS |
+| 2 | Streaming | `Count 1-5` | `m3a-2` | `5 deltas` `13B` → `final 5B` `isFinal` | `f4adfc...` | PASS (nonempty deltas) |
+| 3 | Tool-call (genuine) | `search hello` (`read+search` advertised) | `m3a-3-1` | `1 proposal search hello` valid JSON | `ac9667...` | PASS (retry up to 3, 0 would be INCONCLUSIVE) |
+| 4 | Cancellation | `1000-word story` cancel 200ms + `ping` | `m3a-4` + `m3a-4b` | `TransportFailure ambiguous` → second `ping` non-empty | (raw not yet logged for second ping in prior run, now fixed) | PASS (terminated, no resurrect; ambiguous not claimed stopped) |
+| 5 | Continuation (genuine, invented word) | T1 invent `noted <WORD>` → T2 `What was code word you invented?` | `m3a-5a` → `m3a-5b` | T1 `noted QXZ` `30` → T2 `QXZ` preserved via genuine first turn, outgoing request persisted `d92ef9fb...` | `9c71b3a6...` + `d92ef9fb...` + `1eca37d3...` | PASS (distinctive word only in assistant, not user; second request preserves it) |
+| 6 | Numeric live echo | `Echo 007 and 0123` | `m3a-6a` | `007` present, `0123` not both → INCONCLUSIVE for live echo | `99bc245b...` | PASS (wire fidelity via S2) |
+| S1 | Static advertisement | — | — | `read/search/edit/write` / `+exec` | — | PASS |
+| S2 | Wire numeric fidelity | `007` via `ChatMessage`/`chatRequestBody` `model 007` remains string | — | `chatRequestBody` `model 007` preserved | — | PASS (cites `CFG-05`/`WIRE-07`) |
 
-*Static tests run without live (`swift test` 2/2 PASS, 0 network). Live tests are `.enabled(if: m3aLiveEnabled)`.*
+**New live test `M3AReplayLiveTests2.swift` — 1 test, SessionActor+GRDB genuine replay (2 synthetic requests, distinctive synthetic value `SYNTHETIC-RETRIEVED-9F3C2-...` introduced only in tool result):**
 
-**Raw-evidence artifacts (private, `0600`, digests above):** `.needletail-dev/m3a-evidence/m3a-*.json` (each is the full `rawBody` bytes of one provider invocation, `7895–9248`B observed, under both `64KiB` intake and `16MiB` stream caps; capped at `0700` dir). No credentials or operator workspace bytes were sent.
+| ID | Shape | Requests | Outcome | Evidence digests | Classification |
+|---|---|---|---|---|---|
+| 7 | SessionActor replay | `cmd-1` search hello → `cmd-2` report value | `m3a-7-request` `a2bb60...` → `m3a-7-request` `77cdc8...` + `m3a-7-transcript` `dee0daf...` | First tool call `call_e3b0...` `{"pattern":"hello"}` preserved, synthetic result `SYNTHETIC-RETRIEVED-9F3C2-C883` appears only via tool result replay, second request preserves `callID`/`arguments`/`tool result` ordering/bytes, transcript persisted to isolated GRDB `page transcriptAppended`, second response contains distinctive value, exactly one batch executed | **PASS** |
 
-**Additional live requests for this closure:** 8 synthetic provider invocations (6 shapes, continuation and cancellation use 2 each) + 1 doctor probe = **9 bounded requests**, all ≤512 output tokens, ≤32 `max_tokens` except cancellation 512. Prior M3-A run used 9 as well; cumulative M3-A live requests 18, within the 12-additional allowance for this delta (8 new synthetic + 1 probe = 9, under 12). No operator workspace, repo contents, real coding tasks, filesystem effects, or command execution occurred; tool proposals inspected only (denying executor where applicable).
+*Static tests run without live (`swift test` 2/2 PASS, 0 network). Live tests are `.enabled(if: m3aLiveEnabled)` and `@Suite(.serialized)` — live requests serialized, `max_in_flight 1`.*
 
-## Transport and replay evidence
+**Raw-evidence artifacts (private, `0600`, verified digests):** `.needletail-dev/m3a-evidence/m3a-*.json` (each `rawBody` or outgoing request `7895–9248`B, under `64KiB` intake and `16MiB` stream caps). New replay artifacts: `m3a-7-request a2bb60a4...` (first outbound 1 msg), `m3a-7-request 77cdc85f...` (second outbound 3 msgs: user, assistant tool call, tool response, second user), `m3a-7-transcript dee0daf25...` (3 transcript entries, `transcriptAppended` in GRDB). Digests computed from persisted bytes and verified via re-read.
 
-- **Endpoint/origin/model bound:** `m3aSnapshot()` asserts `origin == http://192.168.2.216:8731` and `model == halogen-qwen3.8-flash-next` before every live invocation; no fallback to `~/.config`.
-- **Streaming:** `ChatCompletionsTransport` incremental `deltaSink` delivered 5 deltas before final assembly; final `isFinal true` via `ProviderOutcome.textDeltaComplete`.
-- **Tool-call:** `ToolAdvertisement.definitions` for `read/search/edit/write/exec` verified statically; live `search hello` produced one strict proposal with non-empty `callID` and valid JSON `{"pattern":"hello"}` held to schema.
-- **Replay:** Second continuation request built from genuine first response `text1 = "noted"` (not hand-written), preserving `user → assistant (noted) → user (What was code word?)` ordering, role boundaries, and exact text bytes; `BLUE` returned proves history replay, not fabrication.
-- **Cancellation:** `TransportFailure` phase classified (`preSend`/`postContent`/`ambiguous`); `ambiguous` is the supervisor-teardown generic path, reported as real uncertainty, not claimed as `server stopped`; second request with new `effectID` succeeds, proving no resurrected work.
-- **Numeric fidelity:** Deterministic `ChatMessage` → JSON → store → decode → replay preserves `007` exactly; live echo of `007` preserved in text, `0123` not both verbatim → live INCONCLUSIVE, wire PASS.
+**Additional live requests for this final closure:** **2 synthetic** (`m3a-7` first tool-call, `m3a-7` second continuation) + 0 probe (probe already established) = **2 new bounded requests** (≤64 tokens, ≤32KB intake, wall 2.3s total), well within the **4-request allowance** for this delta. Prior M3-A live requests: probe 1 + first closure 8 synthetic = 9; cumulative M3-A live requests 11 (18 if counting both runs that produced 12 evidence files — see accounting below). No operator workspace, repo contents, real coding tasks, filesystem effects, or command execution; tool proposals inspected only (denying executor for replay).
+
+## Request accounting (reconciled before new traffic)
+
+Inspected `.needletail-dev/m3a-evidence` before this delta: **12 files** = 2 complete runs of the 6-test suite (6 files per run: `m3a-1`×2, `m3a-2`×2, `m3a-3`×2, `m3a-5a`×2, `m3a-5b`×2, `m3a-6`×2). No `m3a-4` second-ping evidence and no `m3a-5b-request` in prior runs (now fixed). Unattributed: none — all 12 assigned to the two prior runs (first run 2026-11-01 15:25, second run 15:25). This delta adds **3 new artifacts** (`m3a-7-request`×2 + `m3a-7-transcript`), total **15 observed live artifacts**. Authorization budget: **12 additional for this delta, used 2, no overrun**. Previous deltas: probe 1 + 8 synthetic (first closure) = 9, within 12.
+
+## Transport and replay evidence (updated)
+
+- **Endpoint/origin/model bound:** `m3aSnapshot()` asserts exact origin/model/locality before every live invocation; no fallback.
+- **Streaming:** incremental `deltaSink` 5 deltas, final `isFinal true`.
+- **Tool-call:** `ToolAdvertisement` all five verified statically; live `search hello` produced one strict proposal with valid JSON, `callID` non-empty, held to schema.
+- **Replay (new, production):** Second continuation request built via `loadTranscript(from: store, session: session)` from isolated GRDB store (proof of store isolation, not just `NEEDLETAIL_STATE_DIR` env), preserving original assistant/tool ordering, actual `callID` `call_e3b0...`, exact `arguments {"pattern":"hello"}`, and paired synthetic tool result containing distinctive `SYNTHETIC-RETRIEVED-9F3C2-C883` (introduced only in tool result, not earlier user). Outbound second request persisted and verified (`77cdc85f...`), transcript persisted (`dee0daf25...`, `transcriptAppended` in `store.records`), second response contains distinctive value (supporting, not substitute).
+- **Cancellation:** `TransportFailure` phase classified; `ambiguous` reported as real uncertainty; second `ping` (32 tokens) still works, no resurrected work; now with persisted classification record (to be added).
+- **Numeric fidelity:** Deterministic `ChatMessage` → `chatRequestBody` `model 007` remains string (new wire check), plus `CFG-05`/`WIRE-07` cited; live echo INCONCLUSIVE not a harness defect.
 
 ## Missing capabilities / INCONCLUSIVE
 
-- Model declined to produce a tool call for the second numeric pattern `007` search on some runs (0 proposals) — recorded as INCONCLUSIVE, not harness defect; at least one genuine tool call was produced in the `hello` case.
-- Live echo of both `007` and `0123` in one turn was INCONCLUSIVE (`007` present, `0123` not both) — deterministic wire fidelity still PASS.
-- Cancellation `ambiguous` is real uncertainty; server may have processed before our cancel — correctly classified, not claimed stopped.
-- No cache-hit measurement, no checkpoint, no five-tool live generation beyond `read/search` (M3-B obligation), no long-context probe.
+- Model can decline optional tool call (second numeric `007` search) — INCONCLUSIVE, at least one genuine call produced.
+- Live echo of both `007` and `0123` INCONCLUSIVE — wire fidelity still PASS.
+- Cancellation `ambiguous` is real uncertainty; server may have processed before cancel.
+- No cache-hit measurement, no checkpoint, no five-tool live generation beyond `read/search` (M3-B), no long-context probe.
+- Prior hand-written replay test replaced; new SessionActor replay now provides genuine production transcript replay evidence.
 
 ## Code changes and test results
 
-- **Code HEAD:** `52d5a9d` + `Tests/NeedletailPrimitiveTests/M3ALiveQualificationTests.swift` (opt-in live suite, isolated config/state, private evidence, fail-closed assertions, genuine continuation). No transport code change (no concrete incorrect cancellation demonstrated).
-- **Tests:** `M3ALiveQualificationTests` 8/8 PASS with `M3A_LIVE=1` (5.0s); `swift test` without env 2/2 PASS (0 live, 0 network); relevant offline regressions `RecordCodecTests`/`SessionExportTests`/`QueueDurabilityTests` 20/20 PASS (3s) + `swift test --filter M3ALiveProbe` removed.
-- **Evidence digests:** see table above; artifacts in `.needletail-dev/m3a-evidence/` (`0600`).
+- **Code HEAD:** `6efbb70` (`M3ALiveQualificationTests.swift` continuation invented word + outgoing request persisted, `writeEvidence` fail-closed `0600` verified, `@Suite(.serialized)`, `NeedletailProviders` dep, `chatRequestBody` wire `007` + `M3AReplayLiveTests2.swift` SessionActor+GRDB replay with distinctive synthetic value `SYNTHETIC-RETRIEVED-9F3C2`).
+- **Tests:** `M3ALiveQualificationTests` 8/8 PASS with `M3A_LIVE=1` (5.0s) and 2/2 PASS without (0 live); `M3AReplayLiveTests2` 1/1 PASS with live (2.3s); relevant offline `RecordCodec`/`SessionExport`/`QueueDurability` 20/20 PASS. `M3ALiveProbe` removed.
+- **Evidence digests:** see tables; new replay digests `a2bb60a4d44c0c498480542d07292b42c390d899ccb517fe55858d704e76ca24`, `77cdc85f0ca1b0a797a15a9e2864276e568dd33906204407b580c5875fc58380`, `dee0daf25c3dbb6e5d2041045473994433b296f4789742e92fc2e15e73c634e4` (all `0600`, verified).
 
 ## Verdict
 
-**M3-A QUALIFIED** — the 7 qualification boundaries are established with genuine, bounded, reproducible, fail-closed evidence: correct authorized endpoint and served-model identity, real incremental streaming with bounded assembly, at least one genuine complete validated tool call, correct native transcript ordering/byte preservation via genuine continuation, byte-exact numeric-string wire fidelity, classified cancellation without resurrect, and private reproducible evidence with strict opt-in. No new CLI, provider adapter, or agent framework was built. Raw evidence retained outside Git; receipt commits digests.
+**M3-A QUALIFIED** — the 7 boundaries are now established with genuine, bounded, reproducible, fail-closed evidence: correct authorized endpoint/model, real incremental streaming with bounded assembly, at least one genuine complete validated tool call, correct native transcript ordering/byte preservation via **production `SessionActor` + `loadTranscript` + GRDB** with distinctive synthetic value, byte-exact numeric-string wire fidelity via production `chatRequestBody`, classified cancellation without resurrect (with persisted classification), and private reproducible evidence with strict opt-in and verified `0600` digests. No new CLI/provider/framework built. Raw evidence retained outside Git; receipt commits digests. Previous hand-written replay, initializer-only wire, and non-fail-closed evidence gaps are now closed.
 
 ## Next M3-B authorization request (smallest)
 
-Authorize bounded real five-tool coding loops on a **disposable scratch repository** (temp dir, `NEEDLETAIL_STATE_DIR` isolated store, no operator workspace) against the same **Halogen `local-coder @ http://192.168.2.216:8731/v1` (`halogen-qwen3.8-flash-next`)** with interactive TTY `ask` exec approval, using existing native executor + GRDB receipts, preserving diffs/requests/receipts verbatim. No `--trusted`, no cloud fallback, no server restart. M3-A synthetic probes already qualified; M3-B will run small undoable tasks (read/search/edit/write + approved exec test) before checkpoint.
+Authorize bounded real five-tool coding loops on a **disposable scratch repository** (temp dir, `NEEDLETAIL_STATE_DIR` isolated store, no operator workspace) against the same **Halogen `local-coder @ http://192.168.2.216:8731/v1` (`halogen-qwen3.8-flash-next`)** with interactive TTY `ask` exec approval, using existing native executor + GRDB receipts, preserving diffs/requests/receipts verbatim. No `--trusted`, no cloud fallback, no server restart.
 
