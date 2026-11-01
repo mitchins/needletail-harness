@@ -70,3 +70,36 @@ Real-model (this receipt): all tool calls, proposals, diagnostics and summaries 
 ## Smallest follow-up authorization request (to complete M3-B)
 
 Authorize a bounded completion delta (≤15 provider requests, remaining ceiling 25): an operator-approved mechanism for the three held operations — (a) an interactive TTY session for `edit`/`write`/`exec` batches in the retained scratch repos (human answers the prompts), or (b) an operator-supplied ApprovalGateway decision for the exact requests listed above. Scope: complete the gated edit/write/exec receipts, finish the integrated task (fix + regression test + `/usr/bin/python3 -m unittest` run + repair loop), keep the same ledger and evidence discipline.
+
+---
+
+## Completion delta (Phase A corrections + Phase B boundary), 2026-11-02
+
+**Code SHA:** `dc18702` — Phase A production correction (two tool-contract defects fixed with RED/GREEN; committed separately from evidence):
+
+1. **Model-visible read receipt (A1).** Defect: the native executor computed the exact full-file SHA-256 (`ToolCallOutcome.beforeHash`) on every read, but `continueAfterEffectPerCall` emitted only `outcome.data`, so the model never saw the hash — the live loop fabricated `expectedHash 000…0`. Fix: successful native reads now emit `[read receipt] path/sha256/truncated` from the executor-computed hash over the COMPLETE bytes; `edit.expectedHash` validation and optimistic conflict checks untouched. RED/GREEN (`Tests/NeedletailActorTests/M3BReadReceiptTests.swift`, production actor + native executor + real FS): RED = transcript lacked hash; GREEN = receipt carries exact hash; edit-with-observed-hash succeeds; stale hash conflicts with zero overwrite; truncated preview reports the complete-file hash (`truncated: true`).
+2. **Logical search paths (A2).** Defect: `filterSearchJSON` computed the approved logical workspace-relative path but appended the ORIGINAL rg line, exposing `/proc/self/fd/NN/…` to the model. Fix: kept lines are rebuilt through structured JSON re-serialization with `data.path.text` = logical path (no blind string replacement); match text/line numbers/offsets preserved; exact Unicode names byte-exact; lossy (unrepresentable) names dropped fail-closed with the truncation flag; protected classification, FD-anchored traversal, bounds and redaction unchanged. RED/GREEN in `B2ReadSearchTests` (+4): logical path usable directly by `read`, read-root base joined, protected dropped, Unicode preserved, lossy flagged, real-rg end-to-end shows `docs/notes.md` with zero `/proc/self/fd`.
+
+**Regression gate:** B2 14/14, B3+TOOL09+TOOL10 65/65, QueueAttachment 19/19 + actor 19/19, D3 15/15, Undo actor/files/journal + export/codec green. No regressions; only the two targeted behaviors changed.
+
+**Live confirmation (delta budget: 5 of the 15 authorized requests; cumulative 20/40, 20 remaining):**
+- read2 (`2` requests): model read `poem.txt`, receipt `sha256: 03ff0a237b1b178ba45cfba91c4433421e06d285cc8132e5816ef9d7512641c1` in the durable transcript, model reported it verbatim — matches `sha256sum`. exit 0.
+- search2 (`3` requests): model-visible search results carry `docs/notes.md`; model confirmed zero `/proc/self/fd` appeared. exit 0.
+
+**Phase B — operator-attended completion (prepared, stopped at the approval boundary):**
+
+No human operator was available in this session, so per the authorization the boundary stands. The exact runnable command (real terminal required — stdin and stderr must be TTYs for `TerminalApprovalGateway`; do not pipe or redirect them):
+
+```sh
+cd /tmp/m3b-scratch-task
+XDG_CONFIG_HOME=/tmp/m3a-xdg NEEDLETAIL_STATE_DIR=/tmp/m3b-state \
+  /data/coding/needletail/.build/release/needletail run \
+  --workspace /tmp/m3b-scratch-task \
+  --allow-exec \
+  --max-turns 10 \
+  --prompt "This project has a failing unit test. (1) read README.md, mathlib.py and test_mathlib.py (each read receipt carries the file's exact sha256 — use it for expectedHash); (2) edit mathlib.py to fix the moving_average defect (integer division truncates; the spec requires the exact mean); (3) write a new file test_regression.py with a regression test for the spec example; (4) run /usr/bin/python3 -m unittest test_mathlib -v via the exec tool and repair if needed; (5) summarize the diff."
+```
+
+Pre-state hashes (repo unchanged since the first hold): `mathlib.py 6d58508d…`, `test_mathlib.py 2da06b03…`, `README.md 4af599d4…`. The attending human independently approves or denies each prompt (edit batch, write batch, exec identity `/usr/bin/python3` resolved at prompt time — prior `/usr/bin/wc` approval, if any, does not carry over). The development agent does not type `y` or simulate the operator. Result feeds the M3-B completion ledger: approved+executed → tool PASS evidence; denied or absent → SAFETY HOLD stands.
+
+**Reviewer status:** DeepSeek route remains unavailable (`Insufficient account funds`, two attempts 2026-11-02, hold recorded in `.needletail-dev/m3b/ledger.jsonl`). No substitute reviewer used; no APPROVED claimed. **M3-B IMPLEMENTED — REVIEW HOLD.**
