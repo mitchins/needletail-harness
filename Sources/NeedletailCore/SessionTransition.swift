@@ -2892,6 +2892,22 @@ private func execReceiptText(callID: String, op: OperationID, status: String, st
     return "exec \(callID) \(status) op=\(op.raw) \(startedStr) artifact=\(artifact ?? "-") secondary=\(secondaryStr) truncated=\(truncated) :: \(summary)"
 }
 
+/// M3-B A1: model-visible read receipt. `beforeHash` is the executor's
+/// SHA-256 over the COMPLETE observed bytes (never the bounded preview),
+/// and `truncated` states whether the preview was cut. The receipt lets a
+/// follow-up `edit` propose the observed hash instead of fabricating one;
+/// `edit.expectedHash` validation and the optimistic conflict checks are
+/// untouched — the receipt informs, the validator still decides. Non-
+/// success reads (and legacy/scripted outcomes without a 64-hex hash)
+/// keep the plain data body.
+private func readReceiptText(_ outcome: ToolCallOutcome) -> String? {
+    guard outcome.status == "success",
+          let hash = outcome.beforeHash, hash.count == 64 else { return nil }
+    let path = outcome.path ?? "unknown"
+    let truncated = outcome.truncated ? "true" : "false"
+    return "[read receipt]\npath: \(path)\nsha256: \(hash)\ntruncated: \(truncated)\n\(outcome.data)"
+}
+
 /// A3-1 stable operation identity (SPEC §9.1): every externally
 /// dispatchable tool operation is identified by its reservation's effect ID
 /// plus its own call ID. Derived, never minted — so an intent and its later
@@ -3373,6 +3389,11 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: receiptStatus, started: outcome.started, artifact: outcome.artifactID, secondary: outcome.secondaryArtifactIDs, truncated: outcome.truncated, summary: receiptSummary)
             toolText = outcome.data.isEmpty ? "[\(receipt)]" : "\(outcome.data)\n[\(receipt)]"
             uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+        } else if proposal.tool == "read", let receipt = readReceiptText(outcome) {
+            // M3-B A1: successful native reads carry the executor-computed
+            // full-file SHA-256 to the model (the bounded preview alone
+            // previously hid it, so live edit proposals fabricated hashes).
+            toolText = receipt
         } else {
             toolText = outcome.data
         }

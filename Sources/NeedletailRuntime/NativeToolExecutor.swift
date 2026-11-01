@@ -2464,10 +2464,26 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 // collisions across distinct raw inodes); only exact names
                 // the operator approved are visible.
                 if !pathLossy && Self.isSearchPathApproved(logical, approvedPaths: approvedPaths) {
-                    kept.append(line)
+                    if let rewritten = Self.rewriteSearchLine(line, logical: logical) {
+                        kept.append(rewritten)
+                    } else {
+                        omittedUnparseable = true
+                    }
                 }
             case .unprotected:
-                kept.append(line)
+                // M3-B A2: the model-visible result carries the APPROVED
+                // logical workspace-relative path, never the /proc/self/fd
+                // argv prefix. Exact-decoded names are rewritten through a
+                // structured JSON rebuild (no blind string replacement);
+                // lossy skeletons cannot represent the name exactly and are
+                // dropped fail-closed with the truncation flag.
+                if pathLossy {
+                    omittedUnparseable = true
+                } else if let rewritten = Self.rewriteSearchLine(line, logical: logical) {
+                    kept.append(rewritten)
+                } else {
+                    omittedUnparseable = true
+                }
             }
         }
         var out = kept.joined(separator: "\n")
@@ -2475,6 +2491,26 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             out += "\n"
         }
         return (out, omittedUnparseable)
+    }
+
+    /// M3-B A2: re-serialize one parsed rg JSON line with `data.path.text`
+    /// replaced by the approved logical path. Structured rebuild preserves
+    /// match text, line numbers, offsets and submatches byte-exactly; only
+    /// the path field changes. Returns nil when re-serialization fails
+    /// (caller drops the line fail-closed).
+    static func rewriteSearchLine(_ line: String, logical: String) -> String? {
+        guard let objData = line.data(using: .utf8),
+              var obj = try? JSONSerialization.jsonObject(with: objData) as? [String: Any] else {
+            return nil
+        }
+        guard var dataObj = obj["data"] as? [String: Any] else { return nil }
+        dataObj["path"] = ["text": logical]
+        obj["data"] = dataObj
+        guard let newData = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .withoutEscapingSlashes]),
+              let newLine = String(data: newData, encoding: .utf8) else {
+            return nil
+        }
+        return newLine
     }
 
     /// Map an rg-reported path back to its logical relative path: strip the
