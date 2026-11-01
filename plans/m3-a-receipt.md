@@ -48,7 +48,7 @@ The directory holds **45 artifacts**, attributed by modification-time groups (ve
 
 Inventory cross-check (per shape, by group): `m3a-1`=2+1+1+1=5, `m3a-2`=2+1+1+1=5, `m3a-3`=2+1+1+1=5, `m3a-4-classification`=0+0+0+1=1, `m3a-5a`=2+2+1+1=6, `m3a-5b`=2+2+1+1=6, `m3a-5b-request`=0+1+1+1=3, `m3a-6`=2+1+1+1=5, `m3a-7-request`=0+2+2+2=6, `m3a-7-transcript`=0+1+1+1=3 → **45 artifacts total** ✓ (matches directory listing). Group artifact sums: 12+12+10+11 = 45 ✓.
 
-**Total observed live provider requests: 16+12+10+10 = 48, plus 1 doctor probe.** (Artifact count 45 < request count 48 because three cancellation pairs left no evidence in groups 1–3 — fixed at `910729f`.)
+**Total observed live provider requests: 16+12+10+10 = 48, plus 1 doctor probe.** Decomposition of 48 requests → 45 artifacts: **−8** unevidenced cancellation requests (four `m3a-4`+`m3a-4b` pairs: both group-1 runs, group 2's 17:17 run, group 3), **+6** extra non-call artifacts (3 `m3a-5b-request` outgoing-request captures + 3 `m3a-7-transcript` summaries), **−1** because the group-4 `m3a-4-classification` record covers its 2-call pair with one artifact: 48 − 8 + 6 − 1 = **45** ✓. The cancellation evidence gap was fixed at `910729f` (group 4 persists the classification record).
 
 **Budget truthfulness:** the original authorization was bounded synthetic-only with a 12-request first delta and a 4-request final closure. The final-closure group sent **10 requests (6 over the 4-request budget) by rerunning the whole 9-test suite instead of only the delta tests** — recorded here as an execution overrun, not concealed or deleted. Corrective rule recorded: future deltas run only the delta test with `--filter`. No evidence was removed to fit counts.
 
