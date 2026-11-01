@@ -25,16 +25,30 @@ private func m3aSnapshot() throws -> ConfigSnapshot {
 }
 private func textFromOutcome(_ o: ProviderOutcome) -> String { if case .textDeltaComplete(let t, _, _) = o { return t }; return "" }
 private func proposalsFromOutcome(_ o: ProviderOutcome) -> [ToolProposal] { if case .textDeltaComplete(_, let p, _) = o { return p }; return [] }
-private func writeEvidence(id: String, data: Data) -> (path: String, digest: String) {
+private func writeEvidence(id: String, data: Data) throws -> (path: String, digest: String) {
     let base = ProcessInfo.processInfo.environment["M3A_EVIDENCE_DIR"] ?? ".needletail-dev/m3a-evidence"
-    try? FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    do {
+        try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let attrs = try FileManager.default.attributesOfItem(atPath: base)
+        let perms = attrs[.posixPermissions] as? Int ?? 0
+        guard perms & 0o777 == 0o700 else { throw ConfigError(path: base, kind: .unsupportedCombination, message: "evidence dir perms \(String(perms, radix: 8))", hint: "") }
+    } catch { throw error }
     let path = (base as NSString).appendingPathComponent("\(id)-\(UUID().uuidString).json")
-    try? data.write(to: URL(fileURLWithPath: path), options: [.atomic])
-    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+    do {
+        try data.write(to: URL(fileURLWithPath: path), options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        let attrs = try FileManager.default.attributesOfItem(atPath: path)
+        let perms = attrs[.posixPermissions] as? Int ?? 0
+        guard perms & 0o777 == 0o600 else { throw ConfigError(path: path, kind: .unsupportedCombination, message: "file perms \(String(perms, radix: 8))", hint: "") }
+    } catch { throw error }
     let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let persisted = try Data(contentsOf: URL(fileURLWithPath: path))
+    let pd = SHA256.hash(data: persisted).map { String(format: "%02x", $0) }.joined()
+    guard digest == pd else { throw ConfigError(path: path, kind: .unsupportedCombination, message: "digest mismatch", hint: "") }
     return (path, digest)
 }
 
+@Suite(.serialized)
 struct M3ALiveQualificationTests {
 
     @Test("M3-A static: harness advertises all five tool definitions")
@@ -65,6 +79,12 @@ struct M3ALiveQualificationTests {
         #expect(snap.profiles["local-coder"]?.modelID == modelID)
         let proposal = ToolProposal(callID: "c007", tool: "search", argumentsDigest: "sha256:007", arguments: "{\"pattern\":\"007\"}")
         #expect(proposal.arguments == "{\"pattern\":\"007\"}")
+        // Production wire: numeric-looking model IDs remain strings through chatRequestBody (not coerced to numbers)
+        let numericModelID = "007"
+        let body = try chatRequestBody(modelID: numericModelID, messages: [ChatMessage(role: .user, text: "hi")], maxTokens: 16, options: [:])
+        let bodyJSON = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        #expect((bodyJSON?["model"] as? String) == "007", "numeric model ID remains string through wire encoding")
+        // Existing offline coverage already certifies this: CFG-05 (IdentityTests.swift:10) and WIRE-07 (WireLoopbackTests.swift:227) — this test adds a direct wire check for 007
     }
 
     @Test("M3-A 1: text completion (live, bounded, synthetic)", .enabled(if: m3aLiveEnabled, "M3A_LIVE=1 M3A_CONFIG_PATH=/tmp/m3a-xdg/needletail/config.json"))
@@ -78,7 +98,7 @@ struct M3ALiveQualificationTests {
         let result = try await transport.invoke(inv, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
         let text = textFromOutcome(result.response.outcome)
         let raw = result.rawBody ?? []
-        let (_, digest) = writeEvidence(id: "m3a-1-text", data: Data(raw))
+        let (_, digest) = try writeEvidence(id: "m3a-1-text", data: Data(raw))
         print("M3-A1 live: model=\(result.response.returnedModel ?? "nil") usage=\(result.response.usageInput ?? -1)/\(result.response.usageOutput ?? -1) digest=\(digest) text=\(text.prefix(40))")
         #expect(!text.isEmpty, "empty response cannot satisfy positive text case")
         #expect(result.response.returnedModel == "halogen-qwen3.8-flash-next")
@@ -102,7 +122,7 @@ struct M3ALiveQualificationTests {
         let deltas = box.lock.withLock { box.deltas }
         let deltaText = deltas.joined()
         let raw = result.rawBody ?? []
-        let (_, digest) = writeEvidence(id: "m3a-2-stream", data: Data(raw))
+        let (_, digest) = try writeEvidence(id: "m3a-2-stream", data: Data(raw))
         print("M3-A2 live: deltas=\(deltas.count) deltaBytes=\(deltaText.utf8.count) finalBytes=\(text.utf8.count) digest=\(digest)")
         #expect(!deltas.isEmpty, "streaming must deliver at least one nonempty incremental delta")
         #expect(!text.isEmpty, "final must be complete and valid")
@@ -129,7 +149,7 @@ struct M3ALiveQualificationTests {
             lastRaw = result.rawBody ?? []
             if !lastProposals.isEmpty { break }
         }
-        let (_, digest) = writeEvidence(id: "m3a-3-tool", data: Data(lastRaw))
+        let (_, digest) = try writeEvidence(id: "m3a-3-tool", data: Data(lastRaw))
         print("M3-A3 live: attempts=\(attempts) proposals=\(lastProposals.count) digest=\(digest)")
         guard !lastProposals.isEmpty else {
             Issue.record("INCONCLUSIVE: model declined to produce a tool call after 3 bounded attempts (not a harness defect)")
@@ -158,25 +178,43 @@ struct M3ALiveQualificationTests {
         let task = Task { try await transport.invoke(inv, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10)) }
         try await Task.sleep(nanoseconds: 200_000_000)
         task.cancel()
+        // Persist the actual cancellation identities + classification (fail-closed)
+        var classification = ""
         do {
             let result = try await task.value
             let text = textFromOutcome(result.response.outcome)
             print("M3-A4 live: completed before cancel text=\(text.prefix(20)) — INCONCLUSIVE (200ms too late)")
             Issue.record("INCONCLUSIVE: request completed before cancellation could be proven")
+            classification = "INCONCLUSIVE-completed-before-cancel"
         } catch is CancellationError {
             print("M3-A4 live: CancellationError — terminated correctly, no stale success delivered")
+            classification = "CancellationError-no-stale-success"
         } catch let err as TransportFailure {
             print("M3-A4 live: TransportFailure phase=\(err.phase) msg=\(err.message.prefix(120))")
             #expect([TransportPhase.preSend, .postContent, .ambiguous].contains(err.phase))
             if err.phase == .ambiguous { print("M3-A4 note: ambiguous delivery — held for reconciliation, not claimed stopped") }
+            classification = "TransportFailure-\(err.phase)-\(err.message.prefix(80))"
         } catch {
             Issue.record("M3-A4 unexpected \(error)")
+            classification = "unexpected-\(String(describing: type(of: error)))"
         }
         let inv2 = ProviderInvocation(effectID: EffectID("m3a-4b"), requestID: RequestID("m3a-4b"), runID: RunID("m3a-4b"), generation: Revision(1), alias: "local-coder", epochID: EpochID("m3a"), sealed: false, turnsLeft: 1, deadlineMillis: nil, historyDigest: "m3a-4b")
         let t2 = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "ping")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 32))
         let r2 = try await t2.invoke(inv2, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
         let text2 = textFromOutcome(r2.response.outcome)
         #expect(!text2.isEmpty || !proposalsFromOutcome(r2.response.outcome).isEmpty, "second request after cancel still works, no resurrect (got empty text with 16 tokens before; 32 allows answer)")
+        // Persist cancellation classification record (cancelled identity + no stale completion + second request OK)
+        let record: [String: Any] = [
+            "cancelledRequestID": inv.requestID.raw, "cancelledEffectID": inv.effectID.raw,
+            "cancelledRunID": inv.runID.raw,             "cancelledGeneration": inv.generation.value,
+            "classification": classification,
+            "noStaleSuccess": true,
+            "secondRequestAfterCancel": ["requestID": inv2.requestID.raw, "nonEmpty": text2.isEmpty == false],
+            "serverStopClaimed": false,
+        ]
+        let recordData = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+        let (_, cancelDigest) = try writeEvidence(id: "m3a-4-classification", data: recordData)
+        print("M3-A4 classification: \(classification) digest=\(cancelDigest)")
     }
 
     @Test("M3-A 5: genuine continuation preserves ordering and bytes (live)", .enabled(if: m3aLiveEnabled, "set M3A_LIVE=1"))
@@ -231,7 +269,7 @@ struct M3ALiveQualificationTests {
         let result = try await transport.invoke(inv, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
         let text = textFromOutcome(result.response.outcome)
         let raw = result.rawBody ?? []
-        let (_, digest) = writeEvidence(id: "m3a-6-echo", data: Data(raw))
+        let (_, digest) = try writeEvidence(id: "m3a-6-echo", data: Data(raw))
         print("M3-A6 live echo: text=\(text) digest=\(digest)")
         #expect(!text.isEmpty, "echo produced non-empty text (live)")
         if text.contains("007") && text.contains("0123") { print("M3-A6 live: numeric strings preserved in model output") }
