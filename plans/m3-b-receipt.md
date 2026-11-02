@@ -82,9 +82,9 @@ Authorize a bounded completion delta (≤15 provider requests, remaining ceiling
 
 **Regression gate:** B2 14/14, B3+TOOL09+TOOL10 65/65, QueueAttachment 19/19 + actor 19/19, D3 15/15, Undo actor/files/journal + export/codec green. No regressions; only the two targeted behaviors changed.
 
-**Live confirmation (delta budget: 5 of the 15 authorized requests; cumulative 20/40, 20 remaining):**
+**Live confirmation (delta budget: 4 of the 15 authorized requests; cumulative 19/40, 21 remaining):**
 - read2 (`2` requests): model read `poem.txt`, receipt `sha256: 03ff0a237b1b178ba45cfba91c4433421e06d285cc8132e5816ef9d7512641c1` in the durable transcript, model reported it verbatim — matches `sha256sum`. exit 0.
-- search2 (`3` requests): model-visible search results carry `docs/notes.md`; model confirmed zero `/proc/self/fd` appeared. exit 0.
+- search2 (`2` requests, corrected from 3 per durable requesting-events): model-visible search results carry `docs/notes.md`; model confirmed zero `/proc/self/fd` appeared. exit 0.
 
 **Phase B — operator-attended completion (prepared, stopped at the approval boundary):**
 
@@ -102,4 +102,4 @@ XDG_CONFIG_HOME=/tmp/m3a-xdg NEEDLETAIL_STATE_DIR=/tmp/m3b-state \
 
 Pre-state hashes (repo unchanged since the first hold): `mathlib.py 6d58508d…`, `test_mathlib.py 2da06b03…`, `README.md 4af599d4…`. The attending human independently approves or denies each prompt (edit batch, write batch, exec identity `/usr/bin/python3` resolved at prompt time — prior `/usr/bin/wc` approval, if any, does not carry over). The development agent does not type `y` or simulate the operator. Result feeds the M3-B completion ledger: approved+executed → tool PASS evidence; denied or absent → SAFETY HOLD stands.
 
-**Reviewer status:** DeepSeek route remains unavailable (`Insufficient account funds`, two attempts 2026-11-02, hold recorded in `.needletail-dev/m3b/ledger.jsonl`). No substitute reviewer used; no APPROVED claimed. **M3-B IMPLEMENTED — REVIEW HOLD.**
+**Reviewer status:** DeepSeek route was unavailable (`Insufficient account funds`, three failed attempts 2026-11-02 recorded in `.needletail-dev/m3b/ledger.jsonl`); after the account was restored, one focused review was obtained — NEEDS_CHANGES on accounting only (search2 3→2, cumulative 20→19), corrected here; Phase A code and live evidence passed. No substitute reviewer used; no APPROVED claimed. **M3-B IMPLEMENTED — REVIEW HOLD.**
