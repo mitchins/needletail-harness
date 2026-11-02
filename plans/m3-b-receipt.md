@@ -111,3 +111,31 @@ Pre-state hashes (repo unchanged since the first hold): `mathlib.py 6d58508d…`
 Post-authorization readiness verified (binary current at `dc18702` build, config valid, fixtures pristine at pre-state hashes, verifier script `.needletail-dev/m3b/verify-attended.sh` prepared). The interactive run had **not yet been executed** as of ~10 minutes of post-authorization polling (store session count unchanged at 9; task scratch unchanged at `mathlib.py 6d58508d…`, `test_mathlib.py 2da06b03…`, `README.md 4af599d4…`).
 
 **M3-B status: PARTIAL (DeepSeek-qualified as PARTIAL). Exact remaining gap:** the operator's interactive execution of the prepared command (above) — the only unmet M3-B item. Everything else (Phase A corrections, read/search PASS + live confirmations, approval-gate evidence, budget ledger, review) is complete. The durable store retains the run whenever it executes; `.needletail-dev/m3b/verify-attended.sh` then produces the completion evidence (request count, tool receipts, mutation hashes, independent test oracle) for the final receipt update within the 11-request ceiling (20 remaining before the attended run: 19 used + 11 authorized = 30 hard bound; ceiling stays 40).
+
+---
+
+## Operator-attended completion — VERIFIED (2026-11-02 16:28/16:42)
+
+The operator executed in a genuine interactive terminal. Two runs occurred:
+
+**Run 1 (16:28, `sess-run-0BDDE971…`, 6 requests, zero effects):** aborted — the prompt placeholder ("PASTE EXACT PROMPT FROM RECEIPT") was left un-substituted, so the model searched for receipts; one absolute-path `read {"path":"/"}` was denied by the validator. No mutations (no change group, no authorising records).
+
+**Run 2 (16:42, `sess-run-9F31051F…`, 6 requests, exit 0):** the real attended task with the exact prepared prompt. The operator approved two batches (edit + write) and two `/usr/bin/python3` executions. Durable verification (all claims below are checked against store records, artifacts and independent execution — not model reports):
+
+| Tool | Model call | Executed effect (durable evidence) | Verdict |
+|---|---|---|---|
+| `read` ×3 | `README.md` / `mathlib.py` / `test_mathlib.py` (`call_a1b195d7…`, `call_62ef43c5…`, `call_0d449e19…`) | receipts carried the file hashes; the model used `6d58508d…` as `expectedHash` — **from the A1 read receipt, not fabricated** | **PASS** |
+| `edit` | `call_6b6e8df3…` `expectedHash 6d58508d…` (pre-state hash), `old: // BUG… / results.append(sum(chunk) // window)` → `new: # Exact mean… / results.append(sum(chunk) / window)` | executed: change group `chg-20` member with `beforeHash 6d58508d… → afterHash 902af714…`, dev/inode/mode before+after, `grantedRoot /tmp/m3b-scratch-task`; preimage artifact `6d58508d…` durably retained (original bytes verified); independent diff = exactly those 2 lines | **PASS** (operator-approved) |
+| `write` | `test_regression.py` (1270 B, mode 0600) | created; **5 regression tests** (spec example, non-integral mean, negative mean floor-truncation, float results, full-window single result) | **PASS** (operator-approved) |
+| `exec` ×2 | `/usr/bin/python3 -m unittest test_mathlib -v` `call_4bc884d3…` then `test_regression -v` `call_e4a0a1cd…` | receipts: `success … exit 0; stdout 0B; stderr 246B/826B` with stderr artifacts `fd997a01…` / `814d7a5b…` (digests verified on disk); artifact contents: `Ran 2 tests … OK` and `Ran 5 tests … OK` | **PASS** (human-approved identities) |
+| post-verify | 2 artifact reads + final `read mathlib.py` `call_922e6644…` | model inspected its own exec outputs and re-read the fixed file | (read-only) |
+
+**Independent oracle (run directly by this agent, not via needletail):** `cd /tmp/m3b-scratch-task && /usr/bin/python3 -m unittest test_mathlib test_regression -v` → **Ran 7 tests, OK** (2 original + 5 regression — matches the operator's report). Final `mathlib.py` (`902af714…`) diff vs preimage: exactly the 2-line fix (`//` → `/`, comment updated); `README.md`/`test_mathlib.py` untouched (`2da06b03…`/`4af599d4…`); no files beyond `test_regression.py` created (only `__pycache__/` + `.needletail/` runtime byproducts). Zero unresolved/ambiguous markers in the completed session.
+
+**Budget:** the attended window produced **12 requests** (aborted placeholder run 6 + real task 6) against the 11-request additional ceiling — a **1-request overrun**, recorded here and in the ledger, nothing erased. **Cumulative M3-B: 31/40 provider requests (9 remaining).** Original 15-request ledger and all prior audit history preserved intact.
+
+**Failure classification:** the aborted run-1 placeholder prompt was an operator procedure slip (classified environment/procedure, zero effects, correctly denied absolute-path read); no harness defects; no new model defects in run 2 — the model used the receipt hash, made the exact minimal edit, wrote a well-formed regression suite and repaired nothing (first-pass green).
+
+**Code SHA:** production code unchanged since `dc18702` (zero corrections needed in this phase). Receipt/ledger commits only.
+
+**Verdict: M3-B COMPLETE.** Five-tool matrix: read PASS, search PASS, edit PASS (approved, executed, preimage+receipt verified), write PASS (approved, executed, contents verified), exec PASS (human-approved identity, output + exit 0 retained). Integrated task COMPLETE with independently verified diff and 7/7 passing tests.
