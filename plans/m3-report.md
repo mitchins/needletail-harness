@@ -22,12 +22,14 @@ M3 hypothesis: Needletail's checkpoint/epoch mechanism (M3-C) delivers reliable 
 
 **Needletail 15/24 (62.5%) vs Pi 24/24 (100%).** Full table + failure classes in `plans/m3-d-receipt.md`.
 
-- NT wins/parity: T01, T04, T05, T09, T11 (11 cells incl. reps).
-- NT losses cluster: turn-budget exhaustion (T02-R1, T03-R2, T06-R1, T07×2, T10×2), oversized tool batch hard-fail (T08×2), empty output (T12×2).
-- All 9 NT FAILs classify model-side on evidence; one harness-brittleness finding (T08 >8-call hard fail; graceful truncation = future work).
-- Efficiency: NT ~20k in-tokens/turn (full-transcript re-send) vs Pi ~1–3k; NT walls mostly lower per run but success-gated.
+- NT wins/parity: T01, T04, T05, T09, T11, T12 (12 cells).
+- NT losses: 7 turn-budget exhaustion (T02-R1, T03-R2, T06-R1, T07×2, T10×2), 2 oversized tool batch hard-fails (T08×2).
+- One harness-side scoring error found and corrected (T12 answer extractor; read-only rescore, marked).
+- Material asymmetry: 6 of 11 non-T09 NT PASSes ended exit 5 — artifact-complete but non-converging — vs Pi 24/24 exit 0. NT "PASS" is not run-cleanliness comparable to Pi "PASS".
+- All 9 NT FAILs classify model-side on evidence; one harness-brittleness finding (T08 >8-call hard fail; graceful truncation = future work) plus one corrected harness scoring bug (T12 extractor).
+- Efficiency: NT ~2–3k in-tokens per request with full-transcript re-send vs Pi ~1–3k per run compact; NT walls mostly lower per run but success-gated — and 6 NT passes burned full turn budgets anyway.
 - T09: genuine interrupt-recovery demonstrated for Pi (SIGINT after first tool CALL → `--continue` → PASS ×2); NT task too fast to catch (documented limitation).
-- Budget: 364/850 scored, 10/10 diagnostic. No reruns, no cache manipulation.
+- Budget: 386/850 scored (364 verdict-bearing + 22 T09 leg-1), 10/10 diagnostic, ~12 voided counted per amendment ≈ 408 accounted. No reruns, no cache manipulation.
 
 ## 5. Safety evidence (approval policy)
 
@@ -39,7 +41,6 @@ Sandbox grant path active in all 24 NT cells; no human approvals; no denials; ab
 |---|---|---|
 | Turn-budget exhaustion without convergence | T02-R1, T03-R2, T06-R1, T07-R1/R2, T10-R1/R2 | model efficiency |
 | Oversized tool batch (>8 calls) | T08-R1/R2 | model violation; harness truncation missing (M4) |
-| Empty output, exit 0 | T12-R1/R2 | model omission |
 | Interrupt recovery | T09 Pi ×2 genuine; NT ×2 degenerate (fast task) | harness limitation noted |
 
 ## 7. Known limitations (carried + new)

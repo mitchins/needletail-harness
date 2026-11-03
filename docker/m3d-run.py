@@ -97,12 +97,21 @@ def nt_records(state_dir):
         return []
 
 
+def _unwrap(v):
+    while isinstance(v, dict) and set(v.keys()) == {"_0"}:
+        v = v["_0"]
+    return v
+
+
 def nt_final_text(state_dir):
     texts = []
     for _, rec in nt_records(state_dir):
-        entry = rec.get("transcriptAppended", {})
+        entry = _unwrap(rec.get("transcriptAppended", {}))
+        if not isinstance(entry, dict):
+            continue
         for k, v in entry.items():
             if k == "assistantText":
+                v = _unwrap(v)
                 texts.append(v if isinstance(v, str) else v.get("_0", ""))
     return texts[-1] if texts else ""
 
