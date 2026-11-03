@@ -75,9 +75,8 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// ExecIdentityResolver (plan REV12 §3.4b.2): resolve → qualify →
     /// content-hash every exec proposal in the batch. Synchronous,
     /// filesystem-touching, bounded (NC-15: ≤8 calls/batch enforced by the
-    /// validator; ≤256 MiB per executable, ≤512 MiB aggregate here — sized
-    /// to admit standard interpreter binaries such as node (~126 MiB)
-    /// while keeping hash cost bounded per batch). The
+    /// validator; ExecArguments.maxExecBytes per executable,
+    /// maxExecAggregateBytes aggregate here). The
     /// executable walk anchors at "/" and RESOLVES symlinks (≤40 hops,
     /// NC-4) so `/usr/bin/python3` and Conda env binaries qualify; the
     /// final component opens O_NOFOLLOW and must be a regular file. The
@@ -319,11 +318,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             throw ExecResolutionError.qualification("resolved executable is not executable for exec \(callID)")
         }
         let size = UInt64(st.st_size)
-        guard size <= 256 * 1024 * 1024 else {
+        guard size <= ExecArguments.maxExecBytes else {
             throw ExecResolutionError.qualification("executable exceeds the 256 MiB hash bound for exec \(callID)")
         }
         aggregateBytes &+= size
-        guard aggregateBytes <= 512 * 1024 * 1024 else {
+        guard aggregateBytes <= ExecArguments.maxExecAggregateBytes else {
             throw ExecResolutionError.budgetExceeded("resolution budget exceeded (512 MiB aggregate) for exec \(callID)")
         }
         // Content hash over the held fd's bytes (the fd the spawn will use).

@@ -22,6 +22,14 @@ public struct ExecArguments: Sendable, Equatable {
     /// exceed this is rejected `invalid-arguments` — an unrenderable
     /// command is unapprovable (plan REV12 §3.3).
     public static let maxDisplayBytes = 8 * 1024
+    /// Identity hash bounds (Remediation R2): resolution (NativeToolExecutor)
+    /// and spawn re-verification (ExecRunner) MUST agree — a binary admitted
+    /// by one gate and refused by the other is a split-brain refusal. Sized
+    /// to admit standard interpreter binaries such as node (~126 MiB) while
+    /// keeping per-executable hash cost bounded. Single definition: both
+    /// gates reference these constants, so they cannot drift apart again.
+    public static let maxExecBytes: UInt64 = 256 * 1024 * 1024
+    public static let maxExecAggregateBytes: UInt64 = 512 * 1024 * 1024
 
     public let executable: String
     public let argv: [String]

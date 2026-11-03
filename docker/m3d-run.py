@@ -19,7 +19,11 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.join(HERE, "..")
 TASKS = os.path.join(REPO, "plans", "m3-tasks.json")
-RUNS = "/tmp/m3d/runs"
+# Diagnostic overrides (post-M3 remediation probes): alternate run root /
+# Needletail image for UNSCORED runs. Defaults preserve the exact scoring
+# invocation; never point the scoring matrix at another image.
+RUNS = os.environ.get("M3D_RUNS", "/tmp/m3d/runs")
+NT_IMAGE = os.environ.get("M3D_NT_IMAGE", "m3d-needletail:1")
 CFG_HOST = "/tmp/m3d/cfg"
 PHP_IMAGE = "php:8.4-cli"
 
@@ -215,7 +219,7 @@ def nt_cmd(task, rep, ws, state, grant_file, prompt, ceiling, cname):
         "-e", "NEEDLETAIL_STATE_DIR=/state",
         "-e", "XDG_CONFIG_HOME=/cfg",
         "-e", "NEEDLETAIL_REQUEST_BUDGET=%d" % ceiling,
-        "m3d-needletail:1", "run",
+        NT_IMAGE, "run",
         "--workspace", "/workspace",
         "--max-turns", str(task["needletail"]["maxTurns"]),
         "--allow-exec", "--sandbox-grant", "/grant/grant.json",
@@ -403,7 +407,7 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
             "-v", "%s:/grant/grant.json:ro" % grant_path, "-v", "%s:/cfg:ro" % CFG_HOST,
             "-e", "NEEDLETAIL_STATE_DIR=/state", "-e", "XDG_CONFIG_HOME=/cfg",
             "-e", "NEEDLETAIL_REQUEST_BUDGET=%d" % ceiling,
-            "m3d-needletail:1", "run", "--workspace", "/workspace",
+            NT_IMAGE, "run", "--workspace", "/workspace",
             "--max-turns", str(task["needletail"]["maxTurns"]),
             "--allow-exec", "--sandbox-grant", "/grant/grant.json",
             "--prompt", task["promptWithSandboxNote"],

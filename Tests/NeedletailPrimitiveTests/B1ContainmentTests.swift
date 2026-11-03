@@ -1008,6 +1008,30 @@ struct B1ContainmentTests {
         #expect(FileManager.default.fileExists(atPath: url.appendingPathComponent("g.txt").path))
     }
 
+    @Test("R2 large interpreter resolves past the old 64 MiB bound")
+    func r2LargeInterpreterResolves() throws {
+        // A 100 MiB sparse executable (st_size admits, zero-filled pages
+        // hash fast): resolution must admit it — the pre-fix 64 MiB bound
+        // refused node-class binaries here. Spawn re-verification shares
+        // the same constant (C0 value-pin), so no split-brain refusal.
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let big = url.appendingPathComponent("bigbin")
+        let fd = big.path.withCString { open($0, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(0o755)) }
+        try #require(fd >= 0, "sparse binary must create")
+        defer { close(fd) }
+        try #require(ftruncate(fd, off_t(100 * 1024 * 1024)) == 0, "sparse file must size")
+        try #require(fchmod(fd, mode_t(0o755)) == 0, "sparse binary must be executable")
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-r2"), writer: WriterIdentity(session: SessionID("s-r2"), writer: "w"), rgPath: nil, gitPath: nil)
+        let args = "{\"executable\":\"\(big.path)\",\"argv\":[\"\(big.path)\"]}"
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: args)])
+        let ids = try exec.resolveIdentities(batch: batch)
+        #expect(ids.count == 1, "100 MiB binary resolves, got \(ids.count)")
+        #expect(ids[0].size == 100 * 1024 * 1024, "identity carries the true size")
+    }
+
     @Test("R1_argvZeroRewrite")
     func r1ArgvZeroRewrite() throws {
         // GREEN: bare basename equal to the executable's basename rewrites.

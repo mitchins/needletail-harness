@@ -257,6 +257,14 @@ struct C0ExecContractTests {
         #expect(resumed.queueHeld == false, "nothing was dispatched: nothing held")
     }
 
+    @Test("R2 identity hash bound admits standard interpreters")
+    func identityBoundAdmitsInterpreters() {
+        // Single definition shared by resolution and spawn re-verification:
+        // a binary admitted at resolve time must not be refused at spawn.
+        #expect(ExecArguments.maxExecBytes == 256 * 1024 * 1024, "bound admits node-class binaries (~126 MiB)")
+        #expect(ExecArguments.maxExecAggregateBytes == 512 * 1024 * 1024, "aggregate stays bounded")
+    }
+
 /// Self-contained C0 fixtures (NeedletailStateTests fixtures are not
 /// visible across test targets).
 private enum C0Fixtures {
