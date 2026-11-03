@@ -36,13 +36,20 @@ def ceilings():
 
 
 def spent():
+    """Durable ledger spend: per result file, the max of the usage-line
+    count and the durable pre-dispatch budget count (the budget file is
+    the crash-safe superset — it counts sends whose responses never
+    paired, e.g. runs that exit before the usage epilogue)."""
     total = 0
     for root, _, files in os.walk(CONFIRM_RUNS):
         for f in ("result.json", "result-leg2.json", "result-leg1.json"):
             p = os.path.join(root, f)
             if os.path.exists(p):
                 try:
-                    total += int(json.load(open(p)).get("requests", 0) or 0)
+                    d = json.load(open(p))
+                    usage_n = int(d.get("requests", 0) or 0)
+                    budget_n = d.get("budgetUsed")
+                    total += max(usage_n, budget_n if isinstance(budget_n, int) else usage_n)
                 except Exception:
                     pass
     return total

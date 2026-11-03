@@ -1,4 +1,5 @@
 import Foundation
+import NeedletailCore
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
@@ -139,6 +140,19 @@ public struct LiveRequestBudget: Sendable {
               let stored = obj["used"] as? Int else { return nil }
         return stored
     }
+}
+
+/// M3 adjudication fix: the durable budget report line. Pure format
+/// function (no I/O) so the scorer contract is unit-tested without live
+/// inference traffic: `budget: used=N limit=M tag=T` when a durable
+/// counter exists, `budget: unbudgeted tag=T` otherwise. The scorer
+/// parses this line as the crash-safe spend superset (every pre-send
+/// consume, including attempts whose responses never paired).
+public func budgetReportLine(used: Int?, limit: Int?, tag: String) -> String {
+    if let used, let limit {
+        return "budget: used=\(used) limit=\(limit) tag=\(terminalSafe(tag))"
+    }
+    return "budget: unbudgeted tag=\(terminalSafe(tag))"
 }
 
 /// One spelling for `fsync` across the two supported Libcs.

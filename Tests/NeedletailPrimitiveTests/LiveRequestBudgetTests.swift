@@ -135,4 +135,19 @@ struct LiveRequestBudgetTests {
             #expect(error == .counterUnreadable("live-request budget counter is corrupt; refusing to send"))
         }
     }
+
+    @Test("budget report line is the scorer-parseable durable spend figure")
+    func budgetReportLineFormat() {
+        // Exact contract the scorer parses (M3 adjudication fix): every
+        // pre-send consume lands here, including sends whose responses
+        // never pair — the usage-line epilogue is only the token metric.
+        #expect(budgetReportLine(used: 23, limit: 45, tag: "budget") == "budget: used=23 limit=45 tag=budget")
+        #expect(budgetReportLine(used: 12, limit: 12, tag: "checkpoint") == "budget: used=12 limit=12 tag=checkpoint")
+        #expect(budgetReportLine(used: nil, limit: 45, tag: "budget") == "budget: unbudgeted tag=budget")
+        #expect(budgetReportLine(used: 3, limit: nil, tag: "budget") == "budget: unbudgeted tag=budget")
+        // Terminal-safe: control bytes in the tag cannot break the line
+        // the scorer regexes (single-line, no control scalars).
+        let dirty = budgetReportLine(used: 1, limit: 2, tag: "x\ny")
+        #expect(!dirty.contains("\n") && dirty.hasPrefix("budget: used=1 limit=2 tag="), "tag sanitized, got \(dirty)")
+    }
 }

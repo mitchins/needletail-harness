@@ -988,6 +988,17 @@ struct RunCommand: ParsableCommand {
         defer { sigintSource.cancel() }
 
         // 8. Submit and wait for completion (multi-turn loop)
+        // Durable budget report (M3 adjudication fix): the usage epilogue
+        // below is skipped by early exits (wall timeout, capture failure,
+        // checkpoint-stage timeouts, headless approval stops), which let
+        // provider sends escape the reported ledger. The durable
+        // pre-dispatch counter (LiveRequestBudget: every pre-send consume
+        // is fsync'd, counting successful, failed, cancelled and ambiguous
+        // attempts alike) is the authoritative spend figure — emit it on
+        // EVERY terminal path via this helper, never only at the end.
+        func emitBudgetLine() {
+            eprint(budgetReportLine(used: liveBudget?.inspect(), limit: liveBudget?.limit, tag: budgetTag))
+        }
         await actor.submitText(commandID: CommandID("cmd-run"), text: prompt, kind: .followUp, sealed: sealed)
         // Poll for terminal phase with timeout (max 60s per run, plus turn budget)
         let deadline = Date().addingTimeInterval(max(60.0, Double(maxTurns ?? 80) * Double(max(1, profile.requestTimeout))))
@@ -1046,6 +1057,7 @@ struct RunCommand: ParsableCommand {
             done = await actor.currentState()
             let reason = terminalSafe("run did not complete within the wall budget")
             eprint("run did not complete within timeout")
+            emitBudgetLine()
             if isJSONL {
                 try? await sink.emitTerminal(outcome: "budget_exhausted", detail: reason)
             }
@@ -1071,6 +1083,7 @@ struct RunCommand: ParsableCommand {
             let dismissed = await awaitIdle(actor: actor, deadline: Date().addingTimeInterval(30))
             guard dismissed, (await actor.currentState()).phase == .idle else {
                 eprint("checkpoint: run did not dismiss to idle; capture refused")
+            emitBudgetLine()
                 try? await httpClient.shutdown().get()
                 throw ExitCode(1)
             }
@@ -1092,6 +1105,7 @@ struct RunCommand: ParsableCommand {
                   after.epoch.epochID != epochBeforeID,
                   after.epoch.parentEpochID == epochBeforeID else {
                 eprint("checkpoint: capture failed, malformed, or timed out; epoch unchanged")
+            emitBudgetLine()
                 try? await httpClient.shutdown().get()
                 throw ExitCode(1)
             }
@@ -1105,11 +1119,13 @@ struct RunCommand: ParsableCommand {
             let firstMillis = UInt64(Date().timeIntervalSince(firstStart) * 1000)
             guard firstDone else {
                 eprint("checkpoint: post-rollover request exceeded 300s")
+            emitBudgetLine()
                 try? await httpClient.shutdown().get()
                 throw ExitCode(5)
             }
             guard (await actor.currentState()).pendingApproval == nil else {
                 eprint("checkpoint: post-rollover request awaits approval; stopping instead of auto-continuing")
+            emitBudgetLine()
                 try? await httpClient.shutdown().get()
                 throw ExitCode(3)
             }
@@ -1122,11 +1138,13 @@ struct RunCommand: ParsableCommand {
             let warmMillis = UInt64(Date().timeIntervalSince(warmStart) * 1000)
             guard warmDone else {
                 eprint("checkpoint: warm request exceeded 300s")
+            emitBudgetLine()
                 try? await httpClient.shutdown().get()
                 throw ExitCode(5)
             }
             guard (await actor.currentState()).pendingApproval == nil else {
                 eprint("checkpoint: warm request awaits approval; stopping instead of reporting a timing")
+            emitBudgetLine()
                 try? await httpClient.shutdown().get()
                 throw ExitCode(3)
             }
@@ -1143,6 +1161,10 @@ struct RunCommand: ParsableCommand {
         // checkpoint): one line per paired provider response from the
         // actor's complete (never evicted) usage log. Unknown stays "?"
         // — never inferred. Powers the M3-D token metric from stderr.
+        // The durable budget line below is authoritative for spend (it
+        // counts every pre-send consume, including attempts whose
+        // responses never paired); usage lines remain the token metric.
+        emitBudgetLine()
         for entry in await actor.usageLog {
             eprint("usage: request \(terminalSafe(entry.requestID)) phase=\(terminalSafe(entry.phase)) epoch=\(terminalSafe(entry.epochID)) usage_in=\(entry.usageInput.map(String.init) ?? "?") usage_out=\(entry.usageOutput.map(String.init) ?? "?") raw_bytes=\(entry.rawBytes)")
         }

@@ -66,6 +66,27 @@ def write_grant(path, run_id, container):
         json.dump(grant, f, sort_keys=True)
 
 
+def parse_accounting(stderr):
+    """Usage lines (token metric) + durable budget line (authoritative
+    spend: every pre-send consume, including attempts whose responses
+    never paired). requests semantics unchanged (usage-line count);
+    budgetUsed is the crash-safe superset for ledger accounting."""
+    usage = []
+    budget_used = None
+    budget_limit = None
+    for line in stderr.splitlines():
+        m = re.match(r"^usage: request (\S+) phase=(\S+) epoch=(\S+) usage_in=(\S+) usage_out=(\S+) raw_bytes=(\d+)", line)
+        if m:
+            usage.append({"request": m.group(1), "in": None if m.group(4) == "?" else int(m.group(4)),
+                          "out": None if m.group(5) == "?" else int(m.group(5))})
+            continue
+        b = re.match(r"^budget: used=(\d+) limit=(\d+)", line)
+        if b:
+            budget_used = int(b.group(1))
+            budget_limit = int(b.group(2))
+    return usage, budget_used, budget_limit
+
+
 def docker_base(name):
     # Non-root host-mapped uid: processes can never be root, and scored
     # artifacts stay directly auditable on the host (no chown dance).
@@ -467,10 +488,14 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
     leg1 = {"exit": "interrupted", "wall": wall, "stdout": out, "stderr": err,
             "container": cname, "interruptObserved": observed, "exitedEarly": exited_early}
     if harness == "nt":
-        leg1["requests"] = sum(1 for line in err.splitlines() if line.startswith("usage: request "))
+        usage, budget_used, budget_limit = parse_accounting(err)
+        leg1["requests"] = len(usage)
         leg1["tokensIn"] = 0
         leg1["tokensOut"] = 0
         leg1["usageUnknown"] = True
+        leg1["budgetUsed"] = budget_used
+        leg1["budgetLimit"] = budget_limit
+        leg1["accountingDiscrepancy"] = (budget_used - len(usage)) if budget_used is not None else None
     else:
         _, reqs, tin, tout = pi_parse(out)
         leg1["requests"] = reqs
@@ -582,16 +607,14 @@ def main():
             subprocess.run(["chmod", "-R", "a+rwX", ws, state, grantdir], check=False)
             res = run_container(nt_cmd(task, rep, ws, state, grant_path, prompt, ceiling, cname), timeout, cname)
             res["phpOk"] = php_ok
-            usage = []
-            for line in res["stderr"].splitlines():
-                m = re.match(r"^usage: request (\S+) phase=(\S+) epoch=(\S+) usage_in=(\S+) usage_out=(\S+) raw_bytes=(\d+)", line)
-                if m:
-                    usage.append({"request": m.group(1), "in": None if m.group(4) == "?" else int(m.group(4)),
-                                  "out": None if m.group(5) == "?" else int(m.group(5))})
+            usage, budget_used, budget_limit = parse_accounting(res["stderr"])
             res["requests"] = len(usage)
             res["tokensIn"] = sum(u["in"] or 0 for u in usage)
             res["tokensOut"] = sum(u["out"] or 0 for u in usage)
             res["usageUnknown"] = any(u["in"] is None or u["out"] is None for u in usage)
+            res["budgetUsed"] = budget_used
+            res["budgetLimit"] = budget_limit
+            res["accountingDiscrepancy"] = (budget_used - len(usage)) if budget_used is not None else None
             res["answer"] = nt_final_text(state)
             res["phpOk"] = php_ok
             if task["id"] == "T08":
