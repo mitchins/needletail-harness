@@ -248,10 +248,12 @@ def evaluate(task, ws, run, harness, state):
     # Interpreter caches and the harness's own workspace lock are
     # deterministic byproducts, identical across runs — not
     # model-created files.
-    untracked = [u for u in untracked if not (
-        u == "__pycache__" or u.startswith("__pycache__/")
-        or u.endswith(".pyc") or u.startswith(".pytest_cache")
-        or u == ".needletail" or u.startswith(".needletail/"))]
+    def _is_byproduct(path):
+        segs = path.replace("\\", "/").split("/")
+        return (".needletail" in segs or "__pycache__" in segs
+                or ".pytest_cache" in segs
+                or any(s.endswith(".pyc") for s in segs))
+    untracked = [u for u in untracked if not _is_byproduct(u)]
     det = {"diff": diff, "untracked": untracked, "exit": run["exit"], "wall": round(run["wall"], 1)}
     outs = []
 
