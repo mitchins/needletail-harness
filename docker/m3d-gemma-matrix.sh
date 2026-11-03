@@ -38,28 +38,28 @@ EOF
 
 canary() {
   # Frozen protocol: 3 sequential trivial probes; HEALTHY iff all 200,
-  # <60s, exact model id, exact CANARY-OK content.
-  local ok=1
+  # <60s, exact model id, exact CANARY-OK content. Returns 0 when healthy.
+  local degraded=0
   for i in 1 2 3; do
-    out=$(curl -s -m 90 -w '\nHTTP=%{http_code} TIME=%{time_total}' \
+    raw=$(curl -s -m 90 -w '\nHTTP=%{http_code} TIME=%{time_total}' \
       http://192.168.1.14:8000/v1/chat/completions -H 'Content-Type: application/json' \
       -d "{\"model\":\"$GEMMA_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: CANARY-OK\"}],\"temperature\":0,\"max_tokens\":16}")
-    echo "$(date -u +%FT%TZ) canary-$i $out" >> "$CANARY_LOG"
-    body=$(echo "$out" | head -c 2000)
-    meta=$(echo "$out" | tail -1)
-    id=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('model','?'))" 2>/dev/null)
-    content=$(echo "$body" | python3 -c "import json,sys; print((json.load(sys.stdin)['choices'][0]['message'] or {}).get('content','?'))" 2>/dev/null)
+    echo "$(date -u +%FT%TZ) canary-$i $(echo "$raw" | tail -c 300)" >> "$CANARY_LOG"
+    body=$(echo "$raw" | sed '$d')
+    meta=$(echo "$raw" | tail -1)
+    id=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('model','?'))" 2>/dev/null || echo "?")
+    content=$(echo "$body" | python3 -c "import json,sys; print((json.load(sys.stdin)['choices'][0]['message'] or {}).get('content','?'))" 2>/dev/null || echo "?")
     t=$(echo "$meta" | sed 's/.*TIME=//')
     code=$(echo "$meta" | sed 's/.*HTTP=\([0-9]*\).*/\1/')
     slow=$(python3 -c "print(float('$t') >= 60.0)" 2>/dev/null || echo True)
     if [ "$code" != "200" ] || [ "$slow" = "True" ] || [ "$id" != "$GEMMA_ID" ] || [ "$content" != "CANARY-OK" ]; then
       echo "CANARY DEGRADED probe-$i code=$code time=${t}s id=$id content=$(echo "$content" | head -c 60)"
-      ok=0
+      degraded=1
     else
       echo "canary-$i healthy (${t}s)"
     fi
   done
-  return $ok
+  return $degraded
 }
 
 echo "=== gemma health gate: initial triple-probe ==="
