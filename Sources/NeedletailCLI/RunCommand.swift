@@ -59,6 +59,9 @@ struct RunCommand: ParsableCommand {
     @Flag(name: .long, help: "M3-C: after the run completes at a quiescent boundary, capture a two-phase checkpoint (model-generated summary against the warm native history, tool execution locally disabled), publish the shorter epoch, then send a bounded continuation request. Requires --workspace.")
     var checkpoint: Bool = false
 
+    @Option(name: .long, help: "M3-D Docker amendment: container-scoped automatic approval via the launcher-issued grant file at PATH. Approves ONLY validated batches confined to the grant's disposable workspace (hostname-bound, read-only grant). Requires --workspace; conflicts with --sealed and --trusted. Never use on an ordinary host run.")
+    var sandboxGrant: String?
+
     @Option(name: .customLong("acknowledge-unresolved-outcomes"),
             help: "Explicit operator decision for the B5-B cross-run gate: 'operator-accepted-risk' or 'manually-reconciled:<note>'. Records a durable acknowledgment in the new session; required when the store holds unresolved mutating outcomes, never persisted, never exempts future runs.")
     var acknowledgeUnresolvedOutcomes: String?
@@ -110,6 +113,31 @@ struct RunCommand: ParsableCommand {
         }
         if checkpoint && sealed {
             eprint("error: --checkpoint and --sealed are mutually exclusive (a sealed demonstration never opens a provider capture, sealed or otherwise)")
+            throw ExitCode(2)
+        }
+        if sandboxGrant != nil && workspace == nil {
+            eprint("error: --sandbox-grant requires --workspace (the grant binds a disposable workspace)")
+            throw ExitCode(2)
+        }
+        if let grantPath = sandboxGrant, let ws = workspace {
+            // Compose-time tripwire (review hardening): the launcher
+            // mounts the grant read-only OUTSIDE the disposable workspace.
+            // A grant inside the workspace would be model-writable through
+            // the file tools — refuse the composition instead of running
+            // with a self-approvable policy.
+            let canonGrant = (grantPath as NSString).standardizingPath
+            let canonWS = (ws as NSString).standardizingPath
+            if canonGrant == canonWS || canonGrant.hasPrefix(canonWS + "/") {
+                eprint("error: --sandbox-grant file must live outside --workspace (a model-writable grant is a self-approval)")
+                throw ExitCode(2)
+            }
+        }
+        if sandboxGrant != nil && sealed {
+            eprint("error: --sandbox-grant and --sealed are mutually exclusive (a sealed demonstration never auto-approves)")
+            throw ExitCode(2)
+        }
+        if sandboxGrant != nil && trusted {
+            eprint("error: --sandbox-grant and --trusted are mutually exclusive (contradictory backends)")
             throw ExitCode(2)
         }
         if allowExec && workspace == nil {
@@ -188,6 +216,7 @@ struct RunCommand: ParsableCommand {
         let sealedCopy = sealed
         let trustedCopy = trusted
         let allowExecCopy = allowExec
+        let sandboxGrantCopy = sandboxGrant
         Task { @Sendable in
             do {
                 try await RunCommand.executeStatic(
@@ -195,7 +224,7 @@ struct RunCommand: ParsableCommand {
                     format: formatCopy, tools: toolsCopy, alias: aliasCopy,
                     maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy,
                     allowExec: allowExecCopy, workspace: workspaceCopy, readRoot: readRootCopy,
-                    checkpoint: checkpointCopy,
+                    checkpoint: checkpointCopy, sandboxGrant: sandboxGrantCopy,
                     acknowledgedDetermination: acknowledgedDetermination, interactiveApproval: interactiveApprovalTTY, isJSONL: isJSONL)
             } catch let error as ExitCode {
                 box.lock.withLock { box.exitCode = error.rawValue }
@@ -388,7 +417,7 @@ struct RunCommand: ParsableCommand {
         return store
     }
 
-    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, allowExec: Bool, workspace: String?, readRoot: [String], checkpoint: Bool, acknowledgedDetermination: String?, interactiveApproval: Bool, isJSONL: Bool) async throws {
+    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, allowExec: Bool, workspace: String?, readRoot: [String], checkpoint: Bool, sandboxGrant: String? = nil, acknowledgedDetermination: String?, interactiveApproval: Bool, isJSONL: Bool) async throws {
         // Unused format param kept for future envelope versioning
         _ = format
         // Private-by-default file creation for EVERYTHING this process
@@ -826,33 +855,36 @@ struct RunCommand: ParsableCommand {
                                     configuration: ChatTransportPolicy.configuration(profile: profile))
         // Use the session store (GRDB production or sealed-volatile) for transcript paging
         let promptCopy = prompt
-        // M3-C durable pre-send live-request budget (ticket: a separate
-        // 12-request M3-C allowance). Enforced HERE — the single choke
-        // point every live provider request passes through — BEFORE any
-        // byte is sent. The counter is durable in the state directory
+        // Durable pre-send live-request budget. Enforced HERE — the single
+        // choke point every live provider request passes through — BEFORE
+        // any byte is sent. The counter is durable in the state directory
         // (survives crashes; re-runs never reset it); exhaustion or a
         // corrupt counter fails closed (the throw becomes a transport
         // failure: the checkpoint capture fails with the epoch unchanged,
         // a main-run request fails the run — nothing is ever sent).
-        // Non-checkpoint runs are unbudgeted (nil gate).
+        // Checkpoint runs always take the fixed 12-request allowance; other
+        // runs take NEEDLETAIL_REQUEST_BUDGET when set (M3-D scoring), else
+        // unbudgeted (nil gate). Limit selection is pure for testing.
         let liveBudget: LiveRequestBudget?
-        if checkpoint {
+        if let limit = LiveRequestBudget.limit(checkpoint: checkpoint, environment: ProcessInfo.processInfo.environment) {
             let budgetDir = try resolveStateDirectory()
             try FileManager.default.createDirectory(
                 atPath: budgetDir, withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700])
+            let fileName = checkpoint ? "m3c-live-budget.json" : "run-request-budget.json"
             liveBudget = LiveRequestBudget(
-                fileURL: URL(fileURLWithPath: (budgetDir as NSString).appendingPathComponent("m3c-live-budget.json")),
-                limit: 12)
+                fileURL: URL(fileURLWithPath: (budgetDir as NSString).appendingPathComponent(fileName)),
+                limit: limit)
         } else {
             liveBudget = nil
         }
+        let budgetTag = checkpoint ? "checkpoint" : "budget"
         let messageProvider: @Sendable (ProviderInvocation) async throws -> [ChatMessage] = { invocation in
             if let budget = liveBudget {
                 do {
                     _ = try budget.consume()
                 } catch let error as LiveRequestBudget.BudgetError {
-                    eprint("checkpoint: live-request budget refuses to send (\(String(describing: error))); no provider byte sent")
+                    eprint("\(budgetTag): live-request budget refuses to send (\(String(describing: error))); no provider byte sent")
                     throw error
                 }
             }
@@ -895,9 +927,20 @@ struct RunCommand: ParsableCommand {
         // a store fault can never strand it into a deinit fatalError.
         // B5-C: the interactive gateway decides on a real TTY and behaves
         // headless (.unavailable → exit 3, no mutation) otherwise.
+        // M3-D Docker amendment: the approval gateway is selected at
+        // runtime — the interactive TTY gateway by default, the
+        // launcher-bound sandbox policy under --sandbox-grant (container
+        // only; the grant check fails closed anywhere else).
+        let approvalsGateway: AnyApprovalGateway
+        if let grantPath = sandboxGrant {
+            approvalsGateway = AnyApprovalGateway(SandboxPolicyGateway(grantPath: grantPath))
+            eprint("needletail: sandbox approval policy composed (grant \(terminalSafe(grantPath)); host TTY approval bypassed ONLY under a valid launcher grant)")
+        } else {
+            approvalsGateway = AnyApprovalGateway(TerminalApprovalGateway())
+        }
         let actor: SessionActor<
             ChatCompletionsTransport, CLIExecutor, CLIStore,
-            TerminalApprovalGateway, SystemClock, DeterministicIDSource
+            AnyApprovalGateway, SystemClock, DeterministicIDSource
         >
         do {
             // M2-C C0 (plan REV12 §3.4b.1): the native executor is the
@@ -912,7 +955,7 @@ struct RunCommand: ParsableCommand {
             actor = try SessionActor(
                 state: state, ids: DeterministicIDSource(prefix: "run"), clock: SystemClock(),
                 transport: transport, executor: executor, store: store,
-                approvals: TerminalApprovalGateway(), sink: sink, writer: writerID,
+                approvals: approvalsGateway, sink: sink, writer: writerID,
                 execResolver: identityResolver)
         } catch {
             try? await httpClient.shutdown().get()
@@ -965,6 +1008,18 @@ struct RunCommand: ParsableCommand {
                     // first poll; a human answers whenever ready.) The
                     // wall deadline below still bounds the wait; headless
                     // runs resolve immediately via .unavailable.
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    continue
+                }
+                if sandboxGrant != nil && !(current.queueHeld && current.heldReason == .approvalPending) {
+                    // M3-D Docker amendment: the sandbox policy decides
+                    // asynchronously (local grant read on an actor task),
+                    // so a transient authorising state is NOT a headless
+                    // stop — wait for it to resolve. A decided-unavailable
+                    // approval holds the queue with heldReason
+                    // approvalPending, which the next poll observes and
+                    // exits 3 below. The wall deadline still bounds the
+                    // wait. Host headless behavior is unchanged.
                     try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                     continue
                 }
@@ -1089,7 +1144,7 @@ struct RunCommand: ParsableCommand {
         // actor's complete (never evicted) usage log. Unknown stays "?"
         // — never inferred. Powers the M3-D token metric from stderr.
         for entry in await actor.usageLog {
-            eprint("usage: request \(terminalSafe(entry.requestID)) usage_in=\(entry.usageInput.map(String.init) ?? "?") usage_out=\(entry.usageOutput.map(String.init) ?? "?") raw_bytes=\(entry.rawBytes)")
+            eprint("usage: request \(terminalSafe(entry.requestID)) phase=\(terminalSafe(entry.phase)) epoch=\(terminalSafe(entry.epochID)) usage_in=\(entry.usageInput.map(String.init) ?? "?") usage_out=\(entry.usageOutput.map(String.init) ?? "?") raw_bytes=\(entry.rawBytes)")
         }
         // Shutdown HTTP client before handling output (actor no longer needs it)
         try? await httpClient.shutdown().get()

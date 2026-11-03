@@ -291,10 +291,31 @@ public enum ApprovalDecision: Sendable, Equatable {
     /// The gateway cannot decide (headless, no TTY): pending forever —
     /// never auto-approve, never auto-deny (POLICY-04).
     case unavailable(String)
+    /// M3-D Docker amendment: sandbox-policy approval, issued ONLY by the
+    /// container-scoped gateway against a validated launcher grant. Carries
+    /// the grant binding (run/container identity) for the ledger — never
+    /// recorded as a human decision.
+    case sandboxGrant(note: String)
 }
 
 public protocol ApprovalGateway: Sendable {
     func decide(_ request: ApprovalRequest) async -> ApprovalDecision
+}
+
+/// Type-erased approval gateway (M3-D Docker amendment): lets call sites
+/// select the gateway at runtime (interactive TTY vs launcher-bound
+/// sandbox policy) without genericizing the whole composition root.
+/// Forwards identity-preserving; no policy of its own.
+public struct AnyApprovalGateway: ApprovalGateway, Sendable {
+    private let wrapped: any ApprovalGateway
+
+    public init(_ wrapped: any ApprovalGateway) {
+        self.wrapped = wrapped
+    }
+
+    public func decide(_ request: ApprovalRequest) async -> ApprovalDecision {
+        await wrapped.decide(request)
+    }
 }
 
 /// Classified transport failure (M1-C carrier, R2): the ADAPTER classifies
@@ -496,6 +517,13 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.authorising, .approvalGrant(let requestID, _, _)):
         return grantApproval(state, requestID: requestID, ids: &ids)
+    case (.authorising, .approvalSandboxGrant(let requestID, _, let note, _)):
+        // M3-D Docker amendment: same dispatch as a human grant, but the
+        // ledger first records the sandbox binding (run/container identity
+        // from the launcher grant) under its own event kind.
+        let (s1, prefix) = sequenced(state, kind: "sandbox-granted", digest: eventDigest("sandbox-grant", terminalSafe(note)), ids: &ids)
+        let granted = grantApproval(s1, requestID: requestID, ids: &ids)
+        return Transition(state: granted.state, effects: granted.effects, records: prefix + granted.records)
     case (.authorising, .approvalDeny(_, _, _, _)):
         return denyApproval(state, ids: &ids)
     case (.authorising, .approvalUnavailable(let requestID, _, let reason, let at)):
@@ -688,6 +716,7 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
         }
         return nil
     case .approvalGrant(let requestID, let generation, _),
+         .approvalSandboxGrant(let requestID, let generation, _, _),
          .approvalDeny(let requestID, let generation, _, _),
          .approvalUnavailable(let requestID, let generation, _, _):
         guard let run = state.activeRun,
@@ -2944,7 +2973,8 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         requestID: run.requestID, runID: run.runID, generation: run.revision,
         operation: operation,
         requiredGrant: "explicit approval",
-        protectedPaths: grantablePaths.sorted())
+        protectedPaths: grantablePaths.sorted(),
+        batch: batch)
     let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("approval", run.requestID.raw), ids: &ids)
     let next = s1.replacing(phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch))
     return Transition(
@@ -2996,7 +3026,8 @@ private func execIdentitiesResolved<I: IDSource>(
     let request = ApprovalRequest(
         requestID: run.requestID, runID: run.runID, generation: run.revision,
         operation: operation, requiredGrant: "explicit approval",
-        protectedPaths: seed.grantablePaths.sorted(), execIdentities: bound)
+        protectedPaths: seed.grantablePaths.sorted(), execIdentities: bound,
+        batch: batch)
     let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("resolved", resolutionID), ids: &ids)
     let next = s1.replacing(
         phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch),

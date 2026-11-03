@@ -293,8 +293,14 @@ public struct ApprovalRequest: Sendable, Equatable {
     /// M2-C C0 (plan REV12 §3.4b): per-exec-call resolved identity bound
     /// into the approval. Empty for non-exec batches and demo displays.
     public let execIdentities: [ExecCommandIdentity]
+    /// M3-D Docker amendment: the validated batch under approval. The
+    /// sandbox policy gateway evaluates THIS (parsed arguments, paths,
+    /// identities) — never the rendered `operation` display text.
+    /// Defaults empty for pre-existing constructors (test seams that
+    /// never reach a gateway).
+    public let batch: ToolBatch
 
-    public init(requestID: RequestID, runID: RunID, generation: Revision, operation: String, requiredGrant: String, protectedPaths: [String] = [], execIdentities: [ExecCommandIdentity] = []) {
+    public init(requestID: RequestID, runID: RunID, generation: Revision, operation: String, requiredGrant: String, protectedPaths: [String] = [], execIdentities: [ExecCommandIdentity] = [], batch: ToolBatch = ToolBatch()) {
         self.requestID = requestID
         self.runID = runID
         self.generation = generation
@@ -302,6 +308,7 @@ public struct ApprovalRequest: Sendable, Equatable {
         self.requiredGrant = requiredGrant
         self.protectedPaths = protectedPaths
         self.execIdentities = execIdentities
+        self.batch = batch
     }
 }
 

@@ -72,6 +72,11 @@ public enum SessionEvent: Sendable, Equatable {
     /// must lie in the past of the live epoch; nothing is mutated.
     case lineageForkRequest(boundary: LineageBoundary, atMillis: UInt64)
     case approvalGrant(requestID: RequestID, generation: Revision, atMillis: UInt64)
+    /// M3-D Docker amendment: sandbox-policy grant. Dispatched EXACTLY
+    /// like `approvalGrant`, but the ledger records a distinct
+    /// `sandbox-granted` event carrying the grant binding (`note`), so a
+    /// container approval is never mistaken for a human one.
+    case approvalSandboxGrant(requestID: RequestID, generation: Revision, note: String, atMillis: UInt64)
     case approvalDeny(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
     case approvalUnavailable(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
     case switchModel(alias: String, atMillis: UInt64)

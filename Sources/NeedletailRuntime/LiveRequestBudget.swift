@@ -33,6 +33,22 @@ public struct LiveRequestBudget: Sendable {
         self.limit = limit
     }
 
+    /// Pre-send budget limit selection (pure, deterministic): checkpoint
+    /// runs take the fixed 12-request M3-C allowance, raised to
+    /// NEEDLETAIL_REQUEST_BUDGET when explicitly set higher (M3-D T08
+    /// needs up to 45; the checkpoint allowance never shrinks below 12).
+    /// Other runs take NEEDLETAIL_REQUEST_BUDGET when it parses to a
+    /// positive integer, else unbudgeted (nil).
+    public static func limit(checkpoint: Bool, environment: [String: String] = ProcessInfo.processInfo.environment) -> Int? {
+        let env = environment["NEEDLETAIL_REQUEST_BUDGET"].flatMap(Int.init)
+        if checkpoint {
+            if let value = env, value > 12 { return value }
+            return 12
+        }
+        guard let value = env, value > 0 else { return nil }
+        return value
+    }
+
     public enum BudgetError: Error, Equatable, Sendable {
         /// Budget exhausted: no request may be sent. Carries counts only
         /// (no prompts, no routes, no secrets — safe for stderr).

@@ -92,6 +92,19 @@ struct LiveRequestBudgetTests {
         }
     }
 
+    @Test("limit selection: checkpoint floor 12, raised by env; plain runs env-gated")
+    func limitSelection() throws {
+        #expect(LiveRequestBudget.limit(checkpoint: true, environment: [:]) == 12)
+        #expect(LiveRequestBudget.limit(checkpoint: true, environment: ["NEEDLETAIL_REQUEST_BUDGET": "3"]) == 12, "checkpoint allowance never shrinks")
+        #expect(LiveRequestBudget.limit(checkpoint: true, environment: ["NEEDLETAIL_REQUEST_BUDGET": "45"]) == 45, "explicit raise honored")
+        #expect(LiveRequestBudget.limit(checkpoint: true, environment: ["NEEDLETAIL_REQUEST_BUDGET": "many"]) == 12)
+        #expect(LiveRequestBudget.limit(checkpoint: false, environment: [:]) == nil)
+        #expect(LiveRequestBudget.limit(checkpoint: false, environment: ["NEEDLETAIL_REQUEST_BUDGET": "15"]) == 15)
+        #expect(LiveRequestBudget.limit(checkpoint: false, environment: ["NEEDLETAIL_REQUEST_BUDGET": "0"]) == nil)
+        #expect(LiveRequestBudget.limit(checkpoint: false, environment: ["NEEDLETAIL_REQUEST_BUDGET": "-2"]) == nil)
+        #expect(LiveRequestBudget.limit(checkpoint: false, environment: ["NEEDLETAIL_REQUEST_BUDGET": "many"]) == nil)
+    }
+
     @Test("a corrupt counter fails closed and is never reset")
     func corruptFailsClosed() throws {
         let dir = try Self.tempDir()

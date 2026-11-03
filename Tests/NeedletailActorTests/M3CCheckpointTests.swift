@@ -204,6 +204,10 @@ struct M3CCheckpointTests {
         #expect(projected.count < full.count, "projection is shorter than full history (\(projected.count) < \(full.count) messages)")
         #expect(projected.count <= CheckpointTailCut.maxRecords + 2, "bounded tail, got \(projected.count) messages")
         #expect(idle.liveReservations.isEmpty, "commit clears the attempt reservation")
+        // Usage log stages the capture: the checkpointing-phase entry is
+        // the capture request (what T08's transmitted-context comparison keys on).
+        let ulog = await actor.usageLog
+        #expect(ulog.contains(where: { $0.phase.contains("checkpoint") }), "capture staged as checkpointing")
         // Full history intact: every pre-publication record still there.
         #expect(after.contains { if case .transcriptAppended(.user(let t)) = $0 { return t.contains("pinned original task") }; return false })
         // Publication carries pinned constraints + tail cut.
@@ -866,8 +870,9 @@ struct M3CCheckpointTests {
         let log = await actor.usageLog
         #expect(log.count == 2, "one entry per paired response, got \(log.count)")
         #expect(log[0].usageInput == 100 && log[0].usageOutput == 20, "usage carried verbatim")
-        #expect(log[1].usageInput == nil && log[1].usageOutput == nil, "missing usage stays unknown, never zero-filled")
+        #expect(log[1].usageInput == nil && log[1].usageOutput == nil, "missing usage stays nil, never zero-filled")
         #expect(!log[0].requestID.isEmpty && log[0].requestID != log[1].requestID, "distinct invocation identities")
+        #expect(!log[0].phase.isEmpty && !log[0].epochID.isEmpty, "stage mapping fields present")
     }
 
     // MARK: - 17. Capture overlay helper

@@ -69,6 +69,10 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         public let usageInput: Int?
         public let usageOutput: Int?
         public let rawBytes: Int
+        /// Phase + epoch at pairing time: lets scorers map entries to
+        /// stages (main vs capture vs post-rollover) exactly.
+        public let phase: String
+        public let epochID: String
     }
     private var usageLogEntries: [UsageEntry] = []
     public var usageLog: [UsageEntry] { usageLogEntries }
@@ -322,6 +326,8 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         switch decision {
         case .approve:
             await apply(.approvalGrant(requestID: requestID, generation: generation, atMillis: clock.nowMillis()))
+        case .sandboxGrant(let note):
+            await apply(.approvalSandboxGrant(requestID: requestID, generation: generation, note: note, atMillis: clock.nowMillis()))
         case .deny(let reason):
             await apply(.approvalDeny(requestID: requestID, generation: generation, reason: reason, atMillis: clock.nowMillis()))
         case .unavailable(let reason):
@@ -641,7 +647,9 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                 requestID: invocation.requestID.raw,
                 usageInput: result.response.usageInput,
                 usageOutput: result.response.usageOutput,
-                rawBytes: result.rawBody?.count ?? 0))
+                rawBytes: result.rawBody?.count ?? 0,
+                phase: String(describing: state.phase),
+                epochID: state.epoch.epochID.raw))
             deliveryQueue.finish()
             await deliveryTask.value
             if deltaDelivery === deliveryQueue { deltaDelivery = nil }

@@ -180,4 +180,20 @@ struct ApprovalPolicyTests {
             return true
         }, "no approval may ever be requested for sealed tools")
     }
+
+    @Test("M3-D sandbox grant dispatches with a distinct ledger marker; stale identity drops")
+    func sandboxGrantDispatchesDistinctly() throws {
+        var ids = StateFixtures.ids()
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")])
+        let (authorising, run) = try Self.authorisingState(mode: .workspace, batch: batch, ids: &ids)
+        let reqID = try #require(authorising.pendingApproval?.requestID)
+        let granted = transition(authorising, .approvalSandboxGrant(requestID: reqID, generation: run.revision, note: "sandbox:run-1:c1", atMillis: 2000), &ids)
+        #expect(granted.state.phase != .authorising, "sandbox grant releases the hold")
+        #expect(granted.records.contains { if case .eventAppended(_, let kind, _) = $0 { return kind == "sandbox-granted" }; return false }, "distinct sandbox marker recorded")
+        #expect(!granted.records.contains { if case .eventAppended(_, let kind, _) = $0 { return kind == "granted" }; return false }, "never recorded as a human grant")
+        // Stale identity drops without dispatch.
+        let stale = transition(authorising, .approvalSandboxGrant(requestID: RequestID("bogus"), generation: run.revision, note: "sandbox:x:y", atMillis: 2001), &ids)
+        #expect(stale.state.phase == .authorising, "stale sandbox grant drops")
+        #expect(stale.state.droppedStaleCount == authorising.droppedStaleCount + 1, "stale drop counted")
+    }
 }
