@@ -1,5 +1,5 @@
 {
-  "frozen": "2026-11-03 REV4 (pre-scoring: sandbox note strengthened with no-environment-probing rule after observing model pwd-probing on voided T12-R1-nt attempts; prompts identical both harnesses; fixtures/oracles/budgets unchanged; voided runs discarded, not counted)",
+  "frozen": "2026-11-03 REV5 (T09 interrupt trigger clarified to first durable tool CALL + Pi session-dir pre-created; no fixture/oracle/budget changes; prior T09 attempts voided — no valid interruption was ever delivered)",
   "note": "FROZEN pre-registration. Do not modify tasks, prompts, fixtures, oracles, or budgets after the first scored run. Any change requires a new frozen revision and voids prior scores.",
   "endpoint": "http://192.168.2.216:8731/v1",
   "model": "halogen-qwen3.8-flash-next",
@@ -420,7 +420,6 @@
         "interruption-recovery"
       ],
       "approvals": "attended",
-      "conditional": null,
       "fixture": {
         "files": {
           "data.txt": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"
@@ -433,7 +432,7 @@
       ],
       "prompt": "Compute the sum of the numbers in data.txt and write it (digits only) to result.txt.",
       "resumePrompt": "Continue: finish writing the exact sum of data.txt into result.txt (digits only). Do not repeat completed work.",
-      "procedure": "Start run; after the first durable tool result is observable in the harness record, send SIGINT; then resume once per harness (Needletail: new run, same session+state dir, resumePrompt; Pi: documented resume path, finalized at compat check). One resume allowed.",
+      "procedure": "Start run; poll from container start (1s) for the first durable tool CALL (NT: ledger toolCall; Pi: container-log toolCall event — session files may not flush mid-run); on first call (or 150s cap), send SIGINT; then resume once per harness (Needletail: same session+state, resumePrompt; Pi: same --session-dir + --continue, no --session-id). One resume allowed.",
       "oracle": {
         "commands": [
           "test \"$(cat result.txt | tr -d '[:space:]')\" = '55'"

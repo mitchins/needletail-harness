@@ -117,6 +117,14 @@ def nt_tool_results(state_dir):
     return n
 
 
+def nt_tool_calls(state_dir):
+    n = 0
+    for _, rec in nt_records(state_dir):
+        if "transcriptAppended" in rec and "toolCall" in rec["transcriptAppended"]:
+            n += 1
+    return n
+
+
 def nt_write_intents(state_dir, filename):
     n = 0
     for _, rec in nt_records(state_dir):
@@ -404,7 +412,10 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
     # log-collectable below. Explicit rm -f at the end.
     subprocess.Popen(["docker", "run", "-d", "--name", cname] + cmd[4:],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(5)
+    # Fast first poll: short tasks can complete in seconds, so the
+    # interrupt trigger is the first durable tool CALL (not the result),
+    # checked from container start.
+    time.sleep(2)
     observed = False
     exited_early = False
     t0 = time.time()
@@ -414,26 +425,17 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
             exited_early = True
             break
         if harness == "nt":
-            if nt_tool_results(state) > 0:
+            if nt_tool_calls(state) > 0:
                 observed = True
                 break
         else:
-            sess = os.path.join(state, "pi-session")
-            found = False
-            if os.path.isdir(sess):
-                for _, _, files in os.walk(sess):
-                    for fn in files:
-                        if fn.endswith(".jsonl") or fn.endswith(".json"):
-                            try:
-                                blob = open(os.path.join(sess, fn), encoding="utf-8", errors="replace").read()
-                                if "tool" in blob.lower():
-                                    found = True
-                            except Exception:
-                                pass
-            if found:
+            # Pi session files may not flush mid-run; poll the live
+            # container log stream for the first tool call instead.
+            rc, logout, _ = sh(["docker", "logs", "--tail", "50", cname])
+            if "toolCall" in logout or "tool_calls" in logout:
                 observed = True
                 break
-        time.sleep(2)
+        time.sleep(1)
     if not exited_early:
         sh(["docker", "kill", "--signal", "SIGINT", cname])
     try:
@@ -491,6 +493,9 @@ def main():
     os.makedirs(ws, exist_ok=True)
     os.makedirs(state, exist_ok=True)
     os.makedirs(grantdir, exist_ok=True)
+    # Pi cannot create nested session dirs itself (non-recursive mkdir);
+    # pre-create so leg 1 does not crash at startup.
+    os.makedirs(os.path.join(state, "pi-session"), exist_ok=True)
     if leg == 1:
         for root, dirs, files in os.walk(ws, topdown=False):
             for n in files:
