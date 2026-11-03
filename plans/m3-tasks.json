@@ -1,5 +1,5 @@
 {
-  "frozen": "2026-11-03 REV2 (pre-scoring amendment: docker php provisioning, Pi compat resolved, usage-logging delta committed)",
+  "frozen": "2026-11-03 REV4 (pre-scoring: sandbox note strengthened with no-environment-probing rule after observing model pwd-probing on voided T12-R1-nt attempts; prompts identical both harnesses; fixtures/oracles/budgets unchanged; voided runs discarded, not counted)",
   "note": "FROZEN pre-registration. Do not modify tasks, prompts, fixtures, oracles, or budgets after the first scored run. Any change requires a new frozen revision and voids prior scores.",
   "endpoint": "http://192.168.2.216:8731/v1",
   "model": "halogen-qwen3.8-flash-next",
@@ -93,7 +93,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Fix app.py so that all tests in test_app.py pass. Do not modify test_app.py. Verify by running the tests if you can. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Fix app.py so that all tests in test_app.py pass. Do not modify test_app.py. Verify by running the tests if you can. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T02",
@@ -136,7 +138,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Fix calc.ts so that test.mjs passes (run it with node). Do not modify test.mjs. Use only erasable TypeScript syntax. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Fix calc.ts so that test.mjs passes (run it with node). Do not modify test.mjs. Use only erasable TypeScript syntax. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T03",
@@ -181,7 +185,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Fix the syntax error in broken.php with the smallest possible change. Preserve its behavior. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Fix the syntax error in broken.php with the smallest possible change. Preserve its behavior. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T04",
@@ -223,7 +229,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Fix the type error in main.swift with the smallest possible change. Keep the function name describe. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Fix the type error in main.swift with the smallest possible change. Keep the function name describe. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T05",
@@ -265,7 +273,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Fix the off-by-one boundary defect in check (7 must satisfy the check). Never touch the line marked USER-EDIT. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Fix the off-by-one boundary defect in check (7 must satisfy the check). Never touch the line marked USER-EDIT. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T06",
@@ -309,7 +319,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Fix util.py so the test passes. Reproduce every identifier byte-exactly; do not ascii-fold or rename anything. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Fix util.py so the test passes. Reproduce every identifier byte-exactly; do not ascii-fold or rename anything. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T07",
@@ -353,7 +365,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Diagnose the compile error and fix it with the smallest possible change. Touch only the broken file. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Diagnose the compile error and fix it with the smallest possible change. Touch only the broken file. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T08",
@@ -392,7 +406,9 @@
         ],
         "checkpoint": true
       },
-      "timeoutSecs": 3600
+      "timeoutSecs": 3600,
+      "promptWithSandboxNote": "Read every fNN.py file in this workspace individually with the read tool (do not use search; do not modify anything). Compute the sum of all total() return values. Print ONLY the number as your final answer. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Read every fNN.py file in this workspace individually with the read tool (do not use search; do not modify anything). Compute the sum of all total() return values. Print ONLY the number as your final answer. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T09",
@@ -433,7 +449,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1800
+      "timeoutSecs": 1800,
+      "promptWithSandboxNote": "Compute the sum of the numbers in data.txt and write it (digits only) to result.txt. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Continue: finish writing the exact sum of data.txt into result.txt (digits only). Do not repeat completed work. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T10",
@@ -482,7 +500,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Fix pkg_b so its tests pass. Change nothing outside pkg_b. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Fix pkg_b so its tests pass. Change nothing outside pkg_b. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T11",
@@ -533,7 +553,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Rename function oldName to newName consistently in all files. Behavior must not change. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Rename function oldName to newName consistently in all files. Behavior must not change. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     },
     {
       "id": "T12",
@@ -576,7 +598,9 @@
         ],
         "checkpoint": false
       },
-      "timeoutSecs": 1200
+      "timeoutSecs": 1200,
+      "promptWithSandboxNote": "Report the sha256 of README.md and list all .py filenames in this workspace. Change nothing. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only.",
+      "resumePromptWithSandboxNote": "Report the sha256 of README.md and list all .py filenames in this workspace. Change nothing. Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
     }
   ],
   "metricsPerRun": [
@@ -622,5 +646,6 @@
       "2026-11-03 pi -p exact-echo compat probe (1 request)",
       "2026-11-03 pi -p --mode json exact-echo + usage schema (1 request)"
     ]
-  }
+  },
+  "sandboxNote": " Sandbox tooling note (identical for both harnesses; binding for Needletail, guidance for Pi): use the read/search/edit/write file tools for file access. If you run shell commands, use ONLY these executables with arguments inside the workspace: python3, node, swiftc, php, git. Any other command (including sh, bash, ls, cat, curl) will be denied and end the run. Work only inside /workspace (your entire task lives there). Do not probe the environment with pwd, ls, whoami, env, or other inspection commands — use the read/search tools and the listed shell commands only."
 }

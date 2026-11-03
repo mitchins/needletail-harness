@@ -1,6 +1,9 @@
 # M3-D Pi execution image (pinned node base + installed Pi 1.4.0 dist).
+# Symmetric model tooling: node 24 (base) + python3 for model-driven
+# verification; no swiftc/php (oracles cover those).
 FROM node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c
-RUN useradd -m -u 10000 bench && mkdir -p /workspace /state /home/bench/.pi/agent && chown -R bench:bench /workspace /state /home/bench
+RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 10000 bench && mkdir -p /workspace /state /home/bench/.pi/agent && chown -R bench:bench /workspace /state /home/bench
 # Launcher stages pi-dist/ (copy of the installed 1.4.0 package dir),
 # models.json (halogen-only, frozen) and settings.json.
 COPY --chown=bench:bench pi-dist /opt/pi

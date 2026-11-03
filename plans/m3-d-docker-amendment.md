@@ -49,14 +49,15 @@ Zero-request unless noted: (1) both agents execute in-container (whoami/hostname
 
 ## Addendum B. Execution images (2026-11-03, built from frozen `f4fef24` archive)
 
-- `m3d-needletail:1` = `sha256:d16d3b8f01ad699745ec371d3922eb99e08a18cc906ebff04025f43bdc1f13b9` (multi-stage: `swift:6.4-bookworm` builder compiles `git archive` of the frozen tree; runtime `ubuntu:24.04` + bundled Swift runtime libs + `LD_LIBRARY_PATH` launcher; non-root `bench`, entrypoint `needletail`, `--version` → `0.3.0` verified in-container).
-- `m3d-pi:1` = `sha256:5ca61e4b16cace6a29b13d5539fdf70e8de276081d2c6cea9cacc34232223d26` (`node:24-bookworm-slim` + installed Pi 1.4.0 dist + frozen halogen-only `models.json` (`samplingParams.temperature: 0.2`) + settings; non-root `bench`).
+- `m3d-needletail:1` = `sha256:8f7ed7cbf5b5ee27247228d9ca03268d81297884fd7e5bbab3b094edb502164e` (multi-stage: `swift:6.4-bookworm` builder compiles `git archive` of the frozen tree; runtime `node:24-bookworm-slim` + `python3` + bundled Swift runtime libs; non-root `bench`, entrypoint `needletail`; verified in-container: `0.3.0`, `python3 3.11.2`, `node v24.22.2`).
+- `m3d-pi:1` = `sha256:55e429c5be4767c11434f4e644a114e7ede41436d496b4cc44ccce800b682436` (`node:24-bookworm-slim` + `python3` + installed Pi 1.4.0 dist + frozen halogen-only `models.json` (`samplingParams.temperature: 0.2`) + settings; non-root `bench`; verified in-container: `1.4.0`, `python3 3.11.2`, `node v24.22.2`, no php/swiftc).
+- Model toolchain symmetry (verified in both images): python3 ✓ / node ✓ / swiftc ✗ / php ✗. Oracles cover swiftc (host) and php (`php:8.4-cli` container).
 - `m3d-forwarder:1` = `sha256:4acb4add598f6fc5bb233b1dc2917ebd92703822bc378fc328a2c14d9024e40d` (see Addendum A).
 - Scoring-tree equivalence: `Sources/` + `Tests/` are byte-identical between the image build tree (`f4fef24`) and HEAD (verified `git diff f4fef24 HEAD -- Sources Tests` empty); only docs/harness scripts differ.
 
 ## Addendum C. Preflight evidence (2026-11-03; diagnostic spend 10/10, allowance exhausted)
 
-- (1) Both agents execute in containers: `m3d-needletail:1` → `0.3.0`, `m3d-pi:1` → `1.4.0` (uid 10000, hostnames set).
+- (1) Both agents execute in containers: `m3d-needletail:1` → `0.3.0`, `m3d-pi:1` → `1.4.0` (non-root host-mapped uid, hostnames set; per-run identity = container hostname + launcher grant).
 - (2) Unattended Needletail edit/write/test: scratch read→edit→write completed with ZERO human input; model-proposed `exec /bin/sh -c …` resolved to `/usr/bin/dash` and was DENIED by the allowlist (not in [python3,node,swiftc,php,git]) → headless exit 3, no hang. Ledger: `sandbox-granted` event (auto-approved batch) + `approval-required`/`unavailable` hold (denied exec). 6 requests via forwarder.
 - (3) Host binary (piped stdin, edit task): exit 3, `approval required`, file byte-identical. Host policy intact.
 - (4) Deterministic: 15 SandboxPolicy + grant-transition + budget + usage tests green.

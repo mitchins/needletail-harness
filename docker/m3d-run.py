@@ -63,11 +63,16 @@ def write_grant(path, run_id, container):
 
 
 def docker_base(name):
+    # Non-root host-mapped uid: processes can never be root, and scored
+    # artifacts stay directly auditable on the host (no chown dance).
+    # Per-run identity is the container hostname + launcher grant.
+    uid = "%d:%d" % (os.getuid(), os.getgid())
+    assert uid != "0:0", "never run the matrix as root"
     return [
         "docker", "run", "--name", name, "--hostname", name,
         "--network", "m3d-internal", "--read-only",
         "--tmpfs", "/tmp", "--tmpfs", "/run",
-        "--user", "10000:10000",
+        "--user", uid,
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
         "--cpus", "4", "--memory", "8g", "--pids-limit", "256",
     ]
@@ -148,15 +153,17 @@ def pi_parse(stdout):
             ev = json.loads(line)
         except Exception:
             continue
-        if ev.get("type") == "message_end" and ev.get("message", {}).get("role") == "assistant":
-            for c in ev["message"].get("content", []):
+        if ev.get("type") == "message_end" and isinstance(ev.get("message"), dict) \
+                and ev["message"].get("role") == "assistant":
+            m = ev["message"]
+            for c in m.get("content", []):
                 if isinstance(c, dict) and c.get("type") == "text":
                     texts.append(c.get("text", ""))
-            u = ev.get("usage", {})
+            u = m.get("usage", {}) or {}
             tin += u.get("input", 0) or 0
             tout += u.get("output", 0) or 0
-            if ev.get("responseId"):
-                reqs.add(ev["responseId"])
+            if m.get("responseId"):
+                reqs.add(m["responseId"])
     return "".join(texts), len(reqs), tin, tout
 
 
@@ -281,6 +288,9 @@ def evaluate(task, ws, run, harness, state):
     elif tid == "T08":
         ans = run.get("answer", "")
         ok = re.search(r"(^|[^0-9])780([^0-9]|$)", ans) is not None
+        if diff != [] or untracked:
+            ok = False
+            det["mutation"] = diff + ["untracked:" + u for u in untracked]
         det["contextReduction"] = run.get("contextReduction", "NOT-ASSESSED")
         if harness == "nt" and det["contextReduction"] not in ("REDUCED", "NOT-APPLICABLE"):
             ok = False
@@ -310,7 +320,9 @@ def evaluate(task, ws, run, harness, state):
     elif tid == "T12":
         sha = sh(["sha256sum", "README.md"], cwd=ws)[1].split()[0]
         ans = run.get("answer", "")
-        clean = sh(["git", "-C", ws, "status", "--porcelain"])[1].strip() == ""
+        # Seeded files are staged (git add); a clean run adds no unstaged
+        # changes and no untracked files.
+        clean = (diff == [] and not untracked)
         ok = (sha in ans) and clean
         det["expectedSha"] = sha
     det["oracleOutputs"] = outs
@@ -474,7 +486,9 @@ def main():
         subprocess.run(["chmod", "-R", "a+rwX", ws, state], check=False)
     with open(TASKS, encoding="utf-8") as f:
         assert json.load(f)["frozen"].startswith("2026-11-03"), "tasks file changed?"
-    prompt = task["prompt"] if leg == 1 else task.get("resumePrompt", task["prompt"])
+    # REV3: identical sandbox tooling note for both harnesses (binding for
+    # Needletail's sandbox policy, guidance for Pi).
+    prompt = task["promptWithSandboxNote"] if leg == 1 else task.get("resumePromptWithSandboxNote", task["promptWithSandboxNote"])
     php_ok = sh(["docker", "image", "inspect", PHP_IMAGE])[0] == 0
     ceiling = task["needletail"]["requestCeiling"]
     timeout = task.get("timeoutSecs", 1200)
@@ -547,6 +561,11 @@ def main():
         run["verdict"] = verdict
         run["oracle"] = det
     run.update({"task": task_id, "rep": rep, "harness": harness, "leg": leg, "frozen": frozen["frozen"]})
+    suffix = "-leg%d" % leg if task_id == "T09" else ""
+    with open(os.path.join(rundir, "stdout%s.log" % suffix), "w", encoding="utf-8") as f:
+        f.write(run.get("stdout", ""))
+    with open(os.path.join(rundir, "stderr%s.log" % suffix), "w", encoding="utf-8") as f:
+        f.write(run.get("stderr", ""))
     with open(respath, "w", encoding="utf-8") as f:
         json.dump(run, f, indent=1, ensure_ascii=False)
     print("%s R%d %s leg%d: %s (exit=%s wall=%.0fs req=%s)" % (
