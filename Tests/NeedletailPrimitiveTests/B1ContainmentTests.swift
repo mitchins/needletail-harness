@@ -972,7 +972,7 @@ struct B1ContainmentTests {
             #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: batch) }
         }
         // Search "." and "/workspace" are the workspace-root search (omitted path).
-        for raw in [".", "/workspace", "/workspace/"] {
+        for raw in [".", "/workspace", "/workspace/", ""] {
             let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"x\",\"path\":\"\(raw)\"}")])
             let v = try ToolValidator.validateBatchArguments(batch: batch)
             #expect(v[0].paths == [], "\(raw) must validate to root search, got \(v[0].paths)")
@@ -980,6 +980,26 @@ struct B1ContainmentTests {
         // Inner dots still fail loudly (no silent collapsing).
         let inner = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"a/./b\"}")])
         #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: inner) }
+        // Dot-dot THROUGH a normalized prefix must not escape: the strip
+        // is purely lexical (no ".." collapsing), so "../" survives into
+        // the byte-exact ".." rejection below. Neither form may resolve
+        // in-workspace.
+        #expect(ToolValidator.normalizeWorkspacePath("./../x") == "../x")
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace/../x") == "../x")
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace/../../x") == "../../x")
+        for raw in ["./../x", "/workspace/../x", "/workspace/../../x", "..", "../x"] {
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"\(raw)\"}")])
+            #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: batch) }
+        }
+        // Long adversarial input: a 200 KiB "./" run must reject fast
+        // (linear strip + length gate before any copying), not hang.
+        let long = String(repeating: "./", count: 100_000) + "x"
+        let t0 = Date()
+        let normed = ToolValidator.normalizeWorkspacePath(long)
+        #expect(Date().timeIntervalSince(t0) < 1.0, "normalization is linear-time")
+        let longBatch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"\(long)\"}")])
+        #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: longBatch) }
+        _ = normed
     }
 
     @Test("R1_executorAgreesWithValidation")
@@ -1030,6 +1050,61 @@ struct B1ContainmentTests {
         let ids = try exec.resolveIdentities(batch: batch)
         #expect(ids.count == 1, "100 MiB binary resolves, got \(ids.count)")
         #expect(ids[0].size == 100 * 1024 * 1024, "identity carries the true size")
+    }
+
+    @Test("R1_searchRootExecutesEndToEnd")
+    func r1SearchRootExecutesEndToEnd() async throws {
+        // Search spelled "." or "/workspace" executes as the workspace-root
+        // search through the real executor (validation/execution agreement
+        // for the previously rejected spellings).
+        let rg = try #require(["/usr/bin/rg", "/usr/local/bin/rg"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
+                              "rg required for search execution evidence")
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try "rootmark-needle\n".write(to: url.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-r1s"), writer: WriterIdentity(session: SessionID("s-r1s"), writer: "w"), rgPath: rg, gitPath: nil)
+        for raw in [".", "/workspace", "/workspace/"] {
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"rootmark-needle\",\"path\":\"\(raw)\"}")])
+            _ = try ToolValidator.validateBatchArguments(batch: batch)
+            let res = EffectReservation(effectID: EffectID("eff-r1s"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
+            let out = try await exec.execute(batch: batch, reservation: res).calls[0]
+            #expect(out.status == "success" && out.data.contains("rootmark-needle"), "\(raw) root search executes, got \(out)")
+        }
+    }
+
+    @Test("R1_lossySkeletonReadFailsLoudWithoutTwin")
+    func r1LossySkeletonReadFailsLoud() async throws {
+        // Common-case safety for surfaced U+FFFD skeletons: with NO
+        // literal-U+FFFD twin present, acting on the skeleton fails loudly
+        // (exact-bytes open misses) — never silent wrong-file content.
+        // (A planted twin is the documented residual risk: unprotected-only,
+        // receipts show exact bytes, CLOSURE_10 recall wins.)
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let rawName = Data([0x74, 0x6F, 0x70, 0xFF, 0x2E, 0x74, 0x78, 0x74]) // top\xFF.txt
+        let fd = rawName.withUnsafeBytes { ptr in
+            open(url.path.withCString { $0 }, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        try #require(fd >= 0)
+        defer { close(fd) }
+        var cname = Array(rawName) + [UInt8(0)]
+        let wfd = cname.withUnsafeMutableBytes { ptr in
+            openat(fd, ptr.baseAddress!.assumingMemoryBound(to: CChar.self), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o644))
+        }
+        try #require(wfd >= 0, "raw non-UTF-8 file must create")
+        _ = write(wfd, Array("ghost TOPMARK\n".utf8), 14)
+        close(wfd)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-r1l"), writer: WriterIdentity(session: SessionID("s-r1l"), writer: "w"), rgPath: nil, gitPath: nil)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"top�.txt\"}")])
+        _ = try ToolValidator.validateBatchArguments(batch: batch)
+        let res = EffectReservation(effectID: EffectID("eff-r1l"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
+        let out = try await exec.execute(batch: batch, reservation: res).calls[0]
+        #expect(out.status != "success", "skeleton read without a twin must not succeed, got \(out)")
+        #expect(!out.data.contains("TOPMARK"), "no wrong-file content may leak")
     }
 
     @Test("R1_argvZeroRewrite")

@@ -61,6 +61,10 @@ struct OversizedBatchTests {
             if case .operationIntent = $0 { return true }
             return false
         }), "no intents for a batch that never existed")
+        #expect(!out.records.contains(where: {
+            if case .operationResult = $0 { return true }
+            return false
+        }), "no results for a batch that never existed")
     }
 
     @Test("R3 third oversized batch fails terminally")

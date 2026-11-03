@@ -289,6 +289,34 @@ struct B2ReadSearchTests {
         #expect(!out.contains("/proc/self/fd"))
     }
 
+    @Test("R2 undecodable path bytes fail closed with flag")
+    func undecodablePathBytesFailClosed() throws {
+        // base64 that does not decode: the line is dropped AND flagged
+        // (fail-closed with truncation signal — never silently kept).
+        let obj: [String: Any] = [
+            "type": "match",
+            "data": [
+                "path": ["bytes": "!!!not-base64!!!"],
+                "lines": ["text": "x\n"],
+                "line_number": 1,
+                "absolute_offset": 0,
+                "submatches": [],
+            ],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+        let (out, omitted) = NativeToolExecutor.filterSearchJSON(
+            Data(data), roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(out.isEmpty, "undecodable path dropped")
+        #expect(omitted, "undecodable path flagged")
+        // Missing path object on a non-summary record: same treatment.
+        let noPath: [String: Any] = ["type": "match", "data": ["lines": ["text": "y\n"]]]
+        let noPathData = try JSONSerialization.data(withJSONObject: noPath, options: [.sortedKeys])
+        let (out2, omitted2) = NativeToolExecutor.filterSearchJSON(
+            noPathData, roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(out2.isEmpty, "pathless match dropped")
+        #expect(omitted2, "pathless match flagged")
+    }
+
     @Test("M3-B A2: protected paths stay dropped; Unicode exact names preserved; unprotected lossy surfaced, grantable lossy fail closed")
     func searchProtectedUnicodeLossy() throws {
         // Protected path: dropped regardless of rewrite.

@@ -589,18 +589,21 @@ public enum ToolValidator {
     /// Unicode edge can smuggle a separator past the checks below.
     /// Returns nil only for root-naming inputs.
     public static func normalizeWorkspacePath(_ path: String) -> String? {
+        // Length gate FIRST (review finding: normalization ran before the
+        // 4096-byte cap, so a "./"-run input paid per-iteration copies on
+        // the full admissible 512 KiB). Over-long inputs pass through
+        // unchanged so the existing "too long" rejection fires below.
         let bytes = Array(path.utf8)
+        guard bytes.count <= maxPathLength else { return path }
         let ws = Array("/workspace".utf8)
-        // Lone "." or "./": the workspace root. Loop-strip "./" runs
-        // ("././x" → "x"); a bare remainder means the root itself.
+        // Lone "." is the workspace root. Strip leading "./" runs with an
+        // index (O(n), no per-iteration copies): "././x" → "x".
         if bytes == Array(".".utf8) { return nil }
-        var rest = bytes
-        while rest.count >= 2 && rest[0] == 0x2E && rest[1] == 0x2F {
-            rest = Array(rest.dropFirst(2))
-        }
-        if rest.count != bytes.count {
-            if rest.isEmpty { return nil }
-            return String(decoding: rest, as: UTF8.self)
+        var i = 0
+        while i + 1 < bytes.count && bytes[i] == 0x2E && bytes[i + 1] == 0x2F { i += 2 }
+        if i > 0 {
+            if i == bytes.count { return nil } // "./", "././", …
+            return String(decoding: bytes[i...], as: UTF8.self)
         }
         // Exact "/workspace" prefix: only when the remainder is empty or
         // a single path separator away ("/workspace2/x" must NOT strip).
