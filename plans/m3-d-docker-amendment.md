@@ -52,6 +52,7 @@ Zero-request unless noted: (1) both agents execute in-container (whoami/hostname
 - `m3d-needletail:1` = `sha256:d16d3b8f01ad699745ec371d3922eb99e08a18cc906ebff04025f43bdc1f13b9` (multi-stage: `swift:6.4-bookworm` builder compiles `git archive` of the frozen tree; runtime `ubuntu:24.04` + bundled Swift runtime libs + `LD_LIBRARY_PATH` launcher; non-root `bench`, entrypoint `needletail`, `--version` → `0.3.0` verified in-container).
 - `m3d-pi:1` = `sha256:5ca61e4b16cace6a29b13d5539fdf70e8de276081d2c6cea9cacc34232223d26` (`node:24-bookworm-slim` + installed Pi 1.4.0 dist + frozen halogen-only `models.json` (`samplingParams.temperature: 0.2`) + settings; non-root `bench`).
 - `m3d-forwarder:1` = `sha256:4acb4add598f6fc5bb233b1dc2917ebd92703822bc378fc328a2c14d9024e40d` (see Addendum A).
+- Scoring-tree equivalence: `Sources/` + `Tests/` are byte-identical between the image build tree (`f4fef24`) and HEAD (verified `git diff f4fef24 HEAD -- Sources Tests` empty); only docs/harness scripts differ.
 
 ## Addendum C. Preflight evidence (2026-11-03; diagnostic spend 10/10, allowance exhausted)
 
