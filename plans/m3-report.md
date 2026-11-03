@@ -25,7 +25,7 @@ M3 hypothesis: Needletail's checkpoint/epoch mechanism (M3-C) delivers reliable 
 - NT wins/parity: T01, T04, T05, T09, T11, T12 (12 cells).
 - NT losses: 7 turn-budget exhaustion (T02-R1, T03-R2, T06-R1, T07×2, T10×2), 2 oversized tool batch hard-fails (T08×2).
 - One harness-side scoring error found and corrected (T12 answer extractor; read-only rescore, marked).
-- Material asymmetry: 6 of 11 non-T09 NT PASSes ended exit 5 — artifact-complete but non-converging — vs Pi 24/24 exit 0. NT "PASS" is not run-cleanliness comparable to Pi "PASS".
+- Material asymmetry: 6 of 13 non-T09 NT PASSes ended exit 5 — artifact-complete but non-converging — vs Pi 24/24 exit 0. NT "PASS" is not run-cleanliness comparable to Pi "PASS".
 - All 9 NT FAILs classify model-side on evidence; one harness-brittleness finding (T08 >8-call hard fail; graceful truncation = future work) plus one corrected harness scoring bug (T12 extractor).
 - Efficiency: NT ~2–3k in-tokens per request with full-transcript re-send vs Pi ~1–3k per run compact; NT walls mostly lower per run but success-gated — and 6 NT passes burned full turn budgets anyway.
 - T09: genuine interrupt-recovery demonstrated for Pi (SIGINT after first tool CALL → `--continue` → PASS ×2); NT task too fast to catch (documented limitation).
