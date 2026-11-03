@@ -798,7 +798,7 @@ struct M3CCheckpointTests {
         #expect(!(try Self.records(store, session).contains { if case .eventAppended(_, let kind, _) = $0 { return kind == "checkpoint-tool-denied" }; return false }), "no denial consumed")
     }
 
-    // MARK: - 17. Cancel during capture aborts fail-closed (no hang, no publication)
+    // MARK: - 18. Cancel during capture aborts fail-closed (no hang, no publication)
 
     @Test("M3-C: cancelling a capture aborts fail-closed; epoch unchanged; never strands in cancelling")
     func cancelDuringCaptureAborts() async throws {
@@ -844,7 +844,33 @@ struct M3CCheckpointTests {
         #expect(!(try Self.records(store, session).contains { if case .checkpointPublished = $0 { return true }; return false }), "no publication")
     }
 
-    // MARK: - 16. Capture overlay helper
+    // MARK: - 19. M3-D per-request usage accounting
+
+    @Test("M3-D usage log: one complete entry per paired response; unknown stays unknown")
+    func usageLogAccounting() async throws {
+        let (dirURL, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: dirURL) }
+        let (_, store, session, writer) = try Self.tempStore()
+        defer { try? store.close(); try? FileManager.default.removeItem(at: dirURL) }
+        let transport = ScriptedTransport()
+        transport.script = [
+            ProviderResponse(requestID: RequestID("s1"), generation: Revision(0), outcome: .textDeltaComplete(
+                text: "done", toolProposals: [], isFinal: true), usageInput: 100, usageOutput: 20),
+            ActorFixtures.finalResponse(requestID: RequestID("s2"), generation: Revision(1)),
+        ]
+        let actor = try Self.makeActor(dir: fp, store: store, session: session, writer: writer, transport: transport, ids: DeterministicIDSource(prefix: "m3cu"))
+        await actor.submitText(commandID: CommandID("task"), text: "task", kind: .followUp, sealed: false)
+        _ = try await Self.awaitCompleted(actor)
+        await actor.submitText(commandID: CommandID("task2"), text: "task2", kind: .followUp, sealed: false)
+        _ = try await Self.awaitCompleted(actor)
+        let log = await actor.usageLog
+        #expect(log.count == 2, "one entry per paired response, got \(log.count)")
+        #expect(log[0].usageInput == 100 && log[0].usageOutput == 20, "usage carried verbatim")
+        #expect(log[1].usageInput == nil && log[1].usageOutput == nil, "missing usage stays unknown, never zero-filled")
+        #expect(!log[0].requestID.isEmpty && log[0].requestID != log[1].requestID, "distinct invocation identities")
+    }
+
+    // MARK: - 17. Capture overlay helper
 
     @Test("M3-C capture overlay: full history plus retry note plus instruction, input untouched")
     func captureOverlayHelper() throws {

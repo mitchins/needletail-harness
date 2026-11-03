@@ -58,6 +58,20 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     private var rawRingBytes: Int = 0
     private var rawRingMaxCount: Int { 8 }
     private var rawRingMaxBytes: Int { 16 * 1024 * 1024 }
+    /// M3-D per-request usage accounting (tokens in/out + wire bytes).
+    /// ONE entry per paired provider response, never evicted within the
+    /// run (entries are three small integers + an ID — negligible next to
+    /// the transcript). No effects, no transitions, no reducer impact:
+    /// pure observation for the CLI's per-run usage report. The raw ring
+    /// above stays byte-capped; this log stays complete.
+    public struct UsageEntry: Sendable, Equatable {
+        public let requestID: String
+        public let usageInput: Int?
+        public let usageOutput: Int?
+        public let rawBytes: Int
+    }
+    private var usageLogEntries: [UsageEntry] = []
+    public var usageLog: [UsageEntry] { usageLogEntries }
     /// M2-C C0 (plan REV12 §3.4b.1): the injected identity resolver.
     private let execResolver: (any ExecIdentityResolver)?
 
@@ -620,6 +634,14 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                     usageInput: result.response.usageInput,
                     usageOutput: result.response.usageOutput))
             }
+            // M3-D usage accounting: one small entry per paired response,
+            // never evicted (see usageLog). Unknown (nil) stays unknown —
+            // never inferred.
+            usageLogEntries.append(UsageEntry(
+                requestID: invocation.requestID.raw,
+                usageInput: result.response.usageInput,
+                usageOutput: result.response.usageOutput,
+                rawBytes: result.rawBody?.count ?? 0))
             deliveryQueue.finish()
             await deliveryTask.value
             if deltaDelivery === deliveryQueue { deltaDelivery = nil }

@@ -1084,6 +1084,13 @@ struct RunCommand: ParsableCommand {
             eprint("checkpoint: \(terminalSafe(stageTimings.joined(separator: " ")))")
             done = await actor.currentState()
         }
+        // M3-D per-request usage accounting (all runs, not just
+        // checkpoint): one line per paired provider response from the
+        // actor's complete (never evicted) usage log. Unknown stays "?"
+        // — never inferred. Powers the M3-D token metric from stderr.
+        for entry in await actor.usageLog {
+            eprint("usage: request \(terminalSafe(entry.requestID)) usage_in=\(entry.usageInput.map(String.init) ?? "?") usage_out=\(entry.usageOutput.map(String.init) ?? "?") raw_bytes=\(entry.rawBytes)")
+        }
         // Shutdown HTTP client before handling output (actor no longer needs it)
         try? await httpClient.shutdown().get()
         if done.queueHeld && !done.unresolvedOperations.isEmpty && !done.phase.isTerminal {
