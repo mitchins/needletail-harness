@@ -212,6 +212,27 @@ struct SandboxPolicyTests {
         #expect(decision == .unavailable("sandbox denies exec outside the allowlist; fail closed"))
     }
 
+    @Test("version-suffixed resolved binary matches its allowlisted family")
+    func versionSuffixedExecMatches() async throws {
+        let dir = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ws = try Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let path = try Self.writeGrant(in: dir, container: "c", workspace: ws.path)
+        let gateway = SandboxPolicyGateway(grantPath: path, containerID: "c")
+        // Requested python3 resolving to /usr/bin/python3.11 (Debian
+        // alternatives): allowed — same interpreter family.
+        let batch = ToolBatch([ToolProposal(callID: "cx", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"/usr/bin/python3\",\"argv\":[\"/usr/bin/python3\",\"-m\",\"unittest\"]}")])
+        let identities = [ExecCommandIdentity(callID: "cx", requestedPath: "/usr/bin/python3", resolvedPath: "/usr/bin/python3.11", contentDigest: String(repeating: "c", count: 64))]
+        let decision = await gateway.decide(Self.request(batch: batch, identities: identities))
+        #expect(decision == .sandboxGrant(note: "sandbox:run-test-1:c"))
+        // Same request name resolving OUTSIDE every allowlisted family:
+        // denied even though the request names an allowed binary.
+        let identities2 = [ExecCommandIdentity(callID: "cx", requestedPath: "/usr/bin/python3", resolvedPath: "/usr/bin/dash", contentDigest: String(repeating: "d", count: 64))]
+        let denied = await gateway.decide(Self.request(batch: batch, identities: identities2))
+        #expect(denied == .unavailable("sandbox denies exec resolving outside the allowlist; fail closed"))
+    }
+
     @Test("valid confined batch approves as sandbox policy, never as human")
     func validBatchApprovesAsSandboxPolicy() async throws {
         let dir = try Self.tempDir()

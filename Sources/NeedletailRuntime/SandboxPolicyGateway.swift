@@ -111,15 +111,22 @@ public struct SandboxPolicyGateway: ApprovalGateway, Sendable {
                     return .unavailable("sandbox denies unparseable exec; fail closed")
                 }
                 // Both the requested and the RESOLVED basenames must be
-                // allowlisted: a workspace-local symlink named `python3`
-                // pointing elsewhere passes only if its target is also
-                // an allowed interpreter (interpreters already provide
-                // arbitrary execution, so this is naming hygiene, not a
-                // new capability boundary — the container is).
+                // allowlisted. Version-suffixed resolves match their base
+                // (`python3.11` satisfies `python3`) — interpreters are
+                // already fully general, so this is naming hygiene, not a
+                // new capability boundary; the container is. A resolved
+                // name outside every allowlisted family (e.g. a `python3`
+                // symlink to `dash`) is denied.
                 let base = (args.executable as NSString).lastPathComponent
-                let resolvedBase = (request.execIdentities.first(where: { $0.callID == call.callID })?.resolvedPath as NSString?)?.lastPathComponent ?? ""
-                guard !base.isEmpty, grant.allowedExec.contains(base), grant.allowedExec.contains(resolvedBase) else {
+                guard !base.isEmpty, grant.allowedExec.contains(base) else {
                     return .unavailable("sandbox denies exec outside the allowlist; fail closed")
+                }
+                let resolved = (request.execIdentities.first(where: { $0.callID == call.callID })?.resolvedPath as NSString?)?.lastPathComponent ?? ""
+                let resolvedOK = grant.allowedExec.contains { allowed in
+                    resolved == allowed || resolved.hasPrefix(allowed + ".")
+                }
+                guard resolvedOK else {
+                    return .unavailable("sandbox denies exec resolving outside the allowlist; fail closed")
                 }
                 if let cwd = args.cwd, !Self.isWithinWorkspace(cwd, workspace: workspace) {
                     return .unavailable("sandbox denies out-of-workspace cwd; fail closed")
