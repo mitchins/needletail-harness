@@ -493,9 +493,8 @@ def main():
     os.makedirs(ws, exist_ok=True)
     os.makedirs(state, exist_ok=True)
     os.makedirs(grantdir, exist_ok=True)
-    # Pi cannot create nested session dirs itself (non-recursive mkdir);
-    # pre-create so leg 1 does not crash at startup.
-    os.makedirs(os.path.join(state, "pi-session"), exist_ok=True)
+    # NOTE: per-run state subdirs (pi-session, pi-config) are created
+    # AFTER the leg-1 state wipe below, not here.
     if leg == 1:
         for root, dirs, files in os.walk(ws, topdown=False):
             for n in files:
@@ -513,8 +512,11 @@ def main():
         seed_fixture(task, ws)
         # Pi reads its config from PI_CODING_AGENT_DIR (writable per-run
         # state; the read-only image root cannot take its lock files).
+        # NOTE: this must live AFTER the state wipe above, which deletes
+        # everything including any earlier-created subdirs.
         picfg = os.path.join(state, "pi-config")
         os.makedirs(picfg, exist_ok=True)
+        os.makedirs(os.path.join(state, "pi-session"), exist_ok=True)
         for fn in ("pi-models.json", "pi-settings.json"):
             shutil.copy(os.path.join(HERE, fn), os.path.join(picfg, fn.replace("pi-", "")))
         for fn in ("models.json", "settings.json"):
