@@ -241,9 +241,13 @@ def evaluate(task, ws, run, harness, state):
     tid = task["id"]
     diff = sh(["git", "-C", ws, "diff", "--name-only"])[1].split()
     untracked = [l[3:] for l in sh(["git", "-C", ws, "status", "--porcelain"])[1].splitlines() if l.startswith("?? ")]
-    # Interpreter caches are deterministic byproducts of running the test
-    # commands, identical for both harnesses — not model-created files.
-    untracked = [u for u in untracked if not (u == "__pycache__" or u.startswith("__pycache__/") or u.endswith(".pyc") or u.startswith(".pytest_cache"))]
+    # Interpreter caches and the harness's own workspace lock are
+    # deterministic byproducts, identical across runs — not
+    # model-created files.
+    untracked = [u for u in untracked if not (
+        u == "__pycache__" or u.startswith("__pycache__/")
+        or u.endswith(".pyc") or u.startswith(".pytest_cache")
+        or u == ".needletail" or u.startswith(".needletail/"))]
     det = {"diff": diff, "untracked": untracked, "exit": run["exit"], "wall": round(run["wall"], 1)}
     outs = []
 
