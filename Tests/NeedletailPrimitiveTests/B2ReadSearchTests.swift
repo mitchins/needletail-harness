@@ -289,7 +289,7 @@ struct B2ReadSearchTests {
         #expect(!out.contains("/proc/self/fd"))
     }
 
-    @Test("M3-B A2: protected paths stay dropped; Unicode exact names preserved; lossy names fail closed")
+    @Test("M3-B A2: protected paths stay dropped; Unicode exact names preserved; unprotected lossy surfaced, grantable lossy fail closed")
     func searchProtectedUnicodeLossy() throws {
         // Protected path: dropped regardless of rewrite.
         let envLine = Self.rgMatchLine(path: "/proc/self/fd/87/.env", lineNumber: 1, text: "SECRET=1\n")
@@ -303,7 +303,13 @@ struct B2ReadSearchTests {
         #expect(!uniOmitted)
         #expect(uniOut.contains("café-нет.md"), "exact Unicode name preserved, got \(uniOut.prefix(300))")
         #expect(!uniOut.contains("/proc/self/fd"))
-        // Lossy (unrepresentable) name: fail closed, dropped + flagged.
+        // Lossy (unrepresentable) name in an UNPROTECTED path: surfaced
+        // with the U+FFFD skeleton (Remediation R2 / CLOSURE_10: dropping
+        // silently lost legitimate results). The skeleton cannot satisfy
+        // any approval (byte-exact, grantable+lossy still drops below),
+        // and acting on it fails loudly (exact-bytes open misses the real
+        // file), so surfacing is confusion-safe. Undecodable base64 still
+        // fails closed further down.
         let rawName = Data([0x68, 0x69, 0xFF]) // "hi" + invalid byte
         let lossyObj: [String: Any] = [
             "type": "match",
@@ -321,8 +327,26 @@ struct B2ReadSearchTests {
         let lossyData = try JSONSerialization.data(withJSONObject: lossyObj, options: [.sortedKeys])
         let (lossyOut, lossyOmitted) = NativeToolExecutor.filterSearchJSON(
             lossyData, roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
-        #expect(lossyOut.isEmpty, "lossy path dropped fail-closed")
-        #expect(lossyOmitted, "lossy drop flagged as truncation")
+        #expect(lossyOut.contains("hi�"), "unprotected lossy name surfaced with U+FFFD skeleton, got \(lossyOut.prefix(300))")
+        #expect(lossyOut.contains("\"text\":\"hi�\""), "skeleton replaces the path, never the match text")
+        #expect(!lossyOmitted, "nothing omitted: the line is kept, not dropped")
+        // Counterpart: the same lossy name under a GRANTABLE root still
+        // drops (a U+FFFD skeleton must never satisfy an approval).
+        let grantLossyObj: [String: Any] = [
+            "type": "match",
+            "data": [
+                "path": ["bytes": (Data("/proc/self/fd/87/.git/".utf8) + rawName).base64EncodedString()],
+                "lines": ["text": "x\n"],
+                "line_number": 1,
+                "absolute_offset": 0,
+                "submatches": [],
+            ],
+        ]
+        let grantLossyData = try JSONSerialization.data(withJSONObject: grantLossyObj, options: [.sortedKeys])
+        let (grantLossyOut, grantLossyOmitted) = NativeToolExecutor.filterSearchJSON(
+            grantLossyData, roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(grantLossyOut.isEmpty, "grantable lossy path dropped fail-closed")
+        #expect(!grantLossyOmitted, "grantable drop is silent by design (no existence oracle for protected content)")
     }
 
     @Test("M3-B A2: end-to-end executor search yields read-usable workspace-relative paths (real rg)")

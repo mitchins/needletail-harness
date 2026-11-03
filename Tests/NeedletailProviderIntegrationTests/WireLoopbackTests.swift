@@ -108,8 +108,16 @@ struct WireLoopbackTests {
             Issue.record("9th distinct call must refuse")
         } catch let failure as TransportFailure {
             #expect(failure.phase == .postContent, "ninth call follows content: \(failure)")
-            #expect(failure.message == "malformedEvent: more than 8 tool calls",
+            // Remediation R3: the oversized-batch message carries the
+            // machine-readable marker (single definition in Core) plus the
+            // exact bound for the model-visible notice; the reducer
+            // answers with a bounded typed rejection instead of failing.
+            #expect(failure.message.hasPrefix(oversizedBatchMarker + ":"),
+                    "oversized marker prefix: \(failure.message)")
+            #expect(failure.message.contains("more than 8 tool calls"),
                     "typed eight-call bound: \(failure.message)")
+            #expect(failure.message.contains("no tools ran"),
+                    "notice states nothing executed: \(failure.message)")
         } catch {
             Issue.record("wrong error class for ninth tool call: \(error)")
         }

@@ -332,6 +332,17 @@ public struct TransportFailure: Error, Sendable, Equatable {
     }
 }
 
+/// Remediation R3 — oversized-batch marker (M3-D T08: a turn proposing
+/// more than the per-turn tool-call bound died terminally with exit 4
+/// although NOTHING had executed). The provider layer prefixes the
+/// assembly message with this marker (defined once here — Providers
+/// imports Core, so the string cannot drift); the reducer answers with a
+/// bounded model-visible rejection + provider continuation instead of a
+/// terminal failure. Bounded by maxOversizedBatchContinuations per run;
+/// past the bound the run fails exactly as before.
+public let oversizedBatchMarker = "oversized-batch"
+public let maxOversizedBatchContinuations = 2
+
 /// Approval rule (M1B2-5 matrix): sealed batches never reach authorising
 /// (denied at admission); observe admits read/search only (mutating denied
 /// at caps); workspace asks for anything mutating; trustedExec asks only
@@ -955,6 +966,7 @@ private func admitFreshRun<I: IDSource>(
         admittedCommands: index, consumedEffects: Set<EffectID>(),
         turnsUsed: 0, runDeadlineMillis: atMillis + defaultRunDeadlineMillis,
         preSendRetries: 0, invalidTracker: InvalidTracker(),
+        oversizedBatchContinuations: 0,
         retryDeadlineMillis: .some(nil),
         liveReservations: state.liveReservations + [reservation],
         generation: generation, lastSequence: seq.value)
@@ -1633,7 +1645,7 @@ private func handleProviderResponse<I: IDSource>(
 /// never auto-dispatch.
 private func finishRunWithQueue<I: IDSource>(
     _ state: SessionState, receipt: (RunDescriptor, UInt64) -> RunReceipt, atMillis: UInt64,
-    observations: [String: [AttachmentObservation]] = [:], ids: inout I
+    observations: [String: [AttachmentObservation]] = [:], boundary: Bool = false, ids: inout I
 ) -> Transition {
     guard let run = state.activeRun else {
         let (s1, prefix) = sequenced(state, kind: "completed-no-run", digest: "completed", ids: &ids)
@@ -1654,14 +1666,20 @@ private func finishRunWithQueue<I: IDSource>(
     let completedPhase = SessionPhase.completed(receiptValue)
     switch classifyQueuePop(state, observations: observations) {
     case .none:
-        let (s1, prefix) = sequenced(state, kind: "completed", digest: eventDigest("completed", run.runID.raw), ids: &ids)
+        // Remediation R4: a boundary landing uses a distinct event kind so
+        // telemetry separates model-finalized runs ("completed") from
+        // turn-budget-boundary landings. Queue-held/barrier/no-run paths
+        // keep their existing kinds — only the clean landing is marked.
+        let cleanKind = boundary ? "completed-budget-boundary" : "completed"
+        let (s1, prefix) = sequenced(state, kind: cleanKind, digest: eventDigest("completed", run.runID.raw), ids: &ids)
         let next = s1.replacing(
             phase: completedPhase, activeRun: .some(nil), activeRequest: .some(nil),
             pendingApproval: .some(nil), pendingBatch: .some(nil),
             pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
+        let detail = boundary ? "run finished at turn-budget boundary; verdict by oracle" : "run finished"
         return Transition(
             state: next,
-            effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished"))],
+            effects: [.emitUI(.runUpdate(phase: "completed", detail: detail))],
             records: prefix)
     case .barrierHold(let head, let reason):
         return landQueueBarrier(state, head: head, reason: reason, completedPhase: completedPhase, digest: eventDigest("completed", run.runID.raw), ids: &ids)
@@ -2555,7 +2573,7 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
         phase: .admitting, activeRun: .some(run), activeRequest: .some(nil),
         queue: queue, consumedEffects: Set<EffectID>(),
         turnsUsed: 0, runDeadlineMillis: atMillis + defaultRunDeadlineMillis,
-        preSendRetries: 0, retryDeadlineMillis: .some(nil),
+        preSendRetries: 0, oversizedBatchContinuations: 0, retryDeadlineMillis: .some(nil),
         liveReservations: state.liveReservations + [reservation],
         generation: generation, lastSequence: seq.value)
     // M2-D D0 dispatch linkage: bind the entry to the exact provider
@@ -2649,8 +2667,14 @@ private func failTransport<I: IDSource>(
             effects: [.startTimer(deadlineMillis: deadline, purpose: "retry-backoff", runID: run.runID)],
             records: prefix)
     case .postContent:
-        // Bytes demonstrably flowed: this is a provider/protocol failure
-        // (SPEC §12.2 exit 4), not an operator cancellation (130).
+        // Remediation R3: an oversized batch failed in assembly — no tool
+        // ran, no intents exist, nothing to reconcile. Answer with a
+        // bounded typed rejection + continuation (the model sees exactly
+        // what to fix) instead of terminal failure. Any other postContent
+        // error is a provider/protocol failure (SPEC §12.2 exit 4).
+        if error.hasPrefix(oversizedBatchMarker + ":") {
+            return continueAfterOversizedBatch(state, error: error, atMillis: atMillis, ids: &ids)
+        }
         return failRun(state, failure: .providerError("provider stream failed: \(terminalSafe(error))"), hold: true, atMillis: atMillis, ids: &ids)
     case .ambiguous:
         let (s1, prefix) = sequenced(state, kind: "delivery-unknown", digest: "ambiguous", ids: &ids)
@@ -2672,6 +2696,45 @@ private func failTransport<I: IDSource>(
             effects: [.emitUI(.denied(cause: "ambiguous delivery held for reconciliation"))],
             records: prefix + [.operationResult(ref, outcome: "unknown")])
     }
+}
+
+/// Remediation R3 — bounded typed rejection for oversized batches.
+/// Assembly failed before any ToolBatch existed, so no intents, no
+/// results, no side effects: the turn spent one provider request and
+/// taught the model nothing. Instead of terminal failure, emit a
+/// model-visible notice (the Providers-side message carries the exact
+/// bound — Core only relays it, so the number cannot drift) and continue
+/// with a fresh provider request. Bounded per run; past the bound — or
+/// past the turn budget, or with no run — the run fails exactly as
+/// before. The verdict still comes from the oracle, never from this path.
+private func continueAfterOversizedBatch<I: IDSource>(
+    _ state: SessionState, error: String, atMillis: UInt64, ids: inout I
+) -> Transition {
+    _ = atMillis
+    guard let run = state.activeRun else {
+        return failRun(state, failure: .providerError(terminalSafe(error)), hold: true, atMillis: atMillis, ids: &ids)
+    }
+    guard state.turnsUsed < state.turnLimit else {
+        return failRun(state, failure: .budgetExhausted("turn budget exhausted"), hold: true, atMillis: atMillis, ids: &ids)
+    }
+    guard state.oversizedBatchContinuations < maxOversizedBatchContinuations else {
+        return failRun(state, failure: .providerError("oversized tool batch repeated: \(terminalSafe(error))"), hold: true, atMillis: atMillis, ids: &ids)
+    }
+    let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("oversized-batch", run.runID.raw), ids: &ids)
+    let guidance = error.hasPrefix(oversizedBatchMarker + ":")
+        ? String(error.dropFirst(oversizedBatchMarker.count + 1)).trimmingCharacters(in: .whitespaces)
+        : "too many tool calls in one turn; resubmit as smaller batches"
+    let notice = "[harness notice] \(guidance)"
+    let transcripts: [DurableRecord] = [.transcriptAppended(.user(notice))]
+    let nextEffectID = ids.nextEffectID()
+    let seq = ids.nextSequence()
+    let reservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+    let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: s1.epoch.profile.alias, epochID: s1.epoch.epochID, sealed: run.sealed, turnsLeft: s1.turnLimit - s1.turnsUsed, deadlineMillis: s1.runDeadlineMillis, historyDigest: fnv1aHex("\(s1.sessionID.raw):\(seq.value):oversized"))
+    let next = s1.replacing(phase: .requesting, turnsUsed: s1.turnsUsed + 1,
+                            oversizedBatchContinuations: s1.oversizedBatchContinuations + 1,
+                            liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+    return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
+                      records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + transcripts)
 }
 
 private func failAdmissionTransport<I: IDSource>(
@@ -3220,6 +3283,32 @@ private func holdForApproval<I: IDSource>(
 
 // MARK: Effect completion (M1B2-3 continuation)
 
+/// Remediation R4 — quiescent-at-boundary completion (M3-D: 6 oracle-PASS
+/// runs ended exit 5 — and 7 more oracle-FAIL runs ended exit 5 — because
+/// the finishing turn consumed the last turn and the reducer failed the
+/// run instead of landing it). When a fully resolved tool batch completes
+/// and no turns remain, COMPLETE the run through the normal
+/// queue-draining path (telemetry kind "completed-budget-boundary")
+/// instead of failing it: the verdict still comes from the oracle over
+/// the produced artifacts, never from this path. Unknown outcomes still
+/// hold the queue — finishRunWithQueue routes those to completed-held.
+/// Call ONLY where the just-finished batch is fully resolved (the four
+/// after-batch continuations below); mid-pipeline budget guards
+/// (validation, denial, resolution, credential) keep failing terminally
+/// because the model never saw those results.
+private func completeAtBudgetBoundary<I: IDSource>(
+    _ state: SessionState, extraRecords: [DurableRecord] = [], extraEffects: [Effect] = [],
+    atMillis: UInt64, ids: inout I
+) -> Transition {
+    let finished = finishRunWithQueue(
+        state,
+        receipt: { run, at in RunReceipt(runID: run.runID, completedAtMillis: at, turnsUsed: state.turnsUsed, toolCallCount: 0) },
+        atMillis: atMillis, boundary: true, ids: &ids)
+    return Transition(state: finished.state,
+                      effects: extraEffects + finished.effects,
+                      records: extraRecords + finished.records)
+}
+
 private func continueAfterEffect<I: IDSource>(
      _ state: SessionState, effectID: EffectID, receipt: String, atMillis: UInt64, ids: inout I
  ) -> Transition {
@@ -3235,7 +3324,7 @@ private func continueAfterEffect<I: IDSource>(
             records: prefix)
     }
     guard state.turnsUsed < state.turnLimit else {
-        return failRun(state, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: atMillis, ids: &ids)
+        return completeAtBudgetBoundary(state, atMillis: atMillis, ids: &ids)
     }
     guard let run = state.activeRun else {
         return failRun(state, failure: .providerError("effect completion without a run"), hold: true, atMillis: atMillis, ids: &ids)
@@ -3340,10 +3429,10 @@ private func continueAfterPreDispatchFailure<I: IDSource>(_ state: SessionState,
         transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: text)))
     }
     var interimState = state.replacing(consumedEffects: consumed, liveReservations: live)
-    // Pre-dispatch never holds, but preserve already-generated records if turn-budget or missing-run fails
+    // Pre-dispatch never holds; the just-delivered per-call receipts are
+    // preserved whether the run continues or lands at the boundary.
     guard interimState.turnsUsed < interimState.turnLimit else {
-        let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
-        return Transition(state: failed.state, effects: uiEffects + failed.effects, records: records + transcript + failed.records)
+        return completeAtBudgetBoundary(interimState, extraRecords: records + transcript, extraEffects: uiEffects, atMillis: 0, ids: &ids)
     }
     guard let run = interimState.activeRun else {
         let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
@@ -3618,7 +3707,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             return Transition(state: next, effects: uiEffects + [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + newRecords)
         }
         guard fallbackState.turnsUsed < fallbackState.turnLimit else {
-            return failRun(fallbackState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+            return completeAtBudgetBoundary(fallbackState, extraRecords: newRecords, extraEffects: uiEffects, atMillis: 0, ids: &ids)
         }
         guard let run = fallbackState.activeRun else {
             return failRun(fallbackState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
@@ -3660,8 +3749,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         return Transition(state: next, effects: uiEffects + [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + allRecords)
     }
     guard interimState.turnsUsed < interimState.turnLimit else {
-        let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
-        return Transition(state: failed.state, effects: uiEffects + failed.effects, records: allRecords + failed.records)
+        return completeAtBudgetBoundary(interimState, extraRecords: allRecords, extraEffects: uiEffects, atMillis: 0, ids: &ids)
     }
     guard let run = interimState.activeRun else {
         let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)

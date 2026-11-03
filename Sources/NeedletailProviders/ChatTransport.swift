@@ -484,6 +484,18 @@ public struct ChatCompletionsTransport: DeltaStreamingTransport, Sendable {
                         throw TransportFailure(phase: .postContent, message: bound.description)
                     }
                     if let assembly = error as? AssemblyError {
+                        // Remediation R3: the oversized-batch assembly
+                        // failure carries the machine-readable marker (single
+                        // definition in Core — no string drift) plus the
+                        // exact bound for the model-visible notice. The
+                        // reducer answers with a bounded typed rejection +
+                        // continuation; every other assembly failure stays
+                        // terminal as before.
+                        if case .malformedEvent(let why) = assembly,
+                           why == "more than \(SSEBounds.maxToolCalls) tool calls" {
+                            throw TransportFailure(phase: .postContent, message:
+                                "\(oversizedBatchMarker): \(why) (limit \(SSEBounds.maxToolCalls) per turn; no tools ran; resubmit the work as \(SSEBounds.maxToolCalls) or fewer calls per turn)")
+                        }
                         throw TransportFailure(phase: .postContent, message: assembly.description)
                     }
                     throw self.classify(taskError: error, delegate: delegate)

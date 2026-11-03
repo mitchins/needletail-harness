@@ -221,7 +221,10 @@ public enum ToolValidator {
             guard let path = rawPath as? String else {
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path must be string for read \(callID)")
             }
-            try validatePath(path, callID: callID, tool: "read")
+            guard let norm = normalizeWorkspacePath(path) else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path names the workspace root; read requires a file path for read \(callID)")
+            }
+            try validatePath(norm, callID: callID, tool: "read")
             if let limit = json["limit"] {
                 guard let v = limit as? Int else {
                     throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "limit must be int for read \(callID)")
@@ -235,7 +238,7 @@ public enum ToolValidator {
                     throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "offset must be non-negative int for read \(callID)")
                 }
             }
-            return ValidatedToolCall(callID: callID, tool: "read", paths: [path], isMutating: false, rawArguments: raw)
+            return ValidatedToolCall(callID: callID, tool: "read", paths: [norm], isMutating: false, rawArguments: raw)
         } else {
             // Artifact ID path: exactly one alias form allowed
             if json["artifactId"] != nil && json["artifact_id"] != nil {
@@ -282,8 +285,20 @@ public enum ToolValidator {
             guard let path = rawPath as? String else {
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path must be string for search \(callID)")
             }
-            try validatePath(path, callID: callID, tool: "search")
-            return ValidatedToolCall(callID: callID, tool: "search", paths: [path], isMutating: false, rawArguments: raw)
+            // A root-naming path (".", "/workspace") — or an explicitly
+            // empty one — is the workspace-root search, identical to
+            // omitting the path. (Empty is accepted ONLY here: for file
+            // tools it stays a loud rejection below.)
+            if path.isEmpty {
+                return ValidatedToolCall(callID: callID, tool: "search", paths: [], isMutating: false, rawArguments: raw)
+            }
+            // A root-naming path (".", "/workspace") is the workspace-root
+            // search — identical to omitting the path.
+            if let norm = normalizeWorkspacePath(path) {
+                try validatePath(norm, callID: callID, tool: "search")
+                return ValidatedToolCall(callID: callID, tool: "search", paths: [norm], isMutating: false, rawArguments: raw)
+            }
+            return ValidatedToolCall(callID: callID, tool: "search", paths: [], isMutating: false, rawArguments: raw)
         }
         return ValidatedToolCall(callID: callID, tool: "search", paths: [], isMutating: false, rawArguments: raw)
     }
@@ -294,10 +309,13 @@ public enum ToolValidator {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown field \(key) for edit \(callID)")
         }
         // Require path
-        guard let path = json["path"] as? String else {
+        guard let rawEditPath = json["path"] as? String else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing path for edit \(callID)")
         }
-        try validatePath(path, callID: callID, tool: "edit")
+        guard let editPath = normalizeWorkspacePath(rawEditPath) else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path names the workspace root; edit requires a file path for edit \(callID)")
+        }
+        try validatePath(editPath, callID: callID, tool: "edit")
         // B1 Phase1: edit now requires its mandatory payload and SHA before auth/lock
         guard let expectedHash = json["expectedHash"] as? String else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing expectedHash for edit \(callID)")
@@ -335,7 +353,7 @@ public enum ToolValidator {
                 if s.utf8.contains(0) { throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "\(key) contains NUL") }
             }
         }
-        return ValidatedToolCall(callID: callID, tool: "edit", paths: [path], isMutating: true, rawArguments: raw)
+        return ValidatedToolCall(callID: callID, tool: "edit", paths: [editPath], isMutating: true, rawArguments: raw)
     }
 
     private static func validateWrite(callID: String, json: [String: Any], raw: String) throws -> ValidatedToolCall {
@@ -345,10 +363,13 @@ public enum ToolValidator {
         for key in json.keys where !allowed.contains(key) {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "unknown field \(key) for write \(callID)")
         }
-        guard let path = json["path"] as? String else {
+        guard let rawWritePath = json["path"] as? String else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing path for write \(callID)")
         }
-        try validatePath(path, callID: callID, tool: "write")
+        guard let writePath = normalizeWorkspacePath(rawWritePath) else {
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path names the workspace root; write requires a file path for write \(callID)")
+        }
+        try validatePath(writePath, callID: callID, tool: "write")
         guard let content = json["content"] else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "missing content for write \(callID)")
         }
@@ -364,7 +385,7 @@ public enum ToolValidator {
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "expectedHash must be 64 hex for write \(callID)")
             }
         }
-        return ValidatedToolCall(callID: callID, tool: "write", paths: [path], isMutating: true, rawArguments: raw)
+        return ValidatedToolCall(callID: callID, tool: "write", paths: [writePath], isMutating: true, rawArguments: raw)
     }
 
     private static func validateExecConsult(callID: String, json: [String: Any], raw: String) throws {
@@ -453,19 +474,33 @@ public enum ToolValidator {
             argvStrings.append(s)
         }
         // Identity honesty: argv[0] IS the executable (prevents argv[0]
-        // spoofing the displayed command).
+        // spoofing the displayed command). Remediation R1: a BARE basename
+        // equal to the executable's basename ("node" vs
+        // "/usr/local/bin/node") is rewritten, not rejected — the executed
+        // command is byte-identical to the validated one, and receipts
+        // render the normalized form. A bare name with a DIFFERENT
+        // basename, or any slash-carrying argv[0] that is not byte-equal,
+        // still fails closed below.
+        if argvStrings[0] != executable && !argvStrings[0].contains("/") && Self.baseName(of: executable) == argvStrings[0] {
+            argvStrings[0] = executable
+        }
         guard argvStrings[0] == executable else {
-            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv[0] must equal executable for exec \(callID)")
+            throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "argv[0] must equal executable for exec \(callID) (a bare name must exactly match the executable's basename)")
         }
         var cwd: String? = nil
         if json.keys.contains("cwd") {
             guard let c = json["cwd"] as? String else {
                 throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "cwd must be a string for exec \(callID)")
             }
-            // Shape only (workspace-relative, byte-exact components);
-            // existence/identity bind in the resolution phase.
-            try validatePath(c, callID: callID, tool: "exec")
-            cwd = c
+            // A root-naming cwd (".", "/workspace") is the default: nil
+            // already means the workspace root. Anything else normalizes
+            // ("/workspace/sub" → "sub") then validates as usual.
+            if let normCwd = normalizeWorkspacePath(c) {
+                // Shape only (workspace-relative, byte-exact components);
+                // existence/identity bind in the resolution phase.
+                try validatePath(normCwd, callID: callID, tool: "exec")
+                cwd = normCwd
+            }
         }
         var timeoutSecs = ExecArguments.defaultTimeoutSecs
         if json.keys.contains("timeoutSecs") {
@@ -537,6 +572,61 @@ public enum ToolValidator {
             throw ExecResolutionError.qualification("exec arguments are not a JSON object")
         }
         return try parseExecArguments(callID: "resolve", json: json)
+    }
+
+    /// Remediation R1 — model-natural path normalization (M3-D evidence:
+    /// ~40-60% of tool calls in failed runs burned on path-shape
+    /// rejections). Maps unambiguous workspace-root spellings to their
+    /// canonical form BEFORE the byte-exact rules below:
+    ///   "." / "./" / "/workspace" / "/workspace/" → nil (the root; only
+    ///       callers accepting an omitted path may use this)
+    ///   "./rest" / "/workspace/rest" → "rest"
+    /// Everything else passes through UNCHANGED — notably bare absolute
+    /// paths ("/etc/passwd", "/tmp/x"), which must keep failing loudly. A
+    /// silent in-workspace mapping there would read the wrong file while
+    /// the model believes it read the absolute one (a wrong-file trap
+    /// worse than a rejection). All matching is ASCII-byte-exact, so no
+    /// Unicode edge can smuggle a separator past the checks below.
+    /// Returns nil only for root-naming inputs.
+    public static func normalizeWorkspacePath(_ path: String) -> String? {
+        let bytes = Array(path.utf8)
+        let ws = Array("/workspace".utf8)
+        // Lone "." or "./": the workspace root. Loop-strip "./" runs
+        // ("././x" → "x"); a bare remainder means the root itself.
+        if bytes == Array(".".utf8) { return nil }
+        var rest = bytes
+        while rest.count >= 2 && rest[0] == 0x2E && rest[1] == 0x2F {
+            rest = Array(rest.dropFirst(2))
+        }
+        if rest.count != bytes.count {
+            if rest.isEmpty { return nil }
+            return String(decoding: rest, as: UTF8.self)
+        }
+        // Exact "/workspace" prefix: only when the remainder is empty or
+        // a single path separator away ("/workspace2/x" must NOT strip).
+        if bytes.count >= ws.count && bytes.prefix(ws.count).elementsEqual(ws) {
+            let tail = Array(bytes.dropFirst(ws.count))
+            if tail.isEmpty { return nil }
+            if tail.first == 0x2F {
+                let inner = Array(tail.dropFirst())
+                if inner.isEmpty { return nil }
+                if inner.first == 0x2F { return path } // "/workspace//x": reject loudly below
+                return String(decoding: inner, as: UTF8.self)
+            }
+        }
+        return path
+    }
+
+    /// Byte-exact basename: bytes after the last 0x2F (the whole string
+    /// when there is no separator). Used only for the argv[0] bare-name
+    /// rewrite; never for authorization (the validated absolute
+    /// `executable` is what resolves and spawns).
+    public static func baseName(of path: String) -> String {
+        let bytes = Array(path.utf8)
+        if let last = bytes.lastIndex(of: 0x2F) {
+            return String(decoding: bytes[(last + 1)...], as: UTF8.self)
+        }
+        return path
     }
 
     /// Byte-exact path components: split UTF-8 bytes at 0x2F. Character

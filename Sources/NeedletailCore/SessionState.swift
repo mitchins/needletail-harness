@@ -397,6 +397,7 @@ extension SessionState {
         consumedEffects: Set<EffectID>? = nil, turnsUsed: Int? = nil,
         turnLimit: Int? = nil, runDeadlineMillis: UInt64?? = nil,
         preSendRetries: Int? = nil, invalidTracker: InvalidTracker? = nil,
+        oversizedBatchContinuations: Int? = nil,
         checkpointRequestID: RequestID?? = nil, checkpointDenials: Int? = nil,
         pendingApproval: ApprovalRequest?? = nil, pendingBatch: ToolBatch?? = nil,
         pendingResolution: ExecResolutionSeed?? = nil, pendingExecIdentities: [ExecCommandIdentity]?? = nil,
@@ -421,6 +422,7 @@ extension SessionState {
             runDeadlineMillis: runDeadlineMillis ?? self.runDeadlineMillis,
             preSendRetries: preSendRetries ?? self.preSendRetries,
             invalidTracker: invalidTracker ?? self.invalidTracker,
+            oversizedBatchContinuations: oversizedBatchContinuations ?? self.oversizedBatchContinuations,
             checkpointRequestID: checkpointRequestID ?? self.checkpointRequestID,
             checkpointDenials: checkpointDenials ?? self.checkpointDenials,
             pendingApproval: pendingApproval ?? self.pendingApproval,
@@ -505,6 +507,10 @@ public struct SessionState: Sendable, Equatable {
     public let runDeadlineMillis: UInt64?
     public let preSendRetries: Int
     public let invalidTracker: InvalidTracker
+    /// Remediation R3: oversized-batch continuations granted THIS run
+    /// (bounded by maxOversizedBatchContinuations). Reset at each fresh
+    /// admission like turnsUsed (see AdmissionTests run-counter reset).
+    public let oversizedBatchContinuations: Int
     /// M3-C: the in-flight checkpoint capture request identity (nil outside
     /// `.checkpointing`); stale-check anchor for the branch response.
     public let checkpointRequestID: RequestID?
@@ -560,6 +566,7 @@ public struct SessionState: Sendable, Equatable {
         admittedCommands: [CommandID: QueueAck] = [:], consumedEffects: Set<EffectID> = [],
         turnsUsed: Int = 0, turnLimit: Int = 80, runDeadlineMillis: UInt64? = nil,
         preSendRetries: Int = 0, invalidTracker: InvalidTracker = InvalidTracker(),
+        oversizedBatchContinuations: Int = 0,
         checkpointRequestID: RequestID? = nil, checkpointDenials: Int = 0,
         pendingApproval: ApprovalRequest? = nil, pendingBatch: ToolBatch? = nil,
         pendingResolution: ExecResolutionSeed? = nil, pendingExecIdentities: [ExecCommandIdentity]? = nil,
@@ -587,6 +594,7 @@ public struct SessionState: Sendable, Equatable {
         self.runDeadlineMillis = runDeadlineMillis
         self.preSendRetries = preSendRetries
         self.invalidTracker = invalidTracker
+        self.oversizedBatchContinuations = oversizedBatchContinuations
         self.checkpointRequestID = checkpointRequestID
         self.checkpointDenials = checkpointDenials
         self.pendingApproval = pendingApproval
