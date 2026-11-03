@@ -24,7 +24,9 @@ TASKS = os.path.join(REPO, "plans", "m3-tasks.json")
 # invocation; never point the scoring matrix at another image.
 RUNS = os.environ.get("M3D_RUNS", "/tmp/m3d/runs")
 NT_IMAGE = os.environ.get("M3D_NT_IMAGE", "m3d-needletail:1")
-CFG_HOST = "/tmp/m3d/cfg"
+CFG_HOST = os.environ.get("M3D_CFG", "/tmp/m3d/cfg")
+PI_PROVIDER = os.environ.get("M3D_PI_PROVIDER", "halogen-local")
+PI_MODEL = os.environ.get("M3D_PI_MODEL", "halogen-qwen3.8-flash-next")
 PHP_IMAGE = "php:8.4-cli"
 
 
@@ -257,8 +259,8 @@ def pi_cmd(task, rep, ws, state, prompt, cname, leg):
         "-v", "%s:/state:rw" % state,
         "-e", "PI_CODING_AGENT_DIR=/state/pi-config",
         "m3d-pi:1", "-p",
-        "--provider", "halogen-local",
-        "--model", "halogen-qwen3.8-flash-next",
+        "--provider", PI_PROVIDER,
+        "--model", PI_MODEL,
         "--api-key", "local",
         "--no-context-files", "--no-approve", "--no-extensions", "--no-mcp",
         "--mode", "json",
@@ -438,8 +440,8 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
         cmd = docker_base(cname) + [
             "-v", "%s:/workspace:rw" % ws, "-v", "%s:/state:rw" % state,
             "-e", "PI_CODING_AGENT_DIR=/state/pi-config",
-            "m3d-pi:1", "-p", "--provider", "halogen-local",
-            "--model", "halogen-qwen3.8-flash-next", "--api-key", "local",
+            "m3d-pi:1", "-p", "--provider", PI_PROVIDER,
+            "--model", PI_MODEL, "--api-key", "local",
             "--no-context-files", "--no-approve", "--no-extensions", "--no-mcp",
             "--mode", "json", "--session-dir", "/state/pi-session",
             "--session-id", "m3d-%s-R%d" % (task["id"], rep), task["promptWithSandboxNote"]]
@@ -554,11 +556,15 @@ def main():
         # state; the read-only image root cannot take its lock files).
         # NOTE: this must live AFTER the state wipe above, which deletes
         # everything including any earlier-created subdirs.
+        # M3D_PI_MODELS_DIR overrides the shipped halogen configs (Gemma
+        # comparison); the directory must contain pi-models.json +
+        # pi-settings.json with the same layout. Defaults preserve M3-D.
+        models_src = os.environ.get("M3D_PI_MODELS_DIR", HERE)
         picfg = os.path.join(state, "pi-config")
         os.makedirs(picfg, exist_ok=True)
         os.makedirs(os.path.join(state, "pi-session"), exist_ok=True)
         for fn in ("pi-models.json", "pi-settings.json"):
-            shutil.copy(os.path.join(HERE, fn), os.path.join(picfg, fn.replace("pi-", "")))
+            shutil.copy(os.path.join(models_src, fn), os.path.join(picfg, fn.replace("pi-", "")))
         for fn in ("models.json", "settings.json"):
             p = os.path.join(picfg, fn)
             if not os.path.exists(p):
