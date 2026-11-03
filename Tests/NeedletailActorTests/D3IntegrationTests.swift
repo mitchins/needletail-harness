@@ -614,10 +614,6 @@ struct D3IntegrationTests {
         let writer = WriterIdentity(session: session, writer: "w-d3")
         let idle = try Self.idleState(session: session, mode: .workspace, permissive: true)
         let epoch1 = idle.epoch
-        let epoch2 = EpochDescriptor(
-            epochID: EpochID("epoch-2"), parentEpochID: epoch1.epochID,
-            configSnapshot: epoch1.configSnapshot, profile: epoch1.profile,
-            effectiveCaps: epoch1.effectiveCaps, route: epoch1.route)
         var store = try Self.tempStore(at: dir)
         try store.claimWriterOwnership(session: session, writer: writer.writer)
         let resolver = try WorkspaceResolver(workspace: FilePath(dir.path), readRoots: [])
@@ -657,7 +653,7 @@ struct D3IntegrationTests {
         // epoch-2 (observable: was epoch-1) without releasing anything.
         store = try Self.tempStore(at: dir)
         let gate2 = GatedTransport()
-        let (stream2, _) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        let (stream2, cont2) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
         gate2.gate = stream2
         var ids2 = DeterministicIDSource(prefix: "c2b")
         let (actor2, _) = try await reopenHeadlessSession(
@@ -668,25 +664,44 @@ struct D3IntegrationTests {
             attachmentValidator: FilesystemAttachmentValidator(resolver: resolver))
         let held = await actor2.currentState()
         #expect(held.queue.first?.state == .heldUnknown, "link crash holds the head across reopen")
+        // M3-C: checkpoint capture genuinely dials the provider against the
+        // warm history and proceeds ORTHOGONALLY to queue holds (nothing in
+        // the queue moves; no release).
         await actor2.requestCheckpoint()
         try await Self.awaitState(actor2, {
             if case .checkpointing = $0.phase { return true }
             return false
         }, "checkpoint proceeds (orthogonal to queue holds)")
-        await actor2.applyExternalEvent(.checkpointCommitted(newEpoch: epoch2, atMillis: 9_000_000))
-        let switched = await actor2.currentState()
-        #expect(switched.epoch.epochID == EpochID("epoch-2"), "epoch switched")
-        #expect(switched.admittedCommands.isEmpty, "acks pruned at epoch switch")
+        for _ in 0..<20_000 {
+            if gate2.invocations.count == 1 { break }
+            await Task.yield()
+        }
+        #expect(gate2.invocations.count == 1, "capture request sent (orthogonal to holds)")
+        #expect((await actor2.currentState()).queue.first?.state == .heldUnknown, "capture does not release the unknown head")
+        // Feed a valid checkpoint response through the gate; publication is
+        // transactional and switches the epoch (parent epoch-1).
+        let checkpointBody = "{\"task_goal\":\"c2 continuation\",\"user_constraints\":[],\"completed_work\":[],\"current_files\":[],\"open_questions\":[],\"failed_attempts\":[],\"next_actions\":[],\"uncertainties\":[]}"
+        cont2.yield(.respond(ActorFixtures.finalResponse(requestID: RequestID("c2-cp"), generation: Revision(0), text: checkpointBody)))
+        try await Self.awaitState(actor2, { $0.phase == .idle }, "checkpoint published")
+        let published = await actor2.currentState()
+        // M3-C: the publication itself switches the epoch (ID minted from the
+        // allocator, lineage via parentEpochID) — no external commit needed.
+        let liveEpoch = published.epoch
+        #expect(liveEpoch.parentEpochID == epoch1.epochID, "publication links the new epoch to its parent")
+        #expect(published.queue.first?.state == .heldUnknown, "publication never releases the unknown head")
+        #expect(published.admittedCommands.isEmpty, "acks pruned at epoch switch")
+        let switched = published
+        #expect(switched.epoch.epochID == liveEpoch.epochID, "epoch switched")
         let qaID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-a2") })?.entryID)
         let qbID = try #require(switched.queue.first(where: { $0.commandID == CommandID("q-b2") })?.entryID)
         await actor2.retargetQueueEntry(entryID: qaID)
         await actor2.retargetQueueEntry(entryID: qbID)
         let retargeted = await actor2.currentState()
         let qaRetargeted = try #require(retargeted.queue.first(where: { $0.commandID == CommandID("q-a2") }))
-        #expect(qaRetargeted.attachmentConsentEpoch == EpochID("epoch-2"), "retarget refreshes consent to the live epoch")
+        #expect(qaRetargeted.attachmentConsentEpoch == liveEpoch.epochID, "retarget refreshes consent to the live epoch")
         #expect(qaRetargeted.state == .heldUnknown, "retarget never releases the unknown head")
-        #expect(retargeted.queue.first(where: { $0.commandID == CommandID("q-b2") })?.targetEpochID == EpochID("epoch-2"), "follower retargeted too (stale targets never dispatch)")
-        #expect(gate2.invocations.isEmpty, "no dispatch during the epoch manoeuvre")
+        #expect(retargeted.queue.first(where: { $0.commandID == CommandID("q-b2") })?.targetEpochID == liveEpoch.epochID, "follower retargeted too (stale targets never dispatch)")
+        #expect(gate2.invocations.count == 1, "only the checkpoint capture dialed during the epoch manoeuvre")
         await actor2.resumeQueue()
         #expect((await actor2.currentState()).queue.first?.state == .heldUnknown, "resume never releases unknowns")
         await actor2.reconcileQueue(entryID: qaID)
@@ -703,7 +718,7 @@ struct D3IntegrationTests {
         ]
         var ids3 = DeterministicIDSource(prefix: "c2c")
         let (actor3, report3) = try await reopenHeadlessSession(
-            store: store, session: session, epoch: epoch2, trustMode: .workspace,
+            store: store, session: session, epoch: liveEpoch, trustMode: .workspace,
             as: writer.writer, ids: &ids3, clock: SystemClock(),
             transport: transport3, executor: ScriptedExecutor(),
             approvals: ScriptedApprovals(),
@@ -716,7 +731,7 @@ struct D3IntegrationTests {
             return false
         }, "drained under the new epoch")
         let drained = await actor3.currentState()
-        #expect(drained.queue.first(where: { $0.commandID == CommandID("q-a2") })?.attachmentConsentEpoch == EpochID("epoch-2"), "dispatched entry carries reconsented snapshot")
+        #expect(drained.queue.first(where: { $0.commandID == CommandID("q-a2") })?.attachmentConsentEpoch == liveEpoch.epochID, "dispatched entry carries reconsented snapshot")
         let users = try Self.storeRecords(store, session).compactMap { record -> String? in
             if case .transcriptAppended(.user(let text)) = record { return text }
             return nil

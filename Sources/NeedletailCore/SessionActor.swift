@@ -267,8 +267,12 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         await apply(.switchModel(alias: alias, atMillis: clock.nowMillis()))
     }
 
-    public func requestCheckpoint() async {
-        await apply(.checkpointRequested(atMillis: clock.nowMillis()))
+    /// M3-C capture entry point. `sealed` must match the session's mode:
+    /// a sealed context captures sealed (the provider request inherits
+    /// the flag) — the production CLI additionally refuses
+    /// `--checkpoint --sealed` outright.
+    public func requestCheckpoint(sealed: Bool = false) async {
+        await apply(.checkpointRequested(atMillis: clock.nowMillis(), sealed: sealed))
     }
 
     public func tick() async {
@@ -278,6 +282,13 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// Explicit-time tick (tests, replays). Production timers call `tick()`.
     public func tick(at nowMillis: UInt64) async {
         await apply(.tick(nowMillis: nowMillis))
+    }
+
+    /// M3-C measurement accessor: bounded snapshot of the raw provider ring
+    /// (usage accounting per request). Read-only; never includes bodies
+    /// beyond what the ring already retains in memory.
+    public func rawRecordsSnapshot() -> [RawProviderRecord] {
+        rawRing
     }
 
     /// C0 replay/test seam (plan REV12 §3.4b.5): drive a stamped event
@@ -612,7 +623,7 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
             deliveryQueue.finish()
             await deliveryTask.value
             if deltaDelivery === deliveryQueue { deltaDelivery = nil }
-            await pairTransportResult(result, reservation: reservation)
+            await pairTransportResult(result, reservation: reservation, isCheckpoint: invocation.isCheckpoint, checkpointSealed: invocation.sealed)
         } catch is CancellationError {
             deliveryQueue.finish()
             await deliveryTask.value
@@ -641,14 +652,140 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
     /// builds stamped events FROM THE RESERVATION: `requestStarted` first
     /// (stream opened), then the `providerResponse` (data). Unknown
     /// effectIDs drop here — no event is ever built for them.
-    private func pairTransportResult(_ result: TransportResult, reservation: EffectReservation) async {
+    /// M3-C: checkpoint reservations route to the typed branch events with
+    /// ledger facts (pinned constraints, known file hashes, stream bounds,
+    /// tail cut) extracted here — the transitions stay pure.
+    private func pairTransportResult(_ result: TransportResult, reservation: EffectReservation, isCheckpoint: Bool = false, checkpointSealed: Bool = false) async {
         guard reservations[reservation.effectID] != nil else { return }
         guard let requestID = reservation.requestID else { return }
+        if isCheckpoint {
+            // Consumed on pairing (matches completeEffect/failEffect for
+            // every other effect): a late duplicate for it drops at the
+            // reservations guard above instead of double-applying.
+            reservations.removeValue(forKey: reservation.effectID)
+            let at = clock.nowMillis()
+            var proposals: [String] = []
+            var text = ""
+            if case .textDeltaComplete(let t, let p, _) = result.response.outcome {
+                text = t
+                proposals = p.map(\.callID)
+            }
+            if !proposals.isEmpty {
+                // Tool execution is locally disabled for the branch: the
+                // proposal becomes a typed denial event (at most one retry),
+                // never an executor effect or an approval. The denial
+                // carries the attempt identity and the capture's sealed
+                // flag so the retry inherits both exactly.
+                await apply(.checkpointToolDenied(
+                    requestID: requestID, sealed: checkpointSealed,
+                    callIDs: proposals, atMillis: at))
+                return
+            }
+            do {
+                let facts = try await checkpointLedgerFacts()
+                await apply(.checkpointResponse(
+                    requestID: requestID, generation: reservation.generation,
+                    text: text, pinned: facts.pinned, knownFileHashes: facts.hashes,
+                    maxSequence: facts.maxSequence, receiptSequences: facts.receiptSeqs,
+                    retainedFromSeq: facts.retainedFromSeq, atMillis: at))
+            } catch {
+                // Ledger facts unreadable or tail uncuttable: fail closed
+                // with the old epoch, never publish a guess.
+                await apply(.checkpointFailed(
+                    reason: "checkpoint ledger facts unavailable: \(String(describing: error).prefix(160))",
+                    atMillis: at))
+            }
+            return
+        }
         await apply(.requestStarted(
             requestID: requestID, generation: reservation.generation, atMillis: clock.nowMillis()))
         await apply(.providerResponse(
             requestID: requestID, generation: reservation.generation,
             response: result.response, atMillis: clock.nowMillis()))
+    }
+
+    /// M3-C ledger facts for checkpoint validation + publication, extracted
+    /// from THIS session's durable stream (never from model output):
+    /// - pinned: the FIRST user transcript message (exact operator task
+    ///   text) — the harness preserves it itself.
+    /// - hashes: every (path, sha256) the harness recorded via read
+    ///   receipts and change-group members.
+    /// - maxSequence: the durable stream bound; retainedFromSeq: the tail
+    ///   cut at the LAST user message (a call/result boundary by
+    ///   construction — quiescence guarantees completed groups).
+    /// M3-C ledger facts for checkpoint validation + publication, extracted
+    /// from THIS session's durable stream (never from model output), THROWING:
+    /// - pinned: the FIRST user transcript message (exact operator task
+    ///   text) — the harness preserves it itself.
+    /// - hashes: every (path, sha256) the harness recorded via read
+    ///   receipts and change-group AFTER hashes; `receiptSeqs` are the
+    ///   sequences of those receipt-bearing records (an observedSeq must
+    ///   name one of them; a pre-change `beforeHash` never qualifies).
+    /// - maxSequence: the durable stream bound; retainedFromSeq: the tail
+    ///   cut from `CheckpointTailCut` (last ≤64 transcript records snapped
+    ///   to a completed call/result group boundary).
+    /// A store read failure throws (fail-closed — never an empty-facts
+    /// publication); a dangling/orphan tool tail throws
+    /// `.danglingToolCall` (reconcile first — the provider would reject
+    /// an unmatched tool call in the new context).
+    private func checkpointLedgerFacts() async throws -> (
+        pinned: [String], hashes: Set<String>, maxSequence: UInt64,
+        receiptSeqs: Set<UInt64>, retainedFromSeq: UInt64
+    ) {
+        let session = state.sessionID
+        var pinned: [String] = []
+        var hashes = Set<String>()
+        var receiptSeqs = Set<UInt64>()
+        var maxSeq: UInt64 = 0
+        var entries: [(seq: UInt64, entry: TranscriptEntry)] = []
+        var cursor: UInt64 = 0
+        while true {
+            let page: [SequencedRecord]
+            let next: UInt64?
+            do {
+                (page, next) = try store.records(session: session, since: cursor, limit: 1024)
+            } catch {
+                throw CheckpointFactsError.ledgerUnreadable
+            }
+            if page.isEmpty { break }
+            for sequenced in page {
+                maxSeq = max(maxSeq, sequenced.sequence.value)
+                switch sequenced.record {
+                case .transcriptAppended(let entry):
+                    entries.append((seq: sequenced.sequence.value, entry: entry))
+                    switch entry {
+                    case .user(let text):
+                        if pinned.isEmpty { pinned = [text] }
+                    case .toolResponse(_, let responseText):
+                        // A1 read receipts: parse "path: X" + "sha256: H".
+                        if responseText.hasPrefix("[read receipt]"),
+                           let pathLine = responseText.split(separator: "\n").first(where: { $0.hasPrefix("path: ") }),
+                           let hashLine = responseText.split(separator: "\n").first(where: { $0.hasPrefix("sha256: ") }) {
+                            let p = pathLine.dropFirst("path: ".count)
+                            let h = hashLine.dropFirst("sha256: ".count)
+                            hashes.insert("\(p)\u{1F}\(h)")
+                            receiptSeqs.insert(sequenced.sequence.value)
+                        }
+                    default:
+                        break
+                    }
+                case .changeGroup(let group):
+                    for member in group.members {
+                        hashes.insert("\(member.path)\u{1F}\(member.afterHash)")
+                        receiptSeqs.insert(sequenced.sequence.value)
+                    }
+                default:
+                    break
+                }
+            }
+            guard let following = next else { break }
+            cursor = following
+        }
+        guard let cut = CheckpointTailCut.compute(entries) else {
+            throw CheckpointFactsError.danglingToolCall
+        }
+        let retained: UInt64 = cut < entries.count ? entries[cut].seq : 0
+        return (pinned, hashes, maxSeq, receiptSeqs, retained)
     }
 
     private func timerKey(purpose: String, runID: RunID) -> String {

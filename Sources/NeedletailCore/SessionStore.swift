@@ -28,6 +28,13 @@ public enum DurableRecord: Sendable, Equatable, Codable {
     /// file mutation, no branch switch, no history rewrite.
     case lineageFork(LineageFork)
     case checkpointCommitted(EpochDescriptor)
+    /// M3-C: atomic two-phase checkpoint publication (SPEC §7.2). One record
+    /// carries the new epoch (lineage via parentEpochID), the validated
+    /// checkpoint JSON, harness-pinned constraints and the shorter-context
+    /// tail cut. Committed in the same batch as `checkpointCommitted` +
+    /// `epochOpened` AFTER the model response is validated; the old history
+    /// is never truncated.
+    case checkpointPublished(CheckpointPublication)
     /// Authoritative conversation element (M1-D transcript, ARCH §1).
     case transcriptAppended(TranscriptEntry)
     /// A3-3 authorized ownership takeover (SPEC §9.1 recovery): the full

@@ -75,9 +75,28 @@ public enum SessionEvent: Sendable, Equatable {
     case approvalDeny(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
     case approvalUnavailable(requestID: RequestID, generation: Revision, reason: String, atMillis: UInt64)
     case switchModel(alias: String, atMillis: UInt64)
-    case checkpointRequested(atMillis: UInt64)
+    case checkpointRequested(atMillis: UInt64, sealed: Bool)
+    /// RETIRED (M2-D mechanism): the pre-M3-C external epoch switch. No
+    /// producer emits it anymore; the transition table no longer handles
+    /// it (an arrival hits the default ignore — no epoch change). Kept so
+    /// old persisted/replayed event streams still decode.
     case checkpointCommitted(newEpoch: EpochDescriptor?, atMillis: UInt64)
     case checkpointFailed(reason: String, atMillis: UInt64)
+    /// M3-C: the checkpoint capture response, assembled by the actor from
+    /// the provider result on the checkpoint reservation. `pinned` carries
+    /// the harness-extracted exact first-user constraints; `knownFileHashes`
+    /// (+ the receipt-bearing `receiptSequences`), and `maxSequence` are the
+    /// ledger facts used for reference verification; `retainedFromSeq` is
+    /// the tail cut (inclusive) computed by the actor on a completed
+    /// call/result group boundary.
+    case checkpointResponse(requestID: RequestID, generation: Revision, text: String, pinned: [String], knownFileHashes: Set<String>, maxSequence: UInt64, receiptSequences: Set<UInt64>, retainedFromSeq: UInt64, atMillis: UInt64)
+    /// M3-C: the model proposed tools during capture. SPEC §7.1: at most
+    /// one paired local denial + retry; a second tool-bearing response
+    /// terminates the attempt. Calls are NEVER executed or approved. The
+    /// request identity matches the denial to its attempt — a denial for
+    /// a superseded attempt drops as stale instead of consuming the one
+    /// retry.
+    case checkpointToolDenied(requestID: RequestID, sealed: Bool, callIDs: [String], atMillis: UInt64)
     case cancelRequested(atMillis: UInt64)
     case dismissRun(atMillis: UInt64)
     case invalidInput(fingerprint: String, cause: String, atMillis: UInt64)

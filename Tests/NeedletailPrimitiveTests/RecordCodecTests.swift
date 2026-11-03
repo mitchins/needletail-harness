@@ -69,6 +69,11 @@ struct RecordCodecTests {
                 effectID: EffectID("eff-1"), epochID: EpochID("epoch-1"))),
             .checkpointCommitted(try epoch(id: "epoch-3", parent: EpochID("epoch-1"),
                                            route: .allowed(endpoint: "http://127.0.0.1:11434/v1", alias: "local-coder"))),
+            .checkpointPublished(CheckpointPublication(
+                epoch: try epoch(id: "epoch-4", parent: EpochID("epoch-3"),
+                                 route: .allowed(endpoint: "http://127.0.0.1:11434/v1", alias: "local-coder")),
+                checkpointJSON: "{\"task_goal\":\"m3-c codec fixture\"}",
+                pinnedConstraints: ["keep tests green"], retainedFromSeq: 12, boundarySequence: 11)),
             .transcriptAppended(.assistantText("covered here too, not only in the sibling test")),
             .artifactPublished(ArtifactRef(
                 digest: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
@@ -124,6 +129,7 @@ struct RecordCodecTests {
         case .queueUpdated: return "queueUpdated"
         case .queueDispatched: return "queueDispatched"
         case .checkpointCommitted: return "checkpointCommitted"
+        case .checkpointPublished: return "checkpointPublished"
         case .transcriptAppended: return "transcriptAppended"
         case .writerRecovered: return "writerRecovered"
         case .artifactPublished: return "artifactPublished"
@@ -139,7 +145,7 @@ struct RecordCodecTests {
     private static let expectedCaseNames: Set<String> = [
         "sessionOpened", "epochOpened", "eventAppended", "operationIntent",
         "operationResult", "queueAdmitted", "queueUpdated", "queueDispatched",
-        "checkpointCommitted", "transcriptAppended", "writerRecovered",
+        "checkpointCommitted", "checkpointPublished", "transcriptAppended", "writerRecovered",
         "artifactPublished", "cancelledPendingMarker", "cancelledPendingError",
         "acknowledgedUnresolved", "changeGroup", "undoDisposition", "lineageFork",
     ]

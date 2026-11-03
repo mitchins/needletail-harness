@@ -56,6 +56,9 @@ struct RunCommand: ParsableCommand {
     @Option(name: .long, help: "Workspace root (must exist) for mutating file tools.")
     var workspace: String?
 
+    @Flag(name: .long, help: "M3-C: after the run completes at a quiescent boundary, capture a two-phase checkpoint (model-generated summary against the warm native history, tool execution locally disabled), publish the shorter epoch, then send a bounded continuation request. Requires --workspace.")
+    var checkpoint: Bool = false
+
     @Option(name: .customLong("acknowledge-unresolved-outcomes"),
             help: "Explicit operator decision for the B5-B cross-run gate: 'operator-accepted-risk' or 'manually-reconciled:<note>'. Records a durable acknowledgment in the new session; required when the store holds unresolved mutating outcomes, never persisted, never exempts future runs.")
     var acknowledgeUnresolvedOutcomes: String?
@@ -101,6 +104,14 @@ struct RunCommand: ParsableCommand {
         // conflicts with the demo/sealed modes. Host execution without
         // workspace trust is the demo contradiction; sealed is monotone
         // (I06); trusted is and stays the scripted demo path.
+        if checkpoint && workspace == nil {
+            eprint("error: --checkpoint requires --workspace (checkpoint capture runs against a qualified workspace session)")
+            throw ExitCode(2)
+        }
+        if checkpoint && sealed {
+            eprint("error: --checkpoint and --sealed are mutually exclusive (a sealed demonstration never opens a provider capture, sealed or otherwise)")
+            throw ExitCode(2)
+        }
         if allowExec && workspace == nil {
             eprint("error: --allow-exec requires --workspace (host execution without workspace trust is not a supported combination)")
             throw ExitCode(2)
@@ -159,6 +170,7 @@ struct RunCommand: ParsableCommand {
         let aliasCopy = alias
         let maxTurnsCopy = maxTurns
         let workspaceCopy = workspace
+        let checkpointCopy = checkpoint
         let readRootCopy = readRoot
         let acknowledgedDetermination = acknowledgeUnresolvedOutcomes
         final class Box: @unchecked Sendable {
@@ -183,6 +195,7 @@ struct RunCommand: ParsableCommand {
                     format: formatCopy, tools: toolsCopy, alias: aliasCopy,
                     maxTurns: maxTurnsCopy, sealed: sealedCopy, trusted: trustedCopy,
                     allowExec: allowExecCopy, workspace: workspaceCopy, readRoot: readRootCopy,
+                    checkpoint: checkpointCopy,
                     acknowledgedDetermination: acknowledgedDetermination, interactiveApproval: interactiveApprovalTTY, isJSONL: isJSONL)
             } catch let error as ExitCode {
                 box.lock.withLock { box.exitCode = error.rawValue }
@@ -375,7 +388,7 @@ struct RunCommand: ParsableCommand {
         return store
     }
 
-    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, allowExec: Bool, workspace: String?, readRoot: [String], acknowledgedDetermination: String?, interactiveApproval: Bool, isJSONL: Bool) async throws {
+    private static func executeStatic(prompt: String, config: String?, trace: String?, format: String?, tools: String?, alias: String?, maxTurns: Int?, sealed: Bool, trusted: Bool, allowExec: Bool, workspace: String?, readRoot: [String], checkpoint: Bool, acknowledgedDetermination: String?, interactiveApproval: Bool, isJSONL: Bool) async throws {
         // Unused format param kept for future envelope versioning
         _ = format
         // Private-by-default file creation for EVERYTHING this process
@@ -813,17 +826,56 @@ struct RunCommand: ParsableCommand {
                                     configuration: ChatTransportPolicy.configuration(profile: profile))
         // Use the session store (GRDB production or sealed-volatile) for transcript paging
         let promptCopy = prompt
-        let messageProvider: @Sendable (ProviderInvocation) async throws -> [ChatMessage] = { _ in
-            // Paged transcript (M1-D D1): read from store, map to messages
-            // Over-limit throws, which surfaces as preSend failure (honest)
-            do {
-                let messages = try loadTranscript(from: store, session: state.sessionID, limit: 1024)
-                // If no transcript yet (should have user prompt), fallback to prompt
-                if messages.isEmpty {
-                    return [ChatMessage(role: .user, text: promptCopy)]
+        // M3-C durable pre-send live-request budget (ticket: a separate
+        // 12-request M3-C allowance). Enforced HERE — the single choke
+        // point every live provider request passes through — BEFORE any
+        // byte is sent. The counter is durable in the state directory
+        // (survives crashes; re-runs never reset it); exhaustion or a
+        // corrupt counter fails closed (the throw becomes a transport
+        // failure: the checkpoint capture fails with the epoch unchanged,
+        // a main-run request fails the run — nothing is ever sent).
+        // Non-checkpoint runs are unbudgeted (nil gate).
+        let liveBudget: LiveRequestBudget?
+        if checkpoint {
+            let budgetDir = try resolveStateDirectory()
+            try FileManager.default.createDirectory(
+                atPath: budgetDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            liveBudget = LiveRequestBudget(
+                fileURL: URL(fileURLWithPath: (budgetDir as NSString).appendingPathComponent("m3c-live-budget.json")),
+                limit: 12)
+        } else {
+            liveBudget = nil
+        }
+        let messageProvider: @Sendable (ProviderInvocation) async throws -> [ChatMessage] = { invocation in
+            if let budget = liveBudget {
+                do {
+                    _ = try budget.consume()
+                } catch let error as LiveRequestBudget.BudgetError {
+                    eprint("checkpoint: live-request budget refuses to send (\(String(describing: error))); no provider byte sent")
+                    throw error
                 }
-                return messages
             }
+            // M3-C: the checkpoint capture rides the FULL native history
+            // (never the shortened post-rollover projection — a second
+            // capture summarizes everything, not the summary) plus the
+            // bounded checkpoint instruction and, on the single allowed
+            // retry, the fixed tool-denial note. Tool advertisement stays
+            // unchanged; proposals are denied locally by the reducer,
+            // never executed.
+            if invocation.isCheckpoint {
+                let full = try loadTranscript(from: store, session: state.sessionID, limit: 1024)
+                return CheckpointValidator.captureOverlay(history: full, retryNote: invocation.checkpointRetryNote)
+            }
+            // M3-C: ACTIVE-EPOCH projection — after a checkpoint publication
+            // this is the shorter context (checkpoint block + retained
+            // tail); before one, identical to loadTranscript.
+            let messages = try loadTranscriptProjection(from: store, session: state.sessionID, limit: 1024)
+            // If no transcript yet (should have user prompt), fallback to prompt
+            if messages.isEmpty {
+                return [ChatMessage(role: .user, text: promptCopy)]
+            }
+            return messages
         }
         let credentialStore = EnvFileCredentialStore()
         let transport = ChatCompletionsTransport(
@@ -931,7 +983,7 @@ struct RunCommand: ParsableCommand {
             }
             if finalState != nil { break }
         }
-        let done: SessionState
+        var done: SessionState
         if let f = finalState {
             done = f
         } else {
@@ -944,6 +996,93 @@ struct RunCommand: ParsableCommand {
             }
             try? await httpClient.shutdown().get()
             throw ExitCode(5)
+        }
+        // M3-C: two-phase checkpoint after a quiescent completed run.
+        // Capture = 1 provider request against the warm native history with
+        // tool execution locally disabled; publication is transactional;
+        // then a first post-rollover request and one warm request, all
+        // inside the same session (the projection switches to the shorter
+        // epoch context automatically via the durable publication record).
+        var stageTimings: [String] = []
+        if checkpoint, case .completed = done.phase {
+            // Dismiss the completed run to a true idle boundary first (the
+            // reducer refuses meta actions from terminal phases), then
+            // capture against the warm native history with tool execution
+            // locally disabled; publication is transactional; then a first
+            // post-rollover request and one warm request, all inside the
+            // same session (the projection switches to the shorter epoch
+            // context automatically via the durable publication record).
+            await actor.dismissRun()
+            let dismissed = await awaitIdle(actor: actor, deadline: Date().addingTimeInterval(30))
+            guard dismissed, (await actor.currentState()).phase == .idle else {
+                eprint("checkpoint: run did not dismiss to idle; capture refused")
+                try? await httpClient.shutdown().get()
+                throw ExitCode(1)
+            }
+            let captureStart = Date()
+            let epochBeforeID = (await actor.currentState()).epoch.epochID
+            await actor.requestCheckpoint()
+            var afterCheckpoint: SessionState? = nil
+            let cpDeadline = Date().addingTimeInterval(180)
+            while Date() < cpDeadline {
+                let current = await actor.currentState()
+                if current.phase != .checkpointing { afterCheckpoint = current; break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            let captureMillis = UInt64(Date().timeIntervalSince(captureStart) * 1000)
+            // Success is an epoch CHANGE with lineage to the pre-capture
+            // epoch — testing the parent pointer alone would pass on a
+            // refused capture in a session whose epoch already had one.
+            guard let after = afterCheckpoint, after.phase == .idle,
+                  after.epoch.epochID != epochBeforeID,
+                  after.epoch.parentEpochID == epochBeforeID else {
+                eprint("checkpoint: capture failed, malformed, or timed out; epoch unchanged")
+                try? await httpClient.shutdown().get()
+                throw ExitCode(1)
+            }
+            stageTimings.append("checkpoint_capture_ms=\(captureMillis)")
+            eprint("checkpoint: published epoch \(terminalSafe(after.epoch.epochID.raw)) parent \(terminalSafe(after.epoch.parentEpochID?.raw ?? "-")) captureMs=\(captureMillis)")
+            // Stage: first request after rollover (fresh prefill of the
+            // shorter context).
+            let firstStart = Date()
+            await actor.submitText(commandID: CommandID("cmd-post-1"), text: "In one sentence, state the task goal from the checkpoint context.", kind: .followUp, sealed: false)
+            let firstDone = await awaitIdle(actor: actor, deadline: Date().addingTimeInterval(300))
+            let firstMillis = UInt64(Date().timeIntervalSince(firstStart) * 1000)
+            guard firstDone else {
+                eprint("checkpoint: post-rollover request exceeded 300s")
+                try? await httpClient.shutdown().get()
+                throw ExitCode(5)
+            }
+            guard (await actor.currentState()).pendingApproval == nil else {
+                eprint("checkpoint: post-rollover request awaits approval; stopping instead of auto-continuing")
+                try? await httpClient.shutdown().get()
+                throw ExitCode(3)
+            }
+            stageTimings.append("first_post_rollover_ms=\(firstMillis)")
+            eprint("checkpoint: first post-rollover request done in \(firstMillis)ms")
+            // Stage: subsequent warm request in the same (now warm) epoch.
+            let warmStart = Date()
+            await actor.submitText(commandID: CommandID("cmd-post-2"), text: "List the next actions from the checkpoint context, one per line, no commentary.", kind: .followUp, sealed: false)
+            let warmDone = await awaitIdle(actor: actor, deadline: Date().addingTimeInterval(300))
+            let warmMillis = UInt64(Date().timeIntervalSince(warmStart) * 1000)
+            guard warmDone else {
+                eprint("checkpoint: warm request exceeded 300s")
+                try? await httpClient.shutdown().get()
+                throw ExitCode(5)
+            }
+            guard (await actor.currentState()).pendingApproval == nil else {
+                eprint("checkpoint: warm request awaits approval; stopping instead of reporting a timing")
+                try? await httpClient.shutdown().get()
+                throw ExitCode(3)
+            }
+            stageTimings.append("warm_request_ms=\(warmMillis)")
+            eprint("checkpoint: warm request done in \(warmMillis)ms")
+            // Usage/accounting from the actor's raw ring (bounded snapshot).
+            for raw in await actor.rawRecordsSnapshot() {
+                eprint("checkpoint: request \(terminalSafe(raw.requestID.raw)) usage_in=\(raw.usageInput.map(String.init) ?? "?") usage_out=\(raw.usageOutput.map(String.init) ?? "?") raw_bytes=\(raw.rawBody.count)")
+            }
+            eprint("checkpoint: \(terminalSafe(stageTimings.joined(separator: " ")))")
+            done = await actor.currentState()
         }
         // Shutdown HTTP client before handling output (actor no longer needs it)
         try? await httpClient.shutdown().get()
@@ -1083,6 +1222,30 @@ struct HeadlessApprovals: ApprovalGateway, Sendable {
     func decide(_ request: ApprovalRequest) async -> ApprovalDecision {
         .unavailable("headless approval required for \(request.operation)")
     }
+}
+
+/// M3-C: bounded wait until the actor settles (idle/completed). Generic
+/// over the actor composition so nested CLI types are not required.
+/// Returns false on deadline exhaustion.
+@discardableResult
+func awaitIdle<T: ModelTransport, E: ToolExecutor, S: SessionStore, A: ApprovalGateway>(
+    actor: SessionActor<T, E, S, A, SystemClock, DeterministicIDSource>, deadline: Date
+) async -> Bool {
+    while Date() < deadline {
+        let current = await actor.currentState()
+        switch current.phase {
+        case .idle, .completed:
+            return true
+        case .authorising where current.pendingApproval != nil:
+            // Post-rollover verification turns run no tools; a pending
+            // approval is a stop condition, never an autonomous grant.
+            return true
+        default:
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            continue
+        }
+    }
+    return false
 }
 
 /// System clock for production CLI (real wall time, not VirtualClock).
