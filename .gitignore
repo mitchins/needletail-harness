@@ -32,3 +32,6 @@ demo/__pycache__/
 
 # Security
 .env
+
+docker/needletail-src.tar.gz
+docker/pi-dist/

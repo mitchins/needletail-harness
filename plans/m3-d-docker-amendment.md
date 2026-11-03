@@ -47,6 +47,25 @@ Zero-request unless noted: (1) both agents execute in-container (whoami/hostname
 - Network `m3d-internal` (`internal:true`, bridge; no host firewall/daemon changes). Forwarder `m3d-forwarder:1` (alpine:3.21+socat, image `sha256:4acb4add598f6fc5bb233b1dc2917edb92703822bc378fc328a2c14b9024e40d`, container `ef2946bc…fbf`) joins `m3d-internal` + default bridge; L4 forward `*:8731 → 192.168.2.216:8731`. Scoring containers join ONLY `m3d-internal` and address the model as `http://m3d-forwarder:8731`.
 - Negative probes from an unprivileged (`uid=65534`) probe container on `m3d-internal` (2026-11-03): (1) `GET http://m3d-forwarder:8731/v1/models` → Halogen model list (`halogen-qwen3.8-flash-next`) — allowed path works; (2) direct `http://192.168.2.216:8731/v1/models` → `Network unreachable`; (3) `http://example.com/` → DNS failure (`bad address`); (4) `/var/run/docker.sock` absent. Ordinary-bridge egress NOT relied upon.
 
+## Addendum B. Execution images (2026-11-03, built from frozen `f4fef24` archive)
+
+- `m3d-needletail:1` = `sha256:d16d3b8f01ad699745ec371d3922eb99e08a18cc906ebff04025f43bdc1f13b9` (multi-stage: `swift:6.4-bookworm` builder compiles `git archive` of the frozen tree; runtime `ubuntu:24.04` + bundled Swift runtime libs + `LD_LIBRARY_PATH` launcher; non-root `bench`, entrypoint `needletail`, `--version` → `0.3.0` verified in-container).
+- `m3d-pi:1` = `sha256:5ca61e4b16cace6a29b13d5539fdf70e8de276081d2c6cea9cacc34232223d26` (`node:24-bookworm-slim` + installed Pi 1.4.0 dist + frozen halogen-only `models.json` (`samplingParams.temperature: 0.2`) + settings; non-root `bench`).
+- `m3d-forwarder:1` = `sha256:4acb4add598f6fc5bb233b1dc2917ebd92703822bc378fc328a2c14d9024e40d` (see Addendum A).
+
+## Addendum C. Preflight evidence (2026-11-03; diagnostic spend 10/10, allowance exhausted)
+
+- (1) Both agents execute in containers: `m3d-needletail:1` → `0.3.0`, `m3d-pi:1` → `1.4.0` (uid 10000, hostnames set).
+- (2) Unattended Needletail edit/write/test: scratch read→edit→write completed with ZERO human input; model-proposed `exec /bin/sh -c …` resolved to `/usr/bin/dash` and was DENIED by the allowlist (not in [python3,node,swiftc,php,git]) → headless exit 3, no hang. Ledger: `sandbox-granted` event (auto-approved batch) + `approval-required`/`unavailable` hold (denied exec). 6 requests via forwarder.
+- (3) Host binary (piped stdin, edit task): exit 3, `approval required`, file byte-identical. Host policy intact.
+- (4) Deterministic: 15 SandboxPolicy + grant-transition + budget + usage tests green.
+- (5-6) Negative probes: direct Halogen IP unreachable, external DNS fails, no docker socket, no host home, read-only root enforced, workspace/tmp writable only. Live images lack shell probing tools; network shape proven on `m3d-internal` + per-run ledger/usage evidence.
+- (7)Artifacts: per-run dirs on host post-run (workspace, state incl. GRDB, logs, grant); ledger queried read-only (`sandbox-granted` verified).
+- (8) Same model via forwarder: Needletail 6 requests + Pi exact-echo (`PI-DOCKER-OK`, exit 0, `--mode json` usage schema captured: Pi-computed totals, `totalFromProvider:false`).
+- (9) Pi JSON stream parsed for failures (message_end/usage/responseId schema recorded in scorer).
+- Spend: compat probes 2 + NT preflight run 6 + host exit-3 1 + Pi container probe 1 = 10/10 diagnostic. No further pre-scoring live traffic. T09 resume mechanics validated in-situ during scoring (leg 1 interrupt is itself polled + logged).
+- Pi config fix found in preflight: read-only root breaks Pi's settings lockfile → scorer sets `PI_CODING_AGENT_DIR=/state/pi-config` (seeded per run from frozen `docker/pi-models.json` + `docker/pi-settings.json`).
+
 ## 6. Execution and closeout
 
 Resumable scorer runs the 48 AB/BA matrix unattended (skip completed, per-run timeout, durable per-run dirs). Enforcement: Needletail turn limits + per-request budget accounting; Pi counted post-hoc with abort-on-exceed. Preserve logs/events/GRDB/diffs/oracles/usage/container+image identity per attempt. Then: paired analysis, `plans/m3-d-receipt.md`, final M3 report with PROCEED/CONDITIONAL/STOP, CodeRabbit aggregate + CI before any merge recommendation. STOP after: no M4, no push/PR/merge.

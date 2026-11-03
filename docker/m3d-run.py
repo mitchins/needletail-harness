@@ -205,6 +205,8 @@ def nt_cmd(task, rep, ws, state, grant_file, prompt, ceiling, cname):
 def pi_cmd(task, rep, ws, state, prompt, cname, leg):
     cmd = docker_base(cname) + [
         "-v", "%s:/workspace:rw" % ws,
+        "-v", "%s:/state:rw" % state,
+        "-e", "PI_CODING_AGENT_DIR=/state/pi-config",
         "m3d-pi:1", "-p",
         "--provider", "halogen-local",
         "--model", "halogen-qwen3.8-flash-next",
@@ -459,6 +461,16 @@ def main():
             shutil.rmtree(state, ignore_errors=True)
             os.makedirs(state, exist_ok=True)
         seed_fixture(task, ws)
+        # Pi reads its config from PI_CODING_AGENT_DIR (writable per-run
+        # state; the read-only image root cannot take its lock files).
+        picfg = os.path.join(state, "pi-config")
+        os.makedirs(picfg, exist_ok=True)
+        for fn in ("pi-models.json", "pi-settings.json"):
+            shutil.copy(os.path.join(HERE, fn), os.path.join(picfg, fn.replace("pi-", "")))
+        for fn in ("models.json", "settings.json"):
+            p = os.path.join(picfg, fn)
+            if not os.path.exists(p):
+                raise RuntimeError("missing pi config: " + fn)
         subprocess.run(["chmod", "-R", "a+rwX", ws, state], check=False)
     with open(TASKS, encoding="utf-8") as f:
         assert json.load(f)["frozen"].startswith("2026-11-03"), "tasks file changed?"
