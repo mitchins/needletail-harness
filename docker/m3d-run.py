@@ -222,8 +222,12 @@ def pi_cmd(task, rep, ws, state, prompt, cname, leg):
         "--mode", "json",
     ]
     if task["id"] == "T09":
-        cmd += ["--session-dir", "/state/pi-session", "--session-id", "m3d-%s-R%d" % (task["id"], rep)]
-        if leg == 2:
+        # One session per run dir: leg 1 creates it, leg 2 continues the
+        # latest (--session-id cannot combine with --continue).
+        cmd += ["--session-dir", "/state/pi-session"]
+        if leg == 1:
+            cmd += ["--session-id", "m3d-%s-R%d" % (task["id"], rep)]
+        else:
             cmd += ["--continue"]
     else:
         cmd += ["--no-session"]
@@ -394,12 +398,19 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
             "--mode", "json", "--session-dir", "/state/pi-session",
             "--session-id", "m3d-%s-R%d" % (task["id"], rep), task["prompt"]]
     sh(["docker", "rm", "-f", cname])
-    subprocess.Popen(["docker", "run", "--rm", "-d", "--name", cname] + cmd[4:],
+    # No --rm here: an early-exiting run must still be inspectable and
+    # log-collectable below. Explicit rm -f at the end.
+    subprocess.Popen(["docker", "run", "-d", "--name", cname] + cmd[4:],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(5)
     observed = False
+    exited_early = False
     t0 = time.time()
     while time.time() - t0 < 150:
+        running = sh(["docker", "inspect", "-f", "{{.State.Running}}", cname])[1].strip()
+        if running == "false":
+            exited_early = True
+            break
         if harness == "nt":
             if nt_tool_results(state) > 0:
                 observed = True
@@ -421,7 +432,8 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
                 observed = True
                 break
         time.sleep(2)
-    sh(["docker", "kill", "--signal", "SIGINT", cname])
+    if not exited_early:
+        sh(["docker", "kill", "--signal", "SIGINT", cname])
     try:
         subprocess.run(["docker", "wait", cname], timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -434,7 +446,7 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
     with open(os.path.join(rundir, "stderr-leg1.log"), "w", encoding="utf-8") as f:
         f.write(err)
     leg1 = {"exit": "interrupted", "wall": wall, "stdout": out, "stderr": err,
-            "container": cname, "interruptObserved": observed}
+            "container": cname, "interruptObserved": observed, "exitedEarly": exited_early}
     if harness == "nt":
         leg1["requests"] = sum(1 for line in err.splitlines() if line.startswith("usage: request "))
         leg1["tokensIn"] = 0
@@ -526,6 +538,9 @@ def main():
     if task_id == "T09" and leg == 1:
         leg1 = interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling)
         result.update(leg1)
+        # An early exit (crash/completion before SIGINT) means no real
+        # interruption happened; leg 2 still runs (resume of whatever
+        # state exists) and the oracle judges the final artifacts.
         result["verdict"] = "INTERRUPTED-LEG-DONE"
         with open(os.path.join(rundir, "result-leg1.json"), "w", encoding="utf-8") as f:
             json.dump(result, f, indent=1, ensure_ascii=False)
