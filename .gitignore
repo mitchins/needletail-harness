@@ -35,3 +35,4 @@ demo/__pycache__/
 
 docker/needletail-src.tar.gz
 docker/pi-dist/
+__pycache__/
