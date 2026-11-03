@@ -397,16 +397,18 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
             "m3d-needletail:1", "run", "--workspace", "/workspace",
             "--max-turns", str(task["needletail"]["maxTurns"]),
             "--allow-exec", "--sandbox-grant", "/grant/grant.json",
-            "--prompt", task["prompt"],
+            "--prompt", task["promptWithSandboxNote"],
         ]
     else:
         cname = "m3d-%s-R%d-pi-L1" % (task["id"], rep)
-        cmd = docker_base(cname) + ["-v", "%s:/workspace:rw" % ws] + [
+        cmd = docker_base(cname) + [
+            "-v", "%s:/workspace:rw" % ws, "-v", "%s:/state:rw" % state,
+            "-e", "PI_CODING_AGENT_DIR=/state/pi-config",
             "m3d-pi:1", "-p", "--provider", "halogen-local",
             "--model", "halogen-qwen3.8-flash-next", "--api-key", "local",
             "--no-context-files", "--no-approve", "--no-extensions", "--no-mcp",
             "--mode", "json", "--session-dir", "/state/pi-session",
-            "--session-id", "m3d-%s-R%d" % (task["id"], rep), task["prompt"]]
+            "--session-id", "m3d-%s-R%d" % (task["id"], rep), task["promptWithSandboxNote"]]
     sh(["docker", "rm", "-f", cname])
     # No --rm here: an early-exiting run must still be inspectable and
     # log-collectable below. Explicit rm -f at the end.
