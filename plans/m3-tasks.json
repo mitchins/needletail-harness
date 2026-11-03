@@ -1,233 +1,626 @@
 {
-  "frozen": "2026-11-03",
+  "frozen": "2026-11-03 REV2 (pre-scoring amendment: docker php provisioning, Pi compat resolved, usage-logging delta committed)",
   "note": "FROZEN pre-registration. Do not modify tasks, prompts, fixtures, oracles, or budgets after the first scored run. Any change requires a new frozen revision and voids prior scores.",
   "endpoint": "http://192.168.2.216:8731/v1",
   "model": "halogen-qwen3.8-flash-next",
-  "needletailConfig": { "alias": "local-coder", "temperature": 0.2, "maxOutput": 4096, "contextWindow": 262144 },
-  "piConfig": { "providerRegistration": "OPERATOR STEP (see protocol): add halogen-local to ~/.pi/agent/models.json mirroring the ST7-B1 gemma-local entry", "temperature": "record at compat check; match 0.2 if exposed, else document default" },
+  "needletailConfig": {
+    "alias": "local-coder",
+    "temperature": 0.2,
+    "maxOutput": 4096,
+    "contextWindow": 262144
+  },
+  "piConfig": {
+    "providerRegistration": "OPERATOR STEP (see protocol): add halogen-local to ~/.pi/agent/models.json mirroring the ST7-B1 gemma-local entry",
+    "temperature": "record at compat check; match 0.2 if exposed, else document default"
+  },
   "repetitions": 2,
-  "harnesses": ["needletail", "pi"],
-  "order": { "R1": ["needletail", "pi"], "R2": ["pi", "needletail"] },
+  "harnesses": [
+    "needletail",
+    "pi"
+  ],
+  "order": {
+    "R1": [
+      "needletail",
+      "pi"
+    ],
+    "R2": [
+      "pi",
+      "needletail"
+    ]
+  },
   "totalScoredRuns": 48,
   "isolation": "Fresh scratch dir (byte-identical regenerated fixture) + fresh Needletail NEEDLETAIL_STATE_DIR / fresh Pi session (--no-session or fresh --session-dir) per repetition. No shared state between runs.",
   "excludedSetupCosts": "Fixture materialization + git init/add time excluded. Scoring clock starts at run invocation.",
   "budgets": {
-    "perTaskDefault": { "maxTurns": 10, "requestCeiling": 15, "timeoutSecs": 1200 },
-    "perTaskT08": { "maxTurns": 40, "requestCeiling": 45, "timeoutSecs": 3600 },
-    "perTaskT09": { "maxTurns": 10, "requestCeiling": 15, "timeoutSecs": 1800 },
+    "perTaskDefault": {
+      "maxTurns": 10,
+      "requestCeiling": 15,
+      "timeoutSecs": 1200
+    },
+    "perTaskT08": {
+      "maxTurns": 40,
+      "requestCeiling": 45,
+      "timeoutSecs": 3600
+    },
+    "perTaskT09": {
+      "maxTurns": 10,
+      "requestCeiling": 15,
+      "timeoutSecs": 1800
+    },
     "diagnosticAllowance": 10,
     "globalRequestCeiling": 850,
     "rule": "Exceeding a per-task request ceiling FAILS the run (BUDGET_EXCEEDED). Global exhaustion STOPS scoring. Counting: Needletail durable requesting-events; Pi session record; M3-C budget gate where applicable. No silent extension, no full-benchmark reruns."
   },
   "tasks": [
     {
-      "id": "T01", "title": "Python test repair (mean truncation)",
-      "languages": ["python"], "categories": ["test-repair", "scoped-change"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "files": {
-        "app.py": "def mean(xs):\n    return sum(xs) // len(xs)\n",
-        "test_app.py": "import unittest\nfrom app import mean\n\n\nclass T(unittest.TestCase):\n    def test_half(self):\n        self.assertEqual(mean([1, 2]), 1.5)\n\n    def test_q(self):\n        self.assertEqual(mean([1, 2, 3, 4]), 2.5)\n\n    def test_one(self):\n        self.assertEqual(mean([5]), 5)\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T01",
+      "title": "Python test repair (mean truncation)",
+      "languages": [
+        "python"
+      ],
+      "categories": [
+        "test-repair",
+        "scoped-change"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "app.py": "def mean(xs):\n    return sum(xs) // len(xs)\n",
+          "test_app.py": "import unittest\nfrom app import mean\n\n\nclass T(unittest.TestCase):\n    def test_half(self):\n        self.assertEqual(mean([1, 2]), 1.5)\n\n    def test_q(self):\n        self.assertEqual(mean([1, 2, 3, 4]), 2.5)\n\n    def test_one(self):\n        self.assertEqual(mean([5]), 5)\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Fix app.py so that all tests in test_app.py pass. Do not modify test_app.py. Verify by running the tests if you can.",
       "oracle": {
-        "commands": ["python3 -m unittest test_app -v", "git diff --name-only", "git status --porcelain"],
+        "commands": [
+          "python3 -m unittest test_app -v",
+          "git diff --name-only",
+          "git status --porcelain"
+        ],
         "pass": "unittest exit 0; diff names exactly [app.py]; no untracked files"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T02", "title": "TypeScript scoped fix (range sum, node type-stripping)",
-      "languages": ["typescript"], "categories": ["scoped-change", "test-repair"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "files": {
-        "calc.ts": "export function rangeSum(lo: number, hi: number): number {\n  let total = 0;\n  for (let i = lo; i < hi; i++) {\n    total += i;\n  }\n  return total;\n}\n",
-        "test.mjs": "import { rangeSum } from \"./calc.ts\";\nimport assert from \"node:assert/strict\";\nassert.equal(rangeSum(1, 3), 6);\nassert.equal(rangeSum(5, 5), 0);\nassert.equal(rangeSum(-2, 2), 0);\nconsole.log(\"TS-OK\");\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T02",
+      "title": "TypeScript scoped fix (range sum, node type-stripping)",
+      "languages": [
+        "typescript"
+      ],
+      "categories": [
+        "scoped-change",
+        "test-repair"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "calc.ts": "export function rangeSum(lo: number, hi: number): number {\n  let total = 0;\n  for (let i = lo; i < hi; i++) {\n    total += i;\n  }\n  return total;\n}\n",
+          "test.mjs": "import { rangeSum } from \"./calc.ts\";\nimport assert from \"node:assert/strict\";\nassert.equal(rangeSum(1, 3), 6);\nassert.equal(rangeSum(5, 5), 0);\nassert.equal(rangeSum(-2, 2), 0);\nconsole.log(\"TS-OK\");\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Fix calc.ts so that test.mjs passes (run it with node). Do not modify test.mjs. Use only erasable TypeScript syntax.",
       "oracle": {
-        "commands": ["node test.mjs", "git diff --name-only", "git status --porcelain"],
+        "commands": [
+          "node test.mjs",
+          "git diff --name-only",
+          "git status --porcelain"
+        ],
         "pass": "node exit 0 with TS-OK; diff names exactly [calc.ts]; no untracked files"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T03", "title": "PHP syntax repair (missing semicolon)",
-      "languages": ["php"], "categories": ["compile-diagnosis"],
-      "approvals": "attended", "conditional": { "tool": "php", "minVersion": "8.0", "status": "BLOCKED until provisioned" },
-      "fixture": { "files": {
-        "broken.php": "<?php\nfunction greeting($name) {\n    return \"Hello, \" . $name\n}\necho greeting(\"World\") . \"\\n\";\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T03",
+      "title": "PHP syntax repair (missing semicolon)",
+      "languages": [
+        "php"
+      ],
+      "categories": [
+        "compile-diagnosis"
+      ],
+      "approvals": "attended",
+      "conditional": {
+        "tool": "php",
+        "minVersion": "8.0",
+        "status": "PROVISIONED-VIA-DOCKER pending operator image pull (docker pull php:8.4-cli); without it, BLOCKED"
+      },
+      "fixture": {
+        "files": {
+          "broken.php": "<?php\nfunction greeting($name) {\n    return \"Hello, \" . $name\n}\necho greeting(\"World\") . \"\\n\";\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Fix the syntax error in broken.php with the smallest possible change. Preserve its behavior.",
       "oracle": {
-        "commands": ["php -l broken.php", "php broken.php", "git diff --name-only"],
+        "commands": [
+          "php -l broken.php",
+          "php broken.php",
+          "git diff --name-only"
+        ],
         "pass": "php -l exit 0 (no errors); stdout exactly 'Hello, World\\n'; diff names exactly [broken.php]"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T04", "title": "Swift type error fix (string + int)",
-      "languages": ["swift"], "categories": ["compile-diagnosis", "scoped-change"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "files": {
-        "main.swift": "func describe(_ n: Int) -> String {\n    return \"value: \" + n\n}\nprint(describe(42))\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T04",
+      "title": "Swift type error fix (string + int)",
+      "languages": [
+        "swift"
+      ],
+      "categories": [
+        "compile-diagnosis",
+        "scoped-change"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "main.swift": "func describe(_ n: Int) -> String {\n    return \"value: \" + n\n}\nprint(describe(42))\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Fix the type error in main.swift with the smallest possible change. Keep the function name describe.",
       "oracle": {
-        "commands": ["swiftc -typecheck main.swift", "git diff --numstat main.swift", "git diff --name-only"],
+        "commands": [
+          "swiftc -typecheck main.swift",
+          "git diff --numstat main.swift",
+          "git diff --name-only"
+        ],
         "pass": "typecheck exit 0; added+deleted lines <= 5; diff names exactly [main.swift]; file still contains 'func describe'"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T05", "title": "Edit preservation (marked region + boundary defect)",
-      "languages": ["python"], "categories": ["edit-conflict", "scoped-change"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "files": {
-        "config.py": "# USER-EDIT: keep this line exactly => threshold = 7\nthreshold = 7\n\n\ndef check(v):\n    return v > threshold\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T05",
+      "title": "Edit preservation (marked region + boundary defect)",
+      "languages": [
+        "python"
+      ],
+      "categories": [
+        "edit-conflict",
+        "scoped-change"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "config.py": "# USER-EDIT: keep this line exactly => threshold = 7\nthreshold = 7\n\n\ndef check(v):\n    return v > threshold\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Fix the off-by-one boundary defect in check (7 must satisfy the check). Never touch the line marked USER-EDIT.",
       "oracle": {
-        "commands": ["python3 -c \"import config,sys; sys.exit(0 if (config.check(7) is True and config.check(6) is False) else 1)\"", "grep -c -x -F '# USER-EDIT: keep this line exactly => threshold = 7' config.py", "git diff --name-only"],
+        "commands": [
+          "python3 -c \"import config,sys; sys.exit(0 if (config.check(7) is True and config.check(6) is False) else 1)\"",
+          "grep -c -x -F '# USER-EDIT: keep this line exactly => threshold = 7' config.py",
+          "git diff --name-only"
+        ],
         "pass": "behavior exit 0; marker line count exactly 1; diff names exactly [config.py]"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T06", "title": "Unicode identifiers byte-exact (cafe total)",
-      "languages": ["python"], "categories": ["quoted-identifiers", "test-repair"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "files": {
-        "util.py": "def café_total(items):\n    return sum(items) + 0.5\n",
-        "test_util.py": "import unittest\nfrom util import café_total\n\n\nclass T(unittest.TestCase):\n    def test_sum(self):\n        self.assertEqual(café_total([1, 2]), 3)\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T06",
+      "title": "Unicode identifiers byte-exact (cafe total)",
+      "languages": [
+        "python"
+      ],
+      "categories": [
+        "quoted-identifiers",
+        "test-repair"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "util.py": "def café_total(items):\n    return sum(items) + 0.5\n",
+          "test_util.py": "import unittest\nfrom util import café_total\n\n\nclass T(unittest.TestCase):\n    def test_sum(self):\n        self.assertEqual(café_total([1, 2]), 3)\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Fix util.py so the test passes. Reproduce every identifier byte-exactly; do not ascii-fold or rename anything.",
       "oracle": {
-        "commands": ["python3 -m unittest test_util", "test $(grep -o 'café_total' util.py test_util.py | wc -l) -eq 3", "! grep -q 'cafe_total' util.py test_util.py", "git diff --name-only"],
+        "commands": [
+          "python3 -m unittest test_util",
+          "test $(grep -o 'café_total' util.py test_util.py | wc -l) -eq 3",
+          "! grep -q 'cafe_total' util.py test_util.py",
+          "git diff --name-only"
+        ],
         "pass": "unittest exit 0; café_total occurrences exactly 3; no ascii-folded cafe_total; diff names exactly [util.py]"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T07", "title": "Swift compile diagnosis, minimal single-file diff",
-      "languages": ["swift"], "categories": ["compile-diagnosis", "scoped-change"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "files": {
-        "good.swift": "// good.swift - clean\nfunc good() -> Int {\n    return 1\n}\n",
-        "broken.swift": "// broken.swift - type error\nfunc broken() -> Int {\n    let x: Int = \"not a number\"\n    return x\n}\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T07",
+      "title": "Swift compile diagnosis, minimal single-file diff",
+      "languages": [
+        "swift"
+      ],
+      "categories": [
+        "compile-diagnosis",
+        "scoped-change"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "good.swift": "// good.swift - clean\nfunc good() -> Int {\n    return 1\n}\n",
+          "broken.swift": "// broken.swift - type error\nfunc broken() -> Int {\n    let x: Int = \"not a number\"\n    return x\n}\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Diagnose the compile error and fix it with the smallest possible change. Touch only the broken file.",
       "oracle": {
-        "commands": ["swiftc -typecheck good.swift broken.swift", "git diff --name-only", "git diff --quiet -- good.swift", "git diff --numstat broken.swift"],
+        "commands": [
+          "swiftc -typecheck good.swift broken.swift",
+          "git diff --name-only",
+          "git diff --quiet -- good.swift",
+          "git diff --numstat broken.swift"
+        ],
         "pass": "typecheck exit 0; diff names exactly [broken.swift]; good.swift byte-identical; broken.swift added+deleted <= 3"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T08", "title": "Long-context checkpoint (40-file sum + transmitted-context reduction)",
-      "languages": ["python"], "categories": ["long-context", "checkpoint"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "fileCount": 40, "pattern": "fNN.py with 'def total():\\n    return N\\n' for N in 0..39", "expectedSum": 780 },
-      "setup": ["generate 40 files f00.py..f39.py", "git init", "git add -A"],
+      "id": "T08",
+      "title": "Long-context checkpoint (40-file sum + transmitted-context reduction)",
+      "languages": [
+        "python"
+      ],
+      "categories": [
+        "long-context",
+        "checkpoint"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "fileCount": 40,
+        "pattern": "fNN.py with 'def total():\\n    return N\\n' for N in 0..39",
+        "expectedSum": 780
+      },
+      "setup": [
+        "generate 40 files f00.py..f39.py",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Read every fNN.py file in this workspace individually with the read tool (do not use search; do not modify anything). Compute the sum of all total() return values. Print ONLY the number as your final answer.",
       "oracle": {
         "correctness": "final answer matches (^|[^0-9])780([^0-9]|$) (Needletail: ledger last assistant text; Pi: recorded output)",
         "contextReduction": "Needletail only, applies iff pre-capture transcript records > 64: post-rollover usage_in < capture usage_in (stderr usage lines) AND retainedFromSeq > first transcript seq (ledger); else NOT-APPLICABLE (record, not fail)"
       },
-      "needletail": { "maxTurns": 40, "requestCeiling": 45, "flags": ["--workspace", "--max-turns 40", "--checkpoint"], "checkpoint": true },
+      "needletail": {
+        "maxTurns": 40,
+        "requestCeiling": 45,
+        "flags": [
+          "--workspace",
+          "--max-turns 40",
+          "--checkpoint"
+        ],
+        "checkpoint": true
+      },
       "timeoutSecs": 3600
     },
     {
-      "id": "T09", "title": "Interruption and recovery (no duplicate effects)",
-      "languages": ["neutral"], "categories": ["interruption-recovery"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "files": {
-        "data.txt": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T09",
+      "title": "Interruption and recovery (no duplicate effects)",
+      "languages": [
+        "neutral"
+      ],
+      "categories": [
+        "interruption-recovery"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "data.txt": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Compute the sum of the numbers in data.txt and write it (digits only) to result.txt.",
       "resumePrompt": "Continue: finish writing the exact sum of data.txt into result.txt (digits only). Do not repeat completed work.",
       "procedure": "Start run; after the first durable tool result is observable in the harness record, send SIGINT; then resume once per harness (Needletail: new run, same session+state dir, resumePrompt; Pi: documented resume path, finalized at compat check). One resume allowed.",
       "oracle": {
-        "commands": ["test \"$(cat result.txt | tr -d '[:space:]')\" = '55'"],
+        "commands": [
+          "test \"$(cat result.txt | tr -d '[:space:]')\" = '55'"
+        ],
         "pass": "result.txt stripped content exactly '55'; write intents for result.txt <= 2 (Needletail: changeGroup members for the path; Pi: best-effort from session record, else metric UNSUPPORTED)"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1800
     },
     {
-      "id": "T10", "title": "Blast-radius limit (monorepo single-package fix)",
-      "languages": ["python"], "categories": ["scoped-change", "test-repair"],
-      "approvals": "attended", "conditional": null,
-      "fixture": { "files": {
-        "pkg_a/mod.py": "X = 1\n",
-        "pkg_a/test_a.py": "import unittest\nimport mod\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertEqual(mod.X, 1)\n",
-        "pkg_b/mod.py": "def m(xs):\n    return sum(xs) // len(xs)\n",
-        "pkg_b/test_mod.py": "import unittest\nfrom mod import m\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertEqual(m([1, 2]), 1.5)\n",
-        "pkg_c/mod.py": "Y = 2\n",
-        "pkg_c/test_c.py": "import unittest\nimport mod\n\n\nclass T(unittest.TestCase):\n    def test_y(self):\n        self.assertEqual(mod.Y, 2)\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T10",
+      "title": "Blast-radius limit (monorepo single-package fix)",
+      "languages": [
+        "python"
+      ],
+      "categories": [
+        "scoped-change",
+        "test-repair"
+      ],
+      "approvals": "attended",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "pkg_a/mod.py": "X = 1\n",
+          "pkg_a/test_a.py": "import unittest\nimport mod\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertEqual(mod.X, 1)\n",
+          "pkg_b/mod.py": "def m(xs):\n    return sum(xs) // len(xs)\n",
+          "pkg_b/test_mod.py": "import unittest\nfrom mod import m\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertEqual(m([1, 2]), 1.5)\n",
+          "pkg_c/mod.py": "Y = 2\n",
+          "pkg_c/test_c.py": "import unittest\nimport mod\n\n\nclass T(unittest.TestCase):\n    def test_y(self):\n        self.assertEqual(mod.Y, 2)\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Fix pkg_b so its tests pass. Change nothing outside pkg_b.",
       "oracle": {
-        "commands": ["python3 -m unittest discover -s pkg_b", "python3 -m unittest discover -s pkg_a", "python3 -m unittest discover -s pkg_c", "git diff --name-only", "git status --porcelain"],
+        "commands": [
+          "python3 -m unittest discover -s pkg_b",
+          "python3 -m unittest discover -s pkg_a",
+          "python3 -m unittest discover -s pkg_c",
+          "git diff --name-only",
+          "git status --porcelain"
+        ],
         "pass": "all three suites exit 0; every diff line starts with 'pkg_b/'; no untracked files"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T11", "title": "PHP call-site-consistent rename",
-      "languages": ["php"], "categories": ["quoted-identifiers", "scoped-change"],
-      "approvals": "attended", "conditional": { "tool": "php", "minVersion": "8.0", "status": "BLOCKED until provisioned" },
-      "fixture": { "files": {
-        "util.php": "<?php\nfunction oldName($x) {\n    return $x * 2;\n}\n",
-        "helper.php": "<?php\nrequire_once __DIR__ . '/util.php';\nfunction helper() {\n    return oldName(1);\n}\n",
-        "main.php": "<?php\nrequire __DIR__ . '/util.php';\nrequire __DIR__ . '/helper.php';\necho oldName(21) . \"\\n\";\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T11",
+      "title": "PHP call-site-consistent rename",
+      "languages": [
+        "php"
+      ],
+      "categories": [
+        "quoted-identifiers",
+        "scoped-change"
+      ],
+      "approvals": "attended",
+      "conditional": {
+        "tool": "php",
+        "minVersion": "8.0",
+        "status": "PROVISIONED-VIA-DOCKER pending operator image pull (docker pull php:8.4-cli); without it, BLOCKED"
+      },
+      "fixture": {
+        "files": {
+          "util.php": "<?php\nfunction oldName($x) {\n    return $x * 2;\n}\n",
+          "helper.php": "<?php\nrequire_once __DIR__ . '/util.php';\nfunction helper() {\n    return oldName(1);\n}\n",
+          "main.php": "<?php\nrequire __DIR__ . '/util.php';\nrequire __DIR__ . '/helper.php';\necho oldName(21) . \"\\n\";\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Rename function oldName to newName consistently in all files. Behavior must not change.",
       "oracle": {
-        "commands": ["php -l util.php", "php -l helper.php", "php -l main.php", "php main.php", "! grep -rq 'oldName' --include='*.php' .", "grep -q 'newName' util.php main.php helper.php"],
+        "commands": [
+          "php -l util.php",
+          "php -l helper.php",
+          "php -l main.php",
+          "php main.php",
+          "! grep -rq 'oldName' --include='*.php' .",
+          "grep -q 'newName' util.php main.php helper.php"
+        ],
         "pass": "all php -l exit 0; main.php stdout exactly '42\\n'; no oldName remains; newName present in all three files"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     },
     {
-      "id": "T12", "title": "Read-only recon (sha report, zero mutations)",
-      "languages": ["neutral"], "categories": ["recon"],
-      "approvals": "none", "conditional": null,
-      "fixture": { "files": {
-        "README.md": "Needletail benchmark fixture.\nThis repository documents harbor procedures.\n",
-        "a.py": "X = 1\n",
-        "b.py": "Y = 2\n",
-        "c.py": "Z = 3\n"
-      } },
-      "setup": ["write files", "git init", "git add -A"],
+      "id": "T12",
+      "title": "Read-only recon (sha report, zero mutations)",
+      "languages": [
+        "neutral"
+      ],
+      "categories": [
+        "recon"
+      ],
+      "approvals": "none",
+      "conditional": null,
+      "fixture": {
+        "files": {
+          "README.md": "Needletail benchmark fixture.\nThis repository documents harbor procedures.\n",
+          "a.py": "X = 1\n",
+          "b.py": "Y = 2\n",
+          "c.py": "Z = 3\n"
+        }
+      },
+      "setup": [
+        "write files",
+        "git init",
+        "git add -A"
+      ],
       "prompt": "Report the sha256 of README.md and list all .py filenames in this workspace. Change nothing.",
       "oracle": {
-        "commands": ["answer contains $(sha256sum README.md | cut -d' ' -f1)", "git status --porcelain"],
+        "commands": [
+          "answer contains $(sha256sum README.md | cut -d' ' -f1)",
+          "git status --porcelain"
+        ],
         "pass": "answer contains the exact sha; git status empty (zero mutations). Request count reported as efficiency metric, not pass/fail"
       },
-      "needletail": { "maxTurns": 10, "requestCeiling": 15, "flags": ["--workspace", "--max-turns 10"], "checkpoint": false },
+      "needletail": {
+        "maxTurns": 10,
+        "requestCeiling": 15,
+        "flags": [
+          "--workspace",
+          "--max-turns 10"
+        ],
+        "checkpoint": false
+      },
       "timeoutSecs": 1200
     }
   ],
-  "metricsPerRun": ["oracle PASS/FAIL/BLOCKED", "unified diff + changed-file scope", "provider requests", "tokens in/out (UNKNOWN where not surfaced — see protocol token gap)", "wall time total", "provider vs tool time split (best-effort)", "approval count + human wait time", "tool-call and exec failures", "recovery/durability failures", "end transcript size + checkpoint events", "cache evidence (observational; UNKNOWN unless provider field)"],
+  "metricsPerRun": [
+    "oracle PASS/FAIL/BLOCKED",
+    "unified diff + changed-file scope",
+    "provider requests",
+    "tokens in/out (UNKNOWN where not surfaced — see protocol token gap)",
+    "wall time total",
+    "provider vs tool time split (best-effort)",
+    "approval count + human wait time",
+    "tool-call and exec failures",
+    "recovery/durability failures",
+    "end transcript size + checkpoint events",
+    "cache evidence (observational; UNKNOWN unless provider field)"
+  ],
   "cachePolicy": "Classify cache state as observational. UNKNOWN unless a provider usage field reports hits. Never infer from prefix similarity or latency.",
-  "stopRules": ["per-task ceiling breach fails the run", "global 850 exhaustion stops scoring", "no reruns to improve scores", "no oracle edits after first scored run", "blocked tasks reported BLOCKED, never silently dropped"]
+  "stopRules": [
+    "per-task ceiling breach fails the run",
+    "global 850 exhaustion stops scoring",
+    "no reruns to improve scores",
+    "no oracle edits after first scored run",
+    "blocked tasks reported BLOCKED, never silently dropped"
+  ],
+  "scoringEnvironment": "host execution; Docker ONLY for php oracle commands (pinned image php:8.4-cli, scratch dir mounted; image pull is operator-approved, once). Full containerization of either harness is deferred (would change the frozen environment; Pi containerization doc noted as the path).",
+  "toolchainProvision": {
+    "php": "docker run --rm -v <scratch>:/w -w /w php:8.4-cli <php args> (image NOT pulled yet; operator pulls once before scoring, or tasks stay BLOCKED)"
+  },
+  "piCompat": {
+    "registration": "OPERATOR-DONE 2026-11-03: halogen-local in ~/.pi/agent/models.json (baseUrl/api/model verified in file)",
+    "modelsTuiDisplay": "known limitation: custom file providers do not appear in Pi /models browser; direct selection works",
+    "auth": "per-run --api-key local (Halogen accepts any key)",
+    "probe": "PASS 2026-11-03: pi -p exact-echo exit 0 (diagnostic 1/10); --mode json exact-echo exit 0 (diagnostic 2/10)",
+    "usageSchema": "per-message usage {input,output,reasoning,cacheRead,cacheWrite} + totalFromProvider:false (Pi-computed, NOT provider fields); cacheRead/cacheWrite 0. Cache honesty: UNKNOWN both sides.",
+    "turnaround": "trivial probe took ~152s wall (durationMs); budget timeouts unchanged, wall estimates use this",
+    "temperature": "OPEN: Pi model entries support samplingParams (OpenAI-compatible); operator adds {\"temperature\": 0.2} to halogen-local entry pre-scoring, else document default",
+    "approvalsNonInteractive": "OPEN: Pi docs state no per-call approval gates (OS-user permissions); project trust via --approve/--no-approve (frozen: --no-approve + --no-context-files). Assume Pi runs unattended; verify at scoring prep if a prompt ever gates.",
+    "resume": "OPEN: T09 Pi resume via --continue; exact flags verified at scoring prep (<=1 diagnostic)"
+  },
+  "diagnosticSpend": {
+    "used": 2,
+    "remaining": 8,
+    "log": [
+      "2026-11-03 pi -p exact-echo compat probe (1 request)",
+      "2026-11-03 pi -p --mode json exact-echo + usage schema (1 request)"
+    ]
+  }
 }
