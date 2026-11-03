@@ -426,8 +426,20 @@ def interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling):
         f.write(out)
     with open(os.path.join(rundir, "stderr-leg1.log"), "w", encoding="utf-8") as f:
         f.write(err)
-    return {"exit": "interrupted", "wall": wall, "stdout": out, "stderr": err,
+    leg1 = {"exit": "interrupted", "wall": wall, "stdout": out, "stderr": err,
             "container": cname, "interruptObserved": observed}
+    if harness == "nt":
+        leg1["requests"] = sum(1 for line in err.splitlines() if line.startswith("usage: request "))
+        leg1["tokensIn"] = 0
+        leg1["tokensOut"] = 0
+        leg1["usageUnknown"] = True
+    else:
+        _, reqs, tin, tout = pi_parse(out)
+        leg1["requests"] = reqs
+        leg1["tokensIn"] = tin
+        leg1["tokensOut"] = tout
+        leg1["usageUnknown"] = False
+    return leg1
 
 
 def main():
@@ -493,6 +505,16 @@ def main():
     ceiling = task["needletail"]["requestCeiling"]
     timeout = task.get("timeoutSecs", 1200)
     result = {"task": task_id, "rep": rep, "harness": harness, "leg": leg, "frozen": frozen["frozen"]}
+    if task_id in ("T03", "T11") and not php_ok and leg == 1:
+        # No verification possible without the php image: record BLOCKED
+        # WITHOUT running (zero scored spend).
+        result.update({"verdict": "BLOCKED", "requests": 0, "tokensIn": 0, "tokensOut": 0,
+                       "usageUnknown": False, "answer": "",
+                       "oracle": {"reason": "php image not pulled"}})
+        with open(respath, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=1, ensure_ascii=False)
+        print("%s R%d %s: BLOCKED (no php image, zero spend)" % (task_id, rep, harness))
+        return 0
 
     if task_id == "T09" and leg == 1:
         leg1 = interrupt_leg(task, rep, harness, rundir, ws, state, timeout, ceiling)
@@ -547,10 +569,16 @@ def main():
             res["writeIntents"] = pi_tool_writes(res["stdout"], "result.txt")
         run = res
 
-    if harness == "pi" and run["requests"] > ceiling:
-        run["verdict"] = "FAIL"
-        run["oracle"] = {"reason": "BUDGET_EXCEEDED", "requests": run["requests"], "ceiling": ceiling}
-    elif harness == "nt" and run["requests"] > ceiling:
+    if (task_id in ("T03", "T11")) and not php_ok:
+        # No verification possible without the php image: do not burn
+        # scored budget on an unverifiable run.
+        run["verdict"] = "BLOCKED"
+        run["oracle"] = {"reason": "php image not pulled"}
+        run["requests"] = 0
+        run["tokensIn"] = 0
+        run["tokensOut"] = 0
+        run["answer"] = ""
+    elif harness == "pi" and run["requests"] > ceiling:
         run["verdict"] = "FAIL"
         run["oracle"] = {"reason": "BUDGET_EXCEEDED", "requests": run["requests"], "ceiling": ceiling}
     elif cond.startswith("BLOCKED"):

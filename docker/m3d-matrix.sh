@@ -6,8 +6,6 @@ set -u
 FORCE=""
 if [ "${1:-}" = "--force" ]; then FORCE="--force"; fi
 RUNS=/tmp/m3d/runs
-DIAG_USED=2
-DIAG_TOTAL=10
 GLOBAL_CEILING=850
 PASS=0; FAILN=0; BLOCKED=0; SKIPPED=0
 declare -a ORDER
@@ -24,7 +22,7 @@ runs = sys.argv[1]
 total = 0
 for root, _, files in os.walk(runs):
     for f in files:
-        if f == "result.json":
+        if f in ("result.json", "result-leg1.json", "result-leg2.json"):
             try:
                 d = json.load(open(os.path.join(root, f)))
                 total += int(d.get("requests", 0) or 0)
