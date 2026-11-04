@@ -157,7 +157,10 @@ public struct ExecRunner: Sendable {
         guard st.st_uid == 0 || st.st_uid == uid else { close(finalFD); throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity mismatch (owner)") }
         guard (st.st_mode & 0o111) != 0 else { close(finalFD); throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity mismatch (not executable)") }
         let size = UInt64(st.st_size)
-        guard size <= 64*1024*1024 else { close(finalFD); throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "executable too large") }
+        // Same bound as resolution (ExecArguments.maxExecBytes — single
+        // definition, no drift): a binary admitted at resolve time must
+        // not be refused at spawn time.
+        guard size <= ExecArguments.maxExecBytes else { close(finalFD); throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "executable too large") }
         let contentSHA: String
         do { contentSHA = try NativeToolExecutor.sha256Hex(fd: finalFD) } catch { close(finalFD); throw ToolFailure.preDispatch(status: "conflict", summary: "exec identity mismatch (hash failed)") }
         let dev = UInt64(st.st_dev), ino = UInt64(st.st_ino)

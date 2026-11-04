@@ -114,7 +114,13 @@ public func assembleChatTurn(_ events: [ServerSentEvent]) throws -> AssembledTur
                 finishReason = finish
             }
             guard let delta = choice["delta"] as? [String: Any] else { continue }
-            for key in delta.keys.sorted() where !["role", "content", "tool_calls", "reasoning_content"].contains(key) {
+            // Explicit allowlist (compatibility stop, never silent drop).
+            // "reasoning" is vLLM's dialect spelling of the same
+            // provider-side thinking trace as "reasoning_content"
+            // (Gemma-4 qualification: vLLM emits reasoning deltas under
+            // this key); both accumulate into the ignored trace and never
+            // influence assembly decisions.
+            for key in delta.keys.sorted() where !["role", "content", "tool_calls", "reasoning_content", "reasoning"].contains(key) {
                 throw AssemblyError.unknownDeltaKey(key)
             }
             if let content = delta["content"] as? String {
@@ -124,6 +130,12 @@ public func assembleChatTurn(_ events: [ServerSentEvent]) throws -> AssembledTur
             }
             if let reasoningDelta = delta["reasoning_content"] as? String {
                 reasoning += reasoningDelta
+            } else if let rawReasoningContent = delta["reasoning_content"], !(rawReasoningContent is NSNull) {
+                throw AssemblyError.malformedEvent("delta.reasoning_content is not a string")
+            } else if let reasoningAlias = delta["reasoning"] as? String {
+                reasoning += reasoningAlias
+            } else if let rawReasoning = delta["reasoning"], !(rawReasoning is NSNull) {
+                throw AssemblyError.malformedEvent("delta.reasoning is not a string")
             }
             guard let fragments = delta["tool_calls"] as? [[String: Any]] else { continue }
             for fragment in fragments {

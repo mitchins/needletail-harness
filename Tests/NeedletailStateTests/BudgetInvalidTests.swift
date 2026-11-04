@@ -60,12 +60,13 @@ struct BudgetInvalidTests {
             effectID: EffectID("eff-t"), runID: run.runID, generation: run.revision,
             expectedRevision: run.revision, mutating: false,
             outcome: .success("done"), atMillis: 1002), &ids)
-        guard case .failed(let failure) = over.state.phase else {
+        // Remediation R4: a resolved batch at the budget lands completed
+        // (boundary) instead of failed — still no 81st request, verdict
+        // still by oracle.
+        guard case .completed = over.state.phase else {
             Issue.record("81st request must stop, got \(over.state.phase)"); return
         }
-        guard case .budgetExhausted = failure else {
-            Issue.record("wrong failure: \(failure)"); return
-        }
+        #expect(over.state.activeRun == nil, "completed run releases the run")
         #expect(!over.effects.contains(where: {
             if case .requestProvider = $0 { return true }
             return false

@@ -184,7 +184,11 @@ public func reconcileOperations(_ records: [DurableRecord]) throws -> OperationR
              // (reconcileUndoJournal) classifies them separately. Inverse
              // intents/results reuse operation records and classify inline
              // above (intent-only mutating ⇒ unknown + held).
-             .changeGroup, .undoDisposition, .lineageFork:
+             .changeGroup, .undoDisposition, .lineageFork,
+             // M3-C: checkpoint publication is epoch metadata (the new
+             // epoch was already opened by checkpointCommitted in the same
+             // batch); no operation outcomes ride it.
+             .checkpointPublished:
             continue
         }
     }

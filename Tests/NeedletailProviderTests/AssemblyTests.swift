@@ -122,6 +122,44 @@ struct AssemblyTests {
         }
     }
 
+    @Test("WIRE-06b vLLM reasoning dialect key assembles, never decides")
+    func WIRE_06b_reasoningDialectKey() throws {
+        // vLLM emits provider thinking traces under "reasoning" (Gemma-4
+        // qualification); it must assemble exactly like "reasoning_content"
+        // (accumulated trace, no assembly influence), while a non-string
+        // value still fails closed and unknown keys still stop.
+        let data = try! JSONSerialization.data(withJSONObject: [
+            "choices": [["delta": ["reasoning": "thinking...", "content": "hi"], "finish_reason": "stop"]],
+        ])
+        let turn = try assembleChatTurn([Self.event(String(decoding: data, as: UTF8.self))])
+        #expect(turn.text == "hi")
+        #expect(turn.reasoningText == "thinking...")
+        let bad = try! JSONSerialization.data(withJSONObject: [
+            "choices": [["delta": ["reasoning": 42, "content": "hi"], "finish_reason": "stop"]],
+        ])
+        do {
+            _ = try assembleChatTurn([Self.event(String(decoding: bad, as: UTF8.self))])
+            Issue.record("non-string reasoning must reject")
+        } catch let error as AssemblyError {
+            guard case .malformedEvent = error else {
+                Issue.record("wrong error: \(error)"); return
+            }
+        }
+        // Same malformed-value rule for reasoning_content itself: a
+        // non-string, non-null value must fail closed, never drop silently.
+        let badContent = try! JSONSerialization.data(withJSONObject: [
+            "choices": [["delta": ["reasoning_content": 42, "content": "hi"], "finish_reason": "stop"]],
+        ])
+        do {
+            _ = try assembleChatTurn([Self.event(String(decoding: badContent, as: UTF8.self))])
+            Issue.record("non-string reasoning_content must reject")
+        } catch let error as AssemblyError {
+            guard case .malformedEvent = error else {
+                Issue.record("wrong error: \(error)"); return
+            }
+        }
+    }
+
     @Test("WIRE-07 identities and bytes stay lossless")
     func WIRE_07_losslessIdentities() throws {
         let huge = "123456789012345678901234567890"

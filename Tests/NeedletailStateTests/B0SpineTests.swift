@@ -277,14 +277,22 @@ struct B0SpineTests {
     @Test("B0-1: budget exhaustion preserves already-generated records")
     func budgetExhaustionPreserves() throws {
         var ids = StateFixtures.ids()
-        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: #"{"path":"a"}"#)])
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\"}")])
         var (state, run, _) = try Self.executingState(batch: batch, ids: &ids)
         state = state.replacing(turnsUsed: 80, turnLimit: 80)
         let effectID = try #require(state.liveReservations.first).effectID
         let result = Self.perCallResult([("c1", "success", "ok", true)])
         let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(result), atMillis: 1012), &ids)
-        #expect(completed.state.phase == .failed(.budgetExhausted("turn budget exhausted after tool batch")))
-        #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" } else { return false } }), "budget fail must preserve operation result")
+        // Remediation R4: a fully resolved batch at the turn budget lands
+        // completed (boundary), not failed — the verdict still comes from
+        // the oracle over the preserved records.
+        guard case .completed = completed.state.phase else {
+            Issue.record("budget-boundary landing must complete, got \(completed.state.phase)"); return
+        }
+        #expect(completed.state.activeRun == nil, "completed run releases the run")
+        #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" } else { return false } }), "budget landing must preserve operation result")
+        #expect(completed.records.contains(where: { if case .eventAppended(_, let kind, _) = $0 { return kind == "completed-budget-boundary" } else { return false } }), "boundary landing is marked in telemetry")
+        #expect(!completed.effects.contains(where: { if case .requestProvider = $0 { return true } else { return false } }), "no 81st request")
     }
 
     @Test("B0-4: partial scripted execution retains earlier success")

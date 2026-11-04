@@ -75,7 +75,8 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// ExecIdentityResolver (plan REV12 §3.4b.2): resolve → qualify →
     /// content-hash every exec proposal in the batch. Synchronous,
     /// filesystem-touching, bounded (NC-15: ≤8 calls/batch enforced by the
-    /// validator; ≤64 MiB per executable, ≤128 MiB aggregate here). The
+    /// validator; ExecArguments.maxExecBytes per executable,
+    /// maxExecAggregateBytes aggregate here). The
     /// executable walk anchors at "/" and RESOLVES symlinks (≤40 hops,
     /// NC-4) so `/usr/bin/python3` and Conda env binaries qualify; the
     /// final component opens O_NOFOLLOW and must be a regular file. The
@@ -317,12 +318,12 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             throw ExecResolutionError.qualification("resolved executable is not executable for exec \(callID)")
         }
         let size = UInt64(st.st_size)
-        guard size <= 64 * 1024 * 1024 else {
-            throw ExecResolutionError.qualification("executable exceeds the 64 MiB hash bound for exec \(callID)")
+        guard size <= ExecArguments.maxExecBytes else {
+            throw ExecResolutionError.qualification("executable exceeds the 256 MiB hash bound for exec \(callID)")
         }
         aggregateBytes &+= size
-        guard aggregateBytes <= 128 * 1024 * 1024 else {
-            throw ExecResolutionError.budgetExceeded("resolution budget exceeded (128 MiB aggregate) for exec \(callID)")
+        guard aggregateBytes <= ExecArguments.maxExecAggregateBytes else {
+            throw ExecResolutionError.budgetExceeded("resolution budget exceeded (512 MiB aggregate) for exec \(callID)")
         }
         // Content hash over the held fd's bytes (the fd the spawn will use).
         let contentSHA = try Self.sha256Hex(fd: finalFD)
@@ -626,8 +627,23 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
 
     private func executeOne(proposal: ToolProposal, reservation: EffectReservation) throws -> ToolCallOutcome {
         guard let argsStr = proposal.arguments, let data = argsStr.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+              var json = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
             throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "invalid json")
+        }
+        // Remediation R1: apply the same model-natural path normalization
+        // the validator uses, so execution agrees with validation (split-
+        // brain would normalize at approval but execute raw, or vice
+        // versa). Root-naming paths for search mean the workspace root
+        // (drop the key — a missing path searches the root); for file
+        // tools they fail closed here exactly as in validation.
+        if let rawPath = json["path"] as? String {
+            if let norm = ToolValidator.normalizeWorkspacePath(rawPath) {
+                json["path"] = norm
+            } else if proposal.tool == "search" {
+                json.removeValue(forKey: "path")
+            } else {
+                throw ToolFailure.preDispatch(status: "invalid-arguments", summary: "path names the workspace root; \(proposal.tool) requires a file path")
+            }
         }
         // Check protected paths before any FS touch; grantable requires explicit approval in reservation
         if let path = json["path"] as? String {
@@ -2464,10 +2480,29 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 // collisions across distinct raw inodes); only exact names
                 // the operator approved are visible.
                 if !pathLossy && Self.isSearchPathApproved(logical, approvedPaths: approvedPaths) {
-                    kept.append(line)
+                    if let rewritten = Self.rewriteSearchLine(line, logical: logical) {
+                        kept.append(rewritten)
+                    } else {
+                        omittedUnparseable = true
+                    }
                 }
             case .unprotected:
-                kept.append(line)
+                // M3-B A2: the model-visible result carries the APPROVED
+                // logical workspace-relative path, never the /proc/self/fd
+                // argv prefix. Exact-decoded names are rewritten through a
+                // structured JSON rebuild (no blind string replacement).
+                // Remediation R2 (CLOSURE_10): lossy skeletons in
+                // UNPROTECTED paths are kept, not dropped — the match text
+                // is exact, the file is traversable without approval, and
+                // the U+FFFD skeleton cannot authorize anything (approvals
+                // stay byte-exact elsewhere). Dropping them silently lost
+                // legitimate results. Grantable+lossy below still drops
+                // fail-closed (a lossy name must never satisfy an approval).
+                if let rewritten = Self.rewriteSearchLine(line, logical: logical) {
+                    kept.append(rewritten)
+                } else {
+                    omittedUnparseable = true
+                }
             }
         }
         var out = kept.joined(separator: "\n")
@@ -2475,6 +2510,26 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             out += "\n"
         }
         return (out, omittedUnparseable)
+    }
+
+    /// M3-B A2: re-serialize one parsed rg JSON line with `data.path.text`
+    /// replaced by the approved logical path. Structured rebuild preserves
+    /// match text, line numbers, offsets and submatches byte-exactly; only
+    /// the path field changes. Returns nil when re-serialization fails
+    /// (caller drops the line fail-closed).
+    static func rewriteSearchLine(_ line: String, logical: String) -> String? {
+        guard let objData = line.data(using: .utf8),
+              var obj = try? JSONSerialization.jsonObject(with: objData) as? [String: Any] else {
+            return nil
+        }
+        guard var dataObj = obj["data"] as? [String: Any] else { return nil }
+        dataObj["path"] = ["text": logical]
+        obj["data"] = dataObj
+        guard let newData = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .withoutEscapingSlashes]),
+              let newLine = String(data: newData, encoding: .utf8) else {
+            return nil
+        }
+        return newLine
     }
 
     /// Map an rg-reported path back to its logical relative path: strip the

@@ -70,7 +70,7 @@ struct EpochSwitchTests {
         }
         let switched = transition(failed3, .switchModel(alias: "local-coder", atMillis: 4), &ids)
         #expect(switched.state.epoch.epochID == EpochID("epoch-1"), "terminal switch must not open epochs")
-        let checked = transition(failed3, .checkpointRequested(atMillis: 4), &ids)
+        let checked = transition(failed3, .checkpointRequested(atMillis: 4, sealed: false), &ids)
         #expect(checked.state.phase == failed3.phase, "terminal checkpoint must not start")
     }
 
@@ -81,7 +81,7 @@ struct EpochSwitchTests {
         let switched = transition(admitting, .switchModel(alias: "local-coder", atMillis: 1001), &ids)
         #expect(switched.state.phase == .admitting, "admission continues; switch refused")
         #expect(switched.state.queue.isEmpty, "refused meta-commands never queue")
-        let checked = transition(admitting, .checkpointRequested(atMillis: 1001), &ids)
+        let checked = transition(admitting, .checkpointRequested(atMillis: 1001, sealed: false), &ids)
         #expect(checked.state.phase == .admitting)
     }
 
@@ -89,7 +89,7 @@ struct EpochSwitchTests {
     func checkpointBoundary() throws {
         var ids = StateFixtures.ids()
         let idle = try StateFixtures.idle()
-        let started = transition(idle, .checkpointRequested(atMillis: 1000), &ids)
+        let started = transition(idle, .checkpointRequested(atMillis: 1000, sealed: false), &ids)
         guard case .checkpointing = started.state.phase else {
             Issue.record("clean idle must open checkpointing"); return
         }
@@ -99,7 +99,7 @@ struct EpochSwitchTests {
         // Unresolved markers refuse the boundary.
         let marker = OperationRef(operationID: OperationID("op-u"), state: .unknown, mutating: true)
         let dirty = idle.replacing(unresolvedOperations: [marker])
-        let refused = transition(dirty, .checkpointRequested(atMillis: 1002), &ids)
+        let refused = transition(dirty, .checkpointRequested(atMillis: 1002, sealed: false), &ids)
         #expect(refused.state.phase == .idle, "dirty ledger refuses checkpointing")
     }
 }

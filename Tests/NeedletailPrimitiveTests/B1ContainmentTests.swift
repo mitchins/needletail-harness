@@ -932,4 +932,197 @@ struct B1ContainmentTests {
         let result2 = try await exec2.execute(batch: batch2, reservation: res2)
         #expect(result2.calls[0].status == "success", "read via second read-root should succeed, got \(result2.calls[0])")
     }
+
+    // MARK: - Remediation R1: model-natural path normalization + argv[0] rewrite
+
+    @Test("R1_pathNormalization")
+    func r1PathNormalization() throws {
+        // GREEN: unambiguous workspace-root spellings normalize.
+        #expect(ToolValidator.normalizeWorkspacePath("./calc.ts") == "calc.ts")
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace/calc.ts") == "calc.ts")
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace/sub/dir/f.ts") == "sub/dir/f.ts")
+        #expect(ToolValidator.normalizeWorkspacePath(".") == nil)
+        #expect(ToolValidator.normalizeWorkspacePath("./") == nil)
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace") == nil)
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace/") == nil)
+        #expect(ToolValidator.normalizeWorkspacePath("././x.ts") == "x.ts")
+        // GREEN: ordinary relative paths pass through byte-identical.
+        #expect(ToolValidator.normalizeWorkspacePath("calc.ts") == "calc.ts")
+        #expect(ToolValidator.normalizeWorkspacePath("sub/dir/f.ts") == "sub/dir/f.ts")
+        // RED: bare absolute paths must NOT silently map in-workspace (wrong-file trap).
+        #expect(ToolValidator.normalizeWorkspacePath("/etc/passwd") == "/etc/passwd")
+        #expect(ToolValidator.normalizeWorkspacePath("/tmp/x") == "/tmp/x")
+        #expect(ToolValidator.normalizeWorkspacePath("/calc.ts") == "/calc.ts")
+        // RED: near-miss prefixes must not strip ("/workspace2" is not the root).
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace2/x") == "/workspace2/x")
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace//x") == "/workspace//x")
+    }
+
+    @Test("R1_normalizedPathsValidate")
+    func r1NormalizedPathsValidate() throws {
+        // "./x" and "/workspace/x" validate as ordinary relative paths…
+        for raw in ["./calc.ts", "/workspace/calc.ts", "calc.ts"] {
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"\(raw)\"}")])
+            let v = try ToolValidator.validateBatchArguments(batch: batch)
+            #expect(v[0].paths == ["calc.ts"], "\(raw) must validate to calc.ts, got \(v[0].paths)")
+        }
+        // …while bare absolutes still fail loudly.
+        for raw in ["/etc/passwd", "/calc.ts", "/workspace2/x"] {
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"\(raw)\"}")])
+            #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: batch) }
+        }
+        // Search "." and "/workspace" are the workspace-root search (omitted path).
+        for raw in [".", "/workspace", "/workspace/", ""] {
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"x\",\"path\":\"\(raw)\"}")])
+            let v = try ToolValidator.validateBatchArguments(batch: batch)
+            #expect(v[0].paths == [], "\(raw) must validate to root search, got \(v[0].paths)")
+        }
+        // Inner dots still fail loudly (no silent collapsing).
+        let inner = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"a/./b\"}")])
+        #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: inner) }
+        // Dot-dot THROUGH a normalized prefix must not escape: the strip
+        // is purely lexical (no ".." collapsing), so "../" survives into
+        // the byte-exact ".." rejection below. Neither form may resolve
+        // in-workspace.
+        #expect(ToolValidator.normalizeWorkspacePath("./../x") == "../x")
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace/../x") == "../x")
+        #expect(ToolValidator.normalizeWorkspacePath("/workspace/../../x") == "../../x")
+        for raw in ["./../x", "/workspace/../x", "/workspace/../../x", "..", "../x"] {
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"\(raw)\"}")])
+            #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: batch) }
+        }
+        // Long adversarial input: a 200 KiB "./" run must reject fast
+        // (linear strip + length gate before any copying), not hang.
+        let long = String(repeating: "./", count: 100_000) + "x"
+        let t0 = Date()
+        let normed = ToolValidator.normalizeWorkspacePath(long)
+        #expect(Date().timeIntervalSince(t0) < 1.0, "normalization is linear-time")
+        let longBatch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"\(long)\"}")])
+        #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: longBatch) }
+        _ = normed
+    }
+
+    @Test("R1_executorAgreesWithValidation")
+    func r1ExecutorAgreesWithValidation() async throws {
+        // End-to-end: the forms validation normalizes must EXECUTE, not
+        // just validate — validator/executor split-brain would approve one
+        // path and run another (or reject at runtime).
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try "needle-hay\n".write(to: url.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-r1"), writer: WriterIdentity(session: SessionID("s-r1"), writer: "w"), rgPath: nil, gitPath: nil)
+        func run(_ tool: String, _ args: String) async throws -> ToolCallOutcome {
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: tool, argumentsDigest: "d", arguments: args)])
+            _ = try ToolValidator.validateBatchArguments(batch: batch)
+            let res = EffectReservation(effectID: EffectID("eff-r1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: tool != "read" && tool != "search", batch: batch, kind: .executor, approvedPaths: [])
+            return try await exec.execute(batch: batch, reservation: res).calls[0]
+        }
+        let a = try await run("read", "{\"path\":\"/workspace/f.txt\"}")
+        #expect(a.status == "success" && a.data.contains("needle-hay"), "workspace-prefixed read executes, got \(a)")
+        let b = try await run("read", "{\"path\":\"./f.txt\"}")
+        #expect(b.status == "success" && b.data.contains("needle-hay"), "dot-prefixed read executes, got \(b)")
+        let c = try await run("write", "{\"path\":\"/workspace/g.txt\",\"content\":\"x\\n\"}")
+        #expect(c.status == "success", "workspace-prefixed write executes, got \(c)")
+        #expect(FileManager.default.fileExists(atPath: url.appendingPathComponent("g.txt").path))
+    }
+
+    @Test("R2 large interpreter resolves past the old 64 MiB bound")
+    func r2LargeInterpreterResolves() throws {
+        // A 100 MiB sparse executable (st_size admits, zero-filled pages
+        // hash fast): resolution must admit it — the pre-fix 64 MiB bound
+        // refused node-class binaries here. Spawn re-verification shares
+        // the same constant (C0 value-pin), so no split-brain refusal.
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let big = url.appendingPathComponent("bigbin")
+        let fd = big.path.withCString { open($0, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(0o755)) }
+        try #require(fd >= 0, "sparse binary must create")
+        defer { close(fd) }
+        try #require(ftruncate(fd, off_t(100 * 1024 * 1024)) == 0, "sparse file must size")
+        try #require(fchmod(fd, mode_t(0o755)) == 0, "sparse binary must be executable")
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-r2"), writer: WriterIdentity(session: SessionID("s-r2"), writer: "w"), rgPath: nil, gitPath: nil)
+        let args = "{\"executable\":\"\(big.path)\",\"argv\":[\"\(big.path)\"]}"
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: args)])
+        let ids = try exec.resolveIdentities(batch: batch)
+        #expect(ids.count == 1, "100 MiB binary resolves, got \(ids.count)")
+        #expect(ids[0].size == 100 * 1024 * 1024, "identity carries the true size")
+    }
+
+    @Test("R1_searchRootExecutesEndToEnd")
+    func r1SearchRootExecutesEndToEnd() async throws {
+        // Search spelled "." or "/workspace" executes as the workspace-root
+        // search through the real executor (validation/execution agreement
+        // for the previously rejected spellings).
+        let rg = try #require(["/usr/bin/rg", "/usr/local/bin/rg"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
+                              "rg required for search execution evidence")
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try "rootmark-needle\n".write(to: url.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-r1s"), writer: WriterIdentity(session: SessionID("s-r1s"), writer: "w"), rgPath: rg, gitPath: nil)
+        for raw in [".", "/workspace", "/workspace/"] {
+            let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"rootmark-needle\",\"path\":\"\(raw)\"}")])
+            _ = try ToolValidator.validateBatchArguments(batch: batch)
+            let res = EffectReservation(effectID: EffectID("eff-r1s"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
+            let out = try await exec.execute(batch: batch, reservation: res).calls[0]
+            #expect(out.status == "success" && out.data.contains("rootmark-needle"), "\(raw) root search executes, got \(out)")
+        }
+    }
+
+    @Test("R1_lossySkeletonReadFailsLoudWithoutTwin")
+    func r1LossySkeletonReadFailsLoud() async throws {
+        // Common-case safety for surfaced U+FFFD skeletons: with NO
+        // literal-U+FFFD twin present, acting on the skeleton fails loudly
+        // (exact-bytes open misses) — never silent wrong-file content.
+        // (A planted twin is the documented residual risk: unprotected-only,
+        // receipts show exact bytes, CLOSURE_10 recall wins.)
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let rawName = Data([0x74, 0x6F, 0x70, 0xFF, 0x2E, 0x74, 0x78, 0x74]) // top\xFF.txt
+        // The path pointer is valid only inside withCString: open the
+        // directory within the closure (escaping the pointer is UB).
+        let fd = url.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
+        try #require(fd >= 0)
+        defer { close(fd) }
+        var cname = Array(rawName) + [UInt8(0)]
+        let wfd = cname.withUnsafeMutableBytes { ptr in
+            openat(fd, ptr.baseAddress!.assumingMemoryBound(to: CChar.self), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o644))
+        }
+        try #require(wfd >= 0, "raw non-UTF-8 file must create")
+        _ = write(wfd, Array("ghost TOPMARK\n".utf8), 14)
+        close(wfd)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-r1l"), writer: WriterIdentity(session: SessionID("s-r1l"), writer: "w"), rgPath: nil, gitPath: nil)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "read", argumentsDigest: "d", arguments: "{\"path\":\"top�.txt\"}")])
+        _ = try ToolValidator.validateBatchArguments(batch: batch)
+        let res = EffectReservation(effectID: EffectID("eff-r1l"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
+        let out = try await exec.execute(batch: batch, reservation: res).calls[0]
+        #expect(out.status != "success", "skeleton read without a twin must not succeed, got \(out)")
+        #expect(!out.data.contains("TOPMARK"), "no wrong-file content may leak")
+    }
+
+    @Test("R1_argvZeroRewrite")
+    func r1ArgvZeroRewrite() throws {
+        // GREEN: bare basename equal to the executable's basename rewrites.
+        let ok = ToolBatch([ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"/usr/local/bin/node\",\"argv\":[\"node\",\"t.mjs\"]}")])
+        let v = try ToolValidator.validateBatchArguments(batch: ok)
+        #expect(v[0].tool == "exec")
+        let args = try ToolValidator.execArguments(fromRaw: ok.proposals[0].arguments ?? "")
+        #expect(args.argv[0] == "/usr/local/bin/node", "argv[0] must rewrite to the executable, got \(args.argv)")
+        // RED: mismatched bare names still fail (no silent substitution).
+        let badBase = ToolBatch([ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"/usr/bin/python3\",\"argv\":[\"python\",\"x\"]}")])
+        #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: badBase) }
+        // RED: slash-carrying non-equal argv[0] still fails (spoofing guard intact).
+        let spoof = ToolBatch([ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"/usr/bin/python3\",\"argv\":[\"/bin/python3\",\"x\"]}")])
+        #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: spoof) }
+        // RED: bare executable name (no absolute path) still fails — no PATH search.
+        let bare = ToolBatch([ToolProposal(callID: "c1", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"node\",\"argv\":[\"node\",\"x\"]}")])
+        #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: bare) }
+    }
 }

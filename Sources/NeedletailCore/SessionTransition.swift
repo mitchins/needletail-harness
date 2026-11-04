@@ -62,8 +62,16 @@ public struct ProviderInvocation: Sendable, Equatable {
     public let turnsLeft: Int
     public let deadlineMillis: UInt64?
     public let historyDigest: String
+    /// M3-C: true for the two-phase checkpoint capture request. The message
+    /// projection is the FULL native conversation + the bounded checkpoint
+    /// instruction (plus the single retry note after a tool denial); tool
+    /// execution is locally disabled for the branch.
+    public let isCheckpoint: Bool
+    /// M3-C: the fixed one-shot denial + retry note carried on the single
+    /// allowed retry after the model proposed a tool during capture.
+    public let checkpointRetryNote: String?
 
-    public init(effectID: EffectID, requestID: RequestID, runID: RunID, generation: Revision, alias: String, epochID: EpochID, sealed: Bool, turnsLeft: Int, deadlineMillis: UInt64?, historyDigest: String) {
+    public init(effectID: EffectID, requestID: RequestID, runID: RunID, generation: Revision, alias: String, epochID: EpochID, sealed: Bool, turnsLeft: Int, deadlineMillis: UInt64?, historyDigest: String, isCheckpoint: Bool = false, checkpointRetryNote: String? = nil) {
         self.effectID = effectID
         self.requestID = requestID
         self.runID = runID
@@ -74,6 +82,8 @@ public struct ProviderInvocation: Sendable, Equatable {
         self.turnsLeft = turnsLeft
         self.deadlineMillis = deadlineMillis
         self.historyDigest = historyDigest
+        self.isCheckpoint = isCheckpoint
+        self.checkpointRetryNote = checkpointRetryNote
     }
 }
 
@@ -281,10 +291,31 @@ public enum ApprovalDecision: Sendable, Equatable {
     /// The gateway cannot decide (headless, no TTY): pending forever —
     /// never auto-approve, never auto-deny (POLICY-04).
     case unavailable(String)
+    /// M3-D Docker amendment: sandbox-policy approval, issued ONLY by the
+    /// container-scoped gateway against a validated launcher grant. Carries
+    /// the grant binding (run/container identity) for the ledger — never
+    /// recorded as a human decision.
+    case sandboxGrant(note: String)
 }
 
 public protocol ApprovalGateway: Sendable {
     func decide(_ request: ApprovalRequest) async -> ApprovalDecision
+}
+
+/// Type-erased approval gateway (M3-D Docker amendment): lets call sites
+/// select the gateway at runtime (interactive TTY vs launcher-bound
+/// sandbox policy) without genericizing the whole composition root.
+/// Forwards identity-preserving; no policy of its own.
+public struct AnyApprovalGateway: ApprovalGateway, Sendable {
+    private let wrapped: any ApprovalGateway
+
+    public init(_ wrapped: any ApprovalGateway) {
+        self.wrapped = wrapped
+    }
+
+    public func decide(_ request: ApprovalRequest) async -> ApprovalDecision {
+        await wrapped.decide(request)
+    }
 }
 
 /// Classified transport failure (M1-C carrier, R2): the ADAPTER classifies
@@ -300,6 +331,17 @@ public struct TransportFailure: Error, Sendable, Equatable {
         self.message = message
     }
 }
+
+/// Remediation R3 — oversized-batch marker (M3-D T08: a turn proposing
+/// more than the per-turn tool-call bound died terminally with exit 4
+/// although NOTHING had executed). The provider layer prefixes the
+/// assembly message with this marker (defined once here — Providers
+/// imports Core, so the string cannot drift); the reducer answers with a
+/// bounded model-visible rejection + provider continuation instead of a
+/// terminal failure. Bounded by maxOversizedBatchContinuations per run;
+/// past the bound the run fails exactly as before.
+public let oversizedBatchMarker = "oversized-batch"
+public let maxOversizedBatchContinuations = 2
 
 /// Approval rule (M1B2-5 matrix): sealed batches never reach authorising
 /// (denied at admission); observe admits read/search only (mutating denied
@@ -412,8 +454,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return handleLineageFork(state, boundary: boundary, atMillis: at, ids: &ids)
     case (.idle, .switchModel(let alias, let at)):
         return switchModel(state, alias: alias, atMillis: at, ids: &ids)
-    case (.idle, .checkpointRequested(let at)):
-        return requestCheckpoint(state, atMillis: at, ids: &ids)
+    case (.idle, .checkpointRequested(let at, let sealed)):
+        return requestCheckpoint(state, atMillis: at, sealed: sealed, ids: &ids)
     case (.idle, .cancelRequested):
         return Transition(state: state, effects: [], records: [])
     case (.idle, .invalidInput(let fingerprint, let cause, let at)):
@@ -428,12 +470,32 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, atMillis: at, ids: &ids)
     case (.admitting, .operatorInputAttachments(let commandID, let text, let kind, let sealed, let attachments, let at)):
         return admitToQueueState(state, commandID: commandID, text: text, kind: kind, sealed: sealed, attachments: attachments, atMillis: at, ids: &ids)
-    case (.checkpointing, .checkpointCommitted(let newEpoch, let at)):
-        return commitCheckpoint(state, newEpoch: newEpoch, atMillis: at, ids: &ids)
     case (.checkpointing, .checkpointFailed(let reason, let at)):
         return failCheckpoint(state, reason: reason, atMillis: at, ids: &ids)
+    case (.checkpointing, .checkpointResponse(let requestID, let generation, let text, let pinned, let knownFileHashes, let maxSequence, let receiptSequences, let retainedFromSeq, _)):
+        return handleCheckpointResponse(
+            state, requestID: requestID, generation: generation, text: text,
+            pinned: pinned, knownFileHashes: knownFileHashes, maxSequence: maxSequence,
+            receiptSequences: receiptSequences, retainedFromSeq: retainedFromSeq, ids: &ids)
+    case (.checkpointing, .checkpointToolDenied(let attemptID, let sealed, let callIDs, _)):
+        return checkpointToolDenial(state, requestID: attemptID, sealed: sealed, callIDs: callIDs, ids: &ids)
+    case (.checkpointing, .transportFailed(let requestID, _, _, let error, _)):
+        // Capture failure is fail-closed: epoch unchanged, phase back to
+        // idle. Stale/unmatched confirmations drop in checkStale.
+        if state.checkpointRequestID == requestID {
+            return failCheckpoint(state, reason: "checkpoint capture transport failure: \(error.prefix(160))", atMillis: 0, ids: &ids)
+        }
+        return Transition(state: state, effects: [], records: [])
     case (.checkpointing, .cancelRequested(let at)):
-        return cancelActive(state, atMillis: at, ids: &ids)
+        // M3-C: cancelling a capture is a fail-closed abort, NOT a run
+        // cancel — cancelActive would strand the session in .cancelling
+        // (it starts the grace timer only for a live run, and a capture
+        // is not one) and would needlessly hold the queue. The in-flight
+        // provider task is cancelled by the actor; a late response can no
+        // longer pair (the attempt reservation leaves the live table) and
+        // a paired stale event lands on the default no-op with the old
+        // epoch intact.
+        return failCheckpoint(state, reason: "checkpoint cancelled by operator", atMillis: at, ids: &ids)
     case (.requesting, .requestStarted(let requestID, let generation, _)):
         return beginStreaming(state, requestID: requestID, generation: generation, ids: &ids)
     case (.requesting, .providerResponse(_, _, let response, let at)):
@@ -466,6 +528,13 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return cancelActive(state, atMillis: at, ids: &ids)
     case (.authorising, .approvalGrant(let requestID, _, _)):
         return grantApproval(state, requestID: requestID, ids: &ids)
+    case (.authorising, .approvalSandboxGrant(let requestID, _, let note, _)):
+        // M3-D Docker amendment: same dispatch as a human grant, but the
+        // ledger first records the sandbox binding (run/container identity
+        // from the launcher grant) under its own event kind.
+        let (s1, prefix) = sequenced(state, kind: "sandbox-granted", digest: eventDigest("sandbox-grant", terminalSafe(note)), ids: &ids)
+        let granted = grantApproval(s1, requestID: requestID, ids: &ids)
+        return Transition(state: granted.state, effects: granted.effects, records: prefix + granted.records)
     case (.authorising, .approvalDeny(_, _, _, _)):
         return denyApproval(state, ids: &ids)
     case (.authorising, .approvalUnavailable(let requestID, _, let reason, let at)):
@@ -548,7 +617,7 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return refuseBusyMeta(state, what: "model switch to '\(terminalSafe(alias))' during admission", atMillis: at, ids: &ids)
     case (.cancelling, .switchModel(let alias, let at)):
         return refuseBusyMeta(state, what: "model switch to '\(terminalSafe(alias))' during cancellation (retry at idle)", atMillis: at, ids: &ids)
-    case (_, .checkpointRequested(let at)) where state.phase.isBusy:
+    case (_, .checkpointRequested(let at, _)) where state.phase.isBusy:
         return refuseBusyMeta(state, what: "checkpoint (boundary busy)", atMillis: at, ids: &ids)
     case (_, .queueEdit(let entryID, let newText, let baseRevision, let at)):
         return editEntry(state, entryID: entryID, newText: newText, baseRevision: baseRevision, atMillis: at, ids: &ids)
@@ -602,6 +671,13 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
 private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEvent, _ ids: inout I) -> Transition? {
     switch event {
     case .providerResponse(let requestID, let generation, _, _):
+        // M3-C: the checkpoint capture response routes through the branch
+        // (matched on the stamped checkpoint request identity), never
+        // through the run lifecycle.
+        if state.phase == .checkpointing {
+            guard state.checkpointRequestID == requestID else { return drop(state) }
+            return nil
+        }
         guard state.phase == .requesting || state.phase == .streaming,
               let run = state.activeRun,
               run.requestID == requestID, run.revision == generation
@@ -609,7 +685,18 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
             return drop(state)
         }
         return nil
+    case .checkpointResponse:
+        // Typed checkpoint events carry their own identity match in the
+        // handler; unmatched identities fail closed there (stale response).
+        return nil
+    case .checkpointToolDenied:
+        return nil
     case .transportFailed(let requestID, let generation, _, _, _):
+        // M3-C: capture transport failure matched on the checkpoint request.
+        if state.phase == .checkpointing {
+            guard state.checkpointRequestID == requestID else { return drop(state) }
+            return nil
+        }
         // S7: a transport confirmation for the cancelled run short-circuits
         // the grace deadline (matched on runID — generation already bumped).
         if state.phase == .cancelling,
@@ -640,6 +727,7 @@ private func checkStale<I: IDSource>(_ state: SessionState, _ event: SessionEven
         }
         return nil
     case .approvalGrant(let requestID, let generation, _),
+         .approvalSandboxGrant(let requestID, let generation, _, _),
          .approvalDeny(let requestID, let generation, _, _),
          .approvalUnavailable(let requestID, let generation, _, _):
         guard let run = state.activeRun,
@@ -878,6 +966,7 @@ private func admitFreshRun<I: IDSource>(
         admittedCommands: index, consumedEffects: Set<EffectID>(),
         turnsUsed: 0, runDeadlineMillis: atMillis + defaultRunDeadlineMillis,
         preSendRetries: 0, invalidTracker: InvalidTracker(),
+        oversizedBatchContinuations: 0,
         retryDeadlineMillis: .some(nil),
         liveReservations: state.liveReservations + [reservation],
         generation: generation, lastSequence: seq.value)
@@ -1290,31 +1379,157 @@ private func switchModel<I: IDSource>(_ state: SessionState, alias: String, atMi
     return Transition(state: next, effects: [.emitUI(.runUpdate(phase: "epoch", detail: "switched to \(terminalSafe(alias))"))], records: prefix + [.epochOpened(epoch)] + heldChanges)
 }
 
-private func requestCheckpoint<I: IDSource>(_ state: SessionState, atMillis: UInt64, ids: inout I) -> Transition {
+private func requestCheckpoint<I: IDSource>(_ state: SessionState, atMillis: UInt64, sealed: Bool, ids: inout I) -> Transition {
     _ = atMillis
     guard state.unresolvedOperations.isEmpty else {
         let (s1, prefix) = sequenced(state, kind: "checkpoint-refused-unresolved", digest: "checkpoint", ids: &ids)
         return Transition(state: s1, effects: [.emitUI(.denied(cause: "checkpoint needs a clean ledger; reconcile first"))], records: prefix)
     }
+    // M3-C: the capture IS a provider request against the full native
+    // conversation with the bounded checkpoint instruction overlaid and
+    // tool execution locally disabled. Quiescence is enforced by the
+    // (.idle, .checkpointRequested) table entry (no run/tool/approval) plus
+    // the unresolved guard above; an ordinary queue hold does not block.
+    // The sealed flag is inherited from the caller (a sealed context
+    // captures sealed) — the production CLI additionally refuses
+    // `--checkpoint --sealed` outright.
+    let effectID = ids.nextEffectID()
+    let requestID = ids.nextRequestID()
+    let runID = ids.nextRunID()
+    let reservation = EffectReservation(
+        effectID: effectID, runID: runID, requestID: requestID,
+        generation: Revision(0), revision: Revision(0), mutating: false,
+        kind: .provider)
     let (s1, prefix) = sequenced(state, kind: "checkpointing", digest: "checkpoint", ids: &ids)
-    return Transition(state: s1.replacing(phase: .checkpointing), effects: [], records: prefix)
+    let invocation = ProviderInvocation(
+        effectID: effectID, requestID: requestID, runID: runID,
+        generation: Revision(0), alias: state.epoch.profile.alias,
+        epochID: state.epoch.epochID, sealed: sealed,
+        turnsLeft: max(1, state.turnLimit - state.turnsUsed),
+        deadlineMillis: state.runDeadlineMillis,
+        historyDigest: fnv1aHex("\(state.sessionID.raw):\(s1.lastSequence):checkpoint"),
+        isCheckpoint: true)
+    let next = s1.replacing(
+        phase: .checkpointing, checkpointRequestID: .some(requestID), checkpointDenials: 0,
+        liveReservations: s1.liveReservations + [reservation])
+    return Transition(
+        state: next,
+        effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
+        records: prefix)
 }
 
-private func commitCheckpoint<I: IDSource>(_ state: SessionState, newEpoch: EpochDescriptor?, atMillis: UInt64, ids: inout I) -> Transition {
-    _ = atMillis
-    let (s1, prefix) = sequenced(state, kind: "checkpoint-done", digest: "checkpoint", ids: &ids)
-    if let epoch = newEpoch {
-        let next = s1.replacing(epoch: epoch, phase: .idle, admittedCommands: [:])
-        return Transition(state: next, effects: [.emitUI(.runUpdate(phase: "epoch", detail: "checkpoint published"))], records: prefix + [.checkpointCommitted(epoch), .epochOpened(epoch)])
+/// M3-C: tool denial during capture (SPEC §7.1: at most one paired local
+/// denial + retry). The denial is synthesized locally — never executed,
+/// never approved — and the retry rides the overlay, not the transcript.
+/// The denial carries its attempt identity: a denial for a superseded
+/// attempt drops as stale instead of consuming this attempt's one retry.
+/// The retry inherits the capture's sealed flag.
+private func checkpointToolDenial<I: IDSource>(_ state: SessionState, requestID attemptID: RequestID, sealed: Bool, callIDs: [String], ids: inout I) -> Transition {
+    guard state.checkpointRequestID == attemptID else {
+        return drop(state)
     }
-    let next = s1.replacing(phase: .idle)
+    guard state.checkpointDenials == 0, !callIDs.isEmpty else {
+        return failCheckpoint(state, reason: "second tool-bearing response during checkpoint capture", atMillis: 0, ids: &ids)
+    }
+    let effectID = ids.nextEffectID()
+    let requestID = ids.nextRequestID()
+    let runID = ids.nextRunID()
+    let denialCallIDs = callIDs.joined(separator: ",")
+    let retryNote = "\(CheckpointValidator.toolDenialRetry)\n[denied calls: \(denialCallIDs)]"
+    let reservation = EffectReservation(
+        effectID: effectID, runID: runID, requestID: requestID,
+        generation: Revision(0), revision: Revision(0), mutating: false,
+        kind: .provider)
+    let invocation = ProviderInvocation(
+        effectID: effectID, requestID: requestID, runID: runID,
+        generation: Revision(0), alias: state.epoch.profile.alias,
+        epochID: state.epoch.epochID, sealed: sealed,
+        turnsLeft: max(1, state.turnLimit - state.turnsUsed),
+        deadlineMillis: state.runDeadlineMillis,
+        historyDigest: fnv1aHex("\(state.sessionID.raw):\(state.lastSequence):checkpoint-retry"),
+        isCheckpoint: true, checkpointRetryNote: retryNote)
+    let (s1, prefix) = sequenced(state, kind: "checkpoint-tool-denied", digest: eventDigest("checkpoint-denied", denialCallIDs), ids: &ids)
+    // The superseded attempt's reservation leaves the live table with the
+    // retry — a late response for it can never pair again.
+    let live = s1.liveReservations.filter { $0.requestID != attemptID } + [reservation]
+    let next = s1.replacing(
+        checkpointRequestID: .some(requestID), checkpointDenials: 1,
+        liveReservations: live)
+    return Transition(
+        state: next,
+        effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
+        records: prefix)
+}
+
+/// M3-C Phase B: validate the capture text, build the shorter epoch and
+/// publish atomically (checkpointPublished + checkpointCommitted +
+/// epochOpened in ONE record group). `pinned` and the ledger facts come
+/// from the actor (ledger truth); validation here is pure.
+private func handleCheckpointResponse<I: IDSource>(
+    _ state: SessionState, requestID: RequestID, generation: Revision, text: String,
+    pinned: [String], knownFileHashes: Set<String>, maxSequence: UInt64,
+    receiptSequences: Set<UInt64>, retainedFromSeq: UInt64, ids: inout I
+) -> Transition {
+    guard state.checkpointRequestID == requestID else {
+        return failCheckpoint(state, reason: "stale checkpoint response", atMillis: 0, ids: &ids)
+    }
+    do {
+        let doc = try CheckpointValidator.parse(text: text)
+        // Reference verification against ledger facts the ACTOR extracted:
+        // a current_files entry naming an unrecorded (path, sha256) — or
+        // a stale pre-change hash, or an observedSeq naming no
+        // receipt-bearing record — fails the checkpoint without replacing
+        // the active epoch. "The model said tests passed" is not execution
+        // evidence and never enters this ledger.
+        try CheckpointValidator.verify(
+            doc, knownFileHashes: knownFileHashes, maxSequence: maxSequence,
+            receiptSequences: receiptSequences)
+        // Phase B context: unchanged configuration/profile/caps/route;
+        // lineage via parentEpochID. New epoch ID minted from the same
+        // IDSource (allocator continuity).
+        let newEpoch = EpochDescriptor(
+            epochID: ids.nextEpochID(), parentEpochID: state.epoch.epochID,
+            configSnapshot: state.epoch.configSnapshot, profile: state.epoch.profile,
+            effectiveCaps: state.epoch.effectiveCaps, route: state.epoch.route,
+            execComposed: state.epoch.execComposed)
+        // Canonical durable JSON comes from the DECODED document (typed,
+        // bounded, sorted keys) — never re-parsed from raw model text.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let canon = try encoder.encode(doc)
+        let publication = CheckpointPublication(
+            epoch: newEpoch, checkpointJSON: String(decoding: canon, as: UTF8.self),
+            pinnedConstraints: pinned, retainedFromSeq: retainedFromSeq,
+            boundarySequence: maxSequence)
+        return commitCheckpoint(state, newEpoch: newEpoch, publication: publication, atMillis: 0, ids: &ids)
+    } catch {
+        return failCheckpoint(state, reason: String(describing: error).prefix(200).description, atMillis: 0, ids: &ids)
+    }
+}
+
+private func commitCheckpoint<I: IDSource>(_ state: SessionState, newEpoch: EpochDescriptor?, publication: CheckpointPublication? = nil, atMillis: UInt64, ids: inout I) -> Transition {
+    _ = atMillis
+    // Sequenced event + publication records share ONE `sequenced` group;
+    // the event lands here and the durable trio rides `extra`. The attempt
+    // reservation leaves the live table with the verdict — a late
+    // response for it can never pair again.
+    let (s1, prefix) = sequenced(state, kind: "checkpoint-done", digest: "checkpoint", ids: &ids)
+    let live = s1.liveReservations.filter { $0.requestID != state.checkpointRequestID }
+    if let epoch = newEpoch {
+        let next = s1.replacing(epoch: epoch, phase: .idle, admittedCommands: [:], checkpointRequestID: .some(nil), checkpointDenials: 0, liveReservations: live)
+        var extra: [DurableRecord] = []
+        if let publication { extra.append(.checkpointPublished(publication)) }
+        return Transition(state: next, effects: [.emitUI(.runUpdate(phase: "epoch", detail: "checkpoint published"))], records: prefix + extra + [.checkpointCommitted(epoch), .epochOpened(epoch)])
+    }
+    let next = s1.replacing(phase: .idle, checkpointRequestID: .some(nil), checkpointDenials: 0, liveReservations: live)
     return Transition(state: next, effects: [.emitUI(.runUpdate(phase: "epoch", detail: "checkpoint unchanged"))], records: prefix)
 }
 
 private func failCheckpoint<I: IDSource>(_ state: SessionState, reason: String, atMillis: UInt64, ids: inout I) -> Transition {
     _ = atMillis
     let (s1, prefix) = sequenced(state, kind: "checkpoint-failed", digest: eventDigest("checkpoint", reason), ids: &ids)
-    let next = s1.replacing(phase: .idle)
+    let live = s1.liveReservations.filter { $0.requestID != state.checkpointRequestID }
+    let next = s1.replacing(phase: .idle, checkpointRequestID: .some(nil), checkpointDenials: 0, liveReservations: live)
     return Transition(state: next, effects: [.emitUI(.denied(cause: "checkpoint failed: \(terminalSafe(reason)); epoch unchanged"))], records: prefix)
 }
 
@@ -1430,7 +1645,7 @@ private func handleProviderResponse<I: IDSource>(
 /// never auto-dispatch.
 private func finishRunWithQueue<I: IDSource>(
     _ state: SessionState, receipt: (RunDescriptor, UInt64) -> RunReceipt, atMillis: UInt64,
-    observations: [String: [AttachmentObservation]] = [:], ids: inout I
+    observations: [String: [AttachmentObservation]] = [:], boundary: Bool = false, ids: inout I
 ) -> Transition {
     guard let run = state.activeRun else {
         let (s1, prefix) = sequenced(state, kind: "completed-no-run", digest: "completed", ids: &ids)
@@ -1451,14 +1666,20 @@ private func finishRunWithQueue<I: IDSource>(
     let completedPhase = SessionPhase.completed(receiptValue)
     switch classifyQueuePop(state, observations: observations) {
     case .none:
-        let (s1, prefix) = sequenced(state, kind: "completed", digest: eventDigest("completed", run.runID.raw), ids: &ids)
+        // Remediation R4: a boundary landing uses a distinct event kind so
+        // telemetry separates model-finalized runs ("completed") from
+        // turn-budget-boundary landings. Queue-held/barrier/no-run paths
+        // keep their existing kinds — only the clean landing is marked.
+        let cleanKind = boundary ? "completed-budget-boundary" : "completed"
+        let (s1, prefix) = sequenced(state, kind: cleanKind, digest: eventDigest("completed", run.runID.raw), ids: &ids)
         let next = s1.replacing(
             phase: completedPhase, activeRun: .some(nil), activeRequest: .some(nil),
             pendingApproval: .some(nil), pendingBatch: .some(nil),
             pendingResolution: .some(nil), pendingExecIdentities: .some(nil), liveReservations: [])
+        let detail = boundary ? "run finished at turn-budget boundary; verdict by oracle" : "run finished"
         return Transition(
             state: next,
-            effects: [.emitUI(.runUpdate(phase: "completed", detail: "run finished"))],
+            effects: [.emitUI(.runUpdate(phase: "completed", detail: detail))],
             records: prefix)
     case .barrierHold(let head, let reason):
         return landQueueBarrier(state, head: head, reason: reason, completedPhase: completedPhase, digest: eventDigest("completed", run.runID.raw), ids: &ids)
@@ -2352,7 +2573,7 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
         phase: .admitting, activeRun: .some(run), activeRequest: .some(nil),
         queue: queue, consumedEffects: Set<EffectID>(),
         turnsUsed: 0, runDeadlineMillis: atMillis + defaultRunDeadlineMillis,
-        preSendRetries: 0, retryDeadlineMillis: .some(nil),
+        preSendRetries: 0, oversizedBatchContinuations: 0, retryDeadlineMillis: .some(nil),
         liveReservations: state.liveReservations + [reservation],
         generation: generation, lastSequence: seq.value)
     // M2-D D0 dispatch linkage: bind the entry to the exact provider
@@ -2446,8 +2667,14 @@ private func failTransport<I: IDSource>(
             effects: [.startTimer(deadlineMillis: deadline, purpose: "retry-backoff", runID: run.runID)],
             records: prefix)
     case .postContent:
-        // Bytes demonstrably flowed: this is a provider/protocol failure
-        // (SPEC §12.2 exit 4), not an operator cancellation (130).
+        // Remediation R3: an oversized batch failed in assembly — no tool
+        // ran, no intents exist, nothing to reconcile. Answer with a
+        // bounded typed rejection + continuation (the model sees exactly
+        // what to fix) instead of terminal failure. Any other postContent
+        // error is a provider/protocol failure (SPEC §12.2 exit 4).
+        if error.hasPrefix(oversizedBatchMarker + ":") {
+            return continueAfterOversizedBatch(state, error: error, atMillis: atMillis, ids: &ids)
+        }
         return failRun(state, failure: .providerError("provider stream failed: \(terminalSafe(error))"), hold: true, atMillis: atMillis, ids: &ids)
     case .ambiguous:
         let (s1, prefix) = sequenced(state, kind: "delivery-unknown", digest: "ambiguous", ids: &ids)
@@ -2469,6 +2696,45 @@ private func failTransport<I: IDSource>(
             effects: [.emitUI(.denied(cause: "ambiguous delivery held for reconciliation"))],
             records: prefix + [.operationResult(ref, outcome: "unknown")])
     }
+}
+
+/// Remediation R3 — bounded typed rejection for oversized batches.
+/// Assembly failed before any ToolBatch existed, so no intents, no
+/// results, no side effects: the turn spent one provider request and
+/// taught the model nothing. Instead of terminal failure, emit a
+/// model-visible notice (the Providers-side message carries the exact
+/// bound — Core only relays it, so the number cannot drift) and continue
+/// with a fresh provider request. Bounded per run; past the bound — or
+/// past the turn budget, or with no run — the run fails exactly as
+/// before. The verdict still comes from the oracle, never from this path.
+private func continueAfterOversizedBatch<I: IDSource>(
+    _ state: SessionState, error: String, atMillis: UInt64, ids: inout I
+) -> Transition {
+    _ = atMillis
+    guard let run = state.activeRun else {
+        return failRun(state, failure: .providerError(terminalSafe(error)), hold: true, atMillis: atMillis, ids: &ids)
+    }
+    guard state.turnsUsed < state.turnLimit else {
+        return failRun(state, failure: .budgetExhausted("turn budget exhausted"), hold: true, atMillis: atMillis, ids: &ids)
+    }
+    guard state.oversizedBatchContinuations < maxOversizedBatchContinuations else {
+        return failRun(state, failure: .providerError("oversized tool batch repeated: \(terminalSafe(error))"), hold: true, atMillis: atMillis, ids: &ids)
+    }
+    let (s1, prefix) = sequenced(state, kind: "requesting", digest: eventDigest("oversized-batch", run.runID.raw), ids: &ids)
+    let guidance = error.hasPrefix(oversizedBatchMarker + ":")
+        ? String(error.dropFirst(oversizedBatchMarker.count + 1)).trimmingCharacters(in: .whitespaces)
+        : "too many tool calls in one turn; resubmit as smaller batches"
+    let notice = "[harness notice] \(guidance)"
+    let transcripts: [DurableRecord] = [.transcriptAppended(.user(notice))]
+    let nextEffectID = ids.nextEffectID()
+    let seq = ids.nextSequence()
+    let reservation = EffectReservation(effectID: nextEffectID, runID: run.runID, requestID: run.requestID, generation: run.revision, revision: run.revision, mutating: false, kind: .provider)
+    let invocation = ProviderInvocation(effectID: nextEffectID, requestID: run.requestID, runID: run.runID, generation: run.revision, alias: s1.epoch.profile.alias, epochID: s1.epoch.epochID, sealed: run.sealed, turnsLeft: s1.turnLimit - s1.turnsUsed, deadlineMillis: s1.runDeadlineMillis, historyDigest: fnv1aHex("\(s1.sessionID.raw):\(seq.value):oversized"))
+    let next = s1.replacing(phase: .requesting, turnsUsed: s1.turnsUsed + 1,
+                            oversizedBatchContinuations: s1.oversizedBatchContinuations + 1,
+                            liveReservations: s1.liveReservations + [reservation], lastSequence: seq.value)
+    return Transition(state: next, effects: [.reserveEffect(reservation), .requestProvider(invocation: invocation)],
+                      records: prefix + [.eventAppended(seq: seq, kind: "effect-consumed", digest: eventDigest("consumed", nextEffectID.raw))] + transcripts)
 }
 
 private func failAdmissionTransport<I: IDSource>(
@@ -2770,7 +3036,8 @@ private func enterAuthorising<I: IDSource>(_ state: SessionState, batch: ToolBat
         requestID: run.requestID, runID: run.runID, generation: run.revision,
         operation: operation,
         requiredGrant: "explicit approval",
-        protectedPaths: grantablePaths.sorted())
+        protectedPaths: grantablePaths.sorted(),
+        batch: batch)
     let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("approval", run.requestID.raw), ids: &ids)
     let next = s1.replacing(phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch))
     return Transition(
@@ -2822,7 +3089,8 @@ private func execIdentitiesResolved<I: IDSource>(
     let request = ApprovalRequest(
         requestID: run.requestID, runID: run.runID, generation: run.revision,
         operation: operation, requiredGrant: "explicit approval",
-        protectedPaths: seed.grantablePaths.sorted(), execIdentities: bound)
+        protectedPaths: seed.grantablePaths.sorted(), execIdentities: bound,
+        batch: batch)
     let (s1, prefix) = sequenced(state, kind: "authorising", digest: eventDigest("resolved", resolutionID), ids: &ids)
     let next = s1.replacing(
         phase: .authorising, pendingApproval: .some(request), pendingBatch: .some(batch),
@@ -2890,6 +3158,22 @@ private func execReceiptText(callID: String, op: OperationID, status: String, st
     }
     let secondaryStr = secondary.isEmpty ? "-" : secondary.joined(separator: ",")
     return "exec \(callID) \(status) op=\(op.raw) \(startedStr) artifact=\(artifact ?? "-") secondary=\(secondaryStr) truncated=\(truncated) :: \(summary)"
+}
+
+/// M3-B A1: model-visible read receipt. `beforeHash` is the executor's
+/// SHA-256 over the COMPLETE observed bytes (never the bounded preview),
+/// and `truncated` states whether the preview was cut. The receipt lets a
+/// follow-up `edit` propose the observed hash instead of fabricating one;
+/// `edit.expectedHash` validation and the optimistic conflict checks are
+/// untouched — the receipt informs, the validator still decides. Non-
+/// success reads (and legacy/scripted outcomes without a 64-hex hash)
+/// keep the plain data body.
+private func readReceiptText(_ outcome: ToolCallOutcome) -> String? {
+    guard outcome.status == "success",
+          let hash = outcome.beforeHash, hash.count == 64 else { return nil }
+    let path = outcome.path ?? "unknown"
+    let truncated = outcome.truncated ? "true" : "false"
+    return "[read receipt]\npath: \(path)\nsha256: \(hash)\ntruncated: \(truncated)\n\(outcome.data)"
 }
 
 /// A3-1 stable operation identity (SPEC §9.1): every externally
@@ -2999,6 +3283,32 @@ private func holdForApproval<I: IDSource>(
 
 // MARK: Effect completion (M1B2-3 continuation)
 
+/// Remediation R4 — quiescent-at-boundary completion (M3-D: 6 oracle-PASS
+/// runs ended exit 5 — and 7 more oracle-FAIL runs ended exit 5 — because
+/// the finishing turn consumed the last turn and the reducer failed the
+/// run instead of landing it). When a fully resolved tool batch completes
+/// and no turns remain, COMPLETE the run through the normal
+/// queue-draining path (telemetry kind "completed-budget-boundary")
+/// instead of failing it: the verdict still comes from the oracle over
+/// the produced artifacts, never from this path. Unknown outcomes still
+/// hold the queue — finishRunWithQueue routes those to completed-held.
+/// Call ONLY where the just-finished batch is fully resolved (the four
+/// after-batch continuations below); mid-pipeline budget guards
+/// (validation, denial, resolution, credential) keep failing terminally
+/// because the model never saw those results.
+private func completeAtBudgetBoundary<I: IDSource>(
+    _ state: SessionState, extraRecords: [DurableRecord] = [], extraEffects: [Effect] = [],
+    atMillis: UInt64, ids: inout I
+) -> Transition {
+    let finished = finishRunWithQueue(
+        state,
+        receipt: { run, at in RunReceipt(runID: run.runID, completedAtMillis: at, turnsUsed: state.turnsUsed, toolCallCount: 0) },
+        atMillis: atMillis, boundary: true, ids: &ids)
+    return Transition(state: finished.state,
+                      effects: extraEffects + finished.effects,
+                      records: extraRecords + finished.records)
+}
+
 private func continueAfterEffect<I: IDSource>(
      _ state: SessionState, effectID: EffectID, receipt: String, atMillis: UInt64, ids: inout I
  ) -> Transition {
@@ -3014,7 +3324,7 @@ private func continueAfterEffect<I: IDSource>(
             records: prefix)
     }
     guard state.turnsUsed < state.turnLimit else {
-        return failRun(state, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: atMillis, ids: &ids)
+        return completeAtBudgetBoundary(state, atMillis: atMillis, ids: &ids)
     }
     guard let run = state.activeRun else {
         return failRun(state, failure: .providerError("effect completion without a run"), hold: true, atMillis: atMillis, ids: &ids)
@@ -3119,10 +3429,10 @@ private func continueAfterPreDispatchFailure<I: IDSource>(_ state: SessionState,
         transcript.append(.transcriptAppended(.toolResponse(callID: proposal.callID, text: text)))
     }
     var interimState = state.replacing(consumedEffects: consumed, liveReservations: live)
-    // Pre-dispatch never holds, but preserve already-generated records if turn-budget or missing-run fails
+    // Pre-dispatch never holds; the just-delivered per-call receipts are
+    // preserved whether the run continues or lands at the boundary.
     guard interimState.turnsUsed < interimState.turnLimit else {
-        let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
-        return Transition(state: failed.state, effects: uiEffects + failed.effects, records: records + transcript + failed.records)
+        return completeAtBudgetBoundary(interimState, extraRecords: records + transcript, extraEffects: uiEffects, atMillis: 0, ids: &ids)
     }
     guard let run = interimState.activeRun else {
         let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
@@ -3373,6 +3683,11 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             let receipt = execReceiptText(callID: proposal.callID, op: ref.operationID, status: receiptStatus, started: outcome.started, artifact: outcome.artifactID, secondary: outcome.secondaryArtifactIDs, truncated: outcome.truncated, summary: receiptSummary)
             toolText = outcome.data.isEmpty ? "[\(receipt)]" : "\(outcome.data)\n[\(receipt)]"
             uiEffects.append(.emitUI(.runUpdate(phase: "tool-exec", detail: receipt)))
+        } else if proposal.tool == "read", let receipt = readReceiptText(outcome) {
+            // M3-B A1: successful native reads carry the executor-computed
+            // full-file SHA-256 to the model (the bounded preview alone
+            // previously hid it, so live edit proposals fabricated hashes).
+            toolText = receipt
         } else {
             toolText = outcome.data
         }
@@ -3392,7 +3707,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
             return Transition(state: next, effects: uiEffects + [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + newRecords)
         }
         guard fallbackState.turnsUsed < fallbackState.turnLimit else {
-            return failRun(fallbackState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
+            return completeAtBudgetBoundary(fallbackState, extraRecords: newRecords, extraEffects: uiEffects, atMillis: 0, ids: &ids)
         }
         guard let run = fallbackState.activeRun else {
             return failRun(fallbackState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)
@@ -3434,8 +3749,7 @@ private func continueAfterEffectPerCall<I: IDSource>(_ state: SessionState, effe
         return Transition(state: next, effects: uiEffects + [.emitUI(.denied(cause: "continuation blocked: reconcile unknown outcomes first"))], records: prefix + allRecords)
     }
     guard interimState.turnsUsed < interimState.turnLimit else {
-        let failed = failRun(interimState, failure: .budgetExhausted("turn budget exhausted after tool batch"), hold: true, atMillis: 0, ids: &ids)
-        return Transition(state: failed.state, effects: uiEffects + failed.effects, records: allRecords + failed.records)
+        return completeAtBudgetBoundary(interimState, extraRecords: allRecords, extraEffects: uiEffects, atMillis: 0, ids: &ids)
     }
     guard let run = interimState.activeRun else {
         let failed = failRun(interimState, failure: .providerError("effect completion without a run"), hold: true, atMillis: 0, ids: &ids)

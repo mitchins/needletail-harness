@@ -99,11 +99,12 @@ struct ProductionCLIWiringTests {
         return url.path
     }
 
-    private static func run(_ arguments: [String], env: [String: String]) throws -> (exit: Int32, stdout: String, stderr: String) {
+    private static func run(_ arguments: [String], env: [String: String], cwd: URL? = nil) throws -> (exit: Int32, stdout: String, stderr: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: try binary())
         process.arguments = arguments
         process.environment = env
+        if let cwd { process.currentDirectoryURL = cwd }
         let outPipe = Pipe()
         let errPipe = Pipe()
         process.standardOutput = outPipe
@@ -633,6 +634,45 @@ struct ProductionCLIWiringTests {
         #expect(try Self.posixMode(traceURL.path) == 0o600, "operator-requested trace is private")
         #expect(!FileManager.default.fileExists(atPath: stateDir.path),
                 "sealed runs create no state directory at all")
+    }
+
+    @Test("sandbox-grant inside the workspace refuses (exit 2), absolute, relative and symlinked")
+    func sandboxGrantInsideWorkspaceRefuses() throws {
+        // Compose-time tripwire: the grant must live outside the
+        // disposable workspace. Validation precedes all traffic, so these
+        // runs need no provider and must not touch the network.
+        let directory = try Self.freshDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let ws = directory.appendingPathComponent("ws", isDirectory: true)
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        let stateDir = directory.appendingPathComponent("state")
+        let inside = ws.appendingPathComponent("grant.json").path
+        FileManager.default.createFile(atPath: inside, contents: Data())
+
+        // 1. Absolute grant path inside an absolute workspace.
+        let absolute = try Self.run(
+            ["run", "--workspace", ws.path, "--sandbox-grant", inside, "--prompt", "tripwire probe"],
+            env: Self.environment(stateDir: stateDir))
+        #expect(absolute.exit == 2, "inside-workspace grant refuses: \(absolute.stderr.prefix(200))")
+        #expect(absolute.stderr.contains("must live outside"), "tripwire message: \(absolute.stderr.prefix(200))")
+
+        // 2. Relative workspace with an absolute grant inside it (the
+        // pre-fix prefix check compared "ws" against the absolute path
+        // and missed). Run with cwd at the parent so "ws" resolves inside.
+        let relative = try Self.run(
+            ["run", "--workspace", "ws", "--sandbox-grant", inside, "--prompt", "tripwire probe"],
+            env: Self.environment(stateDir: stateDir), cwd: directory)
+        #expect(relative.exit == 2, "relative workspace dodge refuses: \(relative.stderr.prefix(200))")
+        #expect(relative.stderr.contains("must live outside"), "tripwire message: \(relative.stderr.prefix(200))")
+
+        // 3. Symlinked grant path: lexically outside, resolved inside.
+        let link = directory.appendingPathComponent("link.json")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: URL(fileURLWithPath: inside))
+        let symlinked = try Self.run(
+            ["run", "--workspace", ws.path, "--sandbox-grant", link.path, "--prompt", "tripwire probe"],
+            env: Self.environment(stateDir: stateDir))
+        #expect(symlinked.exit == 2, "symlinked-into-workspace grant refuses: \(symlinked.stderr.prefix(200))")
+        #expect(symlinked.stderr.contains("must live outside"), "tripwire message: \(symlinked.stderr.prefix(200))")
     }
 }
 

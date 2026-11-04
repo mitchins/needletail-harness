@@ -1,0 +1,86 @@
+#!/bin/bash
+# M3-D scoring matrix: 12 tasks x 2 reps x 2 harnesses = 48 runs, AB/BA ordered.
+# Resumable: completed runs (verdict-bearing result.json) are skipped unless --force.
+# Stops on global budget exhaustion. Usage: m3d-matrix.sh [--force]
+set -u
+FORCE=""
+if [ "${1:-}" = "--force" ]; then FORCE="--force"; fi
+RUNS=/tmp/m3d/runs
+GLOBAL_CEILING=850
+PASS=0; FAILN=0; BLOCKED=0; SKIPPED=0
+declare -a ORDER
+for rep in 1 2; do
+  if [ "$rep" = "1" ]; then HS="nt pi"; else HS="pi nt"; fi
+  for task in T01 T02 T03 T04 T05 T06 T07 T08 T09 T10 T11 T12; do
+    for h in $HS; do ORDER+=("$task $rep $h"); done
+  done
+done
+total_requests() {
+  # Adjudicated ledger rule (shared with m3d-confirm.py and
+  # m3d-gemma-matrix.sh): per result file, the max of the usage-line
+  # count and the durable pre-dispatch budget count, so early-exit runs
+  # that skip the usage epilogue are still counted.
+  python3 - "$RUNS" <<'EOF'
+import json, os, sys
+runs = sys.argv[1]
+total = 0
+for root, _, files in os.walk(runs):
+    for f in files:
+        if f in ("result.json", "result-leg1.json", "result-leg2.json"):
+            try:
+                d = json.load(open(os.path.join(root, f)))
+                u = int(d.get("requests", 0) or 0)
+                b = d.get("budgetUsed")
+                total += max(u, b if isinstance(b, int) else u)
+            except Exception:
+                pass
+print(total)
+EOF
+}
+for cell in "${ORDER[@]}"; do
+  set -- $cell
+  task=$1; rep=$2; h=$3
+  used=$(total_requests)
+  # Reserve the next cell's ceiling before launch (same rule as the
+  # Gemma runner): a cell starting near the cap must not overshoot it
+  # mid-run before the next check.
+  need=$(python3 -c "import json,sys; print(next(t['needletail']['requestCeiling'] for t in json.load(open('plans/m3-tasks.json'))['tasks'] if t['id']==sys.argv[1]))" "$task")
+  if [ $((used + need)) -gt "$GLOBAL_CEILING" ]; then
+    echo "GLOBAL BUDGET: next cell $task needs $need, spent $used + $need exceeds $GLOBAL_CEILING — stopping matrix"
+    break
+  fi
+  if [ "$task" = "T09" ]; then
+    python3 docker/m3d-run.py "$task" "$rep" "$h" --leg 1 $FORCE || true
+    # leg 2 only if leg 1 recorded an interruption
+    if python3 -c "import json; d=json.load(open('$RUNS/$task-R$rep-$h/result-leg1.json')); assert d.get('verdict')=='INTERRUPTED-LEG-DONE'" 2>/dev/null; then
+      # Launch gate (not a mid-run kill — Pi has no pre-send gate, so a
+      # cell started near the cap would otherwise overspend it mid-run):
+      # re-read the ledger after leg 1, stop launching if leg 2 no longer
+      # fits. Leg 1's spend is already counted in $used.
+      used=$(total_requests)
+      if [ $((used + need)) -gt "$GLOBAL_CEILING" ]; then
+        echo "GLOBAL BUDGET: T09 leg 2 needs $need, spent $used + $need exceeds $GLOBAL_CEILING — stopping matrix"
+        break
+      fi
+      python3 docker/m3d-run.py "$task" "$rep" "$h" --leg 2 $FORCE || true
+    else
+      echo "$task R$rep $h: leg1 missing/blocked, skipping leg2"
+    fi
+  else
+    python3 docker/m3d-run.py "$task" "$rep" "$h" $FORCE || true
+  fi
+done
+echo "=== matrix done ==="
+python3 - "$RUNS" <<'EOF'
+import json, os, sys
+from collections import Counter
+c = Counter()
+for root, _, files in os.walk(sys.argv[1]):
+    for f in files:
+        if f in ("result.json", "result-leg2.json"):
+            try:
+                c[json.load(open(os.path.join(root, f))).get("verdict", "?")] += 1
+            except Exception:
+                pass
+print(dict(c))
+EOF

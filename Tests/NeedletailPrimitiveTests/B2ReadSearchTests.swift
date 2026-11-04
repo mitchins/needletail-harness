@@ -242,4 +242,161 @@ struct B2ReadSearchTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return (dir, dir.appendingPathComponent("store.sqlite").path)
     }
+
+    // MARK: - M3-B A2: model-visible search results carry the approved logical path
+
+    private static func rgMatchLine(path: String, lineNumber: Int, text: String) -> String {
+        let obj: [String: Any] = [
+            "type": "match",
+            "data": [
+                "path": ["text": path],
+                "lines": ["text": text],
+                "line_number": lineNumber,
+                "absolute_offset": 10,
+                "submatches": [["match": ["text": text], "start": 0, "end": text.count]],
+            ],
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    @Test("M3-B A2: model-visible search result exposes the LOGICAL workspace-relative path, never /proc/self/fd")
+    func searchLogicalPathInModelVisibleResult() throws {
+        let line = Self.rgMatchLine(path: "/proc/self/fd/87/docs/notes.md", lineNumber: 1, text: "The hidden identifier is M3B-NEEDLE-7331.\n")
+        let (out, omitted) = NativeToolExecutor.filterSearchJSON(
+            Data(line.utf8), roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(!omitted)
+        #expect(out.contains("M3B-NEEDLE-7331"), "match content preserved")
+        // The model-visible path must be usable by the read tool directly.
+        let objects = out.split(separator: "\n").compactMap { l -> [String: Any]? in
+            try? JSONSerialization.jsonObject(with: Data(l.utf8)) as? [String: Any]
+        }
+        #expect(objects.count == 1)
+        let path = try #require((objects.first?["data"] as? [String: Any])?["path"] as? [String: Any])
+        #expect(path["text"] as? String == "docs/notes.md", "logical path, got \(path)")
+        #expect(!out.contains("/proc/self/fd"), "internal FD path must not reach the model")
+        let lineNumber = (objects.first?["data"] as? [String: Any])?["line_number"] as? Int
+        #expect(lineNumber == 1, "line numbers preserved")
+    }
+
+    @Test("M3-B A2: read-root search joins the logical base (docs/notes.md)")
+    func searchReadRootJoinsLogicalBase() throws {
+        let line = Self.rgMatchLine(path: "/proc/self/fd/88/notes.md", lineNumber: 2, text: "needle\n")
+        let (out, omitted) = NativeToolExecutor.filterSearchJSON(
+            Data(line.utf8), roots: [(proc: "/proc/self/fd/88", logicalBase: "docs")], approvedPaths: [])
+        #expect(!omitted)
+        #expect(out.contains("\"docs/notes.md\""), "logical base joined, got \(out.prefix(300))")
+        #expect(!out.contains("/proc/self/fd"))
+    }
+
+    @Test("R2 undecodable path bytes fail closed with flag")
+    func undecodablePathBytesFailClosed() throws {
+        // base64 that does not decode: the line is dropped AND flagged
+        // (fail-closed with truncation signal — never silently kept).
+        let obj: [String: Any] = [
+            "type": "match",
+            "data": [
+                "path": ["bytes": "!!!not-base64!!!"],
+                "lines": ["text": "x\n"],
+                "line_number": 1,
+                "absolute_offset": 0,
+                "submatches": [],
+            ],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+        let (out, omitted) = NativeToolExecutor.filterSearchJSON(
+            Data(data), roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(out.isEmpty, "undecodable path dropped")
+        #expect(omitted, "undecodable path flagged")
+        // Missing path object on a non-summary record: same treatment.
+        let noPath: [String: Any] = ["type": "match", "data": ["lines": ["text": "y\n"]]]
+        let noPathData = try JSONSerialization.data(withJSONObject: noPath, options: [.sortedKeys])
+        let (out2, omitted2) = NativeToolExecutor.filterSearchJSON(
+            noPathData, roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(out2.isEmpty, "pathless match dropped")
+        #expect(omitted2, "pathless match flagged")
+    }
+
+    @Test("M3-B A2: protected paths stay dropped; Unicode exact names preserved; unprotected lossy surfaced, grantable lossy fail closed")
+    func searchProtectedUnicodeLossy() throws {
+        // Protected path: dropped regardless of rewrite.
+        let envLine = Self.rgMatchLine(path: "/proc/self/fd/87/.env", lineNumber: 1, text: "SECRET=1\n")
+        let (envOut, _) = NativeToolExecutor.filterSearchJSON(
+            Data(envLine.utf8), roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(envOut.isEmpty, "protected path dropped")
+        // Unicode exact name: rewritten byte-exact.
+        let uniLine = Self.rgMatchLine(path: "/proc/self/fd/87/café-нет.md", lineNumber: 3, text: "uni\n")
+        let (uniOut, uniOmitted) = NativeToolExecutor.filterSearchJSON(
+            Data(uniLine.utf8), roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(!uniOmitted)
+        #expect(uniOut.contains("café-нет.md"), "exact Unicode name preserved, got \(uniOut.prefix(300))")
+        #expect(!uniOut.contains("/proc/self/fd"))
+        // Lossy (unrepresentable) name in an UNPROTECTED path: surfaced
+        // with the U+FFFD skeleton (Remediation R2 / CLOSURE_10: dropping
+        // silently lost legitimate results). The skeleton cannot satisfy
+        // any approval (byte-exact, grantable+lossy still drops below),
+        // and acting on it fails loudly (exact-bytes open misses the real
+        // file), so surfacing is confusion-safe. Undecodable base64 still
+        // fails closed further down.
+        let rawName = Data([0x68, 0x69, 0xFF]) // "hi" + invalid byte
+        let lossyObj: [String: Any] = [
+            "type": "match",
+            "data": [
+                // fd-prefixed so the line maps through the pinned root and
+                // reaches the lossy rewrite branch (a bare out-of-root name
+                // is dropped earlier, also fail-closed, without the flag).
+                "path": ["bytes": (Data("/proc/self/fd/87/".utf8) + rawName).base64EncodedString()],
+                "lines": ["text": "x\n"],
+                "line_number": 1,
+                "absolute_offset": 0,
+                "submatches": [],
+            ],
+        ]
+        let lossyData = try JSONSerialization.data(withJSONObject: lossyObj, options: [.sortedKeys])
+        let (lossyOut, lossyOmitted) = NativeToolExecutor.filterSearchJSON(
+            lossyData, roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(lossyOut.contains("hi�"), "unprotected lossy name surfaced with U+FFFD skeleton, got \(lossyOut.prefix(300))")
+        #expect(lossyOut.contains("\"text\":\"hi�\""), "skeleton replaces the path, never the match text")
+        #expect(!lossyOmitted, "nothing omitted: the line is kept, not dropped")
+        // Counterpart: the same lossy name under a GRANTABLE root still
+        // drops (a U+FFFD skeleton must never satisfy an approval).
+        let grantLossyObj: [String: Any] = [
+            "type": "match",
+            "data": [
+                "path": ["bytes": (Data("/proc/self/fd/87/.git/".utf8) + rawName).base64EncodedString()],
+                "lines": ["text": "x\n"],
+                "line_number": 1,
+                "absolute_offset": 0,
+                "submatches": [],
+            ],
+        ]
+        let grantLossyData = try JSONSerialization.data(withJSONObject: grantLossyObj, options: [.sortedKeys])
+        let (grantLossyOut, grantLossyOmitted) = NativeToolExecutor.filterSearchJSON(
+            grantLossyData, roots: [(proc: "/proc/self/fd/87", logicalBase: "")], approvedPaths: [])
+        #expect(grantLossyOut.isEmpty, "grantable lossy path dropped fail-closed")
+        #expect(!grantLossyOmitted, "grantable drop is silent by design (no existence oracle for protected content)")
+    }
+
+    @Test("M3-B A2: end-to-end executor search yields read-usable workspace-relative paths (real rg)")
+    func executorSearchEndToEndLogicalPaths() async throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let docs = url.appendingPathComponent("docs", isDirectory: true)
+        try FileManager.default.createDirectory(at: docs, withIntermediateDirectories: true)
+        try "The hidden identifier is M3B-NEEDLE-7331.\n".write(to: docs.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        let realRg = "/usr/bin/rg"
+        try #require(FileManager.default.fileExists(atPath: realRg), "rg required for B2 search evidence")
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let store = InMemorySessionStore()
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
+        let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"M3B-NEEDLE-7331\"}")])
+        let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
+        let result = try await exec.execute(batch: batch, reservation: res)
+        #expect(result.calls[0].status == "success", "got \(result.calls[0])")
+        let data = result.calls[0].data
+        #expect(data.contains("M3B-NEEDLE-7331"), "match present")
+        #expect(data.contains("docs/notes.md"), "read-usable relative path present, got \(data.prefix(400))")
+        #expect(!data.contains("/proc/self/fd"), "no internal FD path, got \(data.prefix(400))")
+    }
 }
+

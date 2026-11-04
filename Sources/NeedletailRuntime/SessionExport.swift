@@ -192,6 +192,25 @@ public enum SessionExport {
                 row["parentEpochID"] = parent.raw
             }
             return row
+        case .checkpointPublished(let publication):
+            // M3-C: epoch/boundary facts are structural; the checkpoint
+            // summary is model-generated free text — content-gated, with
+            // pinned constraints (operator-authored) content-gated too.
+            var row: [String: Any] = ["seq": seq, "kind": "checkpoint-publication",
+                                      "epochID": publication.epoch.epochID.raw,
+                                      "parentEpochID": publication.epoch.parentEpochID?.raw ?? "",
+                                      "retainedFromSeq": publication.retainedFromSeq,
+                                      "boundarySequence": publication.boundarySequence,
+                                      "pinnedConstraintCount": publication.pinnedConstraints.count,
+                                      "checkpointBytes": publication.checkpointJSON.utf8.count]
+            if includeContent {
+                row["checkpointJSON"] = publication.checkpointJSON
+                row["pinnedConstraints"] = publication.pinnedConstraints
+                row["redacted"] = false
+            } else {
+                row["redacted"] = true
+            }
+            return row
         case .transcriptAppended(let entry):
             return transcriptRow(seq: seq, entry: entry, includeContent: includeContent)
         case .writerRecovered(let recovery):

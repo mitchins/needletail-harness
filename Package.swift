@@ -120,6 +120,7 @@ let package = Package(
                 // STORE certification tests must execute the real Runtime
                 // store, and the ingestion tier map classifies this target.
                 "NeedletailRuntime",
+                "NeedletailProviders",
                 // A5-1: CLI wiring evidence runs the real `needletail`
                 // product binary. Depending on the executable target makes
                 // `swift test` build it fresh first, so spawn-binary tests
