@@ -374,7 +374,12 @@ struct M1DCasesTests {
         let budgetConfig = try M1DCases.writeConfig(budgetDirectory, port: Int(budgetServer.port))
         let budget = try M1DCases.run(M1DCases.runArguments(
             config: budgetConfig, tools: tools, trusted: true, maxTurns: 2))
-        #expect(budget.exit == 5, "budget exhaustion maps to exit 5: \(budget.stderr)")
+        // R4 (remediation, reviewed policy): a fully resolved tool batch at
+        // the turn budget lands completed-boundary instead of failed, so the
+        // CLI exits 0. Mid-pipeline exhaustion still fails (see
+        // BoundaryCompletionTests + B0SpineTests.budgetExhaustionPreserves).
+        #expect(budget.exit == 0, "quiescent-at-budget completion maps to exit 0: \(budget.stderr)")
+        #expect(budget.stderr.contains("budget:"), "budget-limited path exercised: \(budget.stderr)")
 
         let invalidDirectory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: invalidDirectory) }
