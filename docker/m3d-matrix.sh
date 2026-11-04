@@ -53,6 +53,15 @@ for cell in "${ORDER[@]}"; do
     python3 docker/m3d-run.py "$task" "$rep" "$h" --leg 1 $FORCE || true
     # leg 2 only if leg 1 recorded an interruption
     if python3 -c "import json; d=json.load(open('$RUNS/$task-R$rep-$h/result-leg1.json')); assert d.get('verdict')=='INTERRUPTED-LEG-DONE'" 2>/dev/null; then
+      # Launch gate (not a mid-run kill — Pi has no pre-send gate, so a
+      # cell started near the cap would otherwise overspend it mid-run):
+      # re-read the ledger after leg 1, stop launching if leg 2 no longer
+      # fits. Leg 1's spend is already counted in $used.
+      used=$(total_requests)
+      if [ $((used + need)) -gt "$GLOBAL_CEILING" ]; then
+        echo "GLOBAL BUDGET: T09 leg 2 needs $need, spent $used + $need exceeds $GLOBAL_CEILING — stopping matrix"
+        break
+      fi
       python3 docker/m3d-run.py "$task" "$rep" "$h" --leg 2 $FORCE || true
     else
       echo "$task R$rep $h: leg1 missing/blocked, skipping leg2"

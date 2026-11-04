@@ -118,17 +118,23 @@ public func loadTranscriptProjection(from store: SessionStore, session: SessionI
                 break
             }
         }
-        guard records.count <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
         guard let following = next else { break }
         cursor = following
     }
     guard let published = publication else {
+        // No checkpoint: the full-history limit stands (identity behavior
+        // with loadTranscript — over-limit histories fail honest).
+        guard records.count <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
         return try transcriptMessages(records)
     }
     // Shorter context: checkpoint block + retained tail. The tail starts at
     // the published cut (a completed call/result group boundary by
     // construction), so a tool call is never split from its response.
     let tail = records.filter { $0.sequence.value >= published.retainedFromSeq }
+    // The limit now guards the SELECTED active tail, not the preserved
+    // full history: the ledger keeps every pre-checkpoint record, but the
+    // model context is the bounded tail.
+    guard tail.count <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
     var messages: [ChatMessage] = []
     messages.append(ChatMessage(role: .user, text: checkpointBlock(
         checkpointJSON: published.checkpointJSON,

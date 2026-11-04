@@ -85,6 +85,11 @@ for cell in "${ORDER[@]}"; do
   # the cap may otherwise spend its whole ceiling mid-run (Pi has no
   # pre-send gate), overshooting the allowance before the next check.
   need=$(python3 -c "import json,sys; print(next(t['needletail']['requestCeiling'] for t in json.load(open('plans/m3-tasks.json'))['tasks'] if t['id']==sys.argv[1]))" "$task")
+  # T09 runs two legs of up to `need` requests each (leg 2 after
+  # INTERRUPTED-LEG-DONE): reserve the full cell budget before launch.
+  if [ "$task" = "T09" ]; then
+    need=$((need * 2))
+  fi
   if [ $((used + need)) -gt "$GLOBAL_CEILING" ]; then
     echo "GLOBAL BUDGET: next cell $task needs $need, spent $used + $need exceeds $GLOBAL_CEILING — stopping matrix"
     break
