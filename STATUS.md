@@ -1,6 +1,6 @@
 # STATUS — Needletail v0.3
 
-Updated: 4 November 2026 (M2-D MERGED as `1ab0aa4`; M3 CONDITIONALLY ACCEPTED for continued product development per `plans/m3-acceptance.md` — no parity/speedup/Gemma-48 claims; M3 epic PR open, do-not-merge; no M4 implementation until separately authorized). Normative sources: COMPLETE-SPEC.md (all parts), DEPENDENCIES.md. This file is the project's single status tracker; the harness does not create a competing one.
+Updated: 4 November 2026 (M2-D MERGED as `1ab0aa4`; M3 CONDITIONALLY ACCEPTED for continued product development per `plans/m3-acceptance.md` — no parity/speedup/Gemma-48 claims; M3 epic PR #9 `m3-planning` @ `bab0058`, do-not-merge; CodeRabbit aggregate 23 threads all replied + resolved; CI + local offline gates green on the merge candidate; no M4 implementation until separately authorized). Normative sources: COMPLETE-SPEC.md (all parts), DEPENDENCIES.md. This file is the project's single status tracker; the harness does not create a competing one.
 
 ## Current position
 
