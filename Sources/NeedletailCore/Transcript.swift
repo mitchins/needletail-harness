@@ -103,15 +103,21 @@ public func loadTranscript(from store: SessionStore, session: SessionID, limit: 
 /// The complete original history stays in the ledger — only the MODEL
 /// CONTEXT is shorter.
 public func loadTranscriptProjection(from store: SessionStore, session: SessionID, limit: Int = 1024) throws -> [ChatMessage] {
+    // Pass 1 (O(1) memory): count transcript records and keep only the
+    // LATEST publication. Nothing else is retained, so memory never scales
+    // with the ledger no matter how long the pre-checkpoint history is.
+    // No early throw when the count passes the limit mid-scan: a later
+    // publication can still legitimate the history (that early throw WAS
+    // the reported bug), so the decision waits for the full scan.
     var cursor: UInt64 = 0
-    var records: [SequencedRecord] = []
+    var transcriptCount = 0
     var publication: CheckpointPublication? = nil
     while true {
         let (page, next) = try store.records(session: session, since: cursor, limit: limit)
         for sequenced in page {
             switch sequenced.record {
             case .transcriptAppended:
-                records.append(sequenced)
+                transcriptCount += 1
             case .checkpointPublished(let p):
                 publication = p
             default:
@@ -123,18 +129,42 @@ public func loadTranscriptProjection(from store: SessionStore, session: SessionI
     }
     guard let published = publication else {
         // No checkpoint: the full-history limit stands (identity behavior
-        // with loadTranscript — over-limit histories fail honest).
-        guard records.count <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
+        // with loadTranscript — over-limit histories fail honest). The
+        // re-scan below is bounded: the count check already passed.
+        guard transcriptCount <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
+        var records: [SequencedRecord] = []
+        records.reserveCapacity(transcriptCount)
+        cursor = 0
+        while true {
+            let (page, next) = try store.records(session: session, since: cursor, limit: limit)
+            records.append(contentsOf: page.filter { if case .transcriptAppended = $0.record { return true } else { return false } })
+            guard let following = next else { break }
+            cursor = following
+        }
         return try transcriptMessages(records)
     }
     // Shorter context: checkpoint block + retained tail. The tail starts at
     // the published cut (a completed call/result group boundary by
     // construction), so a tool call is never split from its response.
-    let tail = records.filter { $0.sequence.value >= published.retainedFromSeq }
-    // The limit now guards the SELECTED active tail, not the preserved
-    // full history: the ledger keeps every pre-checkpoint record, but the
-    // model context is the bounded tail.
-    guard tail.count <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
+    // Pass 2 re-pages from just before the cut — `records(since:)` is
+    // EXCLUSIVE (`seq > since`), so starting at the cut itself would drop
+    // the first tail record; `retainedFromSeq - 1` keeps it.
+    let floor: UInt64 = published.retainedFromSeq > 0 ? published.retainedFromSeq - 1 : 0
+    var tail: [SequencedRecord] = []
+    cursor = floor
+    while true {
+        let (page, next) = try store.records(session: session, since: cursor, limit: limit)
+        tail.append(contentsOf: page.filter {
+            if case .transcriptAppended = $0.record { return $0.sequence.value >= published.retainedFromSeq }
+            return false
+        })
+        // The limit guards the SELECTED active tail, not the preserved
+        // full history: the ledger keeps every pre-checkpoint record, but
+        // the model context is the bounded tail.
+        guard tail.count <= limit else { throw TranscriptError.pageOverflow(limit: limit) }
+        guard let following = next else { break }
+        cursor = following
+    }
     var messages: [ChatMessage] = []
     messages.append(ChatMessage(role: .user, text: checkpointBlock(
         checkpointJSON: published.checkpointJSON,
