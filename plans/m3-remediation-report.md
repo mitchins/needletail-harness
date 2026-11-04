@@ -5,31 +5,31 @@ Scope: the three demonstrated M3-D issues + CLOSURE_10. No benchmark scoring, no
 
 ## 1. Diagnostic method (frozen evidence)
 
-All 48 frozen run dirs under `/tmp/m3d/runs/` were mined read-only: per-turn tool calls, preDispatch rejections, and outcomes from NT ledgers; Pi JSON traces for the matched cells. The 15 NT cells of interest (7 exhausted FAILs, 6 exit-5 PASSes, 2 T08 exit-4s) yielded **100 rejected tool calls** — the complete waste surface.
+All 48 frozen run dirs under `/tmp/m3d/runs/` were mined read-only: per-turn tool calls, preDispatch rejections, and outcomes from NT ledgers; Pi JSON traces for the matched cells. The 15 NT cells of interest (7 exhausted FAILs, 6 exit-5 PASSes, 2 T08 exit-4s) yielded **101 tool-failure outcomes** — the complete waste surface. (Erratum 2026-11-04: first stated as 100 with a category table summing to 102. Re-mined from the preserved GRDB ledgers — `operationResult` rows with `tool-failure` outcomes across the 15 cells, mutually-exclusive reason-text buckets — the ground truth is 101: 100 validation rejections plus 1 execution-time directory open. The table below is corrected; the R1/R2 remediation mapping is unchanged.)
 
 Pi contrast (same tasks): 6–11 turns, 8–14 tool calls per run, **zero rejections** — `bash` for everything, one edit (3 for T11), natural paths. NT same cells: 10–19 calls with **30–60% preDispatch rejections**, learning path conventions by trial per run.
 
 ## 2. Turn efficiency — model vs harness split
 
-Categorized all 100 rejections (reason text + arguments, callIDs stripped):
+Categorized all 101 rejections (reason text + arguments, callIDs stripped):
 
 | Category | Count | Owner | Remediation |
 |---|---|---|---|
-| `search "."` (root search spelled dot) | 22 | harness | R1: normalize to root search |
-| `search ""` (empty path) | 7 | harness | R1: empty = root search |
+| `search "."` (root search spelled dot) | 25 | harness | R1: normalize to root search |
+| `search ""` (empty path) | 8 | harness | R1: empty = root search |
 | `/workspace/…`-prefixed paths (prompt-induced) | 8 | harness | R1: strip exact prefix |
 | `argv[0]` bare basename == executable basename | 11 | harness | R1: rewrite argv[0] |
-| exec `cwd` dot forms | 8 | harness | R1: dot cwd = root |
+| exec `cwd` dot/empty forms | 4 | harness | R1: dot cwd = root |
 | node binaries blocked by 64 MiB hash bound | 3 | harness | R2: 256 MiB unified bound |
 | bare executable names (`node`, `git`, …; no PATH search) | 14 | deliberate boundary | kept (message improved) |
 | nonexistent absolute guesses (`/usr/bin/git`, …) | 10 | model (friction-contributed) | kept; better guidance text |
-| bare absolute paths (`/etc/passwd`-class) | 8 | deliberate boundary | kept (wrong-file trap) |
+| bare absolute paths (`/`, `/etc/passwd`-class) | 8 | deliberate boundary | kept (wrong-file trap) |
 | control bytes / bad argv shape / missing hash | 7 | deliberate boundary | kept |
-| read of workspace root (directory, not a file) | 1+3 | correct rejection | kept, clearer message |
+| read of workspace root / directory open | 3 | correct rejection | kept, clearer message |
 
-Harness-shape waste: **~60 of 100 rejections**; the rest are deliberate boundaries or model-side. Estimated turn saving where the model behaves identically: up to ~40% fewer wasted calls on path-heavy tasks. Not claimed as a score delta — the model adapts per run.
+Harness-shape waste: **~60 of 101 rejections** (R1-normalizable 56 + R2 3 = 59); the rest are deliberate boundaries or model-side. Estimated turn saving where the model behaves identically: up to ~40% fewer wasted calls on path-heavy tasks. Not claimed as a score delta — the model adapts per run.
 
-**Replay check (unscored, frozen arguments through the remediated validator): 62/100 now validate** (read 7, search 29, exec 26); with the `""`-means-root addition, ~69/100. Residual 30+ are deliberate rejections (bare executables, bare absolutes, control bytes, missing hash) or model-side wrong-path guesses.
+**Replay check (unscored, frozen arguments through the remediated validator): 62/101 now validate** (read 7, search 29, exec 26); with the `""`-means-root addition, ~69/101. Residual 30+ are deliberate rejections (bare executables, bare absolutes, control bytes, missing hash) or model-side wrong-path guesses. (Numerators from the original replay run against the mined set; denominator corrected to the re-mined 101.)
 
 ## 3. Fixes
 

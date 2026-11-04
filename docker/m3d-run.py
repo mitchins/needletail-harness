@@ -146,17 +146,17 @@ def nt_final_text(state_dir):
 def nt_tool_results(state_dir):
     n = 0
     for _, rec in nt_records(state_dir):
-        if "transcriptAppended" in rec:
-            e = rec["transcriptAppended"]
-            if "toolResponse" in e or "toolCall" in e:
-                n += 1
+        e = _unwrap(rec.get("transcriptAppended"))
+        if isinstance(e, dict) and ("toolResponse" in e or "toolCall" in e):
+            n += 1
     return n
 
 
 def nt_tool_calls(state_dir):
     n = 0
     for _, rec in nt_records(state_dir):
-        if "transcriptAppended" in rec and "toolCall" in rec["transcriptAppended"]:
+        e = _unwrap(rec.get("transcriptAppended"))
+        if isinstance(e, dict) and "toolCall" in e:
             n += 1
     return n
 
@@ -222,15 +222,6 @@ def pi_tool_writes(stdout, filename):
             except Exception:
                 pass
     return n
-
-
-def run_container(cmd, timeout, cname):
-    t0 = time.time()
-    rc, out, err = sh(cmd, timeout=timeout + 60)
-    wall = time.time() - t0
-    sh(["docker", "logs", cname])
-    sh(["docker", "rm", "-f", cname])
-    return {"exit": rc, "wall": wall, "stdout": out, "stderr": err, "container": cname}
 
 
 def nt_cmd(task, rep, ws, state, grant_file, prompt, ceiling, cname):
@@ -526,8 +517,12 @@ def main():
     if task_id != "T09" and os.path.exists(respath) and not force:
         print("exists, skipping: %s" % respath)
         return 0
-    if task_id == "T09" and leg == 1 and os.path.exists(os.path.join(rundir, "result.json")) and not force:
-        print("exists, skipping T09")
+    # T09 persists per-leg results (result-leg1.json / result-leg2.json),
+    # never result.json: resume skips only when the FINAL leg is recorded,
+    # for both legs, so a re-run can neither wipe scored state nor
+    # overwrite a recorded verdict.
+    if task_id == "T09" and os.path.exists(os.path.join(rundir, "result-leg2.json")) and not force:
+        print("exists, skipping T09 leg%d (result-leg2.json recorded)" % leg)
         return 0
     ws = os.path.join(rundir, "workspace")
     state = os.path.join(rundir, "state")

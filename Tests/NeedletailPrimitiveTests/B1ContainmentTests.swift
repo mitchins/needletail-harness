@@ -1084,9 +1084,9 @@ struct B1ContainmentTests {
         let (url, fp) = try Self.tempRoot()
         defer { try? FileManager.default.removeItem(at: url) }
         let rawName = Data([0x74, 0x6F, 0x70, 0xFF, 0x2E, 0x74, 0x78, 0x74]) // top\xFF.txt
-        let fd = rawName.withUnsafeBytes { ptr in
-            open(url.path.withCString { $0 }, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        }
+        // The path pointer is valid only inside withCString: open the
+        // directory within the closure (escaping the pointer is UB).
+        let fd = url.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
         try #require(fd >= 0)
         defer { close(fd) }
         var cname = Array(rawName) + [UInt8(0)]

@@ -35,8 +35,20 @@ def base(name):
 
 
 def run(cmd, timeout=300):
+    # A hung harness must not abort the script before results.json is
+    # written: kill the container (identified by its --name, docker
+    # invocations only) and record the timeout as a failed check. check()
+    # persists results.json then exits, matching every other failed check.
+    # The docker client kill is best-effort; the container-side wall
+    # timeout remains the authoritative bound.
     t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if "--name" in cmd:
+            subprocess.run(["docker", "rm", "-f", cmd[cmd.index("--name") + 1]], capture_output=True)
+        check("timeout:" + (cmd[cmd.index("--name") + 1] if "--name" in cmd else cmd[0]), False, "exceeded %ds" % timeout)
+        raise
     return r, time.time() - t0
 
 

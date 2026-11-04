@@ -124,9 +124,16 @@ struct RunCommand: ParsableCommand {
             // mounts the grant read-only OUTSIDE the disposable workspace.
             // A grant inside the workspace would be model-writable through
             // the file tools — refuse the composition instead of running
-            // with a self-approvable policy.
-            let canonGrant = (grantPath as NSString).standardizingPath
-            let canonWS = (ws as NSString).standardizingPath
+            // with a self-approvable policy. Compare absolute,
+            // symlink-resolved paths: a relative workspace ("ws") or a
+            // symlinked grant path would otherwise dodge a prefix check.
+            let cwd = FileManager.default.currentDirectoryPath
+            func canonical(_ p: String) -> String {
+                let abs = p.hasPrefix("/") ? p : (cwd as NSString).appendingPathComponent(p)
+                return URL(fileURLWithPath: abs).standardizedFileURL.resolvingSymlinksInPath().path
+            }
+            let canonGrant = canonical(grantPath)
+            let canonWS = canonical(ws)
             if canonGrant == canonWS || canonGrant.hasPrefix(canonWS + "/") {
                 eprint("error: --sandbox-grant file must live outside --workspace (a model-writable grant is a self-approval)")
                 throw ExitCode(2)
@@ -1123,6 +1130,12 @@ struct RunCommand: ParsableCommand {
                 try? await httpClient.shutdown().get()
                 throw ExitCode(5)
             }
+            if let code = checkpointContinuationExitCode(for: await actor.currentState().phase) {
+                eprint("checkpoint: post-rollover request ended terminally; refusing to report timing")
+            emitBudgetLine()
+                try? await httpClient.shutdown().get()
+                throw code
+            }
             guard (await actor.currentState()).pendingApproval == nil else {
                 eprint("checkpoint: post-rollover request awaits approval; stopping instead of auto-continuing")
             emitBudgetLine()
@@ -1141,6 +1154,12 @@ struct RunCommand: ParsableCommand {
             emitBudgetLine()
                 try? await httpClient.shutdown().get()
                 throw ExitCode(5)
+            }
+            if let code = checkpointContinuationExitCode(for: await actor.currentState().phase) {
+                eprint("checkpoint: warm request ended terminally; refusing to report timing")
+            emitBudgetLine()
+                try? await httpClient.shutdown().get()
+                throw code
             }
             guard (await actor.currentState()).pendingApproval == nil else {
                 eprint("checkpoint: warm request awaits approval; stopping instead of reporting a timing")
@@ -1308,9 +1327,11 @@ struct HeadlessApprovals: ApprovalGateway, Sendable {
     }
 }
 
-/// M3-C: bounded wait until the actor settles (idle/completed). Generic
-/// over the actor composition so nested CLI types are not required.
-/// Returns false on deadline exhaustion.
+/// M3-C: bounded wait until the actor settles. Terminal phases
+/// (idle/completed/failed/interrupted) return promptly — a provider
+/// failure or interruption after a checkpoint continuation must surface
+/// through the failure mapping, never spin to the deadline and misreport
+/// as a timeout. Returns false only on deadline exhaustion.
 @discardableResult
 func awaitIdle<T: ModelTransport, E: ToolExecutor, S: SessionStore, A: ApprovalGateway>(
     actor: SessionActor<T, E, S, A, SystemClock, DeterministicIDSource>, deadline: Date
@@ -1318,7 +1339,7 @@ func awaitIdle<T: ModelTransport, E: ToolExecutor, S: SessionStore, A: ApprovalG
     while Date() < deadline {
         let current = await actor.currentState()
         switch current.phase {
-        case .idle, .completed:
+        case .idle, .completed, .failed, .interrupted:
             return true
         case .authorising where current.pendingApproval != nil:
             // Post-rollover verification turns run no tools; a pending
@@ -1330,6 +1351,30 @@ func awaitIdle<T: ModelTransport, E: ToolExecutor, S: SessionStore, A: ApprovalG
         }
     }
     return false
+}
+
+/// Exit code for a terminal phase observed while awaiting a checkpoint
+/// continuation (nil = still in flight, keep waiting). Mirrors the §12.2
+/// run mapping: provider errors stay 4, budget exhaustion stays 5,
+/// interruption stays 130 — a failed continuation must never be reported
+/// as a 300 s timeout.
+private func checkpointContinuationExitCode(for phase: SessionPhase) -> ExitCode? {
+    switch phase {
+    case .idle, .completed:
+        return nil
+    case .failed(let failure):
+        switch failure {
+        case .approvalDenied: return ExitCode(3)
+        case .budgetExhausted: return ExitCode(5)
+        case .integrityStopped: return ExitCode(6)
+        case .invalidStopped: return ExitCode(2)
+        case .providerError: return ExitCode(4)
+        }
+    case .interrupted:
+        return ExitCode(130)
+    default:
+        return nil
+    }
 }
 
 /// System clock for production CLI (real wall time, not VirtualClock).

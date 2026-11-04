@@ -145,6 +145,19 @@ struct AssemblyTests {
                 Issue.record("wrong error: \(error)"); return
             }
         }
+        // Same malformed-value rule for reasoning_content itself: a
+        // non-string, non-null value must fail closed, never drop silently.
+        let badContent = try! JSONSerialization.data(withJSONObject: [
+            "choices": [["delta": ["reasoning_content": 42, "content": "hi"], "finish_reason": "stop"]],
+        ])
+        do {
+            _ = try assembleChatTurn([Self.event(String(decoding: badContent, as: UTF8.self))])
+            Issue.record("non-string reasoning_content must reject")
+        } catch let error as AssemblyError {
+            guard case .malformedEvent = error else {
+                Issue.record("wrong error: \(error)"); return
+            }
+        }
     }
 
     @Test("WIRE-07 identities and bytes stay lossless")

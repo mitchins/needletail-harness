@@ -81,8 +81,12 @@ for cell in "${ORDER[@]}"; do
   set -- $cell
   task=$1; rep=$2; h=$3
   used=$(spent)
-  if [ "$used" -ge "$GLOBAL_CEILING" ]; then
-    echo "GLOBAL BUDGET EXHAUSTED at $used/$GLOBAL_CEILING — stopping matrix"
+  # Reserve the next cell's ceiling before launch: a cell starting near
+  # the cap may otherwise spend its whole ceiling mid-run (Pi has no
+  # pre-send gate), overshooting the allowance before the next check.
+  need=$(python3 -c "import json,sys; print(next(t['needletail']['requestCeiling'] for t in json.load(open('plans/m3-tasks.json'))['tasks'] if t['id']==sys.argv[1]))" "$task")
+  if [ $((used + need)) -gt "$GLOBAL_CEILING" ]; then
+    echo "GLOBAL BUDGET: next cell $task needs $need, spent $used + $need exceeds $GLOBAL_CEILING — stopping matrix"
     break
   fi
   n=$((n+1))

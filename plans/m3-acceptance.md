@@ -106,6 +106,14 @@ Reconciliation of the 498/700 observations against the 850 cap:
    separated; T09-NT degenerate (task too fast to catch); oversized-batch truncation
    missing (future work); NT transcript verbosity inflates in-tokens; boundary-PASSes
    are oracle-verified but weaker evidence than model-finalized passes.
+8. **Output-token cap asymmetry (disclosed, frozen protocol untouched).** The frozen
+   comparison ran Needletail with `max_output 4096` (`docker/m3d-config.json`) against
+   Pi `halogen-local` with `maxTokens 65536` (`docker/pi-models.json`) on the same
+   model and temperature. A completion needing >4096 output tokens truncates under
+   Needletail while Pi may finish it — a like-for-like caveat on output behavior,
+   recorded here rather than in the frozen protocol (which cannot be revised
+   post-result). No frozen cell's verdict is attributed to truncation on current
+   evidence; the asymmetry stands as a method bound, not a score adjustment.
 
 ## 4. Merge readiness (this closeout)
 

@@ -29,6 +29,15 @@ def load_m3d_run():
     return m
 
 
+def load_m3d_confirm():
+    # m3d-confirm.py is import-safe (constants + defs only; the run loop
+    # sits behind __main__), so the test exercises the production spent().
+    spec = importlib.util.spec_from_file_location("m3d_confirm", os.path.join(HERE, "m3d-confirm.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
 def main():
     m = load_m3d_run()
     pa = m.parse_accounting
@@ -57,7 +66,8 @@ def main():
     _, used, _ = pa(unb)
     check("unbudgeted: None", used is None)
 
-    # Cohort ledger rule: max(requests, budgetUsed) per result file.
+    # Cohort ledger rule: max(requests, budgetUsed) per result file,
+    # asserted against the production spent() from m3d-confirm.py.
     with tempfile.TemporaryDirectory() as tmp:
         cell = os.path.join(tmp, "T08-R1-nt")
         os.makedirs(cell)
@@ -68,16 +78,9 @@ def main():
         cell3 = os.path.join(tmp, "T09-R1-nt")
         os.makedirs(cell3)
         json.dump({"requests": 4}, open(cell3 + "/result-leg1.json", "w"))
-        total = 0
-        for root, _, files in os.walk(tmp):
-            for f in ("result.json", "result-leg2.json", "result-leg1.json"):
-                p = os.path.join(root, f)
-                if os.path.exists(p):
-                    d = json.load(open(p))
-                    u = int(d.get("requests", 0) or 0)
-                    b = d.get("budgetUsed")
-                    total += max(u, b if isinstance(b, int) else u)
-        check("ledger rule totals 10+23+4", total == 37, "got %d" % total)
+        conf = load_m3d_confirm()
+        conf.CONFIRM_RUNS = tmp
+        check("ledger rule totals 10+23+4", conf.spent() == 37, "got %d" % conf.spent())
 
     print("failures: %d" % len(failures))
     return 1 if failures else 0

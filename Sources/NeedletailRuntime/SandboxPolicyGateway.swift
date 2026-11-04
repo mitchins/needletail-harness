@@ -91,6 +91,17 @@ public struct SandboxPolicyGateway: ApprovalGateway, Sendable {
         guard !validated.isEmpty else {
             return .unavailable("sandbox cannot approve an empty batch")
         }
+        // Container-grant scope note (review disposition): grantable
+        // protected paths (.git/*, .env*, .ssh/*) are NOT separately
+        // denied here. The grant binds a single disposable workspace;
+        // the launcher mounts it read-only outside that workspace and
+        // the container is destroyed after the run, so workspace dotfiles
+        // carry no cross-run sensitivity inside this scope. The human
+        // gateway still prompts for them on ordinary host runs, where
+        // that sensitivity is real. Denying them here would break
+        // legitimate task flows (e.g. git operations in the scratch
+        // repo) without adding containment: every path above is still
+        // confined to the grant workspace.
         for call in validated {
             guard grant.allowedTools.contains(call.tool) else {
                 return .unavailable("sandbox denies tool \(call.tool); fail closed")

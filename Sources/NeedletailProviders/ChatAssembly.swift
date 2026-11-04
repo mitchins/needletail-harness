@@ -130,6 +130,8 @@ public func assembleChatTurn(_ events: [ServerSentEvent]) throws -> AssembledTur
             }
             if let reasoningDelta = delta["reasoning_content"] as? String {
                 reasoning += reasoningDelta
+            } else if let rawReasoningContent = delta["reasoning_content"], !(rawReasoningContent is NSNull) {
+                throw AssemblyError.malformedEvent("delta.reasoning_content is not a string")
             } else if let reasoningAlias = delta["reasoning"] as? String {
                 reasoning += reasoningAlias
             } else if let rawReasoning = delta["reasoning"], !(rawReasoning is NSNull) {

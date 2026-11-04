@@ -16,6 +16,10 @@ for rep in 1 2; do
   done
 done
 total_requests() {
+  # Adjudicated ledger rule (shared with m3d-confirm.py and
+  # m3d-gemma-matrix.sh): per result file, the max of the usage-line
+  # count and the durable pre-dispatch budget count, so early-exit runs
+  # that skip the usage epilogue are still counted.
   python3 - "$RUNS" <<'EOF'
 import json, os, sys
 runs = sys.argv[1]
@@ -25,7 +29,9 @@ for root, _, files in os.walk(runs):
         if f in ("result.json", "result-leg1.json", "result-leg2.json"):
             try:
                 d = json.load(open(os.path.join(root, f)))
-                total += int(d.get("requests", 0) or 0)
+                u = int(d.get("requests", 0) or 0)
+                b = d.get("budgetUsed")
+                total += max(u, b if isinstance(b, int) else u)
             except Exception:
                 pass
 print(total)
@@ -35,8 +41,12 @@ for cell in "${ORDER[@]}"; do
   set -- $cell
   task=$1; rep=$2; h=$3
   used=$(total_requests)
-  if [ "$used" -ge "$GLOBAL_CEILING" ]; then
-    echo "GLOBAL BUDGET EXHAUSTED at $used/$GLOBAL_CEILING — stopping matrix"
+  # Reserve the next cell's ceiling before launch (same rule as the
+  # Gemma runner): a cell starting near the cap must not overshoot it
+  # mid-run before the next check.
+  need=$(python3 -c "import json,sys; print(next(t['needletail']['requestCeiling'] for t in json.load(open('plans/m3-tasks.json'))['tasks'] if t['id']==sys.argv[1]))" "$task")
+  if [ $((used + need)) -gt "$GLOBAL_CEILING" ]; then
+    echo "GLOBAL BUDGET: next cell $task needs $need, spent $used + $need exceeds $GLOBAL_CEILING — stopping matrix"
     break
   fi
   if [ "$task" = "T09" ]; then

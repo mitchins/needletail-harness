@@ -768,6 +768,7 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         var receiptSeqs = Set<UInt64>()
         var maxSeq: UInt64 = 0
         var entries: [(seq: UInt64, entry: TranscriptEntry)] = []
+        var toolByCall: [String: String] = [:]
         var cursor: UInt64 = 0
         while true {
             let page: [SequencedRecord]
@@ -786,9 +787,15 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
                     switch entry {
                     case .user(let text):
                         if pinned.isEmpty { pinned = [text] }
-                    case .toolResponse(_, let responseText):
+                    case .toolCall(let call):
+                        toolByCall[call.callID] = call.tool
+                    case .toolResponse(let callID, let responseText):
                         // A1 read receipts: parse "path: X" + "sha256: H".
-                        if responseText.hasPrefix("[read receipt]"),
+                        // Only a genuine `read` call can carry a receipt:
+                        // exec stdout can imitate the text shape, so an
+                        // unmatched or non-read callID never mints hashes.
+                        if toolByCall[callID] == "read",
+                           responseText.hasPrefix("[read receipt]"),
                            let pathLine = responseText.split(separator: "\n").first(where: { $0.hasPrefix("path: ") }),
                            let hashLine = responseText.split(separator: "\n").first(where: { $0.hasPrefix("sha256: ") }) {
                             let p = pathLine.dropFirst("path: ".count)
