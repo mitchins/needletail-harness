@@ -31,11 +31,18 @@ struct NetLoopbackTests {
             requestTimeout: requestTimeout)
         // Unwind-safe: a throwing invoke must still drain the client or
         // AHC traps on un-shut-down deinit and masks the real failure.
-        defer { await LoopbackFixtures.shutdown(transport.client) }
-        let result = try await transport.invoke(
-            LoopbackFixtures.invocation(alias: invocationAlias ?? alias),
-            intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
-        return (result.response, server.requests, server.connectionCount)
+        // No `defer` here: Swift 6.1/Xcode 16.3 toolchains reject `await`
+        // in `defer`, so the shutdown runs explicitly on both paths.
+        do {
+            let result = try await transport.invoke(
+                LoopbackFixtures.invocation(alias: invocationAlias ?? alias),
+                intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
+            await LoopbackFixtures.shutdown(transport.client)
+            return (result.response, server.requests, server.connectionCount)
+        } catch {
+            await LoopbackFixtures.shutdown(transport.client)
+            throw error
+        }
     }
 
     @Test("NET-02a unknown alias and stripped allow-list refuse with zero traffic")
@@ -145,23 +152,30 @@ struct NetLoopbackTests {
             connectTimeout: 2, readIdleTimeout: 2, requestTimeout: 60)
         let profile = try #require(snapshot.profiles["tls"])
         let client = LoopbackFixtures.client(profile: profile)
-        defer { await LoopbackFixtures.shutdown(client) }
-        let transport = ChatCompletionsTransport(
-            client: client,
-            messageProvider: { _ in [ChatMessage(role: .user, text: "x")] },
-            credentialProvider: { _, _ in "loopback-test-secret" },
-            snapshotProvider: { snapshot })
-        do {
-            _ = try await transport.invoke(
-                LoopbackFixtures.invocation(alias: "tls"),
-                intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
-            Issue.record("https-against-plaintext must fail")
-        } catch let failure as TransportFailure {
-            #expect(failure.phase == .preSend, "no head byte ever arrived: \(failure)")
-        } catch {
-            Issue.record("wrong error class (must be typed): \(error)")
+        // No `defer` for the shutdown: Swift 6.1/Xcode 16.3 toolchains
+        // reject `await` in `defer`. The remainder cannot throw (invoke is
+        // caught, #expect records), so the explicit shutdown below runs on
+        // every path; the non-throwing nested function keeps it that way.
+        func runRefusal() async {
+            let transport = ChatCompletionsTransport(
+                client: client,
+                messageProvider: { _ in [ChatMessage(role: .user, text: "x")] },
+                credentialProvider: { _, _ in "loopback-test-secret" },
+                snapshotProvider: { snapshot })
+            do {
+                _ = try await transport.invoke(
+                    LoopbackFixtures.invocation(alias: "tls"),
+                    intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
+                Issue.record("https-against-plaintext must fail")
+            } catch let failure as TransportFailure {
+                #expect(failure.phase == .preSend, "no head byte ever arrived: \(failure)")
+            } catch {
+                Issue.record("wrong error class (must be typed): \(error)")
+            }
+            #expect(tlsServer.requests.isEmpty, "handshake never completed: no valid request")
         }
-        #expect(tlsServer.requests.isEmpty, "handshake never completed: no valid request")
+        await runRefusal()
+        await LoopbackFixtures.shutdown(client)
     }
 
     @Test("NET-02a pre-dial failures classify preSend, never ambiguous")
@@ -174,24 +188,29 @@ struct NetLoopbackTests {
         server.start()
         defer { server.stop() }
         let (base, _) = try LoopbackFixtures.transport(server: server)
-        defer { await LoopbackFixtures.shutdown(base.client) }
-        let empty = ChatCompletionsTransport(
-            client: base.client,
-            messageProvider: { _ in [] },
-            credentialProvider: { _, _ in "loopback-test-secret" },
-            snapshotProvider: base.snapshotProvider)
-        do {
-            _ = try await empty.invoke(
-                LoopbackFixtures.invocation(),
-                intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
-            Issue.record("empty history must refuse")
-        } catch let failure as TransportFailure {
-            #expect(failure.phase == .preSend, "nothing was sent: \(failure)")
-            #expect(failure.message.contains("emptyMessages"), "typed: \(failure.message)")
-        } catch {
-            Issue.record("wrong error class (must be typed preSend): \(error)")
+        // No `defer` for the shutdown (see runRefusal above): the remainder
+        // cannot throw, so the explicit shutdown below runs on every path.
+        func runPreDial() async {
+            let empty = ChatCompletionsTransport(
+                client: base.client,
+                messageProvider: { _ in [] },
+                credentialProvider: { _, _ in "loopback-test-secret" },
+                snapshotProvider: base.snapshotProvider)
+            do {
+                _ = try await empty.invoke(
+                    LoopbackFixtures.invocation(),
+                    intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
+                Issue.record("empty history must refuse")
+            } catch let failure as TransportFailure {
+                #expect(failure.phase == .preSend, "nothing was sent: \(failure)")
+                #expect(failure.message.contains("emptyMessages"), "typed: \(failure.message)")
+            } catch {
+                Issue.record("wrong error class (must be typed preSend): \(error)")
+            }
+            #expect(server.requests.isEmpty, "zero bytes sent")
         }
-        #expect(server.requests.isEmpty, "zero bytes sent")
+        await runPreDial()
+        await LoopbackFixtures.shutdown(base.client)
     }
 
     @Test("NET-03 429 and 500 never retry and never sleep")

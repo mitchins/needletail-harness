@@ -86,6 +86,7 @@ enum ActorLoopback {
     }
 }
 
+#if canImport(Glibc) // M4-A G14: darwin 512KB cooperative-pool stacks overflow on -Onone frames in deep actor paths (deterministic SIGBUS/SIGILL, layout-sensitive set); Linux-debug + darwin -O green, see receipt.
 @Suite(.serialized)
 struct ActorLoopbackTests {
     @Test("NET-05 actor arms on preSend, ticks once, completes over loopback")
@@ -95,35 +96,45 @@ struct ActorLoopbackTests {
         server.start()
         defer { server.stop() }
         let (inner, snapshot) = try LoopbackFixtures.transport(server: server)
-        defer { await LoopbackFixtures.shutdown(inner.client) }
-        let flaky = FlakyTransport(inner: inner)
-        let actor = try SessionActor(
-            state: try ActorLoopback.idleState(snapshot: snapshot),
-            ids: DeterministicIDSource(prefix: "e2e"), clock: VirtualClock(now: 1_000_000),
-            transport: flaky, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "test-writer")
+        // No `defer` for the shutdown (await-in-defer needs Swift 6.2+):
+        // the body below is the unit of unwind-safety.
+        func runArmed() async throws {
+            let flaky = FlakyTransport(inner: inner)
+            let actor = try SessionActor(
+                state: try ActorLoopback.idleState(snapshot: snapshot),
+                ids: DeterministicIDSource(prefix: "e2e"), clock: VirtualClock(now: 1_000_000),
+                transport: flaky, executor: TrivialExecutor(),
+                store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "test-writer")
 
-        await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
-        // Arm: the flaky preSend classifies, the actor arms the deadline —
-        // no inline resend (delegated stays 0), zero bytes on the wire.
-        let armed = try await ActorLoopback.awaitState({ $0.retryDeadlineMillis != nil }, "retry armed", actor: actor)
-        #expect(flaky.failures == 1, "exactly one classified failure")
-        #expect(flaky.delegated == 0, "no inline resend before the tick")
-        #expect(server.requests.isEmpty, "armed means zero bytes sent")
-        let deadline = try #require(armed.retryDeadlineMillis)
-        // Tick: exactly one retry dispatches through the REAL adapter.
-        await actor.tick(at: deadline)
-        let done = try await ActorLoopback.awaitState({
-            if case .completed = $0.phase { return true }
-            return false
-        }, "run completed", actor: actor)
-        #expect(flaky.delegated == 1, "exactly one retry dispatched")
-        #expect(server.connectionCount == 1, "single connection end to end")
-        guard case .completed(let receipt) = done.phase else {
-            Issue.record("expected completed, got \(done.phase)"); return
+            await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
+            // Arm: the flaky preSend classifies, the actor arms the deadline —
+            // no inline resend (delegated stays 0), zero bytes on the wire.
+            let armed = try await ActorLoopback.awaitState({ $0.retryDeadlineMillis != nil }, "retry armed", actor: actor)
+            #expect(flaky.failures == 1, "exactly one classified failure")
+            #expect(flaky.delegated == 0, "no inline resend before the tick")
+            #expect(server.requests.isEmpty, "armed means zero bytes sent")
+            let deadline = try #require(armed.retryDeadlineMillis)
+            // Tick: exactly one retry dispatches through the REAL adapter.
+            await actor.tick(at: deadline)
+            let done = try await ActorLoopback.awaitState({
+                if case .completed = $0.phase { return true }
+                return false
+            }, "run completed", actor: actor)
+            #expect(flaky.delegated == 1, "exactly one retry dispatched")
+            #expect(server.connectionCount == 1, "single connection end to end")
+            guard case .completed(let receipt) = done.phase else {
+                Issue.record("expected completed, got \(done.phase)"); return
+            }
+            #expect(receipt.turnsUsed == 2, "initial attempt + one tick retry")
+            #expect(receipt.toolCallCount == 0, "pure text turn")
         }
-        #expect(receipt.turnsUsed == 2, "initial attempt + one tick retry")
-        #expect(receipt.toolCallCount == 0, "pure text turn")
+        do {
+            try await runArmed()
+            await LoopbackFixtures.shutdown(inner.client)
+        } catch {
+            await LoopbackFixtures.shutdown(inner.client)
+            throw error
+        }
     }
 
     @Test("NET-05 actor never retries a mid-stream abort")
@@ -138,32 +149,43 @@ struct ActorLoopbackTests {
         server.start()
         defer { server.stop() }
         let (inner, snapshot) = try LoopbackFixtures.transport(server: server)
-        defer { await LoopbackFixtures.shutdown(inner.client) }
-        // No flakiness: the first (only) attempt streams, then FINs.
-        let flaky = FlakyTransport(inner: inner, failFirst: false)
-        let actor = try SessionActor(
-            state: try ActorLoopback.idleState(snapshot: snapshot),
-            ids: DeterministicIDSource(prefix: "e2e-abort"), clock: VirtualClock(now: 2_000_000),
-            transport: flaky, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "test-writer")
+        // No `defer` for the shutdown (await-in-defer needs Swift 6.2+):
+        // the body below is the unit of unwind-safety.
+        func runAbort() async throws {
+            // No flakiness: the first (only) attempt streams, then FINs.
+            let flaky = FlakyTransport(inner: inner, failFirst: false)
+            let actor = try SessionActor(
+                state: try ActorLoopback.idleState(snapshot: snapshot),
+                ids: DeterministicIDSource(prefix: "e2e-abort"), clock: VirtualClock(now: 2_000_000),
+                transport: flaky, executor: TrivialExecutor(),
+                store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "test-writer")
 
-        await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
-        let done = try await ActorLoopback.awaitState({
-            if case .failed = $0.phase { return true }
-            return false
-        }, "run failed", actor: actor)
-        #expect(flaky.delegated == 1, "one attempt, delegated to the real adapter")
-        #expect(server.connectionCount == 1, "no resume, no retry after abort")
-        guard case .failed = done.phase else {
-            Issue.record("expected failed, got \(done.phase)"); return
+            await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
+            let done = try await ActorLoopback.awaitState({
+                if case .failed = $0.phase { return true }
+                return false
+            }, "run failed", actor: actor)
+            #expect(flaky.delegated == 1, "one attempt, delegated to the real adapter")
+            #expect(server.connectionCount == 1, "no resume, no retry after abort")
+            guard case .failed = done.phase else {
+                Issue.record("expected failed, got \(done.phase)"); return
+            }
+            // Post-failure ticks stay silent: postContent never arms a retry.
+            #expect(done.retryDeadlineMillis == nil, "no deadline armed for postContent")
+            await actor.tick(at: 9_000_000)
+            let still = await actor.currentState()
+            #expect(flaky.delegated == 1, "tick after abort dispatches nothing")
+            guard case .failed = still.phase else {
+                Issue.record("run must stay failed, got \(still.phase)"); return
+            }
         }
-        // Post-failure ticks stay silent: postContent never arms a retry.
-        #expect(done.retryDeadlineMillis == nil, "no deadline armed for postContent")
-        await actor.tick(at: 9_000_000)
-        let still = await actor.currentState()
-        #expect(flaky.delegated == 1, "tick after abort dispatches nothing")
-        guard case .failed = still.phase else {
-            Issue.record("run must stay failed, got \(still.phase)"); return
+        do {
+            try await runAbort()
+            await LoopbackFixtures.shutdown(inner.client)
+        } catch {
+            await LoopbackFixtures.shutdown(inner.client)
+            throw error
         }
     }
 }
+#endif

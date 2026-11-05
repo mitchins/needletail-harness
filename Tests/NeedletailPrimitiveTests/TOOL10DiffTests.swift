@@ -102,6 +102,7 @@ struct TOOL10DiffTests {
         #expect(GitDiff.fixedArgv.contains("core.fsmonitor=false"), "fsmonitor override pinned: repo config must not execute hooks")
     }
 
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_fsmonitorNeutralized")
     func fsmonitorNeutralized() throws {
         let (dir, git) = try Self.makeRepo()
@@ -118,6 +119,8 @@ struct TOOL10DiffTests {
         _ = try Self.runGit(git, args: ["diff"], cwd: dir)
         #expect(FileManager.default.fileExists(atPath: marker), "sensitivity: unsanitized git honors core.fsmonitor")
     }
+#endif
+
 
     @Test("TOOL_10_sanitizedEnvExact")
     func sanitizedEnvExact() {
@@ -129,6 +132,7 @@ struct TOOL10DiffTests {
 
     // MARK: - Native legs
 
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_cleanTreeEmpty")
     func cleanTreeEmpty() throws {
         let (dir, git) = try Self.makeRepo()
@@ -137,7 +141,10 @@ struct TOOL10DiffTests {
         #expect(out.stdout.isEmpty, "clean tree diffs empty")
         #expect(!out.truncated)
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_dirtyWorktreeShowsUnstaged")
     func dirtyWorktree() throws {
         let (dir, git) = try Self.makeRepo()
@@ -149,7 +156,10 @@ struct TOOL10DiffTests {
         #expect(text.contains("-hello") && text.contains("+hello world"), "unstaged hunk present")
         #expect(!out.truncated)
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_diffExternalNeutralized")
     func diffExternalNeutralized() throws {
         let (dir, git) = try Self.makeRepo()
@@ -169,7 +179,10 @@ struct TOOL10DiffTests {
         let raw = try Self.runGit(git, args: ["diff"], cwd: dir)
         #expect(FileManager.default.fileExists(atPath: marker) || raw.out.isEmpty, "sensitivity: unsanitized git honors diff.external")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_textconvNeutralized")
     func textconvNeutralized() throws {
         let (dir, git) = try Self.makeRepo(files: ["f.txt": "hello\n"])
@@ -194,6 +207,8 @@ struct TOOL10DiffTests {
         let raw = try Self.runGit(git, args: ["diff"], cwd: dir)
         #expect(raw.out.contains("CONVERTED"), "sensitivity: unsanitized git runs textconv")
     }
+#endif
+
 
     @Test("TOOL_10_missingGit")
     func missingGit() throws {
@@ -238,6 +253,7 @@ struct TOOL10DiffTests {
 
     enum TOOL10Error: Error { case noGit, missingBinary }
 
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_largeOutputTruncated")
     func largeOutputTruncated() throws {
         let (dir, git) = try Self.makeRepo(files: ["big.txt": String(repeating: "a\n", count: 10)])
@@ -250,7 +266,10 @@ struct TOOL10DiffTests {
         #expect(out.stdout.count == GitDiff.maxStdoutBytes, "bounded exactly at the cap, got \(out.stdout.count)")
         #expect(!out.stdout.isEmpty)
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_binaryDiffSafe")
     func binaryDiffSafe() throws {
         let (dir, git) = try Self.makeRepo(files: ["f.txt": "hello\n"])
@@ -264,6 +283,8 @@ struct TOOL10DiffTests {
         let text = String(data: out.stdout, encoding: .utf8) ?? ""
         #expect(text.contains("Binary"), "binary diff reported, got \(text)")
     }
+#endif
+
 
     @Test("TOOL_10_writeOutputDiscipline")
     func writeOutputDiscipline() throws {
@@ -329,6 +350,50 @@ struct TOOL10DiffTests {
         }
         let sibling = runner.deletingLastPathComponent().appendingPathComponent("needletail")
         if FileManager.default.isExecutableFile(atPath: sibling.path) { return sibling }
+        // macOS `swift test` nests the runner inside the .xctest bundle, so
+        // the product is NOT beside it: walk up to the products directory
+        // (…/debug or …/release) and look there. Portable across platforms.
+        // Roots cover both argv[0] and the bundle layout. Newer toolchains
+        // run tests inside swiftpm-testing-helper, which lives in the Xcode
+        // toolchain with no path relation to the products dir; the .build
+        // search below covers that layout from the package directory.
+        var roots = [runner.deletingLastPathComponent()]
+        if let bundleExe = Bundle.main.executableURL?.deletingLastPathComponent() {
+            roots.append(bundleExe)
+        }
+        roots.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+        for root in roots {
+            var dir: URL? = root
+            for _ in 0..<8 {
+                guard let d = dir else { break }
+                for config in ["debug", "release"] where d.lastPathComponent != config {
+                    let cand = d.appendingPathComponent(config).appendingPathComponent("needletail")
+                    if FileManager.default.isExecutableFile(atPath: cand.path) { return cand }
+                }
+                let direct = d.appendingPathComponent("needletail")
+                if FileManager.default.isExecutableFile(atPath: direct.path) { return direct }
+                if d.path == "/" { break }
+                dir = d.deletingLastPathComponent()
+            }
+        }
+        // swiftpm-testing-helper layout: products live under the package
+        // directory's .build (possibly a per-triple subdirectory).
+        let pkgDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let dotBuild = pkgDir.appendingPathComponent(".build")
+        var buildCands = [
+            dotBuild.appendingPathComponent("debug/needletail"),
+            dotBuild.appendingPathComponent("release/needletail"),
+        ]
+        if let subs = try? FileManager.default.contentsOfDirectory(
+            at: dotBuild, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for sub in subs {
+                buildCands.append(sub.appendingPathComponent("debug/needletail"))
+                buildCands.append(sub.appendingPathComponent("release/needletail"))
+            }
+        }
+        for cand in buildCands {
+            if FileManager.default.isExecutableFile(atPath: cand.path) { return cand }
+        }
         let built = URL(fileURLWithPath: "/data/coding/needletail/.build/debug/needletail")
         if FileManager.default.isExecutableFile(atPath: built.path) { return built }
         Issue.record("needletail binary missing; build the product before diff binary legs")
@@ -379,6 +444,7 @@ struct TOOL10DiffTests {
         return (p.terminationStatus, out, err)
     }
 
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_binaryCleanAndDirty")
     func binaryCleanAndDirty() throws {
         let bin = try Self.binary()
@@ -397,7 +463,10 @@ struct TOOL10DiffTests {
         let mode = try FileManager.default.attributesOfItem(atPath: target)[.posixPermissions] as? Int
         #expect(mode == 0o600, "output is 0600, got \(String(format: "%o", mode ?? 0))")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G-cwd: CLI `diff` denies on Darwin; binary legs exercise the diff surface
     @Test("TOOL_10_binaryPoisonedEnv")
     func binaryPoisonedEnv() throws {
         let bin = try Self.binary()
@@ -424,6 +493,8 @@ struct TOOL10DiffTests {
         #expect(raw.status != 0, "sensitivity: unsanitized git breaks under the poisons (status \(raw.status))")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G-cwd: CLI `diff` denies on Darwin; binary legs exercise the diff surface
     @Test("TOOL_10_binaryMissingGit")
     func binaryMissingGit() throws {
         let bin = try Self.binary()
@@ -442,6 +513,8 @@ struct TOOL10DiffTests {
         #expect(code3 == 2, "relative --git exits 2, got \(code3)")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G-cwd: CLI `diff` denies on Darwin; binary legs exercise the diff surface
     @Test("TOOL_10_binaryBadWorkspace")
     func binaryBadWorkspace() throws {
         let bin = try Self.binary()
@@ -455,6 +528,7 @@ struct TOOL10DiffTests {
         #expect(code2 == 2, "symlink workspace exits 2, got \(code2) err=\(err2)")
     }
 
+#endif
     @Test("TOOL_10_binaryNonGitToolsUnaffected")
     func binaryNonGitToolsUnaffected() throws {
         // With git removed from PATH, non-git commands are unaffected.
@@ -466,6 +540,7 @@ struct TOOL10DiffTests {
         #expect(helpOut.contains("diff"), "diff stays listed")
     }
 
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_binaryTruncationNote")
     func binaryTruncationNote() throws {
         let bin = try Self.binary()
@@ -483,7 +558,10 @@ struct TOOL10DiffTests {
         #expect(err2.contains(target), "note names the artifact file, got \(err2)")
         #expect(try String(contentsOfFile: target, encoding: .utf8) == out2, "artifact is byte-exact")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
     @Test("TOOL_10_binaryDriversNeutralized")
     func binaryDriversNeutralized() throws {
         // diff.external + textconv through the real binary.
@@ -501,4 +579,5 @@ struct TOOL10DiffTests {
         #expect(!FileManager.default.fileExists(atPath: marker), "external driver never ran through the binary")
         #expect(out.contains("+v2"), "normal diff through the binary, got \(out)")
     }
+#endif // M4-A G-cwd: GitDiff pins the repo via an open dir FD; Darwin spawn cannot fchdir
 }

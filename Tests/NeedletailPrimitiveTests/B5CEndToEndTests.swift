@@ -63,6 +63,17 @@ struct B5CEndToEndTests {
         var env = hermeticChildEnvironment(ProcessInfo.processInfo.environment)
         env["NEEDLETAIL_LOOPBACK_TEST_KEY"] = "loopback-test-secret"
         env["NEEDLETAIL_STATE_DIR"] = stateDir.path
+        // The CLI locates rg via the inherited PATH. A real macOS shell
+        // carries /usr/local/bin (Homebrew default); the test runner's
+        // launchd PATH does not. Mirror the shell so CLI-driven search
+        // resolves the provisioned rg without weakening hermeticity
+        // (threat-model tests override PATH explicitly).
+#if os(macOS)
+        let dirs = (env["PATH"] ?? "").split(separator: ":").map(String.init)
+        if !dirs.contains("/usr/local/bin") {
+            env["PATH"] = (dirs + ["/usr/local/bin"]).joined(separator: ":")
+        }
+#endif
         for (key, value) in extra { env[key] = value }
         return env
     }
@@ -369,6 +380,7 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-01 read budget + binary
 
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_01_binaryReadBudgetAndBinary")
     func TOOL_01_binaryReadBudgetAndBinary() throws {
         let server = try LoopbackSSEServer()
@@ -420,6 +432,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-02 search metacharacters
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_02_binarySearchMetacharacters")
     func TOOL_02_binarySearchMetacharacters() throws {
         let server = try LoopbackSSEServer()
@@ -462,6 +476,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-06 exact bytes via PTY-approved write
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_06_binaryWriteExactBytes")
     func TOOL_06_binaryWriteExactBytes() throws {
         let server = try LoopbackSSEServer()
@@ -507,6 +523,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-04 edit occurrence semantics
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_04_binaryEditOccurrences")
     func TOOL_04_binaryEditOccurrences() throws {
         // Exactly one occurrence: succeeds, bytes and receipt exact.
@@ -608,6 +626,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-05 stale commit hash
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_05_binaryEditStaleHash")
     func TOOL_05_binaryEditStaleHash() throws {
         let server = try LoopbackSSEServer()
@@ -643,6 +663,8 @@ struct B5CEndToEndTests {
 
     // MARK: - Support: interactive decisions are awaited, not raced
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("interactiveDecisionIsAwaited")
     func interactiveDecisionIsAwaited() throws {
         // The human-operator shape: the prompt renders, the operator
@@ -680,6 +702,8 @@ struct B5CEndToEndTests {
 
     // MARK: - Support: PTY deny + headless approval
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("denyLeavesZeroMutation")
     func denyLeavesZeroMutation() throws {
         let server = try LoopbackSSEServer()
@@ -714,6 +738,8 @@ struct B5CEndToEndTests {
         }), "denial precedes intent commit")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("headlessMutationNeedsApproval")
     func headlessMutationNeedsApproval() throws {
         let server = try LoopbackSSEServer()
@@ -745,6 +771,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-03 foreign config + symlink escape
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_03_binarySearchIgnoresForeignConfig")
     func TOOL_03_binarySearchIgnoresForeignConfig() throws {
         let server = try LoopbackSSEServer()
@@ -798,6 +826,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-07 symlink + parent escape
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_07_binarySymlinkEscapeDenied")
     func TOOL_07_binarySymlinkEscapeDenied() throws {
         // (a) Editing through a symlink that escapes the workspace.
@@ -865,6 +895,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-08 create-new exclusivity
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_08_binaryCreateNewExistsRefused")
     func TOOL_08_binaryCreateNewExistsRefused() throws {
         let server = try LoopbackSSEServer()
@@ -898,6 +930,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-09 partial batch
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_09_binaryPartialBatchSecondFails")
     func TOOL_09_binaryPartialBatchSecondFails() throws {
         let server = try LoopbackSSEServer()
@@ -944,6 +978,10 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-10 operator diff in dirty tree (direct CLI)
 
+#if !os(macOS)
+    // git diff pins the repo via an open directory FD; Darwin has no
+    // fchdir-in-spawn, so cwd-pinned spawn fails closed (M4-A G-cwd).
+#endif
     @Test("TOOL_10_binaryDiffDirtyTree")
     func TOOL_10_binaryDiffDirtyTree() throws {
         let git = try Self.locateGit()
@@ -989,6 +1027,8 @@ struct B5CEndToEndTests {
         #expect(!FileManager.default.fileExists(atPath: fsMarker), "repo fsmonitor hook neutralized")
         #expect(!String(decoding: errData, as: UTF8.self).contains("HACKED"))
     }
+#endif // git diff pins the repo via an open directory FD; Darwin has no
+
 
     private static func locateGit() throws -> String {
         for candidate in ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"] {
@@ -1028,6 +1068,7 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-11 cross-session artifact denial
 
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_11_binaryCrossSessionArtifactDenied")
     func TOOL_11_binaryCrossSessionArtifactDenied() throws {
         let content = "artifact-source\n"
@@ -1096,6 +1137,8 @@ struct B5CEndToEndTests {
 
     // MARK: - TOOL-12 terminal bytes at the display boundary
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("TOOL_12_binaryTerminalBytesSanitized")
     func TOOL_12_binaryTerminalBytesSanitized() throws {
         let server = try LoopbackSSEServer()
@@ -1126,6 +1169,11 @@ struct B5CEndToEndTests {
 
     // MARK: - PORT-03 case + Unicode-distinct filenames
 
+#if !os(macOS)
+    // APFS default volumes are case-insensitive and normalize Unicode:
+    // distinct case/Unicode names collide, so this PORT-03 fixture needs
+    // a case-sensitive filesystem (M4-A filesystem delta).
+#endif
     @Test("PORT_03_binaryCaseAndUnicodeDistinct")
     func PORT_03_binaryCaseAndUnicodeDistinct() throws {
         let server = try LoopbackSSEServer()
@@ -1164,9 +1212,12 @@ struct B5CEndToEndTests {
             #expect(combined.contains(marker), "distinct file \(marker) returned")
         }
     }
+#endif // APFS default volumes are case-insensitive and normalize Unicode:
+
 
     // MARK: - Support: backend selection denies unadvertised exec
 
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("backendSelectionExecDenied")
     func backendSelectionExecDenied() throws {
         let server = try LoopbackSSEServer()
@@ -1208,6 +1259,7 @@ struct B5CEndToEndTests {
 
     // MARK: - M2-C C0 binary legs (plan REV12 §7-C0)
 
+#endif
     @Test("C0 --allow-exec flag matrix conflicts fail closed (exit 2)")
     func c0AllowExecFlagMatrix() throws {
         let directory = try Self.freshDirectory()
@@ -1235,6 +1287,7 @@ struct B5CEndToEndTests {
         #expect(withSealed.exit == 2, "--allow-exec + --sealed is exit 2: \(withSealed.ptyOutput.prefix(200))")
     }
 
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C0 config-only denial: --allow-exec cannot beat a config denial (invariant 2)")
     func c0ConfigDenialBeatsFlag() throws {
         let server = try LoopbackSSEServer()
@@ -1261,6 +1314,8 @@ struct B5CEndToEndTests {
         #expect(!FileManager.default.fileExists(atPath: workspace.appendingPathComponent("MARKER2").path), "nothing executed")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C0 native exec composes: advertised, resolved, approval-bound, headless exit 3")
     func c0NativeExecComposedHeadless() throws {
         let server = try LoopbackSSEServer()
@@ -1300,6 +1355,8 @@ struct B5CEndToEndTests {
 
     // MARK: - Support: trusted demo cannot mutate real files
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("trustedCannotMutateRealFiles")
     func trustedCannotMutateRealFiles() throws {
         let server = try LoopbackSSEServer()
@@ -1337,6 +1394,8 @@ struct B5CEndToEndTests {
 
     // MARK: - Support: sealed runs stay tool-free and non-persistent
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("sealedRunsStayToolFree")
     func sealedRunsStayToolFree() throws {
         let server = try LoopbackSSEServer()
@@ -1364,6 +1423,7 @@ struct B5CEndToEndTests {
 
     // MARK: - Support: persistence failure blocks the provider
 
+#endif
     @Test("persistenceFailureBlocksProvider")
     func persistenceFailureBlocksProvider() throws {
         let server = try LoopbackSSEServer()

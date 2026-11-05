@@ -2,6 +2,17 @@ import Testing
 import AsyncHTTPClient
 import Foundation
 
+
+// SOCK_STREAM is a typed enum on Glibc (needs .rawValue) but a plain
+// Int32 constant in Darwin.
+private func sockStreamType() -> Int32 {
+#if canImport(Glibc)
+    return Int32(SOCK_STREAM.rawValue)
+#else
+    return SOCK_STREAM
+#endif
+}
+
 /// NET-04 primitive tier — transport cancellation over the production HTTP
 /// client. Given an in-flight request against a synthetic loopback server
 /// that has received the request but will never respond, when the operator
@@ -79,7 +90,7 @@ private final class SyntheticLoopbackServer: @unchecked Sendable {
     var threadExited: Bool { lifetime.exited }
 
     init() throws {
-        listenFD = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        listenFD = socket(AF_INET, sockStreamType(), 0)
         guard listenFD >= 0 else { throw TestServerError.socketFailed }
         let boundPort = try bindTestServerSocket(listenFD)
         var pipeFDs: [Int32] = [-1, -1]
@@ -233,7 +244,7 @@ private func raceToCompletion(
 /// A loopback port with nothing listening: bind, read the port back, close.
 /// Connecting there fails fast with connection-refused (no cancellation).
 private func bindThenCloseLoopbackPort() throws -> UInt16 {
-    let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+    let fd = socket(AF_INET, sockStreamType(), 0)
     guard fd >= 0 else { throw TestServerError.socketFailed }
     let port = try bindTestServerSocket(fd)
     close(fd)

@@ -1386,6 +1386,93 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
     /// already-validated open directory FD via fchdir (nil: inherit).
     /// Both are internal so GitDiff reuses this runner without duplicating
     /// the fork/exec/drain/escalation machinery.
+#if !canImport(Glibc)
+    /// Darwin spawn primitive (M4-A PORT-02 shim). fork() is unavailable in
+    /// the Swift overlay, so the child setup that fork+execve performs —
+    /// stdio wiring, default signal dispositions, own process group — is
+    /// expressed as posix_spawn file actions + spawn attributes instead.
+    /// Everything downstream (drain, escalation, reaping) operates on the
+    /// returned pid unchanged.
+    ///
+    /// Deliberate deltas vs the fork path (all fail-closed, recorded in the
+    /// M4-A receipt): no fchdir pinning (no set-cwd primitive on the macOS
+    /// 14 floor — a non-nil cwdFD refuses); no fd-bound exec (no
+    /// /proc/self/fd or /dev/fd TOCTOU-safe equivalent — callers pass plain
+    /// resolved paths on Darwin); setsid has no spawn equivalent, so a
+    /// session child becomes a process-group leader instead (kill(-pgid)
+    /// escalation is unaffected; there is no controlling terminal in the
+    /// pipe-only contexts this runner serves). posix_spawn reports exec
+    /// failure synchronously via its return code; success means the image
+    /// executed, which subsumes the fork path's 0x01 marker protocol.
+    private static func posixSpawnDarwin(
+        executablePath: String,
+        argv: [UnsafeMutablePointer<CChar>?],
+        envp: [UnsafeMutablePointer<CChar>?],
+        outW: Int32, errW: Int32,
+        cwdFD: Int32?, useSession: Bool
+    ) throws -> pid_t {
+        if cwdFD != nil {
+            throw ToolFailure.preDispatch(status: "failed", summary: "spawn failed: cwd pinning unavailable on Darwin (no fchdir-in-spawn)")
+        }
+        var actions: posix_spawn_file_actions_t?
+        var attrs: posix_spawnattr_t?
+        // Separate init steps with paired cleanup: a failed attr init must
+        // still destroy the initialized file actions.
+        guard posix_spawn_file_actions_init(&actions) == 0 else {
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg spawn failed: actions init")
+        }
+        guard posix_spawnattr_init(&attrs) == 0 else {
+            posix_spawn_file_actions_destroy(&actions)
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg spawn failed: spawn init")
+        }
+        defer {
+            posix_spawn_file_actions_destroy(&actions)
+            posix_spawnattr_destroy(&attrs)
+        }
+        // Stdio wiring (mirrors the fork-child dup2 block).
+        guard posix_spawn_file_actions_adddup2(&actions, outW, STDOUT_FILENO) == 0,
+              posix_spawn_file_actions_adddup2(&actions, errW, STDERR_FILENO) == 0 else {
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg spawn failed: file actions")
+        }
+        // Close-everything-else (mirrors the fork-child close loop): fds
+        // not named by file actions close at exec.
+        // Signal defaults (mirrors the fork-child signal() resets).
+        var sigdefault = sigset_t()
+        sigemptyset(&sigdefault)
+        sigaddset(&sigdefault, SIGINT)
+        sigaddset(&sigdefault, SIGTERM)
+        sigaddset(&sigdefault, SIGPIPE)
+        guard posix_spawnattr_setsigdefault(&attrs, &sigdefault) == 0 else {
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg spawn failed: sigdefault")
+        }
+        var flags = Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF)
+        if useSession {
+            // Own process group (no setsid equivalent under spawn; the
+            // group boundary is what escalation signals).
+            flags |= Int16(POSIX_SPAWN_SETPGROUP)
+            guard posix_spawnattr_setpgroup(&attrs, 0) == 0 else {
+                throw ToolFailure.preDispatch(status: "failed", summary: "rg spawn failed: setpgroup")
+            }
+        }
+        guard posix_spawnattr_setflags(&attrs, flags) == 0 else {
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg spawn failed: setflags")
+        }
+        var pid: pid_t = 0
+        let rc = argv.withUnsafeBufferPointer { abuf in
+            envp.withUnsafeBufferPointer { ebuf in
+                executablePath.withCString { pathC in
+                    posix_spawn(&pid, pathC, &actions, &attrs, abuf.baseAddress!, ebuf.baseAddress!)
+                }
+            }
+        }
+        guard rc == 0 else {
+            var buf = [CChar](repeating: 0, count: 256)
+            _ = strerror_r(rc, &buf, buf.count)
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg spawn failed: \(String(cString: buf))")
+        }
+        return pid
+    }
+#endif
     static func runBounded(executablePath: String, args: [String], stdoutCap: Int, stderrCap: Int, timeout: TimeInterval, env: [String: String] = sanitizedSearchEnv, cwdFD: Int32? = nil, execPath: String? = nil, useSession: Bool = false) throws -> BoundedRunResult {
         try Task.checkCancellation()
         // Snapshot test hooks into locals BEFORE fork: the child below must
@@ -1460,7 +1547,26 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
 #if canImport(Glibc)
         pid = Glibc.fork()
 #else
-        pid = Darwin.fork()
+        // Darwin: fork() is unavailable in the Swift overlay — spawn via
+        // posix_spawn (see posixSpawnDarwin). fd-bound exec has no Darwin
+        // equivalent and fails closed here (digest-approved exec is already
+        // refused on non-Glibc at the ExecRunner gate).
+        if execPath != nil {
+            close(outR); close(errR); close(outW); close(errW)
+            close(errPipeRead); close(errPipeWrite)
+            Self.spawnLock.unlock()
+            throw ToolFailure.preDispatch(status: "failed", summary: "rg spawn failed: fd-bound exec unavailable on Darwin")
+        }
+        do {
+            pid = try Self.posixSpawnDarwin(
+                executablePath: executablePath, argv: argv, envp: envp,
+                outW: outW, errW: errW, cwdFD: cwdFD, useSession: useSession)
+        } catch {
+            close(outR); close(errR); close(outW); close(errW)
+            close(errPipeRead); close(errPipeWrite)
+            Self.spawnLock.unlock()
+            throw error
+        }
 #endif
         if pid < 0 {
             let e = errno
@@ -1680,6 +1786,7 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         // possibly zeroed); a bare [0x01] or no bytes at all stays
         // inconclusive and the main deadline/reap machinery decides
         // (timeout ⇒ unknown+hold, never a fabricated success).
+#if canImport(Glibc)
         do {
             var errBytes: [UInt8] = []
             errBytes.reserveCapacity(8)
@@ -1753,6 +1860,12 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                 execStarted = true
             }
         }
+#else
+        // Darwin: posix_spawn returns 0 only after the image executes, so a
+        // successful spawn IS the started signal — no marker protocol needed.
+        // Spawn failure already threw pre-dispatch above.
+        execStarted = true
+#endif
         // Close the read end after classification (defer close)
         close(errPipeRead)
         var outData = Data()
@@ -1900,8 +2013,13 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
                     st = st2
                 } else if wr < 0 && errno == ECHILD {
                     childDone = true
-                    reaped = true
-                    unsafeToSignal = true
+                    // Already reaped by us above: ECHILD is the expected steady
+                    // state, not a hazard. Only a first-observation ECHILD
+                    // (reaped elsewhere — lifecycle unknowable) is unsafe.
+                    if !reaped {
+                        reaped = true
+                        unsafeToSignal = true
+                    }
                 }
             }
 #endif
@@ -2153,7 +2271,18 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         // main launch so both execute the qualified inode.
         let rgFD = try qualifiedRgFD()
         defer { close(rgFD) }
+#if canImport(Glibc)
         let rgExec = Self.fdProcPath(rgFD)
+#else
+        // Darwin: /dev/fd execution is refused by the kernel, so spawn the
+        // validated absolute path. Open-time checks (non-symlink, dev/ino
+        // pinned at open) still hold; only the exec-time binding degrades
+        // from fd to path (M4-A G1 limitation). qualifiedRgFD already
+        // refused a missing rgPath; this guard is belt-and-braces.
+        guard let rgExec = rgPath else {
+            throw ToolFailure.preDispatch(status: "denied", summary: "rg not provisioned")
+        }
+#endif
         do {
             try rgVersionGate(execPath: rgExec)
         } catch is CancellationError {
@@ -2228,7 +2357,20 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
             }
             _ = fcntl(f, F_SETFD, 0)
             heldRootFDs.append(f)
+#if canImport(Glibc)
             return Self.fdProcPath(f)
+#else
+            // Darwin: /dev/fd directory traversal is refused by the kernel,
+            // so resolve the validated fd to its canonical path. The fd was
+            // validated at open (O_NOFOLLOW, device/inode binding); only the
+            // child-side binding degrades from fd to path (M4-A G1). F_GETPATH
+            // returns the fully resolved path, so no symlink can smuggle in.
+            var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            guard fcntl(f, F_GETPATH, &buf) == 0 else {
+                throw ToolFailure.preDispatch(status: "failed", summary: "fd path resolution failed")
+            }
+            return String(cString: buf)
+#endif
         }
         if let searchPath = json["path"] as? String, !searchPath.isEmpty {
             let cls = ToolValidator.protectedClassification(for: searchPath)

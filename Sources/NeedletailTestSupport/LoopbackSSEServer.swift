@@ -109,8 +109,15 @@ public final class LoopbackSSEServer: @unchecked Sendable {
     }
 
     public init() throws {
+#if os(Linux) || os(macOS)
+        // BSD sockets are identical on Linux and Darwin; only the SOCK_STREAM
+        // spelling differs (typed enum on Glibc, plain Int32 on Darwin).
 #if os(Linux)
-        let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        let sockType = Int32(SOCK_STREAM.rawValue)
+#else
+        let sockType = SOCK_STREAM
+#endif
+        let fd = socket(AF_INET, sockType, 0)
         guard fd >= 0 else { throw LoopbackError.socketFailed }
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))

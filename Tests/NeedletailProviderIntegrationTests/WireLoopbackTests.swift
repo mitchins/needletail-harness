@@ -41,11 +41,17 @@ struct WireLoopbackTests {
             server: server, alias: alias, messages: messages, credential: credential)
         // Unwind-safe: a throwing invoke must still drain the client or
         // AHC traps on un-shut-down deinit and masks the real failure.
-        defer { await LoopbackFixtures.shutdown(transport.client) }
-        let result = try await transport.invoke(
-            LoopbackFixtures.invocation(alias: alias),
-            intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
-        return (result.response, server.requests, server.connectionCount)
+        // No `defer` for the shutdown (await-in-defer needs Swift 6.2+).
+        do {
+            let result = try await transport.invoke(
+                LoopbackFixtures.invocation(alias: alias),
+                intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
+            await LoopbackFixtures.shutdown(transport.client)
+            return (result.response, server.requests, server.connectionCount)
+        } catch {
+            await LoopbackFixtures.shutdown(transport.client)
+            throw error
+        }
     }
 
     @Test("WIRE-01 byte-split delivery assembles identically end to end")

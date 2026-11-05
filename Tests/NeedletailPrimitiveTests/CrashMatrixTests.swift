@@ -451,8 +451,11 @@ struct CrashMatrixTests {
             effectiveCaps: caps, route: route)
     }
 
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("STORE-02 sqlite kill before intent commit leaves nothing")
     func STORE_02_sqliteKillBeforeIntentCommitLeavesNothing() throws {
+        // Same harness dependency as the other staging tests: the child
+        // re-invokes the test bundle (no swift-testing protocol on macOS).
         try Self.withKilledChild(stage: "s1") { directory, dbPath in
             // Private fixture root (hermetic even on shared /tmp).
             let dirAttrs = try FileManager.default.attributesOfItem(atPath: directory.path)
@@ -478,7 +481,10 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
 
+
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("STORE-02 sqlite kill after intent commit holds unknown")
     func STORE_02_sqliteKillAfterIntentCommitHoldsUnknown() throws {
         try Self.withKilledChild(stage: "s2") { directory, dbPath in
@@ -495,7 +501,10 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
 
+
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("STORE-02 sqlite kill after side effect holds without redispatch")
     func STORE_02_sqliteKillAfterSideEffectHoldsWithoutRedispatch() throws {
         try Self.withKilledChild(stage: "s3") { directory, dbPath in
@@ -530,7 +539,10 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
 
+
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("STORE-02 sqlite kill before result commit derives uncertainty")
     func STORE_02_sqliteKillBeforeResultCommitDerivesUncertainty() throws {
         try Self.withKilledChild(stage: "s4") { directory, dbPath in
@@ -570,7 +582,10 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
 
+
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("STORE-02 sqlite kill after result commit survives complete")
     func STORE_02_sqliteKillAfterResultCommitSurvivesComplete() throws {
         try Self.withKilledChild(stage: "s5") { directory, dbPath in
@@ -593,7 +608,10 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
 
+
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("STORE-02 sqlite interrupted artifact tmp reports no reference")
     func STORE_02_sqliteInterruptedArtifactTmpReportsNoReference() throws {
         try Self.withKilledChild(stage: "s6") { directory, dbPath in
@@ -609,7 +627,10 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
 
+
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("STORE-02 sqlite renamed artifact without reference is orphan")
     func STORE_02_sqliteRenamedArtifactWithoutReferenceIsOrphan() throws {
         try Self.withKilledChild(stage: "s7") { _, dbPath in
@@ -631,7 +652,10 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
 
+
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("STORE-02 sqlite committed artifact reference reads verified")
     func STORE_02_sqliteCommittedArtifactReferenceReadsVerified() throws {
         try Self.withKilledChild(stage: "s8") { _, dbPath in
@@ -654,6 +678,8 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
+
 
     @Test("in-memory contrast cannot prove kill survival")
     func inMemoryContrastCannotProveKillSurvival() throws {
@@ -676,6 +702,7 @@ struct CrashMatrixTests {
         #expect(memPage.count == 2, "in-memory ledger completes with no kill involved")
     }
 
+#if canImport(Glibc) // staging child re-invocation of the test bundle has no swift-testing protocol on macOS (M4-A test-harness gap)
     @Test("PORT-04 sqlite native kill reopen leg must execute")
     func PORT_04_sqliteNativeKillReopenLegMustExecute() throws {
         // PORT-04 native leg, and ONLY the native leg: a REAL child dies
@@ -695,4 +722,6 @@ struct CrashMatrixTests {
             try Self.assertWritableAfterReopen(dbPath: dbPath)
         }
     }
+#endif
+
 }

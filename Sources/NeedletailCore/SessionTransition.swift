@@ -400,22 +400,31 @@ private func integrityStop<I: IDSource>(_ state: SessionState, ids: inout I) -> 
 }
 
 public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent, _ ids: inout I) -> Transition {
+    // Terminal revive without self-recursion (M4-A G13): operator input on
+    // a terminal phase implicitly acknowledges the receipt and re-enters
+    // as a fresh admission. The former direct self-recursion stacked two
+    // of this very large function's frames and overflowed Darwin
+    // cooperative-pool thread stacks (deterministic SIGBUS on x86_64
+    // Swift 6.3.3; Linux pool threads survived it). Shadowing the
+    // parameters keeps every row below unchanged; the loop revives at most
+    // once per call (idle is non-terminal). Equivalent by construction:
+    // checkStale has no operatorInput* row, so skipping its pre-revive
+    // evaluation changes nothing, and all other event/phase pairs break
+    // out immediately with the original values.
+    var state = state
+    reviveLoop: while state.phase.isTerminal {
+        switch event {
+        case .operatorInput, .operatorInputAttachments:
+            state = state.replacing(phase: .idle)
+        default:
+            break reviveLoop
+        }
+    }
     // Universal stale-drop for async events mismatching the live run
     // (R1/R3/M1B2-4): runID, requestID, generation, revision AND effect
     // consumption are ALL checked before any row below runs.
     if let stale = checkStale(state, event, &ids) {
         return stale
-    }
-    // Terminal phases: operator input implicitly acknowledges the receipt
-    // and re-enters as a fresh admission (exactly once — the recursive call
-    // lands on an idle row and terminates).
-    if state.phase.isTerminal, case .operatorInput = event {
-        return transition(state.replacing(phase: .idle), event, &ids)
-    }
-    // M2-D D2: attachment-carrying input recurses the same way (fresh
-    // admission once idle; the snapshots ride the event).
-    if state.phase.isTerminal, case .operatorInputAttachments = event {
-        return transition(state.replacing(phase: .idle), event, &ids)
     }
     // M2-D D2: exclusive compensation phase. While an undo command owns
     // the session, dispatch-adjacent and meta work is refused loudly;

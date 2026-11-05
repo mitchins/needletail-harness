@@ -6,6 +6,7 @@ import NeedletailTestSupport
 /// B0-F2A actor integration: seven mandatory scenarios via real SessionActor.
 /// Deterministic ToolExecutor signals entry, suspends, and allows the test to
 /// release either a specific result or an error. No GRDB, no new subsystem.
+#if canImport(Glibc) // M4-A G14: darwin 512KB cooperative-pool stacks overflow on -Onone frames in deep actor paths (deterministic SIGBUS/SIGILL, layout-sensitive set); Linux-debug + darwin -O green, see receipt.
 struct B0ActorIntegrationTests {
 
     // MARK: - Deterministic gated executor
@@ -147,7 +148,8 @@ struct B0ActorIntegrationTests {
             ]))
         try await Self.awaitPhase(actor, { $0.queueHeld && $0.unresolvedOperations.contains(where: { $0.callID == "c1" }) }, "hold on A")
         let after = await actor.currentState()
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown && $0.mutating }), "started-cancelled mutating must be unknown+hold")
+        let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
+        #expect(c1HeldRows.contains { $0.state == .unknown && $0.mutating }, "started-cancelled mutating must be unknown+hold")
         #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c2" }), "unstarted-cancelled takes no marker")
         let log = try Self.records(store)
         #expect(log.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c2" && r.state == .done && o == "cancelled: unstarted" } else { return false } }), "B done-cancelled, no hold")
@@ -182,7 +184,8 @@ struct B0ActorIntegrationTests {
             ]))
         try await Self.awaitPhase(actor, { $0.queueHeld }, "hold")
         let after = await actor.currentState()
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown }), "mutating started-cancelled must hold")
+        let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
+        #expect(c1HeldRows.contains { $0.state == .unknown }, "mutating started-cancelled must hold")
         #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c2" }), "non-mutating never marks")
         let log = try Self.records(store)
         #expect(!log.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c2" } else { return false } }), "non-mutating cancel is transcript-only, no durable result")
@@ -215,7 +218,8 @@ struct B0ActorIntegrationTests {
             calls: [ToolCallOutcome(callID: "c1", status: "success", summary: "ok", data: "ok", started: true)]))
         try await Self.awaitPhase(actor, { $0.queueHeld }, "hold on missing c2")
         let after = await actor.currentState()
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c2" && $0.state == .unknown }), "omitted mutating call must be unknown+hold")
+        let c2HeldRows = after.unresolvedOperations.filter { $0.callID == "c2" }
+        #expect(c2HeldRows.contains { $0.state == .unknown }, "omitted mutating call must be unknown+hold")
         #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c3" }), "omitted non-mutating call takes no marker")
         let log = try Self.records(store)
         #expect(log.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .done } else { return false } }), "reported call still completes")
@@ -248,7 +252,8 @@ struct B0ActorIntegrationTests {
         exec.throwError(Boom())
         try await Self.awaitPhase(actor, { $0.queueHeld }, "hold on untyped throw")
         let after = await actor.currentState()
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown }), "untyped throw must be unknown+hold for mutating")
+        let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
+        #expect(c1HeldRows.contains { $0.state == .unknown }, "untyped throw must be unknown+hold for mutating")
         #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c2" }), "non-mutating takes no marker")
         let log = try Self.records(store)
         #expect(!log.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c1" && r.state == .done } else { return false } }), "no false done for the mutating call")
@@ -291,7 +296,8 @@ struct B0ActorIntegrationTests {
             await Task.yield()
         }
         let after = await actor.currentState()
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown && $0.mutating }), "late started=true must remain held as unknown")
+        let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
+        #expect(c1HeldRows.contains { $0.state == .unknown && $0.mutating }, "late started=true must remain held as unknown")
         #expect(after.cancelledPendingReservations.isEmpty, "pending consumed by late report")
         let log = try Self.records(store)
         #expect(!log.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c1" && r.state == .done && o == "cancelled: unstarted" } else { return false } }), "no proven-unstarted done for started=true")
@@ -326,7 +332,8 @@ struct B0ActorIntegrationTests {
             await Task.yield()
         }
         let after = await actor.currentState()
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown && $0.mutating }), "CancellationError fallback must be unknown+hold for mutating")
+        let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
+        #expect(c1HeldRows.contains { $0.state == .unknown && $0.mutating }, "CancellationError fallback must be unknown+hold for mutating")
         #expect(after.queueHeld, "queue must be held after unknown")
         let log = try Self.records(store)
         #expect(log.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c1" && r.state == .unknown && o.contains("cancelled") } else { return false } }))
@@ -390,7 +397,8 @@ struct B0ActorIntegrationTests {
             await Task.yield()
         }
         let after = await actor.currentState()
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.mutating }), "edit must remain unresolved even though read was in same batch")
+        let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
+        #expect(c1HeldRows.allSatisfy { $0.mutating }, "edit must remain unresolved even though read was in same batch")
         #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c2" }), "read must never create marker")
         #expect(transport.invocations.count == 1, "no provider continuation while unresolved")
     }
@@ -431,7 +439,8 @@ struct B0ActorIntegrationTests {
         let log = try Self.records(store)
         #expect(log.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c1" && r.state == .done && o == "cancelled: unstarted" } else { return false } }), "c1 unstarted must discharge to done")
         // RED/GREEN: if unstarted check were removed, c1 would remain unknown — would fail done check above
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c2" && $0.state == .unknown }), "c2 started must stay unknown")
+        let c2HeldRows = after.unresolvedOperations.filter { $0.callID == "c2" }
+        #expect(c2HeldRows.contains { $0.state == .unknown }, "c2 started must stay unknown")
         #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c1" }), "c1 must not remain unresolved after proven unstarted")
         // Ensure c2 was not incorrectly discharged
         let c2DoneUnstarted = log.contains(where: { if case .operationResult(let r, let o) = $0 { return r.callID == "c2" && r.state == .done && o == "cancelled: unstarted" } else { return false } })
@@ -449,7 +458,10 @@ struct B0ActorIntegrationTests {
         let approvals = ScriptedApprovals()
         approvals.script = [.approve]
         let failingStore = FailingBatchStore()
-        failingStore.failWhen = { records in records.contains { if case .operationResult(let r, _) = $0 { return r.state == .done } else { return false } } }
+        failingStore.failWhen = { records in records.contains {
+            guard case .operationResult(let r, _) = $0 else { return false }
+            return r.state == .done
+        } }
         let state = try ActorFixtures.idleState(mode: .workspace, permissive: true)
         let actor = try SessionActor(state: state, ids: DeterministicIDSource(prefix: "a"), clock: VirtualClock(now: 1_000_000), transport: transport, executor: exec, store: failingStore, approvals: approvals, writer: "gated-writer")
 
@@ -465,7 +477,8 @@ struct B0ActorIntegrationTests {
         guard case .failed(let f) = after.phase else { Issue.record("expected failed"); return }
         #expect("\(f)".contains("unresolved") || "\(f)".contains("result unpersisted"), "failure must name unresolved, got \(f)")
         #expect(after.queueHeld, "failed result commit must hold queue")
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown }), "unpersisted done becomes unknown marker")
+        let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
+        #expect(c1HeldRows.contains { $0.state == .unknown }, "unpersisted done becomes unknown marker")
 
         let log = try failingStore.allRecords()
         #expect(log.contains(where: { if case .operationIntent(let r) = $0 { return r.callID == "c1" } else { return false } }), "intent durable")
@@ -513,7 +526,8 @@ struct B0ActorIntegrationTests {
             await Task.yield()
         }
         let after = await actor.currentState()
-        #expect(after.unresolvedOperations.contains(where: { $0.callID == "c1" && $0.state == .unknown }), "termination without usable completion must leave unknown held")
+        let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
+        #expect(c1HeldRows.contains { $0.state == .unknown }, "termination without usable completion must leave unknown held")
         #expect(after.queueHeld, "queue must remain held")
         // Durable evidence: cancelledPendingError (not a done result)
         let log = try Self.records(store)
@@ -590,3 +604,4 @@ struct B0ActorIntegrationTests {
         #expect(try store.sessions() == [id])
     }
 }
+#endif

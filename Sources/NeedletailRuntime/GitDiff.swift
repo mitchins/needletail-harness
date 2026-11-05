@@ -69,8 +69,20 @@ public enum GitDiff {
     ///   - gitPath: absolute path to the git executable (nil → missingGit).
     ///   - timeout: wall-clock budget (default 120 s).
     public static func run(workspace: URL, gitPath: String?, timeout: TimeInterval = defaultTimeoutSeconds) throws -> Output {
+        // Git-binary qualification runs on every platform BEFORE the Darwin
+        // refusal below, so provisioning errors (missingGit, symlink,
+        // world-writable, ...) surface identically on Linux and Darwin; only
+        // the actual pinned-cwd spawn denies. (M4-A review: denial ordering.)
         let gitFD = try qualifiedGitFD(gitPath: gitPath)
         defer { close(gitFD) }
+#if !canImport(Glibc)
+        // M4-A G-cwd: the repo is pinned via an open directory FD and the
+        // child enters it with fchdir; Darwin's posix_spawn has no fchdir
+        // action, so the pinned-cwd spawn is unavailable there. Deny typed
+        // (Failure.denied → CLI exit 4 "diff unavailable") instead of
+        // letting the generic spawn failure surface as an untyped error.
+        throw Failure.denied("git diff requires cwd pinning, unavailable on Darwin")
+#else
         let dirFD = try validatedDirFD(workspace: workspace)
         defer { close(dirFD) }
         let gitExec = NativeToolExecutor.fdProcPath(gitFD)
@@ -99,6 +111,7 @@ public enum GitDiff {
             throw Failure.failed("git diff failed: \(detail)")
         }
         return Output(stdout: run.stdout, stderr: run.stderr, truncated: run.stdoutTruncated)
+#endif
     }
 
     // MARK: - Workspace pinning
