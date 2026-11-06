@@ -392,4 +392,108 @@ G13/G14 stack-limitation evidence (all Darwin-native, x86_64):
   Actor 2/2, Boundary 6/6, B5C 22/22, ProductionCLI 9/9 (C3 binary legs,
   D3, B0Spine `-O` runs pending — Linux-debug green stands in;
   macbuild host went unreachable 2026-11-07 before these three could
-  run — see host note below).
+  run — see §12 host note).
+
+## 12. Final qualification attempt 2026-11-06 UTC (SHA `96eaeda`, BLOCKED)
+
+Tree: `96eaeda2433ef9c0b6f0601f28e502473bbbe7e6` (branch `m4-a`,
+local-only), working tree clean. No code changes in this slice
+(receipt-only); DeepSeek READY stands, no re-review launched.
+
+Host note (the "below" §11 points at): macbuild `build@192.168.2.106`
+is unreachable at L2 — `ping` 100% loss, `ssh` "No route to host",
+`tracepath` ends `!H` at gateway 192.168.1.1, no ARP entry for .106.
+The local segment is healthy (peer 192.168.2.216 answers in <1 ms on
+`enp9s0`; gateway answers). No VPN/tunnel interfaces exist on this
+machine. A port-22 sweep of 192.168.1.0/24 found only unrelated Linux
+lab hosts (no macOS SSH banner). The host is powered off, crashed, or
+disconnected — same outage §4/§5 record, not returned. NO other macOS
+host exists in this environment (`uname -a`: Linux betalab 7.0.0-38).
+Conclusion: §1 (D3/B0Spine/C3 `-O`, final-tree keepers, G13 re-verify)
+is NOT executable here. Nothing from earlier trees is carried forward
+as final-tree qualification: the pending items remain pending.
+
+§1 status (all unexecuted, none waived):
+- D3 optimized: not run (Linux-debug green stands in, unexecuted).
+- B0Spine optimized: not run (Linux-debug green stands in).
+- C3 optimized (13 G14 legs): not run (Linux-debug green stands in).
+- Final-tree keeper re-verification (C2/B2/B3/C1/DX/Wire/Net keepers
+  on the committed tree incl. c59401c/96eaeda assertion+gate fixes):
+  not run on Darwin (Linux green, §12 gate below).
+- G13 loop-revive re-verify on final tree: not run on Darwin.
+  Static check only: `transition` has exactly one definition
+  (`SessionTransition.swift:402`), zero self-call sites — the
+  recursion is structurally absent; Linux behavior identical
+  (full gate green, no test change needed).
+
+G14 adjudication (static, exact — no Darwin reruns possible, none
+substituted):
+- Inventory verified against code: 8 suite-level G14 gates (B0, B1,
+  TOOL09, Timer, Actor, Boundary, D3, B0Spine — test-process crashers,
+  0 run each on Darwin-debug) + 39 per-test G14 gates (B5C 19, C3 13,
+  ProductionCLI 7 — debug-child crashers, test process survives) +
+  C3 5 G1 + B5C TOOL_10 G-cwd + B5C PORT_03 + keepers (B5C 3,
+  ProductionCLI 2, C2 21, TOOL10 8, B2 27, B3 30, C1 8, DX/Wire/Net).
+  Every gate comment states its mechanism; counts match §§3/5.
+- Mechanism split is precise, not blanket: suite gates exist ONLY
+  where the runner process itself dies (a per-test gate cannot survive
+  process death); per-test gates everywhere else. All gates are
+  Darwin-only (`#if canImport(Glibc)`); Linux runs everything.
+- Classification truthful: failing sequences are proven correct code
+  (Linux-debug green everywhere + Darwin `-O` green for 6/8 suites,
+  B5C, ProductionCLI — same product code, test-only gates lifted).
+  Failure requires Darwin-debug specifically (512 KiB pool stacks ×
+  `-Onone` frame bloat). No shipped configuration (`-c release`)
+  has ever demonstrated the failure; the one implicated production
+  path (G13 self-recursion) was fixed as product change P7, which
+  REMOVED an exclusion rather than adding one. G14 adds zero product
+  code (diff `0614491..HEAD -- Sources/`: one 5-line comment).
+- No gated test is recorded PASS: §§3/5 record "0 run"; `-O`
+  results are labeled evidence ("behavior qualified"), never pass
+  claims. The §3 line "every G14 exclusion with -O evidence ...
+  passes optimized" refers to the excluded BEHAVIOR under `-O`,
+  not to the debug tests.
+- Targeted-reproduction caveat: fresh crash evidence (samples,
+  stack measurements) is NOT obtainable without the host; the §11
+  evidence stands as recorded run evidence (11-06 sessions), not
+  re-derived here. Adjudication here is inventory + mechanism +
+  labeling verification, which is complete.
+- Pre-existing honesty gap retained: D3/B0Spine/C3 `-O` runs are the
+  only unexecuted leg of the triangulation for those three suites.
+
+Linux gate at final SHA (this slice, no model traffic):
+- `./dev test offline` → **OFFLINE OK: all scheduled offline layers
+  passed** (0 FAIL lines), plus `./dev vendor-check` → VENDOR OK
+  (offline + clone). Tree clean before and after.
+- Incident: the first full-gate attempt FAILed ONLY in the
+  coverage-evidence bulk lane: `TOOL_05_concurrentEdits` (B3, 5
+  issues — a double-failure interleaving: artifact-verify fail +
+  lock contention, zero clean winners). Same test passed 2× earlier
+  in that same run (quick + native lanes), 3× standalone, and 1× in
+  an isolated bulk-lane retry (266/266 pass) — 6 passes vs 1 failure
+  under bulk+coverage scheduling perturbation. Product stayed
+  fail-closed in every branch (no silent corruption/lost update);
+  zero product-code changes exist in this tree to implicate. The
+  second FULL `./dev test offline` run is green end-to-end (the
+  flake did not recur — 7th consecutive pass). Recorded as
+  environmental timing flake, consistent with the ./dev FINAL-02/03
+  notes on bulk-lane scheduler contention; test strictness
+  (exactly-one-winner) intentionally unchanged.
+
+Verdict: **M4-A BLOCKED** — scope precisely:
+- QUALIFIED-requirements met: Linux offline gate green at final SHA,
+  vendor-check green, G14 classified truthfully with exact inventory,
+  no demonstrated production portability blocker (G13 fixed; G14
+  confined to Darwin-debug with dual-platform behavioral evidence
+  except the three pending `-O` legs).
+- QUALIFIED-requirements unmet (all host-dependent): D3/B0Spine/C3
+  `-O` runs, final-tree Darwin keeper evidence, final-tree Darwin
+  G13 re-verify.
+- Unblock condition: macbuild (or any Intel macOS host with Xcode
+  26.x/Swift 6.3.x) returns → sync tree at `96eaeda` (or its
+  successor if the keeper re-verify forces changes), run the §1
+  battery with command lines + exit codes + host identity recorded,
+  then QUALIFIED can be declared without further review iff all
+  green and no code changes result.
+- STOP honored: no M4-B/C/D, no push/PR/merge (branch local-only),
+  no model traffic (M3A live-gated, none invoked).
