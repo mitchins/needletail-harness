@@ -1027,7 +1027,7 @@ struct B5CEndToEndTests {
         #expect(!FileManager.default.fileExists(atPath: fsMarker), "repo fsmonitor hook neutralized")
         #expect(!String(decoding: errData, as: UTF8.self).contains("HACKED"))
     }
-#endif // git diff pins the repo via an open directory FD; Darwin has no
+#endif // G-cwd: fchdir-in-spawn unavailable on Darwin
 
 
     private static func locateGit() throws -> String {
@@ -1212,7 +1212,7 @@ struct B5CEndToEndTests {
             #expect(combined.contains(marker), "distinct file \(marker) returned")
         }
     }
-#endif // APFS default volumes are case-insensitive and normalize Unicode:
+#endif // PORT-03: needs case-sensitive filesystem
 
 
     // MARK: - Support: backend selection denies unadvertised exec

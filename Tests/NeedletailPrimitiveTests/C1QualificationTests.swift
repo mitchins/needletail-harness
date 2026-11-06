@@ -832,10 +832,11 @@ private struct TestError: Error, CustomStringConvertible {
 }
 
 // Shared within the PrimitiveTests target: thrown to skip a test whose
-// platform precondition is absent, with an explicit reason instead of a
-// silent pass. (Linux-only lifecycle tests now use compile-time
-// `#if canImport(Glibc)` gates instead; RequireSkip remains for
-// runtime-detected preconditions.)
+// platform precondition is absent at RUNTIME, with an explicit reason
+// instead of a silent pass. (Linux-only lifecycle tests now use
+// compile-time `#if canImport(Glibc)` gates instead, including the
+// x86_64/arm64 offset guard; RequireSkip remains for runtime-detected
+// preconditions.)
 struct RequireSkip: Error {
     let msg: String
     init(_ m: String) { msg = m }

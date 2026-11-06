@@ -159,8 +159,7 @@ by P7); G14 is new (this section, end).
 - **G1 exec fd-binding (load-bearing)**: digest-approved exec refuses
   closed on Darwin ("exec requires Linux"). Narrowed per review (§11)
   from whole-suite to per-test gates: C2ExecDurableTests runs 21/21
-  natively (20 per-test gates: 14 exec-spawning + 3 actor-spawning + 3 digest-actor-spawn found by the native re-run
-  paths + 3 actor-spawning via the digest path); the DIGEST-VERIFIED
+  natively (20 per-test gates: 17 G1 [14 exec-spawning incl. digest/cwd-pinned paths + 3 actor-spawning] + 3 G-exec digest-actor-spawn found by the native re-run); the DIGEST-VERIFIED
   exec guarantee remains Linux-qualified. C3 keeps its 5 G1 binary-test
   gates (fd-bound exec legs).
 - **G-cwd**: GitDiff pins the repo via an open dir FD (`fchdir` in child);
@@ -216,7 +215,7 @@ by P7); G14 is new (this section, end).
     qualified-by-Linux).
   - Child-process crashers (test process survives → per-test gates,
     keepers keep running): B5CEndToEndTests 19 run-driving binary legs
-    (3 early-denial keepers pass), C3ExecQualificationTests 13 binary
+    (3 early-denial keepers pass), C3ExecQualificationTests 18 binary
     legs (5 G1 + 13 G14 run-driving; 0 run on Darwin-debug),
     ProductionCLIWiringTests 7 run-driving tests (2 early-denial keepers
     pass).
@@ -298,7 +297,7 @@ by P7); G14 is new (this section, end).
   512 KiB cooperative-pool stacks + `-Onone` frame bloat overflow in
   deep actor paths and debug CLI children. Behavior is qualified by
   Linux-debug (all green) and Darwin-`-O` (all gated suites/tests
-  verified green except D3/B0Spine `-O`, pending). Not a product defect;
+  verified green except C3/D3/B0Spine `-O`, pending). Not a product defect;
   no M4-B blocker (lanes run Linux-debug; Darwin native lanes record
   G14 exclusions explicitly).
 
