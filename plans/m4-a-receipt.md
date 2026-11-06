@@ -61,22 +61,24 @@ Darwin `-O` green — evidence §11).
 | Suite (macOS, native x86_64, debug) | Result |
 |---|---|
 | ImportGate + PresentationGate + M3CProjectionLimitTests | 5 + 3 pass |
-| C2ExecDurableTests | 21/21 pass (17 per-test gates: 14 exec-spawn + 3 actor-spawn, G-exec) |
+| C2ExecDurableTests | 21/21 pass (20 per-test gates: 14 exec-spawn + 3 actor-spawn + 3 digest-actor-spawn found by native re-run, G-exec) |
 | TOOL10DiffTests | 8/8 pass (13 per-test gates: 10 spawn + 3 binary-diff legs, G-cwd) |
 | C3ExecQualificationTests | 0 run (18/18 gated: 5 G1 + 13 G14 child-run) |
-| B5CEndToEndTests | 3/22 run, pass (19 binary-run legs gated G14; TOOL_10 + PORT_03 pre-gated) |
+| B5CEndToEndTests | 3/24 run, pass (19 G14 binary-run legs + TOOL_10 G-cwd + PORT_03 PORT-03 section gates) |
 | ProductionCLIWiringTests | 2/9 run, pass (7 run-driving tests gated G14) |
 | B0ActorIntegrationTests / B1ContainmentTests / TOOL09OrderedBatchTests / TimerLoopbackTests / ActorLoopbackTests / BoundaryVerificationTests / D3IntegrationTests / B0SpineTests | 0 run each (G14 suite gates) |
 | B2ClosureTests / B2ReadSearchTests | 12/12 + 15/15 pass |
 | B3EditWriteTests | 30/30 pass |
-| C1QualificationTests | 8/8 pass |
+| C1QualificationTests | 8/23 run, pass (15 pre-existing Linux-only lifecycle gates: /proc offsets, group probe, crash staging) |
 | DX / Wire / NetLoopbackTests | 3 + 11 + 8 pass |
 | CrossRunGateTests | 20/20 pass |
 | M3AReplayLiveTests2 | 1/1 pass (rest live-gated, skipped) |
 
-Darwin `-O` (optimized) evidence, same sources: B0 12/12, B1 39/39,
+Darwin `-O` (optimized) evidence — same PRODUCT code as the committed
+tree (test-only `#if canImport(Glibc)` G14 gates lifted for these runs,
+since the gates exclude all configs on Darwin): B0 12/12, B1 39/39,
 TOOL09 13/13, TimerLoopback 2/2, ActorLoopback 2/2, BoundaryVerification
-6/6, B5C 22/22, ProductionCLI 9/9, C3 binary legs green — every G14
+6/6, B5C 22/22, ProductionCLI 9/9 — every G14 exclusion with -O evidence
 exclusion passes optimized (behavior qualified; debug frames are the
 limitation, §11).
 
@@ -157,7 +159,7 @@ by P7); G14 is new (this section, end).
 - **G1 exec fd-binding (load-bearing)**: digest-approved exec refuses
   closed on Darwin ("exec requires Linux"). Narrowed per review (§11)
   from whole-suite to per-test gates: C2ExecDurableTests runs 21/21
-  natively (17 per-test gates: 14 exec-spawning incl. digest/cwd-pinned
+  natively (20 per-test gates: 14 exec-spawning + 3 actor-spawning + 3 digest-actor-spawn found by the native re-run
   paths + 3 actor-spawning via the digest path); the DIGEST-VERIFIED
   exec guarantee remains Linux-qualified. C3 keeps its 5 G1 binary-test
   gates (fd-bound exec legs).
@@ -174,7 +176,7 @@ by P7); G14 is new (this section, end).
   B1 `port03CaseSensitive`, `port03UnicodeDistinct`,
   `r1LossySkeletonReadFailsLoud` + `b1CounterfactualUnicodeNormalization`
   (NFD open resolves on APFS), B3 `approvalTwin` (NFC/NFD twin),
-  B2Closure `nonUTF8Paths` (APFS rejects raw non-UTF-8 names), B5C
+  B2Closure `nonUTF8Paths` (APFS rejects raw non-UTF-8 names), `CLOSURE_01_explicitRootRace` + `CLOSURE_02_workspaceRootRace` (fd-bound search identity is Linux-only, G1), B5C
   `PORT_03_binaryCaseAndUnicodeDistinct`. Byte-exact path semantics are
   environment-conditional; documented, not claimed on macOS defaults.
 - **STORE-02 crash primitives**: macOS system sqlite (3.51.0) does not
@@ -203,18 +205,19 @@ by P7); G14 is new (this section, end).
   release` passes everything). This is a toolchain/platform harness
   limit, not a behavior defect: Linux-debug is green everywhere and
   Darwin-`-O` is green for every exclusion below.
-  - Test-process crashers (process dies, suite aborts → suite gates, set
-    verified on the final binary): B0ActorIntegrationTests,
-    B1ContainmentTests, TOOL09OrderedBatchTests, TimerLoopbackTests,
-    ActorLoopbackTests, BoundaryVerificationTests, D3IntegrationTests,
-    B0SpineTests — 0 tests run on Darwin-debug; 12+39+13+2+2+6+D3+B0Spine
-    Linux-debug green AND Darwin-`-O` green (B0/B1/TOOL09/Timer/Actor/
-    Boundary verified `-O` green this slice; D3/B0Spine `-O` pending
-    re-run — counted as qualified-by-Linux, `-O` evidence to complete).
+  - Test-process crashers (process dies, suite aborts → suite gates;
+    crashing suites identified on the post-rebuild binary, gate set
+    frozen for this tree state — see host note on rebuild sensitivity):
+    B0ActorIntegrationTests, B1ContainmentTests, TOOL09OrderedBatchTests,
+    TimerLoopbackTests, ActorLoopbackTests, BoundaryVerificationTests,
+    D3IntegrationTests, B0SpineTests — 0 tests run on Darwin-debug;
+    Linux-debug green for all; Darwin-`-O` green for B0/B1/TOOL09/Timer/
+    Actor/Boundary (D3/B0Spine `-O` pending host return — counted as
+    qualified-by-Linux).
   - Child-process crashers (test process survives → per-test gates,
     keepers keep running): B5CEndToEndTests 19 run-driving binary legs
     (3 early-denial keepers pass), C3ExecQualificationTests 13 binary
-    legs (5 G1 + 8 G14 run-driving; 0 run on Darwin-debug),
+    legs (5 G1 + 13 G14 run-driving; 0 run on Darwin-debug),
     ProductionCLIWiringTests 7 run-driving tests (2 early-denial keepers
     pass).
 - **Test-fix shims (not exclusions)**: B1 `b1SearchProtected`, B5C rg
@@ -385,7 +388,8 @@ G13/G14 stack-limitation evidence (all Darwin-native, x86_64):
   debug crashes are deep single-entry chains (cancel/failEffect paths,
   full CLI runs) overflowing the same 512 KiB — layout-sensitive
   (identical sources flip pass/fail across rebuilds), release-clean.
-- `-O` evidence (same tree): B0 12/12, B1 39/39, TOOL09 13/13, Timer 2/2,
+- `-O` evidence — same product code (test-only G14 gates lifted for
+  these runs): B0 12/12, B1 39/39, TOOL09 13/13, Timer 2/2,
   Actor 2/2, Boundary 6/6, B5C 22/22, ProductionCLI 9/9 (C3 binary legs,
   D3, B0Spine `-O` runs pending — Linux-debug green stands in;
   macbuild host went unreachable 2026-11-07 before these three could

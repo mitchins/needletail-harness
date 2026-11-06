@@ -975,13 +975,13 @@ struct B5CEndToEndTests {
         #expect(byCall["c1"] == "write ok.txt", "first write succeeds exactly")
         #expect(byCall["c2"] != "write trap", "second call fails honestly, never the success shape")
     }
+#endif
 
     // MARK: - TOOL-10 operator diff in dirty tree (direct CLI)
 
-#if !os(macOS)
+#if canImport(Glibc)
     // git diff pins the repo via an open directory FD; Darwin has no
     // fchdir-in-spawn, so cwd-pinned spawn fails closed (M4-A G-cwd).
-#endif
     @Test("TOOL_10_binaryDiffDirtyTree")
     func TOOL_10_binaryDiffDirtyTree() throws {
         let git = try Self.locateGit()
@@ -1166,14 +1166,14 @@ struct B5CEndToEndTests {
         let errBytes = Array(result.stderr.utf8)
         #expect(!errBytes.contains(0x1B), "no ESC byte on stderr either")
     }
+#endif
 
     // MARK: - PORT-03 case + Unicode-distinct filenames
 
-#if !os(macOS)
+#if canImport(Glibc)
     // APFS default volumes are case-insensitive and normalize Unicode:
     // distinct case/Unicode names collide, so this PORT-03 fixture needs
     // a case-sensitive filesystem (M4-A filesystem delta).
-#endif
     @Test("PORT_03_binaryCaseAndUnicodeDistinct")
     func PORT_03_binaryCaseAndUnicodeDistinct() throws {
         let server = try LoopbackSSEServer()

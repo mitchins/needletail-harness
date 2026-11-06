@@ -398,7 +398,7 @@ struct B0ActorIntegrationTests {
         }
         let after = await actor.currentState()
         let c1HeldRows = after.unresolvedOperations.filter { $0.callID == "c1" }
-        #expect(c1HeldRows.allSatisfy { $0.mutating }, "edit must remain unresolved even though read was in same batch")
+        #expect(c1HeldRows.contains { $0.mutating }, "edit must remain unresolved even though read was in same batch")
         #expect(!after.unresolvedOperations.contains(where: { $0.callID == "c2" }), "read must never create marker")
         #expect(transport.invocations.count == 1, "no provider continuation while unresolved")
     }

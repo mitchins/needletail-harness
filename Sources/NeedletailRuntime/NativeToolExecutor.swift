@@ -1436,6 +1436,11 @@ public struct NativeToolExecutor: ToolExecutor, ExecIdentityResolver, Sendable {
         }
         // Close-everything-else (mirrors the fork-child close loop): fds
         // not named by file actions close at exec.
+        // NOTE (M4-A): POSIX_SPAWN_CLOEXEC_DEFAULT also closes stdin in
+        // the child (the fork path inherits it). Harmless for the
+        // qualified search/exec uses (stdio is always wired to pipes
+        // here); recorded so a future stdin-inheriting caller knows to
+        // add an explicit file action.
         // Signal defaults (mirrors the fork-child signal() resets).
         var sigdefault = sigset_t()
         sigemptyset(&sigdefault)

@@ -561,7 +561,7 @@ struct TOOL09OrderedBatchTests {
         let log = try Self.allRecords(run.store, run.session)
         let done = Self.results(log)
         let c1Rows = done.filter { $0.0.callID == "c1" }
-        #expect(c1Rows.allSatisfy { $0.0.state != .done }, "no false done despite applied bytes")
+        #expect(!c1Rows.isEmpty && c1Rows.allSatisfy { $0.0.state != .done }, "no false done despite applied bytes")
         let c1Held = done.filter { $0.0.callID == "c1" }
         #expect(c1Held.contains { $0.0.state == .unknown }, "post-commit timeout is unknown+hold, got \(done)")
         let state = await run.actor.currentState()
@@ -638,7 +638,7 @@ struct TOOL09OrderedBatchTests {
         let log = try Self.allRecords(run.store, run.session)
         let done = Self.results(log)
         let c1Rows = done.filter { $0.0.callID == "c1" }
-        #expect(c1Rows.allSatisfy { $0.0.state != .done }, "aggregate success must not complete the write")
+        #expect(!c1Rows.isEmpty && c1Rows.allSatisfy { $0.0.state != .done }, "aggregate success must not complete the write")
         let c1Held = done.filter { $0.0.callID == "c1" }
         #expect(c1Held.contains { $0.0.state == .unknown }, "write intent becomes unknown+held")
         #expect(!done.contains(where: { $0.0.callID == "c2" }), "read takes no durable result")
@@ -673,7 +673,7 @@ struct TOOL09OrderedBatchTests {
         let log = try Self.allRecords(run.store, run.session)
         let done = Self.results(log)
         let c1Rows = done.filter { $0.0.callID == "c1" }
-        #expect(c1Rows.allSatisfy { $0.0.state != .done }, "no false done for the executed write")
+        #expect(!c1Rows.isEmpty && c1Rows.allSatisfy { $0.0.state != .done }, "no false done for the executed write")
         let c1Held = done.filter { $0.0.callID == "c1" }
         #expect(c1Held.contains { $0.0.state == .unknown }, "executed write is unknown+held")
         #expect(!done.contains(where: { $0.0.callID == "c2" }), "non-mutating throw is transcript-only")
