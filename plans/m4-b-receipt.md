@@ -291,6 +291,37 @@ unchanged.
 - Reviews: B0 READY×2, B1 READY×2, B2 READY, B3 READY, B4 READY,
   B5 READY. B6 delta re-review round 1 NEEDS-CHANGES addressed
   (Q10 stale barrier, Q01/Q03 partial, Q09 denial, UNDO-06 mode,
-  receipt honesty); round 2 at this HEAD queued; Linux gate is green
-  end-to-end, mac keepers from `89bf90d` are valid for this source
-  tree, final mac `-O` rerun pending host reachability.
+  receipt honesty); round 2 READY at `0b5c1cf` (final polish at this
+  HEAD is wording-only); Linux gate is green end-to-end, mac keepers
+  from `89bf90d` are valid for this source tree, final mac `-O`
+  rerun pending host reachability (staged tar+script at this HEAD).
+
+## Verdict — M4-B QUALIFIED at this commit
+
+M4-B pure presentation and interaction contract is **QUALIFIED** on
+branch `m4-a` at this commit (Linux primary gate; resolve via
+`git rev-parse HEAD`). All 36 M4-due `pure`
+cases are closed (RENDER-01…08 + DX-09/10 in B5, MENTION/NAV/QUEUE/UNDO
+legs across B1…B6; QUEUE-01/03 physical streaming + incomplete
+tool-JSON interleave variants are the only PARTIAL, deferred to M4-D
+per plan). B6 deferred integration/native legs are FULL per plan §8
+with the PARTIAL noted above; no duplicate of M2-exited lanes. No
+TUI/ANSI/PTY/desktop, no second source of truth, no generic UI
+framework/persistence/new approval engine, no model traffic; UIAction
+→ reducer → UIEffect → SessionActor → projection → UIState, and
+Presentation never mints/grants/mutates (PORT-02 import gate holds).
+
+Evidence: Linux offline green at this HEAD (`quick` 199+34+267+96+77+28,
+`native` 267, `timing` 8, `e2e` 239, `feasibility` 12, `coverage`
+merged 741, BDD-01 ingestion 3/3) + B6 per-suite logs
+(QueueIntegration 10/10 with Q10 new-epoch proof, QueueAttachment
+7/7, QueueContract 7/7, QueueDurability 25/25, QueueCrash 8/8,
+UndoFiles 11/11, UndoTests 34/34, UndoJournal 5/5, UndoActor 6/6,
+SemanticFrame+Headless 18/18) + macOS keepers at `89bf90d` (C2 21,
+TOOL10 8, B2 12+15, B3 30, C1 8, CrossRun 20 debug; gated suites as
+above) + staged `run-b6final.sh` precise-lift battery (this HEAD,
+re-run queued). G14 gates are test-only and byte-identical;
+BDD-06 probes present.
+
+**STOP** after M4-B qualification per mission: no M4-C/D work, no
+push/PR/merge, no model traffic. Maintainer review is the next gate.
