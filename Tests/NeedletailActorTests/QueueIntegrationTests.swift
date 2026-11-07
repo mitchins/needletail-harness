@@ -455,6 +455,12 @@ struct QueueIntegrationTests {
         // re-binds the new epoch and dispatches exactly once.
         let dispatched = try Self.linkCommandIDs(store: store, session: idle.sessionID, ids: Self.entryIDsByCommand(await actor2.currentState()))
         #expect(dispatched.contains("q-1"), "re-consented entry dispatched: \(dispatched)")
+        let (allLinks, _) = try store.records(session: idle.sessionID, since: 0, limit: 500)
+        let q1Links = allLinks.compactMap { rec -> QueueDispatchLink? in
+            if case .queueDispatched(let l) = rec.record, l.commandID == CommandID("q-1") { return l }
+            return nil
+        }
+        #expect(q1Links.last?.epochID == resumed.epoch.epochID, "dispatched link carries live epoch, got \(String(describing: q1Links.last?.epochID)) vs \(resumed.epoch.epochID)")
         continuation.finish()
     }
 }
