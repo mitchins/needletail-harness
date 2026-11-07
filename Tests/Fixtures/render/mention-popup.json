@@ -1,0 +1,9 @@
+{
+  "width": 80,
+  "lines": [
+    {"id": "status-idle", "runs": [{"text": "idle", "role": "status"}]},
+    {"id": "candidate-0", "runs": [{"text": "doc.md", "role": "candidate"}]},
+    {"id": "candidate-1", "runs": [{"text": "docs/guide.md", "role": "candidateSelected"}]},
+    {"id": "mention-range-error", "runs": [{"text": "invalid range \"#L30-L10\"; use #L10 or #L10-L30", "role": "errorNotice"}]}
+  ]
+}

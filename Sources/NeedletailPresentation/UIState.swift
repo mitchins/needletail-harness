@@ -49,11 +49,34 @@ public struct MentionSuggestionState: Sendable, Equatable {
     public var query: String
     public var revision: UInt64
     public var candidates: [CandidateFile]
+    /// Display selection into `candidates` (clamped, never wrapping).
+    public var selectedIndex: Int?
+    /// Set when accepting with an invalid `#L` range (UX-MENTION-08);
+    /// cleared on the next completion or query change.
+    public var rangeError: String?
 
-    public init(query: String, revision: UInt64, candidates: [CandidateFile] = []) {
+    public init(query: String, revision: UInt64, candidates: [CandidateFile] = [],
+                selectedIndex: Int? = nil, rangeError: String? = nil) {
         self.query = query
         self.revision = revision
         self.candidates = candidates
+        self.selectedIndex = selectedIndex
+        self.rangeError = rangeError
+    }
+}
+
+/// A structured file token accepted from a mention (B1). Display text
+/// lives in the composer; identity (path + 1-based line range) lives
+/// here for the M2-D attach path. Pure record, no I/O.
+public struct MentionToken: Sendable, Equatable {
+    public var path: String
+    public var lineRange: ClosedRange<Int>?
+    public var revision: UInt64
+
+    public init(path: String, lineRange: ClosedRange<Int>? = nil, revision: UInt64) {
+        self.path = path
+        self.lineRange = lineRange
+        self.revision = revision
     }
 }
 
@@ -107,6 +130,9 @@ public enum UIStatus: Sendable, Equatable {
 public struct UIState: Sendable, Equatable {
     public var composer: ComposerState
     public var suggestion: MentionSuggestionState?
+    /// Accepted file tokens (B1): display text is in the composer,
+    /// structured identity here. Never submitted implicitly.
+    public var tokens: [MentionToken]
     public var queue: [QueueSummary]
     public var activeAgent: AgentSummary?
     public var inspection: InspectionView?
@@ -115,11 +141,13 @@ public struct UIState: Sendable, Equatable {
     public init(
         composer: ComposerState = ComposerState(),
         suggestion: MentionSuggestionState? = nil,
+        tokens: [MentionToken] = [],
         queue: [QueueSummary] = [], activeAgent: AgentSummary? = nil,
         inspection: InspectionView? = nil, status: UIStatus = .idle
     ) {
         self.composer = composer
         self.suggestion = suggestion
+        self.tokens = tokens
         self.queue = queue
         self.activeAgent = activeAgent
         self.inspection = inspection

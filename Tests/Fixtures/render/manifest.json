@@ -1,6 +1,7 @@
 {
-  "reviewed_rev": "m1-b-plan-rev4",
+  "reviewed_rev": "m4-b-b1",
   "files": [
-    {"path": "basic-chat.json", "sha256": "fc54d113d696ffedfd4b1e5f219a797d189fdd1f2d9ac58de54119db36d021ba"}
+    {"path": "basic-chat.json", "sha256": "fc54d113d696ffedfd4b1e5f219a797d189fdd1f2d9ac58de54119db36d021ba"},
+    {"path": "mention-popup.json", "sha256": "1b9e1845ce617f1910c0b2ec387c3642ae8bc038e2b81f9ec86a169bbfe30cd8"}
   ]
 }

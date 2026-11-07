@@ -11,6 +11,14 @@ public enum UIAction: Sendable, Equatable {
     case completion(CompletionResult)
     case terminal(TerminalCapabilityChange)
     case queueOp(QueueOperation)
+    case mention(MentionAction)
+}
+
+public enum MentionAction: Sendable, Equatable {
+    case selectNext
+    case selectPrevious
+    case acceptSelected
+    case dismissSuggestion
 }
 
 public enum InputAction: Sendable, Equatable {
@@ -50,6 +58,10 @@ public enum QueueOperation: Sendable, Equatable {
     case editEntry(entryID: String, newText: String, baseRevision: UInt64)
     case withdrawEntry(entryID: String)
     case resumeQueue
+    /// M2-D connection intent: the actor validates (snapshot/consent/
+    /// sealed/route) and refuses loudly; Presentation never grants.
+    /// `range` is 1-based closed, nil for the whole file.
+    case attachFile(path: String, range: ClosedRange<Int>?)
 }
 
 public enum UIEffect: Sendable, Equatable {
@@ -62,6 +74,7 @@ public enum UIEffect: Sendable, Equatable {
     case requestCompletions(query: String, revision: UInt64)
     case cancelCurrent
     case inspect(InspectionCommand)
+    case attachFile(path: String, range: ClosedRange<Int>?)
 }
 
 public struct OperatorInput: Sendable, Equatable {

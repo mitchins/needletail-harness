@@ -117,12 +117,18 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
                 role: .status)]))
     }
     if let suggestion = state.suggestion {
+        let selected = suggestion.selectedIndex ?? 0
         for (index, candidate) in suggestion.candidates.enumerated() {
             lines.append(SemanticLine(
                 id: "candidate-\(index)",
                 runs: [StyledRun(
                     text: terminalSafe(candidate.path),
-                    role: index == 0 ? .candidateSelected : .candidate)]))
+                    role: index == selected ? .candidateSelected : .candidate)]))
+        }
+        if let error = suggestion.rangeError {
+            lines.append(SemanticLine(
+                id: "mention-range-error",
+                runs: [StyledRun(text: terminalSafe(error), role: .errorNotice)]))
         }
     }
     let wrapped = lines.flatMap { wrapLine($0, width: safeWidth) }

@@ -52,13 +52,15 @@ struct PermutationTests {
     }
 
     /// Replays one scripted trace, collecting invariant violations. All
-    /// five claimed invariants are asserted here (S3): (1) draft byte-exact;
+    /// claimed invariants are asserted here (S3): (1) draft byte-exact;
     /// (2) every queueOp emits exactly one explicit effect (never silent,
     /// never double — the actor decides, the UI always asks out loud);
     /// (3) stale revisions drop without mutation; (4) single owner: at most
     /// one submission-like effect per action; (5) non-session actions never
     /// touch the queue projection (no auto-dispatch while held — the
-    /// projection only moves on actor-originated session events).
+    /// projection only moves on actor-originated session events);
+    /// (6) plain typing emits NOTHING except mention-fetch requests
+    /// (B1: `@`-derivation may ask for completions, never submit/queue).
     static func replay(_ ops: [ScriptOp]) -> TraceResult {
         var state = UIState()
         state.suggestion = MentionSuggestionState(query: "q", revision: 2, candidates: [])
@@ -79,8 +81,9 @@ struct PermutationTests {
                 if state.composer.text != draft {
                     violations.append("draft corrupted: '\(state.composer.text)' vs '\(draft)'")
                 }
-                if !emitted.isEmpty {
-                    violations.append("plain typing must emit no effects")
+                for effect in emitted {
+                    if case .requestCompletions = effect { continue }
+                    violations.append("plain typing emitted a non-fetch effect")
                 }
             case .sessionAdmit(let revision):
                 let (next, emitted) = reduce(
@@ -93,17 +96,20 @@ struct PermutationTests {
                 effects += emitted.count
             case .completion(let rev):
                 let before = state.composer.text
-                let beforeCount = state.suggestion?.candidates.count ?? -1
+                let beforeSuggestion = state.suggestion
                 let (next, emitted) = reduce(state, .completion(CompletionResult(
                     queryRevision: rev, candidates: [CandidateFile(path: "late")])))
                 state = next
                 effects += emitted.count
                 if rev != 2 {
+                    // Stale completions change nothing: neither the draft
+                    // nor the live suggestion (B1: an unrepresentable seed
+                    // is dismissed by typing before any completion lands).
                     if state.composer.text != before {
                         violations.append("stale completion touched the draft")
                     }
-                    if (state.suggestion?.candidates.count ?? -2) != beforeCount {
-                        violations.append("stale completion overwrote candidates")
+                    if state.suggestion != beforeSuggestion {
+                        violations.append("stale completion mutated the suggestion")
                     }
                 }
             case .cancelNotice:

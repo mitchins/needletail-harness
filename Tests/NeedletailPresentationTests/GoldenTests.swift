@@ -49,6 +49,18 @@ enum GoldenFixtures {
         return data
     }
 
+    static func mentionScenario() -> RenderFrame {
+        var state = UIState()
+        (state, _) = reduce(state, .input(.insertText("see @doc#L30-L10")))
+        let rev = state.suggestion!.revision
+        (state, _) = reduce(state, .completion(CompletionResult(
+            queryRevision: rev,
+            candidates: [CandidateFile(path: "doc.md"), CandidateFile(path: "docs/guide.md")])))
+        (state, _) = reduce(state, .mention(.selectNext))
+        (state, _) = reduce(state, .mention(.acceptSelected))
+        return render(state, width: 80, capabilities: TerminalCapabilities())
+    }
+
     static func scenario() -> RenderFrame {
         var state = UIState()
         state.suggestion = MentionSuggestionState(query: "src/", revision: 5, candidates: [])
@@ -84,6 +96,22 @@ struct GoldenTests {
         let golden = try JSONDecoder().decode(
             GoldenFrame.self, from: GoldenFixtures.load("basic-chat.json"))
         let frame = GoldenFixtures.scenario()
+        #expect(frame.width == golden.width)
+        #expect(frame.lines.count == golden.lines.count,
+                "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
+        for (actual, expected) in zip(frame.lines, golden.lines) {
+            #expect(actual.id == expected.id, "line id: \(actual.id) vs \(expected.id)")
+            #expect(actual.runs.map(\.text) == expected.runs.map(\.text), "text for \(expected.id)")
+            #expect(actual.runs.map(\.role.rawValue) == expected.runs.map(\.role),
+                    "roles for \(expected.id)")
+        }
+    }
+
+    @Test("DX-07 mention popup renders selection and range error")
+    func DX_07_mentionPopupFramesMatch() throws {
+        let golden = try JSONDecoder().decode(
+            GoldenFrame.self, from: GoldenFixtures.load("mention-popup.json"))
+        let frame = GoldenFixtures.mentionScenario()
         #expect(frame.width == golden.width)
         #expect(frame.lines.count == golden.lines.count,
                 "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
