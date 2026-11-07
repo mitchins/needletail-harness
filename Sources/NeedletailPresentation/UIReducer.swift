@@ -24,9 +24,14 @@ public func reduce(_ state: UIState, _ action: UIAction) -> (UIState, [UIEffect]
     case .inspectResult(let result):
         return reduceInspectResult(state, result)
     case .inspect(let command):
-        // Local read only: the edge fetches from the store/actor and
-        // returns an inspectResult. No provider traffic is possible —
-        // no such effect exists in this layer.
+        // Dismiss clears locally with no fetch. Every other command is a
+        // LOCAL store/actor read via the edge (inspectResult comes back);
+        // no provider traffic is possible — no such effect exists here.
+        if command == .dismiss {
+            var next = state
+            next.inspection = nil
+            return (next, [])
+        }
         return (state, [.inspect(command)])
     case .mention(let mention):
         return reduceMention(state, mention)
@@ -151,20 +156,33 @@ private func reduceSession(_ state: UIState, _ projection: SessionEventProjectio
             if phase == "completed" || phase == "interrupted" {
                 next.status = .idle
                 next.activeAgent = nil
+            } else if phase == "budget-boundary" {
+                // Core-minted boundary landing (distinct kind, like the
+                // durable record): finished, but explicitly not clean.
+                next.status = .completedBudgetBoundary(detail: projection.detail)
+                next.activeAgent = nil
             } else if phase == "failed" {
                 next.status = .failed(cause: projection.detail)
             } else {
                 next.status = .busy(operation: projection.detail)
             }
         } else if projection.kind == "run_finished" {
-            // Terminal envelope: the outcome distinguishes clean
-            // completion from budget-boundary exhaustion (B3).
-            if projection.outcome == "completed-budget-boundary" {
-                next.status = .completedBudgetBoundary(detail: projection.detail)
-            } else if projection.outcome == "completed" {
+            // Terminal envelope vocabulary (CLI emitTerminal): map every
+            // real outcome explicitly. budget_exhausted is a FAILURE
+            // (exit 5), distinct from a clean boundary landing, which
+            // arrives via run:budget-boundary above.
+            switch projection.outcome {
+            case .some("completed"), .some("interrupted"):
                 next.status = .idle
-            } else if projection.outcome == "failed" {
+            case .some("approval_required"):
+                next.status = .held(reason: "approval required")
+            case .some("budget_exhausted"), .some("provider_error"),
+                 .some("integrity"), .some("invalid"), .some("ambiguous"):
                 next.status = .failed(cause: projection.detail)
+            case .some(let unknown):
+                next.status = .failed(cause: "unknown terminal outcome \(unknown): \(projection.detail)")
+            case .none:
+                break
             }
             next.activeAgent = nil
         }

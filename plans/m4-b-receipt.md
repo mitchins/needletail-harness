@@ -71,18 +71,25 @@ re-review READY).
 ## B3 — session, model, context, epoch views (review pending)
 
 - `SessionViews.swift` (new): `UISessionRow` + `sessionLiveness`
-  (active/idle/stale/unknown, 5-min explicit rule), `UIAgentRow`
-  (consult child), `UIModelRoute` (local/cloud), `UIContextUsage`
-  (actual vs estimated, UNKNOWN cache), `UIEpochRow` + checkpoint
-  states, `UICompactPreview` (providerCalls always 0),
-  `InspectionResult` typed payloads.
-- Reducer: `inspect` intent (local-read effect only) +
-  `inspectResult` projection; `run_finished` outcome mapping
-  (budget-boundary distinct from clean completion); typed
-  `InspectionView` replaces untyped strings; held-clear preserved.
-- Render: per-view branches with stable IDs; budget-boundary line.
-- Tests: 7 UX-NAV RED→GREEN (NAV-07 diff deferred to B4);
-  sessions golden + manifest `m4-b-b3`; BDD-06 liveness probe
+  (active/idle/stale/unknown, explicit 5-min rule, skew guard),
+  `UIAgentRow` (consult child), `UIModelRoute` (local/cloud),
+  `UIContextUsage` (actual vs estimated, UNKNOWN cache),
+  `UIEpochRow` + checkpoint states, `UICompactPreview` (note
+  rendered, no provider-call concept), `InspectionResult` typed
+  payloads. All NAV cases here are catalog `pure`-only.
+- Core (one line): boundary landing projects distinct kind
+  `run:budget-boundary` (record kind already did; projection
+  lagged) — replay-safe (records untouched, reconcile reads
+  record kinds). Test asserts kind + detail at the landing.
+- Reducer: `inspect` intent (local) + `.dismiss` clears locally;
+  `inspectResult` projection; `run:budget-boundary` →
+  completedBudgetBoundary; `run_finished` maps the REAL CLI
+  outcome vocabulary (completed/interrupted→idle,
+  approval_required→held, budget_exhausted/provider_error/
+  integrity/invalid/ambiguous→failed, unknown→failed visibly).
+- Tests: 10 UX-NAV + run-outcome RED→GREEN (NAV-07 diff views
+  deferred to B4); liveness boundary pins; sessions golden +
+  manifest `m4-b-b3`; BDD-06 liveness probe
   (`plans/m4-b-b3-probe-liveness.log`).
 - Linux `quick` green (exit 0).
 

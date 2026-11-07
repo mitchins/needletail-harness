@@ -213,7 +213,7 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
             lines.append(SemanticLine(
                 id: "compact-estimate",
                 runs: [StyledRun(
-                    text: "compact dry-run: ~\(preview.estimatedTokens) tokens, \(preview.wouldReplaceEpoch ? "would replace epoch" : "no epoch change"), 0 provider calls",
+                    text: "compact dry-run: ~\(preview.estimatedTokens) tokens, \(preview.wouldReplaceEpoch ? "would replace epoch" : "no epoch change"), 0 provider calls (\(terminalSafe(preview.note)))",
                     role: .normal)]))
         case .queue(let ids):
             for id in ids {

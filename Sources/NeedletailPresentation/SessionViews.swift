@@ -140,14 +140,13 @@ public struct UIEpochRow: Sendable, Equatable {
 public struct UICompactPreview: Sendable, Equatable {
     public var estimatedTokens: UInt64
     public var wouldReplaceEpoch: Bool
-    /// Always zero: a dry run performs no provider call (UX-NAV-05).
-    public var providerCalls: UInt64
+    /// Offline note (always local; there is no provider call to count —
+    /// dry-run performs none by construction, since no such effect exists).
     public var note: String
 
-    public init(estimatedTokens: UInt64, wouldReplaceEpoch: Bool, providerCalls: UInt64, note: String) {
+    public init(estimatedTokens: UInt64, wouldReplaceEpoch: Bool, note: String) {
         self.estimatedTokens = estimatedTokens
         self.wouldReplaceEpoch = wouldReplaceEpoch
-        self.providerCalls = providerCalls
         self.note = note
     }
 }

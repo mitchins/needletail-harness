@@ -1758,7 +1758,12 @@ private func finishRunWithQueue<I: IDSource>(
         let detail = boundary ? "run finished at turn-budget boundary; verdict by oracle" : "run finished"
         return Transition(
             state: next,
-            effects: [.emitUI(.runUpdate(phase: "completed", detail: detail))],
+            // B4-era telemetry separation, completed in M4-B B3: the UI
+            // projection carries the boundary in its KIND (like the
+            // durable record does), not just the detail text, so the
+            // reducer can distinguish clean completion without parsing
+            // display strings.
+            effects: [.emitUI(.runUpdate(phase: boundary ? "budget-boundary" : "completed", detail: detail))],
             records: prefix)
     case .barrierHold(let head, let reason):
         return landQueueBarrier(state, head: head, reason: reason, completedPhase: completedPhase, digest: eventDigest("completed", run.runID.raw), ids: &ids)
