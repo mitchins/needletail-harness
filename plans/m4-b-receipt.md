@@ -177,7 +177,17 @@ not duplicated.
   QUEUE-06→D0 boundary 1/2/3 + new case test; QUEUE-08→existing
   "stale head holds" test; QUEUE-09→new pure test; QUEUE-10→D3 C2/C3
   epoch-switch lanes; MENTION-09/10/12→new tests above.
-- Linux `quick` + targeted suites green (exit 0).
-- macOS (same host/toolchain): integration actor suites crash the
-  debug runner (SIGBUS, G14-class) → B2/B6-era suite gates;
-  `-O` green where executed. Evidence under `.needletail-dev/m4b-b6/`.
+- Linux `quick` + targeted suites green (exit 0); full `offline`
+  gate green at close (see Closeout).
+- macOS (same host/toolchain), final code tree (HEAD differs from
+  the executed tree by receipt only):
+  - Keepers battery green (debug): C2 21/21, TOOL10 8/8,
+    B2 12/12 + 15/15, B3 30/30, C1 8/8, CrossRunGate 20/20.
+  - `-O` green with test-only gates lifted: QueueIntegration 9/9,
+    QueueAttachment 7/7, QueueContract 7/7, QueueDurability 25/25,
+    QueueCrashActor 8/8. All reverted byte-identical;
+    QueueAttachment/QueueIntegration/QueueContract/QueueDurability
+    crash the Darwin-debug runner (SIGBUS, G14-class) → B2/B6-era
+    suite gates; Linux-debug covers them.
+  - Evidence under `.needletail-dev/m4b-b6/` (keeper logs,
+    lifted `-O` logs, revert check).
