@@ -116,4 +116,9 @@ re-review READY).
   approval identity); undo golden + manifest `m4-b-b4`;
   BDD-06 run-intent probe (`plans/m4-b-b4-probe-undorun.log`).
 - Linux `quick` green (exit 0).
+- macOS R7 (same host/toolchain): `swift build` clean;
+  Presentation 78/78 debug green; QueueReorderTests 6/6 `-O`
+  green with test-only gate lifted on the exact tree
+  (file restored byte-identical after). Evidence logs:
+  `.needletail-dev/m4b-b4/`.
 
