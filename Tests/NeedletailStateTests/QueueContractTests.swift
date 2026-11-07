@@ -133,7 +133,18 @@ struct QueueContractTests {
         var ids = StateFixtures.ids()
         let (admitting, _) = try StateFixtures.admitted("run", ids: &ids)
         var state = transition(admitting, .requestDispatched(requestID: admitting.activeRun!.requestID, atMillis: 1001), &ids).state
-        for i in 1...20 {
+        // 64 KiB single text refused on the BYTE budget from a nearly
+        // empty queue (count cap not involved: only 2 entries present).
+        state = transition(state, StateFixtures.input("t-1", id: "c-1", kind: .followUp), &ids).state
+        state = transition(state, StateFixtures.input("t-2", id: "c-2", kind: .followUp), &ids).state
+        let big = transition(state, StateFixtures.input(String(repeating: "x", count: 65_536), id: "c-big", kind: .followUp), &ids)
+        #expect(!big.effects.contains(where: {
+            if case .emitUI(let p) = $0 { return p.kind == "admitted" }
+            return false
+        }), "over-budget text is not admitted")
+        #expect(big.state.admittedCommands[CommandID("c-big")] == nil, "no ack for over-budget text")
+        // 21st entry refused on the COUNT cap (budget not involved).
+        for i in 3...20 {
             state = transition(state, StateFixtures.input("t-\(i)", id: "c-\(i)", kind: .followUp), &ids).state
         }
         #expect(state.queue.count == 20, "twenty queued")
@@ -144,9 +155,6 @@ struct QueueContractTests {
             if case .emitUI(let p) = $0 { return p.kind == "denied" }
             return false
         }), "typed refusal, got: \(refused.effects)")
-        let big = transition(state, StateFixtures.input(String(repeating: "x", count: 65_536), id: "c-big", kind: .followUp), &ids)
-        #expect(big.state.queue.count == 20, "over-budget text refused")
-        #expect(big.state.admittedCommands[CommandID("c-big")] == nil)
     }
 }
 #endif

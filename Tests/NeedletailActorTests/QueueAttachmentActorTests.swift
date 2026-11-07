@@ -368,8 +368,7 @@ struct QueueAttachmentActorTests {
     func UX_MENTION_10_boundedOrSealed() async throws {
         let files = try Self.makeFiles()
         defer { try? FileManager.default.removeItem(at: files.dir) }
-        // 2 MiB through the REAL capture pipeline (bounded excerpt +
-        // content hash + manifest), exactly as production admission sees it.
+        // 2 MiB of repetitive content with unique head/tail markers.
         let big = "HEAD-MARKER\n" + String(repeating: "x", count: 2 * 1024 * 1024) + "\nTAIL-MARKER-never-included\n"
         try big.write(to: files.dir.appendingPathComponent("big.bin"), atomically: true, encoding: .utf8)
         let idle0 = try ActorFixtures.idleState()
@@ -380,9 +379,6 @@ struct QueueAttachmentActorTests {
             routeGrant: AttachmentRouteGrant(alias: "local-coder", locality: .local, sealed: false))
         files.validator.expect(path: snap.path, bytes: Data(big.utf8))
         #expect(snap.content.excerptBytes <= 4 * 1024, "capture bounds the excerpt, got \(snap.content.excerptBytes)")
-        // The scripted validator tracks the real file: unchanged bytes
-        // validate fresh (hash fidelity itself is covered in PrimitiveTests).
-        files.validator.expect(path: files.path("big.bin"), bytes: Data(big.utf8))
         let store = InMemorySessionStore()
         let idle = try ActorFixtures.idleState()
         let gate = GatedTransport()

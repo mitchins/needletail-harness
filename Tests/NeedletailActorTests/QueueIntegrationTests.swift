@@ -52,8 +52,14 @@ struct QueueIntegrationTests {
         Dictionary(uniqueKeysWithValues: state.queue.map { ($0.entryID, $0.commandID.raw) })
     }
 
-    @Test("UX-QUEUE-01 follow-up queues during streaming, drains after")
-    func UX_QUEUE_01_streamingFollowupQueued() async throws {
+    // NOTE (B6 review): the GatedTransport suspends before
+    // requestStarted, so the run sits in requesting, not streaming.
+    // Both phases route operatorInput to the identical admitToQueueState
+    // path (SessionTransition: requesting + streaming arms), so queueing
+    // behavior is phase-independent; the streaming-specific interleave
+    // (tool JSON never split) is covered by D0 boundary tests + DX-04.
+    @Test("UX-QUEUE-01 follow-up queues during a busy run, drains after")
+    func UX_QUEUE_01_busyFollowupQueued() async throws {
         let (actor, store, gate, cont) = try Self.gatedPair()
         let session = try await actor.currentState().sessionID
         await actor.submitText(commandID: CommandID("run-1"), text: "run", kind: .followUp, sealed: false)
@@ -101,8 +107,11 @@ struct QueueIntegrationTests {
         cont.finish()
     }
 
-    @Test("UX-QUEUE-03 steer waits for the in-flight turn boundary")
-    func UX_QUEUE_03_steerWaitsForBoundary() async throws {
+    // NOTE (B6 review): same busy-run admission path as above; no
+    // tool call is in flight in this harness (see D0 boundary tests
+    // for tool-JSON atomicity under steer).
+    @Test("UX-QUEUE-03 steer queues during a busy run, never interleaves")
+    func UX_QUEUE_03_steerQueuesDuringBusyRun() async throws {
         let (actor, store, gate, cont) = try Self.gatedPair()
         await actor.submitText(commandID: CommandID("run-1"), text: "run", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitInvocations(gate, count: 1)
@@ -182,7 +191,16 @@ struct QueueIntegrationTests {
         #expect(!dispatched.contains("a"), "withdrawn never dispatches: \(dispatched)")
         #expect(dispatched.first == "c", "reordered entry dispatches first: \(dispatched)")
         let bEntry = await actor.currentState().queue.first(where: { $0.commandID == CommandID("b") })
-        #expect(bEntry?.text == "B!", "edited text is what dispatched")
+        #expect(bEntry?.text == "B!", "edited text is what dispatched: \(String(describing: bEntry?.text))")
+        let (records, _) = try store.records(session: session, since: 0, limit: 500)
+        let composed = records.compactMap { rec -> String? in
+            if case .transcriptAppended(let t) = rec.record {
+                if case .user(let text) = t { return text }
+                return nil
+            }
+            return nil
+        }.joined(separator: "\n")
+        #expect(composed.contains("B!"), "edited bytes enter model context, not the stale text")
         cont.finish()
     }
 
@@ -239,18 +257,12 @@ struct QueueIntegrationTests {
                 callID: "c1", tool: "edit", argumentsDigest: "d",
                 arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}")], isFinal: false))]
         await actor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
-        try await ActorFixtures.awaitPhase(actor, { state in
-            if state.queueHeld { return true }
-            if case .failed = state.phase { return true }
-            return false
-        }, "headless hold or terminal")
-        let state = await actor.currentState()
+        try await ActorFixtures.awaitPhase(actor, { $0.queueHeld }, "headless approval holds the queue")
+        let held = await actor.currentState()
+        #expect(held.queueHeld, "unavailable gateway holds rather than auto-consents")
+        #expect(held.heldReason == .approvalPending, "hold cites the pending approval, got: \(String(describing: held.heldReason))")
+        #expect(held.pendingApproval != nil, "approval request is recorded for the operator")
         #expect(executor.calls.isEmpty, "no tool executed without a grant decision")
-        let terminallyFailed: Bool = {
-            if case .failed = state.phase { return true }
-            return false
-        }()
-        #expect(state.queueHeld || terminallyFailed, "held explicitly, never auto-consented")
     }
 
     @Test("UX-QUEUE-12 failed run keeps the queue; resume is explicit")
@@ -289,8 +301,10 @@ struct QueueIntegrationTests {
         }, "explicit resume dispatches")
     }
 
-    @Test("UX-QUEUE-06 crash at the dispatch boundary replays exactly once")
-    func UX_QUEUE_06_crashBoundaryNoDuplicate() async throws {
+    // The uncertain pre-crash dispatch is not re-sent automatically;
+    // exactly one explicit redispatch completes the work.
+    @Test("UX-QUEUE-06 crash at the dispatch boundary: no auto-resend, one explicit redispatch")
+    func UX_QUEUE_06_crashBoundaryNoAutoResend() async throws {
         let store = InMemorySessionStore()
         let idle = try ActorFixtures.idleState()
         let gate = GatedTransport()
