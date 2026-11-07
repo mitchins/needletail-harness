@@ -455,7 +455,7 @@ struct UndoFilesTests {
         let execOutcome = ToolCallOutcome(
             callID: "c2", status: "success", summary: "ok", data: "",
             artifactID: nil, secondaryArtifactIDs: [], truncated: false, warnings: [],
-            error: nil, path: "g.txt", mode: nil,
+            error: nil, path: "g.txt", mode: "100644",
             beforeHash: Self.sha("g0\n"), afterHash: Self.sha("g0-shelled\n"),
             started: true, mutating: true,
             deviceBefore: 7, inodeBefore: 9, deviceAfter: 7, inodeAfter: 9,

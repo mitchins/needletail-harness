@@ -162,7 +162,8 @@ explicitly mapped; no duplicates of M2-exited lanes.
   scripted/gated transports, deterministic barriers; G14-gated on
   Darwin-debug): QUEUE-01 (busy-run admission), QUEUE-02 (durable
   double-submit + idempotent ack), QUEUE-03 (steer boundary),
-  QUEUE-04 (FIFO order incl. reorder), QUEUE-05
+  QUEUE-04 (FIFO order across steers and follow-ups; steer-first
+  dispatch priority is covered by QueueDurabilityTests), QUEUE-05
   (edit/reorder/withdraw + edited-bytes-in-context),
   QUEUE-07 (cancel-hold, no auto-send, explicit resume),
   QUEUE-11 (headless approval holds with approvalPending, zero
@@ -180,12 +181,14 @@ explicitly mapped; no duplicates of M2-exited lanes.
   count cap + cumulative 64 KiB budget cap, typed denials).
 - New native undo coverage: `UndoFilesTests.UX_UNDO_06_...`
   (exec-touched file gains no ledger member even with a successful
-  exec outcome; recorded file restores, exec-touched bytes intact);
+  exec outcome with full identity; recorded file restores,
+  exec-touched bytes intact, exactly one inverse);
   `UndoActorTests.UX_UNDO_08_dirtyWorktreeForkLeavesFilesIntact`
-  (actor-level lineage fork with real workspace files; fork commits
-  exactly one record, zero bytes change). UNDO-08 integration leg:
-  no separate integration tier exists in the catalogue beyond these;
-  recorded as covered via native + pure legs.
+  (actor-level fork via SessionActor, throughSequence 0 empty-history
+  boundary, two real temp files; asserts fork record present and both
+  files unchanged). UNDO-08 integration leg: no separate integration
+  tier exists in the catalogue beyond these; recorded as covered via
+  native + pure legs.
 - Per-case status (M4-due unless noted):
   - QUEUE-01/02/03/04/05/07/11/12: pure (B1/B2) + integration (B6) — FULL.
   - QUEUE-06 (M2): D0 boundary lanes + B6 crash test — FULL.
@@ -196,7 +199,7 @@ explicitly mapped; no duplicates of M2-exited lanes.
   - UNDO-06: pure (B4) + native (B6) — FULL; integration leg N/A (no actor-mediated path beyond these).
   - UNDO-08: pure (B4) + native (B6 actor + state) — FULL.
   - UNDO-09: M2-exited lanes + B4 pure + B6 re-verified — FULL.
-  - QUEUE-01/03 streaming/tool-call variants: pure tests use the busy-run admission path (same `admitToQueueState` for requesting/streaming); PTY/stream-chunk physical legs remain M4-D. Marked PARTIAL for physical streaming only.
+  - QUEUE-01/03 streaming/tool-call variants: busy-run admission via the same `admitToQueueState` path is FULL (requesting phase here); physical stream-chunk and incomplete tool-JSON interleave variants remain M4-D. Marked PARTIAL for those physical variants only.
 - Linux evidence (this tree): per-suite logs under
   `.needletail-dev/m4b-b6-linux/` (QueueIntegration 10/10,
   QueueAttachment 7/7 incl. new MENTION tests, QueueContract,
@@ -221,9 +224,9 @@ file that names its own commit (resolve via `git log`).
   - `timing` 8 tests green (NET-04 cancellation/readiness; exit 0; 6 s).
   - `e2e` 239 tests green (13 suites including B5CEndToEnd, TOOL10, C2/C3 etc; exit 0; 515 s at 08:09 AEDT; `.needletail-dev/logs/dev-e2e.log`, `.needletail-dev/xunit/results-e2e-swift-testing.xml`).
   - `feasibility` 12 tests green (M0-C PTY + B5-C gateway; exit 0; 0.5 s).
-  - `coverage` reconcile green: XUNIT MERGE bulk=494 timing=8 e2e=239 merged=741 failures=0 unsatisfied=14 missing=146 satisfied=40 executed=741 labeled=163 skipped=1 failed=0; BDD-01 ingestion 3/3 green (`.needletail-dev/logs/dev-coverage.log`).
+  - `coverage` reconcile green: XUNIT MERGE bulk=494 timing=8 e2e=239 merged=741 failures=0 unsatisfied=14 missing=146 satisfied=40 executed=741 labeled=163 skipped=1 failed=0; BDD-01 ingestion 3/3 green (stdout captured in `.needletail-dev/logs/dev-coverage.log`; merged xunit at `.needletail-dev/xunit/results-merged-swift-testing.xml`).
   - B6 per-suite logs at this HEAD (`.needletail-dev/m4b-b6-linux/`): QueueIntegration 10/10, QueueAttachment 7/7, QueueContract 7/7, QueueDurability 25/25, QueueCrashActor 8/8, UndoFiles 11/11, UndoTests 34/34, UndoJournal 5/5, UndoActor 6/6; SemanticFrame+Headless 18/18; `quick` aggregate 96 presentation tests green.
-  - Cases via `./dev test case` per ID: UX-QUEUE-01/02/03/04/05/06/07/10/11/12, UX-MENTION-09/10/12, UX-UNDO-06/08/09 + RENDER-01…08 + DX-09/10 all green (see Linux B6 logs and `FINAL-*.log`).
+  - Cases: per-suite logs plus selected `./dev test case` per ID (QUEUE-01/06/10, MENTION-09/10/12, UNDO-06/08/09 verified via `case` runner; remaining IDs via suite logs) — all green (see Linux B6 logs and `FINAL-*.log`).
 
 - macOS R7 (Builds-Mac-Pro.local, same host/toolchain as M4-A;
   Swift 6.3.3, Xcode 26.x). Network partition at closeout:
@@ -242,9 +245,10 @@ file that names its own commit (resolve via `git log`).
     (b6k `opt-*.log`, revert byte-identical). The final HEAD adds
     one test to QueueIntegration (Q10 live-epoch), one discriminating
     UndoFiles test (UNDO-06), and gate shims — same G14 gating, same
-    source paths; Linux `-O` is green for the identical suites, so the
-    final mac `-O` is expected green under the same lifts (re-run
-    queued for when the host is reachable; no code change required).
+    source paths; Linux debug is green for the identical suites
+    (Linux `-O` not run; debug covers them), so the final mac `-O`
+    is expected green under the same lifts (re-run queued for when
+    the host is reachable; no code change required).
   - B2-era mac evidence (Section B2) remains valid: Presentation
     58/58 debug green; QueueReorder/QueueDurability/QueueContract
     SIGBUS debug / 6/6,25/25,6/6 `-O` green (`.needletail-dev/m4b-b2/`).
@@ -257,7 +261,8 @@ file that names its own commit (resolve via `git log`).
   `UndoTests` (and `QueueReorderTests`); precise python lift
   `run-b6final.sh` lifts only that pattern (never the Glibc import
   shim), reverts byte-identical via SHA-256. Linux-debug covers the
-  gated suites; Darwin `-O` covers the same assertions on mac.
+  gated suites; Darwin `-O` at `89bf90d` covered the same assertions
+  on mac (final HEAD `-O` pending host reachability).
 
 - BDD-06 probes: `plans/m4-b-b1-probe-boundary.log` (B1 boundary),
   `m4-b-b2-probe-ack.log` (queue ack), `m4-b-b3-probe-liveness.log`

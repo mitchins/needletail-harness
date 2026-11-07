@@ -56,8 +56,8 @@ struct QueueIntegrationTests {
     // admitToQueueState path; the GatedTransport suspends before
     // requestStarted so runs here sit in requesting): the follow-up
     // queues without dispatching mid-turn, then auto-continues after
-    // the in-flight run completes. Physical stream-chunk and tool-JSON
-    // interleave behavior is covered by D0 boundary tests + DX-04.
+    // the in-flight run completes. Physical stream-chunk and
+    // incomplete tool-JSON interleave variants are M4-D.
     @Test("UX-QUEUE-01 follow-up queues during a busy run, drains after")
     func UX_QUEUE_01_busyFollowupQueued() async throws {
         let (actor, store, gate, cont) = try Self.gatedPair()
@@ -107,9 +107,10 @@ struct QueueIntegrationTests {
         cont.finish()
     }
 
-    // NOTE (B6 review): same busy-run admission path as above; no
-    // tool call is in flight in this harness (see D0 boundary tests
-    // for tool-JSON atomicity under steer).
+    // Steer admission during a busy run (requesting phase here;
+    // same admitToQueueState path as streaming). Incomplete tool-call
+    // JSON + steer interleave and physical stream-chunk variants are
+    // M4-D (no actor-level harness for streamed partial tool JSON).
     @Test("UX-QUEUE-03 steer queues during a busy run, never interleaves")
     func UX_QUEUE_03_steerQueuesDuringBusyRun() async throws {
         let (actor, store, gate, cont) = try Self.gatedPair()
@@ -302,9 +303,7 @@ struct QueueIntegrationTests {
     }
 
     // The uncertain pre-crash dispatch is not re-sent automatically;
-    // exactly one explicit redispatch completes the work.
-    // The uncertain pre-crash dispatch is not auto-resent; exactly
-    // one explicit redispatch completes the work (no duplicate).
+    // exactly one explicit redispatch completes the work (no duplicate).
     @Test("UX-QUEUE-06 crash at the dispatch boundary: no auto-resend, one explicit redispatch")
     func UX_QUEUE_06_crashBoundaryNoAutoResend() async throws {
         let store = InMemorySessionStore()
@@ -384,21 +383,30 @@ struct QueueIntegrationTests {
             state: idle, ids: rids, clock: VirtualClock(now: 1_000_000),
             transport: gate, executor: ScriptedExecutor(), store: store,
             approvals: ScriptedApprovals(), writer: "q10-writer")
-        // Queue behind an in-flight run, then cancel + dismiss to reach
-        // idle WITH a queued entry (switchModel refuses busy and
-        // terminal phases, so admission must precede the switch).
+        // Queue behind an in-flight run, then fail + dismiss to reach
+        // idle WITH a queued entry. A failed run leaves queued entries
+        // `.queued` (global hold set, per-entry state untouched) so the
+        // subsequent epoch switch must exercise the stale-attachment
+        // barrier (cancel would have marked entries `.held` and the
+        // switch would be a no-op). switchModel refuses busy and
+        // terminal phases, so admission must precede the switch.
         await actor.submitText(commandID: CommandID("run-1"), text: "run", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitInvocations(gate, count: 1)
         await actor.submitText(commandID: CommandID("q-1"), text: "queued", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(actor, { $0.queue.count == 1 }, "queued under epoch A")
-        await actor.cancel()
-        try await ActorFixtures.awaitPhase(actor, { $0.queueHeld }, "cancel holds")
-        await actor.tick(at: 1_006_000)
-        try await ActorFixtures.awaitPhase(actor, { if case .interrupted = $0.phase { return true }; return false }, "terminal")
+        let preSwitchCount = gate.invocations.count
+        continuation.yield(.respond(Self.failedRun()))
+        try await ActorFixtures.awaitPhase(actor, { if case .failed = $0.phase { return true }; return false }, "run failed")
+        // Failed landing holds globally but entries stay `.queued` — the
+        // switch must re-hold them as `.staleAttachment`.
+        let afterFail = await actor.currentState()
+        #expect(afterFail.queue.first?.state == .queued, "failed run keeps entry queued, not held: \(String(describing: afterFail.queue.first?.state))")
         await actor.dismissRun()
         try await ActorFixtures.awaitPhase(actor, {
             if case .idle = $0.phase { return true }; return false
         }, "dismissed back to idle with queue intact")
+        let idleWithQueue = await actor.currentState()
+        #expect(idleWithQueue.queue.first?.state == .queued, "idle still queued before switch")
         // Live epoch switch: the queued entry's target goes stale and
         // the whole queue holds. Nothing dispatches on the stale epoch.
         await actor.switchModel(alias: "local-reviewer")
@@ -406,7 +414,16 @@ struct QueueIntegrationTests {
         let held = await actor.currentState()
         #expect(held.queue.first?.targetEpochID == EpochID("epoch-a"), "target pinned at admission epoch")
         #expect(held.epoch.epochID != EpochID("epoch-a"), "live epoch advanced past admission: \(held.epoch.epochID)")
-        #expect(gate.invocations.count == 1, "no dispatch on the stale epoch")
+        #expect(held.epoch.parentEpochID == EpochID("epoch-a"), "new epoch parents admission epoch: \(held.epoch.epochID)")
+        #expect(held.heldReason == .staleAttachment, "stale-attachment hold, got: \(String(describing: held.heldReason))")
+        #expect(held.queue.first?.state == .held, "entry marked held by switch")
+        let (allRecords, _) = try store.records(session: idle.sessionID, since: 0, limit: 500)
+        let staleHeld = allRecords.contains(where: { rec in
+            if case .queueUpdated(let e) = rec.record { return e.entryID == held.queue.first?.entryID && e.state == .held }
+            return false
+        })
+        #expect(staleHeld, "durable queueUpdated stale hold recorded")
+        #expect(gate.invocations.count == preSwitchCount, "no dispatch on the stale epoch")
         // Explicit re-consent (retarget to the live epoch) + resume.
         let entryID = try #require(held.queue.first?.entryID)
         await actor.retargetQueueEntry(entryID: entryID)
@@ -434,6 +451,10 @@ struct QueueIntegrationTests {
             $0.queue.allSatisfy { $0.state == .admittedToHistory }
         }, "re-consented queue drains completely")
         #expect(t2.invocations.count >= 1, "post-switch dispatches happened")
+        // Redispatch carries the live-epoch bytes: the queued entry
+        // re-binds the new epoch and dispatches exactly once.
+        let dispatched = try Self.linkCommandIDs(store: store, session: idle.sessionID, ids: Self.entryIDsByCommand(await actor2.currentState()))
+        #expect(dispatched.contains("q-1"), "re-consented entry dispatched: \(dispatched)")
         continuation.finish()
     }
 }

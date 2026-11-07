@@ -145,6 +145,10 @@ struct QueueContractTests {
             return false
         }), "over-budget text is not admitted")
         #expect(big.state.admittedCommands[CommandID("c-big")] == nil, "no ack for over-budget text")
+        #expect(big.effects.contains(where: {
+            if case .emitUI(let p) = $0 { return p.kind == "denied" }
+            return false
+        }), "byte-budget refusal is typed denied, got: \(big.effects)")
         // 21st entry refused on the COUNT cap (budget not involved).
         for i in 3...20 {
             state = transition(state, StateFixtures.input("t-\(i)", id: "c-\(i)", kind: .followUp), &ids).state
