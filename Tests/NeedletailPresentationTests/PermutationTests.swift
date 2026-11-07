@@ -130,20 +130,43 @@ struct PermutationTests {
                 if emitted.count != 1 {
                     violations.append("queue intent must emit exactly one effect, got \(emitted.count)")
                 }
-                if state.queue != queueBefore {
-                    violations.append("queue intent mutated the projection instead of emitting")
+                // B2: submit intents project exactly one OPTIMISTIC row
+                // per command (visibly pending, Core confirms later);
+                // resubmits replace idempotently. Nothing else in the
+                // projection may move.
+                let matching = state.queue.filter { $0.isOptimistic && $0.commandID == CommandID("probe-q") }
+                let authoritativeBefore = queueBefore.filter { !$0.isOptimistic }
+                let authoritativeAfter = state.queue.filter { !$0.isOptimistic }
+                if matching.count != 1 {
+                    violations.append("queue intent must project exactly one optimistic row")
+                }
+                if authoritativeBefore != authoritativeAfter {
+                    violations.append("queue intent touched authoritative rows instead of only projecting")
                 }
             }
-            if state.queue != queueBefore, !isSessionOp(op) {
+            if state.queue != queueBefore, !isSessionOp(op), !isOptimisticOnlyDelta(before: queueBefore, after: state.queue) {
                 violations.append("non-session action touched the queue projection")
             }
         }
         return TraceResult(draft: draft, effects: effects, violations: violations)
     }
 
+    /// B2: the only legal queue delta from a non-session action is
+    /// appended optimistic rows (submit intents); anything else —
+    /// mutation, removal, authoritative edits — is a violation.
+    private static func isOptimisticOnlyDelta(before: [QueueSummary], after: [QueueSummary]) -> Bool {
+        guard after.count >= before.count else { return false }
+        guard Array(after.prefix(before.count)) == before else { return false }
+        return after.dropFirst(before.count).allSatisfy(\.isOptimistic)
+    }
     private static func isSessionOp(_ op: ScriptOp) -> Bool {
         switch op {
         case .sessionAdmit, .sessionDeny: return true
+        // cancelNotice and completion both carry session projections
+        // (denied clears optimistic rows; completions are display
+        // hints). Their queue effects are projection effects, pinned
+        // separately — never silent product mutation.
+        case .cancelNotice, .completion: return true
         default: return false
         }
     }

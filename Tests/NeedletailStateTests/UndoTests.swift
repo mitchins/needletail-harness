@@ -567,7 +567,7 @@ struct UndoTests {
         let unknownEntry = QueueEntry(
             entryID: "q-9", commandID: CommandID("cmd-9"), kind: .followUp,
             state: .heldUnknown, revision: 2, text: "maybe sent",
-            targetEpochID: EpochID("epoch-1"), orderKey: 9, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 9, rank: Double(9), sealed: false)
         let idle = try StateFixtures.idle()
         let held = idle.replacing(queue: [unknownEntry], queueHeld: true)
         #expect(!undoQuiescent(held), "heldUnknown is a deliveryUnknown leg")
@@ -580,7 +580,7 @@ struct UndoTests {
         let stale = QueueEntry(
             entryID: "q-8", commandID: CommandID("cmd-8"), kind: .followUp,
             state: .held, revision: 2, text: "stale",
-            targetEpochID: EpochID("epoch-1"), orderKey: 8, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 8, rank: Double(8), sealed: false)
         let staleHeld = idle.replacing(queue: [stale], queueHeld: true)
         #expect(undoQuiescent(staleHeld), "non-delivery holds do not gate undo")
     }
@@ -827,7 +827,7 @@ struct UndoTests {
         let entry = QueueEntry(
             entryID: "q-7", commandID: CommandID("cmd-7"), kind: .followUp,
             state: .queued, revision: 1, text: "x",
-            targetEpochID: EpochID("epoch-1"), orderKey: 7, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 7, rank: Double(7), sealed: false)
         let fork = LineageFork(
             forkID: "fork-17", sessionID: SessionID("s-1"),
             parentEpochID: EpochID("epoch-1"),
@@ -843,7 +843,7 @@ struct UndoTests {
         let junk = QueueEntry(
             entryID: "q-abc", commandID: CommandID("cmd-x"), kind: .followUp,
             state: .queued, revision: 1, text: "x",
-            targetEpochID: EpochID("epoch-1"), orderKey: 0, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 0, rank: Double(0), sealed: false)
         let records: [DurableRecord] = [
             .eventAppended(seq: SequenceNumber(5), kind: "k", digest: "d"),
             .queueAdmitted(entry), .queueAdmitted(junk),

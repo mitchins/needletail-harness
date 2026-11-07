@@ -483,7 +483,8 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
         entries[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .heldUnknown, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank,
+            sealed: entry.sealed,
             attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
         unknownLinks.append(link)
         queueHeld = true

@@ -59,10 +59,10 @@ struct RecordCodecTests {
                              outcome: "denied: exec"),
             .queueAdmitted(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .followUp,
                                       state: .queued, revision: 3, text: "fix the bug",
-                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: true)),
+                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, rank: 42.0, sealed: true)),
             .queueUpdated(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .steer,
                                      state: .dispatched, revision: 4, text: "fix the bug NOW",
-                                     targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false)),
+                                     targetEpochID: EpochID("epoch-1"), orderKey: 42, rank: 42.0, sealed: false)),
             .queueDispatched(QueueDispatchLink(
                 entryID: "q-1", commandID: CommandID("cmd-1"),
                 runID: RunID("r-1"), requestID: RequestID("req-1"),
@@ -308,7 +308,7 @@ struct RecordCodecTests {
         let bare = QueueEntry(
             entryID: "q-old", commandID: CommandID("cmd-old"), kind: .followUp,
             state: .queued, revision: 1, text: "old text",
-            targetEpochID: EpochID("epoch-1"), orderKey: 7, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 7, rank: 7.0, sealed: false)
         let encoded = try RecordCodec.encode(.queueAdmitted(bare))
         var outer = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         // The associated-value wrapper nests the entry one level deeper.
@@ -343,7 +343,7 @@ struct RecordCodecTests {
         let fresh = QueueEntry(
             entryID: "q-new", commandID: CommandID("cmd-new"), kind: .steer,
             state: .held, revision: 2, text: "new", targetEpochID: EpochID("epoch-1"),
-            orderKey: 9, sealed: false, attachments: [snap],
+            orderKey: 9, rank: 9.0, sealed: false, attachments: [snap],
             attachmentConsentEpoch: EpochID("epoch-1"))
         let back = try RecordCodec.decode(try RecordCodec.encode(.queueUpdated(fresh)))
         #expect(back == .queueUpdated(fresh), "snapshots + consent round-trip")

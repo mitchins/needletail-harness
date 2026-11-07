@@ -12,6 +12,9 @@ public enum UIAction: Sendable, Equatable {
     case terminal(TerminalCapabilityChange)
     case queueOp(QueueOperation)
     case mention(MentionAction)
+    /// Authoritative queue snapshot from Core (built by the impure edge
+    /// via `QueueSyncSnapshot.from`). The ONLY writer of `UIState.queue`.
+    case queueSync(QueueSyncSnapshot)
 }
 
 public enum MentionAction: Sendable, Equatable {
@@ -62,6 +65,14 @@ public enum QueueOperation: Sendable, Equatable {
     /// sealed/route) and refuses loudly; Presentation never grants.
     /// `range` is 1-based closed, nil for the whole file.
     case attachFile(path: String, range: ClosedRange<Int>?)
+    /// B2 reorder intent (display rank only; Core owns order).
+    case reorderEntry(entryID: String, beforeID: String?)
+    /// B2 approval intents: IDs come from the projected
+    /// `ApprovalRequestView`; without a live view these emit nothing.
+    case grantApproval
+    case denyApproval(reason: String)
+    /// B2 cancel intent: the actor cancels and holds; no auto-resume.
+    case cancelRun
 }
 
 public enum UIEffect: Sendable, Equatable {
@@ -75,6 +86,8 @@ public enum UIEffect: Sendable, Equatable {
     case cancelCurrent
     case inspect(InspectionCommand)
     case attachFile(path: String, range: ClosedRange<Int>?)
+    case queueReorder(entryID: String, beforeID: String?)
+    case decideApproval(ApprovalDecision, requestID: RequestID, generation: Revision)
 }
 
 public struct OperatorInput: Sendable, Equatable {

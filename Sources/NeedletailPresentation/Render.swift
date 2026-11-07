@@ -105,9 +105,16 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
         lines.append(SemanticLine(id: "status-failed", runs: [StyledRun(text: terminalSafe(cause), role: .errorNotice)]))
     }
     for entry in state.queue {
+        var text = "\(entry.kind) \(entry.state)\(entry.pending ? " (pending)" : "")"
+        if entry.staleTarget {
+            text += " [stale target]"
+        }
+        if entry.hasAttachments {
+            text += " [attachments]"
+        }
         lines.append(SemanticLine(
             id: "queue-\(entry.entryID)",
-            runs: [StyledRun(text: "\(entry.kind) \(entry.state)\(entry.pending ? " (pending)" : "")", role: .normal)]))
+            runs: [StyledRun(text: terminalSafe(text), role: .normal)]))
     }
     if let agent = state.activeAgent {
         lines.append(SemanticLine(
@@ -115,6 +122,13 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
             runs: [StyledRun(
                 text: "\(terminalSafe(agent.modelAlias)) · \(terminalSafe(agent.locality)) · \(terminalSafe(agent.phase))",
                 role: .status)]))
+    }
+    if let approval = state.pendingApproval {
+        lines.append(SemanticLine(
+            id: "approval-request",
+            runs: [StyledRun(
+                text: "\(approval.sandbox ? "sandbox" : "human") approval: \(terminalSafe(approval.operation)) [\(terminalSafe(approval.requiredGrant))]",
+                role: .candidateSelected)]))
     }
     if let suggestion = state.suggestion {
         let selected = suggestion.selectedIndex ?? 0

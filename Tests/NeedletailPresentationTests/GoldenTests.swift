@@ -61,6 +61,26 @@ enum GoldenFixtures {
         return render(state, width: 80, capabilities: TerminalCapabilities())
     }
 
+    static func queueScenario() -> RenderFrame {
+        var state = UIState()
+        let live = EpochID("e-1")
+        let stale = QueueEntry(entryID: "q-2", commandID: CommandID("b"), kind: .steer,
+            state: .held, revision: 2, text: "t", targetEpochID: EpochID("e-0"),
+            orderKey: 2, rank: 2.0)
+        let fresh = QueueEntry(entryID: "q-1", commandID: CommandID("a"), kind: .followUp,
+            state: .queued, revision: 1, text: "t", targetEpochID: live,
+            orderKey: 1, rank: 1.0)
+        (state, _) = reduce(state, .queueSync(QueueSyncSnapshot(
+            entries: [fresh, stale], activeRequest: nil,
+            queueHeld: true, heldReason: .cancelled(sinceMillis: 9),
+            pendingApproval: ApprovalRequestView(
+                requestID: RequestID("r-2"), generation: Revision(4), operation: "exec",
+                requiredGrant: "exec", protectedPaths: [], sandbox: true),
+            admittedCommandIDs: [CommandID("a"), CommandID("b")],
+            liveEpoch: live)))
+        return render(state, width: 80, capabilities: TerminalCapabilities())
+    }
+
     static func scenario() -> RenderFrame {
         var state = UIState()
         state.suggestion = MentionSuggestionState(query: "src/", revision: 5, candidates: [])
@@ -96,6 +116,22 @@ struct GoldenTests {
         let golden = try JSONDecoder().decode(
             GoldenFrame.self, from: GoldenFixtures.load("basic-chat.json"))
         let frame = GoldenFixtures.scenario()
+        #expect(frame.width == golden.width)
+        #expect(frame.lines.count == golden.lines.count,
+                "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
+        for (actual, expected) in zip(frame.lines, golden.lines) {
+            #expect(actual.id == expected.id, "line id: \(actual.id) vs \(expected.id)")
+            #expect(actual.runs.map(\.text) == expected.runs.map(\.text), "text for \(expected.id)")
+            #expect(actual.runs.map(\.role.rawValue) == expected.runs.map(\.role),
+                    "roles for \(expected.id)")
+        }
+    }
+
+    @Test("DX-07 queue hold, stale target and approval render")
+    func DX_07_queueGoldenFramesMatch() throws {
+        let golden = try JSONDecoder().decode(
+            GoldenFrame.self, from: GoldenFixtures.load("queue-held.json"))
+        let frame = GoldenFixtures.queueScenario()
         #expect(frame.width == golden.width)
         #expect(frame.lines.count == golden.lines.count,
                 "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")

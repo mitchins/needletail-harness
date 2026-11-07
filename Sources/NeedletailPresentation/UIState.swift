@@ -81,22 +81,57 @@ public struct MentionToken: Sendable, Equatable {
 }
 
 /// Read-only projection of one queue entry (QueueSummary(entry:) is the
-/// ONLY constructor — Presentation mints no queue identity).
+/// ONLY constructor for authoritative rows — Presentation mints no queue
+/// identity; optimistic rows use `QueueSummary.optimistic` and are
+/// replaced by authoritative rows on sync).
 public struct QueueSummary: Sendable, Equatable {
     public var entryID: String
+    public var commandID: CommandID?
     public var kind: String
     public var state: String
     public var revision: UInt64
     public var delivery: DeliveryStatus
     public var pending: Bool
+    /// True only for locally projected unconfirmed intents (never Core
+    /// truth). Cleared by sync-confirm or denial rollback.
+    public var isOptimistic: Bool
+    /// True when the entry's target epoch differs from the live epoch.
+    public var staleTarget: Bool
+    public var hasAttachments: Bool
 
     public init(entry: QueueEntry, delivery: DeliveryStatus, pending: Bool) {
         self.entryID = entry.entryID
+        self.commandID = entry.commandID
         self.kind = entry.kind.rawValue
         self.state = entry.state.rawValue
         self.revision = entry.revision
         self.delivery = delivery
         self.pending = pending
+        self.isOptimistic = false
+        self.staleTarget = false
+        self.hasAttachments = !entry.attachments.isEmpty
+    }
+
+    public static func optimistic(text: String, kind: QueueKind, commandID: CommandID, revision: UInt64) -> QueueSummary {
+        QueueSummary(entryID: "pending-\(commandID.raw)", commandID: commandID,
+            kind: kind.rawValue, state: "queued", revision: revision,
+            delivery: .queued, pending: true, isOptimistic: true,
+            staleTarget: false, hasAttachments: false)
+    }
+
+    public init(entryID: String, commandID: CommandID?, kind: String, state: String,
+                revision: UInt64, delivery: DeliveryStatus, pending: Bool,
+                isOptimistic: Bool, staleTarget: Bool, hasAttachments: Bool) {
+        self.entryID = entryID
+        self.commandID = commandID
+        self.kind = kind
+        self.state = state
+        self.revision = revision
+        self.delivery = delivery
+        self.pending = pending
+        self.isOptimistic = isOptimistic
+        self.staleTarget = staleTarget
+        self.hasAttachments = hasAttachments
     }
 }
 
@@ -136,6 +171,9 @@ public struct UIState: Sendable, Equatable {
     /// retain them (attach re-validates path/identity in Core at submit).
     public var tokens: [MentionToken]
     public var queue: [QueueSummary]
+    /// Core-minted approval awaiting decision (nil when none). Display
+    /// and ID-carrying intents only — never granted here.
+    public var pendingApproval: ApprovalRequestView?
     public var activeAgent: AgentSummary?
     public var inspection: InspectionView?
     public var status: UIStatus
@@ -144,13 +182,15 @@ public struct UIState: Sendable, Equatable {
         composer: ComposerState = ComposerState(),
         suggestion: MentionSuggestionState? = nil,
         tokens: [MentionToken] = [],
-        queue: [QueueSummary] = [], activeAgent: AgentSummary? = nil,
+        queue: [QueueSummary] = [], pendingApproval: ApprovalRequestView? = nil,
+        activeAgent: AgentSummary? = nil,
         inspection: InspectionView? = nil, status: UIStatus = .idle
     ) {
         self.composer = composer
         self.suggestion = suggestion
         self.tokens = tokens
         self.queue = queue
+        self.pendingApproval = pendingApproval
         self.activeAgent = activeAgent
         self.inspection = inspection
         self.status = status

@@ -449,6 +449,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.idle, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (.idle, .queueReorder(let entryID, let beforeID, let at)):
+        return reorderQueueEntry(state, entryID: entryID, beforeID: beforeID, atMillis: at, ids: &ids)
     case (.idle, .acknowledgeUnknown(let operationID, let determination, let at)):
         return acknowledgeUnknownOp(state, operationID: operationID, determination: determination, atMillis: at, ids: &ids)
     case (.idle, .queueAttachmentReplace(let entryID, let snapshots, let at)):
@@ -588,6 +590,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (.failed, .queueReconcile(let entryID, let at)), (.completed, .queueReconcile(let entryID, let at)), (.interrupted, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (.failed, .queueReorder(let entryID, let beforeID, let at)), (.completed, .queueReorder(let entryID, let beforeID, let at)), (.interrupted, .queueReorder(let entryID, let beforeID, let at)):
+        return reorderQueueEntry(state, entryID: entryID, beforeID: beforeID, atMillis: at, ids: &ids)
     case (.failed, .acknowledgeUnknown(let operationID, let determination, let at)), (.completed, .acknowledgeUnknown(let operationID, let determination, let at)), (.interrupted, .acknowledgeUnknown(let operationID, let determination, let at)):
         return acknowledgeUnknownOp(state, operationID: operationID, determination: determination, atMillis: at, ids: &ids)
     case (.failed, .queueAttachmentReplace(let entryID, let snapshots, let at)), (.completed, .queueAttachmentReplace(let entryID, let snapshots, let at)), (.interrupted, .queueAttachmentReplace(let entryID, let snapshots, let at)):
@@ -638,6 +642,8 @@ public func transition<I: IDSource>(_ state: SessionState, _ event: SessionEvent
         return retargetQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
     case (_, .queueReconcile(let entryID, let at)):
         return reconcileQueueEntry(state, entryID: entryID, atMillis: at, ids: &ids)
+    case (_, .queueReorder(let entryID, let beforeID, let at)):
+        return reorderQueueEntry(state, entryID: entryID, beforeID: beforeID, atMillis: at, ids: &ids)
     case (_, .acknowledgeUnknown(let operationID, let determination, let at)):
         return acknowledgeUnknownOp(state, operationID: operationID, determination: determination, atMillis: at, ids: &ids)
     case (_, .queueAttachmentReplace(let entryID, let snapshots, let at)):
@@ -1057,7 +1063,7 @@ private func admitToQueueState<I: IDSource>(
     let entry = QueueEntry(
         entryID: "q-\(seq.value)", commandID: commandID, kind: kind,
         state: state.queueHeld ? .held : .queued, revision: 1, text: text,
-        targetEpochID: state.epoch.epochID, orderKey: seq.value, sealed: sealed,
+        targetEpochID: state.epoch.epochID, orderKey: seq.value, rank: Double(seq.value), sealed: sealed,
         attachments: attachments, attachmentConsentEpoch: attachments.isEmpty ? nil : state.epoch.epochID)
     let ack = QueueAck(commandID: commandID, entryID: entry.entryID, sequence: seq, revision: 1, state: entry.state)
     index[commandID] = ack
@@ -1137,7 +1143,7 @@ private func withdrawEntry<I: IDSource>(_ state: SessionState, entryID: String, 
     let tombstone = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .withdrawn, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
         attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
     queue[position] = tombstone
     // S5: the ack index tracks the tombstone (a retry replays the withdrawn
@@ -1189,7 +1195,7 @@ private func resumeQueue<I: IDSource>(_ state: SessionState, atMillis: UInt64, i
         queue[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .queued, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
             attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
         unholds.append(.queueUpdated(queue[i]))
     }
@@ -1255,7 +1261,7 @@ private func retargetQueueEntry<I: IDSource>(_ state: SessionState, entryID: Str
     queue[position] = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: entry.state, revision: entry.revision, text: entry.text,
-        targetEpochID: state.epoch.epochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        targetEpochID: state.epoch.epochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
         attachments: entry.attachments,
         attachmentConsentEpoch: entry.attachments.isEmpty ? entry.attachmentConsentEpoch : state.epoch.epochID)
     let (s1, prefix) = sequenced(state, kind: "queue-retargeted", digest: eventDigest("retarget", entryID), ids: &ids)
@@ -1287,7 +1293,7 @@ private func reconcileQueueEntry<I: IDSource>(_ state: SessionState, entryID: St
     queue[position] = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .queued, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
         attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
     let (s1, prefix) = sequenced(state, kind: "queue-reconciled", digest: eventDigest("reconcile", entryID), ids: &ids)
     let next = s1.replacing(queue: queue)
@@ -1295,6 +1301,62 @@ private func reconcileQueueEntry<I: IDSource>(_ state: SessionState, entryID: St
         state: next,
         effects: [.emitUI(.runUpdate(phase: "queue", detail: "reconciled \(entryID): requeued by explicit operator decision"))],
         records: prefix + [.queueUpdated(queue[position])])
+}
+
+/// M4-B B2: explicit operator reorder. Only undispatched entries
+/// (queued/held) move; dispatched/history/withdrawn/heldUnknown refuse
+/// loudly. `orderKey` is never reassigned — the move assigns a midpoint
+/// `rank` and re-inserts at the anchor position. The ack index is
+/// untouched (identity preserved). Anchor `nil` appends at the end;
+/// anchor == entry is an idempotent no-op ack.
+private func reorderQueueEntry<I: IDSource>(_ state: SessionState, entryID: String, beforeID: String?, atMillis: UInt64, ids: inout I) -> Transition {
+    _ = atMillis
+    guard let position = state.queue.firstIndex(where: { $0.entryID == entryID }) else {
+        let (s1, prefix) = sequenced(state, kind: "queue-reorder-unknown", digest: eventDigest("reorder", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "unknown queue entry"))], records: prefix)
+    }
+    let entry = state.queue[position]
+    guard entry.state == .queued || entry.state == .held else {
+        let (s1, prefix) = sequenced(state, kind: "queue-reorder-refused", digest: eventDigest("reorder", entryID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "only undispatched entries can be reordered"))], records: prefix)
+    }
+    if let beforeID, beforeID == entryID {
+        let (s1, prefix) = sequenced(state, kind: "queue-reordered", digest: eventDigest("reorder", entryID), ids: &ids)
+        return Transition(
+            state: s1,
+            effects: [.emitUI(.admitted(commandID: entry.commandID, revision: entry.revision))],
+            records: prefix)
+    }
+    if let beforeID, state.queue.firstIndex(where: { $0.entryID == beforeID }) == nil {
+        let (s1, prefix) = sequenced(state, kind: "queue-reorder-unknown-anchor", digest: eventDigest("reorder", entryID, beforeID), ids: &ids)
+        return Transition(state: s1, effects: [.emitUI(.denied(cause: "unknown reorder anchor"))], records: prefix)
+    }
+    var queue = state.queue
+    queue.remove(at: position)
+    let insertAt: Int
+    let newRank: Double
+    if let beforeID, let target = queue.firstIndex(where: { $0.entryID == beforeID }) {
+        let beforeRank = queue[target].rank
+        let prevRank = target > 0 ? queue[target - 1].rank : beforeRank - 2.0
+        newRank = (prevRank + beforeRank) / 2.0
+        insertAt = target
+    } else {
+        newRank = (queue.map(\.rank).max() ?? 0.0) + 1.0
+        insertAt = queue.count
+    }
+    let moved = QueueEntry(
+        entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
+        state: entry.state, revision: entry.revision, text: entry.text,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: newRank,
+        sealed: entry.sealed,
+        attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
+    queue.insert(moved, at: insertAt)
+    let (s1, prefix) = sequenced(state, kind: "queue-reordered", digest: eventDigest("reorder", entryID), ids: &ids)
+    let next = s1.replacing(queue: queue)
+    return Transition(
+        state: next,
+        effects: [.emitUI(.admitted(commandID: entry.commandID, revision: entry.revision))],
+        records: prefix + [.queueUpdated(moved)])
 }
 
 /// M2-D D3: explicit operator reconciliation of one unknown mutating
@@ -1372,7 +1434,7 @@ private func switchModel<I: IDSource>(_ state: SessionState, alias: String, atMi
         queue[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .held, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
             attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
         // M2-D D0: the stale-epoch hold is durable AND holds the queue —
         // retarget or withdraw is required before anything dispatches
@@ -1816,7 +1878,7 @@ private func dispatchQueuePosition<I: IDSource>(
     let dispatched = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .dispatched, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
         attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
     queue[position] = dispatched
     let mid = state.replacing(
@@ -1846,7 +1908,7 @@ private func holdStaleQueuePosition<I: IDSource>(
     let heldEntry = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .held, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
         attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
     queue[position] = heldEntry
     let (s1, prefix) = sequenced(state, kind: "completed-stale-attachment", digest: digest, ids: &ids)
@@ -1957,7 +2019,7 @@ private func replaceEntryAttachments<I: IDSource>(
     queue[position] = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: entry.state, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
         attachments: snapshots,
         attachmentConsentEpoch: snapshots.isEmpty ? entry.attachmentConsentEpoch : state.epoch.epochID)
     let (s1, prefix) = sequenced(state, kind: "queue-replaced", digest: eventDigest("replace", entryID), ids: &ids)
@@ -2572,7 +2634,7 @@ private func admitReservedRun<I: IDSource>(_ state: SessionState, entry: QueueEn
     let history = QueueEntry(
         entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
         state: .admittedToHistory, revision: entry.revision, text: entry.text,
-        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+        targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank, sealed: entry.sealed,
         attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
     var queue = state.queue
     if let position = queue.firstIndex(where: { $0.entryID == entry.entryID }) {
@@ -3985,7 +4047,7 @@ private func cancelActive<I: IDSource>(_ state: SessionState, atMillis: UInt64, 
         queue[i] = QueueEntry(
             entryID: queue[i].entryID, commandID: queue[i].commandID, kind: queue[i].kind,
             state: .held, revision: queue[i].revision, text: queue[i].text,
-            targetEpochID: queue[i].targetEpochID, orderKey: queue[i].orderKey, sealed: queue[i].sealed,
+            targetEpochID: queue[i].targetEpochID, orderKey: queue[i].orderKey, rank: queue[i].rank, sealed: queue[i].sealed,
             attachments: queue[i].attachments, attachmentConsentEpoch: queue[i].attachmentConsentEpoch)
         records.append(.queueUpdated(queue[i]))
     }

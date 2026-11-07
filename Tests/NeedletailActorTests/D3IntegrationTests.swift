@@ -1247,7 +1247,7 @@ struct D3IntegrationTests {
         let entry = QueueEntry(
             entryID: "q-cf", commandID: CommandID("cmd-cf"), kind: .followUp,
             state: .queued, revision: 1, text: "queued work",
-            targetEpochID: epoch.epochID, orderKey: 7, sealed: false)
+            targetEpochID: epoch.epochID, orderKey: 7, rank: Double(7), sealed: false)
         try store.appendBatch([.queueAdmitted(entry)], as: writer)
         // Bypass: a fresh actor on the used store sees no queue.
         let bypass = try SessionActor(
