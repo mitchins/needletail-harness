@@ -127,5 +127,26 @@ struct QueueContractTests {
             }
         }
     }
+
+    @Test("UX-QUEUE-09 queue caps refuse loudly: 21st entry and 64 KiB text")
+    func UX_QUEUE_09_capsRefuse() throws {
+        var ids = StateFixtures.ids()
+        let (admitting, _) = try StateFixtures.admitted("run", ids: &ids)
+        var state = transition(admitting, .requestDispatched(requestID: admitting.activeRun!.requestID, atMillis: 1001), &ids).state
+        for i in 1...20 {
+            state = transition(state, StateFixtures.input("t-\(i)", id: "c-\(i)", kind: .followUp), &ids).state
+        }
+        #expect(state.queue.count == 20, "twenty queued")
+        let refused = transition(state, StateFixtures.input("t-21", id: "c-21", kind: .followUp), &ids)
+        #expect(refused.state.queue.count == 20, "21st refused, nothing silently dropped")
+        #expect(refused.state.admittedCommands[CommandID("c-21")] == nil, "no ack for the refused entry")
+        #expect(refused.effects.contains(where: {
+            if case .emitUI(let p) = $0 { return p.kind == "denied" }
+            return false
+        }), "typed refusal, got: \(refused.effects)")
+        let big = transition(state, StateFixtures.input(String(repeating: "x", count: 65_536), id: "c-big", kind: .followUp), &ids)
+        #expect(big.state.queue.count == 20, "over-budget text refused")
+        #expect(big.state.admittedCommands[CommandID("c-big")] == nil)
+    }
 }
 #endif
