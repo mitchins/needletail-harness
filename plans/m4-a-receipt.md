@@ -497,3 +497,72 @@ Verdict: **M4-A BLOCKED** — scope precisely:
   green and no code changes result.
 - STOP honored: no M4-B/C/D, no push/PR/merge (branch local-only),
   no model traffic (M3A live-gated, none invoked).
+
+## 13. Final native evidence 2026-11-07 UTC — M4-A QUALIFIED
+
+Host (explicitly verified): `Builds-Mac-Pro.local`, Darwin 25.6.0,
+macOS 26.7.1 (Build 25G241), Intel x86_64 (Core i7-8700),
+Xcode 26.6 (17F113), Apple Swift 6.3.3, SDK MacOSX26.5.sdk.
+Fresh reboot (up 49 s at first contact 2026-11-06 23:50 UTC; operator
+restart). Disk 11% used. rg 15.2.0 via brew (see provisioning note).
+Readiness log: `.needletail-dev/m4a-final/host-ready.log`.
+
+Tree sync (exact final tree): `git archive 32d2226` →
+`.needletail-dev/m4a-final/m4a-32d2226.tar`, SHA-256
+`22d5dcf27ce04432a73d3d0a270c0a54da9608febfedf20613210808958`
+identical on betalab and macbuild; extracted to `~/m4a`; spot hash
+(`B0ActorIntegrationTests.swift` `96aa1b65…`) matches local `32d2226`
+byte-for-byte. No `.git` on host (archive tree); tree identity is the
+tarball hash. Transfer log: `transfer.log`.
+
+Provisioning incident (mine, not the tree's): brew installs rg as a
+symlink; the product's rg pinning correctly denied it ("rg is
+symlink"), failing B2 keepers on first run. Replaced the symlink with
+the real Cellar binary at `/usr/local/bin/rg` (same 15.2.0); B2
+re-ran green. Product fail-closed behavior confirmed working.
+(`rg-provision.log`, `rg-fix.log`.)
+
+Keepers, debug, pristine tree, `swift test --filter <Suite>`, each
+suite individually, all exit 0 (2026-11-07 00:05–00:12 UTC,
+`keepers-final.log`, B2 re-runs `b2-rerun.log`):
+C2 21/21, TOOL10 8/8, B2Closure 12/12, B2ReadSearch 15/15, B3 30/30,
+C1 8 run, DX 3/3, Wire 11/11, Net 8/8, CrossRunGate 20/20,
+M3AReplayLiveTests2 1/1 (live-gated, skipped — no model traffic),
+B5CEndToEndTests 3/3 keepers, ProductionCLIWiringTests 2/2 keepers.
+
+Optimized battery, `swift test -c release --filter <Suite>`, test-only
+G14 lifts (47/47 verified: 8 suite + 39 per-test; G1/G-cwd/PORT-03
+untouched; revert verified pristine 11/11 + local hash match):
+- B0 12/12, B1 39/39, TOOL09 13/13, Timer 2/2, Actor 2/2, Boundary 6/6,
+  D3 15/15, B0Spine 22/22 — all exit 0 (`m4a-optimized-final2.log`).
+- B5C 22/22, ProductionCLI 9/9, C3 13/13 (13 G14 legs; 5 G1 stay
+  gated by design) — all exit 0 with `NEEDLETAIL_BIN` pointing at the
+  release product binary built from the same tree
+  (`m4a-optimized-final3.log`, REVERT-CLEAN).
+155 optimized test executions, zero failures. The three child suites
+first ran against the debug fallback binary (SIGBUS — expected G14,
+my procedure error, documented in the logs, not tree evidence), then
+green against the release binary. First `-O` attempt void (harness
+word-split bug, 0 tests, no tree effect); second attempt's
+REVERT-DIRTY proven cosmetic by independent 11/11 hash check.
+
+G13 re-verify on final tree: B0-F2A 7/7 pass in `-O` (incl. F2A 5,
+the terminal-revive scenario that SIGBUS'd pre-fix); Boundary ring
+test passes. The revive loop is green on the final tree; `transition`
+has one definition and zero self-call sites (static check §12).
+
+Linux standing: full `./dev test offline` green + vendor-check green
+at `96eaeda` (§12); `96eaeda..32d2226` is receipt-markdown only
+(`git diff --stat`: 1 file), so product+test code is identical and
+the gate results carry over exactly.
+
+G14 final state: classification from §12 stands, now with complete
+triangulation — every one of the 47 exclusions has Darwin `-O`
+behavioral evidence green plus Linux-debug green. No pending legs.
+Gated tests remain recorded as "0 run", never PASS.
+
+Verdict: **M4-A QUALIFIED**. All scheduled optimized native
+portability tests pass on the final tree; final-tree keeper evidence
+complete; Linux gate green; G14 truthfully classified with full
+evidence; no production portability blocker. STOP honored: no
+M4-B/C/D, no push/PR/merge (branch local-only), no model traffic.
