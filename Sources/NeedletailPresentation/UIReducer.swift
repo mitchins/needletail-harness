@@ -24,15 +24,32 @@ public func reduce(_ state: UIState, _ action: UIAction) -> (UIState, [UIEffect]
     case .inspectResult(let result):
         return reduceInspectResult(state, result)
     case .inspect(let command):
-        // Dismiss clears locally with no fetch. Every other command is a
-        // LOCAL store/actor read via the edge (inspectResult comes back);
-        // no provider traffic is possible — no such effect exists here.
-        if command == .dismiss {
+        // Dismiss clears locally with no fetch. Undo preview is an
+        // actor-reconciled read (edge translates the effect). Everything
+        // else is a LOCAL store/actor read via the edge (inspectResult
+        // comes back); no provider traffic is possible — no such
+        // effect exists in this layer.
+        switch command {
+        case .dismiss:
             var next = state
             next.inspection = nil
             return (next, [])
+        case .undoPreview(let groupID):
+            return (state, [.undoPreview(groupID: groupID)])
+        default:
+            return (state, [.inspect(command)])
         }
-        return (state, [.inspect(command)])
+    case .undoIntent(let intent):
+        switch intent {
+        case .preview(let groupID):
+            return (state, [.undoPreview(groupID: groupID)])
+        case .run(let groupID):
+            // Explicit run only; the actor reconciles, validates, and
+            // records idempotently. The UI never runs inverses itself.
+            return (state, [.runUndo(groupID: groupID)])
+        }
+    case .rewindRequest(let boundary):
+        return (state, [.requestLineageFork(boundary: boundary)])
     case .mention(let mention):
         return reduceMention(state, mention)
     }
@@ -322,6 +339,14 @@ private func reduceInspectResult(_ state: UIState, _ result: InspectionResult) -
         next.inspection = .epochs(rows: rows)
     case .compact(let preview):
         next.inspection = .compact(preview: preview)
+    case .diff(let files):
+        next.inspection = .diff(files: files)
+    case .undoPreview(let preview):
+        next.inspection = .undoPreview(preview: preview)
+    case .undoOutcome(let outcome):
+        next.inspection = .undoOutcome(outcome: outcome)
+    case .rewind(let view):
+        next.inspection = .rewind(view: view)
     }
     return (next, [])
 }

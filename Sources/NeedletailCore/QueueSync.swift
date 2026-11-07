@@ -1,32 +1,55 @@
 import Foundation
 
+/// Rendered executable identity bound into an approval (resolved path
+/// + content digest + cwd identity). Display-only projection of the
+/// Core `ExecCommandIdentity` — the UI never re-resolves executables.
+public struct ExecIdentitySummary: Sendable, Equatable {
+    public var resolvedPath: String
+    public var contentDigest: String
+
+    public init(resolvedPath: String, contentDigest: String) {
+        self.resolvedPath = resolvedPath
+        self.contentDigest = contentDigest
+    }
+
+    public init(identity: ExecCommandIdentity) {
+        self.init(resolvedPath: identity.resolvedPath, contentDigest: identity.contentDigest)
+    }
+}
+
 /// M4-B B2: Core-minted read-only approval view. Carries the exact IDs
 /// the actor's `decideApproval` requires, so Presentation can display
 /// and route decisions without inventing identity or reading actor
 /// state. `sandbox` marks gateway-originated policy decisions (display
-/// and grant-kind only — the UI never evaluates policy).
+/// only — the UI never evaluates policy). B4 adds the bound executable
+/// identities and protected scope for exact-identity display.
 public struct ApprovalRequestView: Sendable, Equatable {
     public var requestID: RequestID
     public var generation: Revision
     public var operation: String
     public var requiredGrant: String
     public var protectedPaths: [String]
+    public var execIdentities: [ExecIdentitySummary]
     public var sandbox: Bool
 
     public init(requestID: RequestID, generation: Revision, operation: String,
-                requiredGrant: String, protectedPaths: [String], sandbox: Bool) {
+                requiredGrant: String, protectedPaths: [String],
+                execIdentities: [ExecIdentitySummary] = [], sandbox: Bool) {
         self.requestID = requestID
         self.generation = generation
         self.operation = operation
         self.requiredGrant = requiredGrant
         self.protectedPaths = protectedPaths
+        self.execIdentities = execIdentities
         self.sandbox = sandbox
     }
 
     public init(request: ApprovalRequest, sandbox: Bool) {
         self.init(requestID: request.requestID, generation: request.generation,
                   operation: request.operation, requiredGrant: request.requiredGrant,
-                  protectedPaths: request.protectedPaths, sandbox: sandbox)
+                  protectedPaths: request.protectedPaths,
+                  execIdentities: request.execIdentities.map(ExecIdentitySummary.init(identity:)),
+                  sandbox: sandbox)
     }
 }
 

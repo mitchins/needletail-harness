@@ -160,4 +160,8 @@ public enum InspectionResult: Sendable, Equatable {
     case context(usage: UIContextUsage)
     case epochs(rows: [UIEpochRow])
     case compact(preview: UICompactPreview)
+    case diff(files: [UIDiffFile])
+    case undoPreview(preview: UIUndoPreview)
+    case undoOutcome(outcome: UIUndoOutcome)
+    case rewind(view: UIRewindView)
 }

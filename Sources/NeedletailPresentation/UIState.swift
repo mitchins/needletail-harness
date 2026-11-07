@@ -157,6 +157,10 @@ public enum InspectionView: Sendable, Equatable {
     case agents(rows: [UIAgentRow])
     case models(routes: [UIModelRoute])
     case compact(preview: UICompactPreview)
+    case diff(files: [UIDiffFile])
+    case undoPreview(preview: UIUndoPreview)
+    case undoOutcome(outcome: UIUndoOutcome)
+    case rewind(view: UIRewindView)
 }
 
 public enum UIStatus: Sendable, Equatable {

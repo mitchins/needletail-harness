@@ -68,7 +68,7 @@ re-review READY).
   still runs them fully). These suites were not M4-A macOS
   keepers, so no qualified result changes. Evidence logs:
   `.needletail-dev/m4b-b2/` (mac build + debug + -O logs).
-## B3 — session, model, context, epoch views (review pending)
+## B3 — session, model, context, epoch views (DeepSeek READY)
 
 - `SessionViews.swift` (new): `UISessionRow` + `sessionLiveness`
   (active/idle/stale/unknown, explicit 5-min rule, skew guard),
@@ -97,4 +97,23 @@ Branch `m4-a` (local-only; no push/PR/merge without authorization).
 Baselines: M4-A qualified code `32d2226` (receipt `29af6f0`), boundary
 `plans/m4-a-boundary.md`, plan `plans/m4-b-plan.md` (DeepSeek READY,
 re-review READY).
+
+## B4 — diff, undo, rewind, approval views (review pending)
+
+- `UndoDiffViews.swift` (new): `UIUndoFile/Preview/Outcome`
+  (eligibility, conflicts, partials, unknown-outcome notices),
+  `UIDiffFile` + provenance (agent/user/mixed — never implied
+  authorship), `UIRewindView` (lineage fork + divergence warning),
+  `UndoIntent` (preview/run). Approval view gains bound
+  `execIdentities` + protected scope (rendered exactly).
+- Intents: `undoIntent` → `.undoPreview/.runUndo` effects;
+  `rewindRequest` → `.requestLineageFork` (record-only);
+  inspect commands/results for diff/undo-preview/undo-outcome/rewind.
+  Views request; the actor reconciles/validates/records.
+- Render: diff/undo/rewind branches with stable IDs; approval
+  exec-identity lines.
+- Tests: 8 UX RED→GREEN (UNDO-06/08/09 pure legs, NAV-07,
+  approval identity); undo golden + manifest `m4-b-b4`;
+  BDD-06 run-intent probe (`plans/m4-b-b4-probe-undorun.log`).
+- Linux `quick` green (exit 0).
 

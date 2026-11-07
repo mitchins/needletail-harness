@@ -21,6 +21,12 @@ public enum UIAction: Sendable, Equatable {
     /// Inspection intent: the edge performs a LOCAL store/actor read
     /// and feeds back an `inspectResult`. Never a provider request.
     case inspect(InspectionCommand)
+    /// Undo intent: the actor reconciles the group and validates;
+    /// never a direct mutation by the UI.
+    case undoIntent(UndoIntent)
+    /// Rewind fork request: record-only lineage fork (Core validates
+    /// the boundary; no file mutation, no branch switch).
+    case rewindRequest(boundary: LineageBoundary)
 }
 
 public enum MentionAction: Sendable, Equatable {
@@ -94,6 +100,9 @@ public enum UIEffect: Sendable, Equatable {
     case attachFile(path: String, range: ClosedRange<Int>?)
     case queueReorder(entryID: String, beforeID: String?)
     case decideApproval(ApprovalDecision, requestID: RequestID, generation: Revision)
+    case undoPreview(groupID: String)
+    case runUndo(groupID: String)
+    case requestLineageFork(boundary: LineageBoundary)
 }
 
 public struct OperatorInput: Sendable, Equatable {
@@ -114,5 +123,8 @@ public enum InspectionCommand: Sendable, Equatable {
     case agents
     case models
     case compactDryRun
+    case diff
+    case undoPreview(groupID: String)
+    case rewind(epochID: EpochID, throughSequence: UInt64)
     case dismiss
 }

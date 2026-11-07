@@ -126,11 +126,20 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
                 role: .status)]))
     }
     if let approval = state.pendingApproval {
+        var text = "\(approval.sandbox ? "sandbox" : "human") approval: \(terminalSafe(approval.operation)) [\(terminalSafe(approval.requiredGrant))]"
+        if !approval.protectedPaths.isEmpty {
+            text += " scope: \(approval.protectedPaths.map(terminalSafe).joined(separator: ","))"
+        }
         lines.append(SemanticLine(
             id: "approval-request",
-            runs: [StyledRun(
-                text: "\(approval.sandbox ? "sandbox" : "human") approval: \(terminalSafe(approval.operation)) [\(terminalSafe(approval.requiredGrant))]",
-                role: .candidateSelected)]))
+            runs: [StyledRun(text: text, role: .candidateSelected)]))
+        for (index, identity) in approval.execIdentities.enumerated() {
+            lines.append(SemanticLine(
+                id: "approval-exec-\(index)",
+                runs: [StyledRun(
+                    text: "exec: \(terminalSafe(identity.resolvedPath))#\(terminalSafe(String(identity.contentDigest.prefix(12))))",
+                    role: .normal)]))
+        }
     }
     if let suggestion = state.suggestion {
         let selected = suggestion.selectedIndex ?? 0
@@ -221,6 +230,46 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
                     id: "inspect-queue-\(id)",
                     runs: [StyledRun(text: id, role: .normal)]))
             }
+        case .diff(let files):
+            for file in files {
+                lines.append(SemanticLine(
+                    id: "diff-\(file.path)",
+                    runs: [StyledRun(
+                        text: "\(file.path) [\(file.provenance.rawValue)]",
+                        role: .normal)]))
+                for (index, hunk) in file.hunks.enumerated() {
+                    lines.append(SemanticLine(
+                        id: "diff-\(file.path)#\(index)",
+                        runs: [StyledRun(text: terminalSafe(hunk), role: .normal)]))
+                }
+            }
+        case .undoPreview(let preview):
+            lines.append(SemanticLine(
+                id: "undo-preview-\(preview.groupID)",
+                runs: [StyledRun(
+                    text: "undo \(preview.groupID): \(preview.canRun ? "ready" : "blocked") — \(terminalSafe(preview.notice))",
+                    role: preview.canRun ? .status : .errorNotice)]))
+            for file in preview.files {
+                var text = "\(file.path): \(file.eligible ? "eligible" : "ineligible")"
+                if let conflict = file.conflict {
+                    text += " (\(conflict))"
+                }
+                lines.append(SemanticLine(
+                    id: "undo-file-\(file.path)",
+                    runs: [StyledRun(text: terminalSafe(text), role: file.eligible ? .normal : .errorNotice)]))
+            }
+        case .undoOutcome(let outcome):
+            lines.append(SemanticLine(
+                id: "undo-outcome-\(outcome.groupID)",
+                runs: [StyledRun(
+                    text: "undo \(outcome.groupID): \(outcome.applied.count) applied, \(outcome.refused.count) refused, \(outcome.failed.count) failed — \(terminalSafe(outcome.notice))",
+                    role: outcome.failed.isEmpty ? .status : .errorNotice)]))
+        case .rewind(let view):
+            lines.append(SemanticLine(
+                id: "rewind-\(view.boundaryEpoch)",
+                runs: [StyledRun(
+                    text: "rewind to \(view.boundaryEpoch)#\(view.throughSequence)\(view.divergent ? " DIVERGENT" : ""): \(terminalSafe(view.warning))",
+                    role: view.divergent ? .errorNotice : .status)]))
         }
     }
     let wrapped = lines.flatMap { wrapLine($0, width: safeWidth) }

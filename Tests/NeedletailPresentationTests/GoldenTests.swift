@@ -81,6 +81,17 @@ enum GoldenFixtures {
         return render(state, width: 80, capabilities: TerminalCapabilities())
     }
 
+    static func undoScenario() -> RenderFrame {
+        var state = UIState()
+        (state, _) = reduce(state, .inspectResult(.undoPreview(preview: UIUndoPreview(
+            groupID: "g-2",
+            files: [UIUndoFile(path: "a", eligible: true),
+                    UIUndoFile(path: "b", eligible: false, conflict: "changed by user")],
+            canRun: false,
+            notice: "1 conflict blocks the run"))))
+        return render(state, width: 80, capabilities: TerminalCapabilities())
+    }
+
     static func sessionsScenario() -> RenderFrame {
         var state = UIState()
         (state, _) = reduce(state, .inspectResult(.sessions(rows: [
@@ -145,6 +156,22 @@ struct GoldenTests {
         let golden = try JSONDecoder().decode(
             GoldenFrame.self, from: GoldenFixtures.load("queue-held.json"))
         let frame = GoldenFixtures.queueScenario()
+        #expect(frame.width == golden.width)
+        #expect(frame.lines.count == golden.lines.count,
+                "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
+        for (actual, expected) in zip(frame.lines, golden.lines) {
+            #expect(actual.id == expected.id, "line id: \(actual.id) vs \(expected.id)")
+            #expect(actual.runs.map(\.text) == expected.runs.map(\.text), "text for \(expected.id)")
+            #expect(actual.runs.map(\.role.rawValue) == expected.runs.map(\.role),
+                    "roles for \(expected.id)")
+        }
+    }
+
+    @Test("DX-07 undo preview renders eligibility and conflicts")
+    func DX_07_undoGoldenFramesMatch() throws {
+        let golden = try JSONDecoder().decode(
+            GoldenFrame.self, from: GoldenFixtures.load("undo-preview.json"))
+        let frame = GoldenFixtures.undoScenario()
         #expect(frame.width == golden.width)
         #expect(frame.lines.count == golden.lines.count,
                 "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
