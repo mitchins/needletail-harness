@@ -151,3 +151,33 @@ re-review READY).
 - BDD-06 probes: frame-cap marker (`plans/m4-b-b5-probe-framecap.log`)
   + new maxFrameLines/dumb-mode coverage.
 - Linux `quick` green (exit 0).
+
+## B6 — deferred integration/native completion (review pending)
+
+Scope per plan §8: M4-due integration legs (UX-QUEUE-01/02/03/04/
+05/07/11/12, UX-UNDO-06/08/09) executed on the final M4-B tree;
+M2-due leftovers with zero prior coverage (QUEUE-06/09/10,
+MENTION-09/10/12 integration) executed; M2-exited lanes mapped,
+not duplicated.
+- New `QueueIntegrationTests` (actor-level, InMemory store +
+  scripted/gated transports, deterministic barriers): 9 tests —
+  streaming follow-up, durable double-submit, steer boundary,
+  FIFO order, edit/reorder/withdraw, cancel-hold-no-autosend,
+  headless approval hold, failed-run hold, crash-boundary
+  replay-exactly-once.
+- New `QueueAttachmentActorTests` MENTION cases: -09 mutation
+  holds with zero half-composed context; -10 real-capture
+  2 MiB bounded excerpt + sealed refusal; -12 epoch-switch hold,
+  explicit re-consent, redispatch with manifest.
+- New `QueueContractTests.UX_QUEUE_09_capsRefuse` (21st entry +
+  64 KiB budget refusal, typed denial).
+- UNDO native legs: existing UndoFilesTests/UndoJournalTests
+  green on final tree (no new tests needed; mapped in §8 table).
+- M2 integration tiers mapped to executing suites (no duplicates):
+  QUEUE-06→D0 boundary 1/2/3 + new case test; QUEUE-08→existing
+  "stale head holds" test; QUEUE-09→new pure test; QUEUE-10→D3 C2/C3
+  epoch-switch lanes; MENTION-09/10/12→new tests above.
+- Linux `quick` + targeted suites green (exit 0).
+- macOS (same host/toolchain): integration actor suites crash the
+  debug runner (SIGBUS, G14-class) → B2/B6-era suite gates;
+  `-O` green where executed. Evidence under `.needletail-dev/m4b-b6/`.
