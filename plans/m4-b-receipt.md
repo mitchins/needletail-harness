@@ -128,3 +128,20 @@ re-review READY).
   (branch `m4-a` tip at B4 close; resolve via `git log`, since a
   file cannot name its own commit hash).
 
+
+## B5 — semantic frame + headless consumer gate (review pending)
+
+- `Render` bounds: `maxQueueRows` (64 + `queue-truncated` marker),
+  `maxFrameLines` (512 post-wrap safety + marker); composer overlay
+  never truncated. Terminal input fully neutralized across roles.
+- `HeadlessConsumer` (test-only, Foundation+Presentation+Core):
+  send/receive/replay; import gate pins the module boundary.
+- Six capabilities proven: complete projection intake; action
+  sequence → exact recorded (unexecuted) effects; authoritative
+  responses applied with no requested work; replay equality;
+  queue/permissions/undo/epoch inspection without terminal import.
+- Frame-level pins: same state → same frame; same query never
+  refetches; render purity (no state change, no effects possible);
+  hostile bytes inert in text and ids.
+- BDD-06 frame-cap probe (`plans/m4-b-b5-probe-framecap.log`).
+- Linux `quick` green (exit 0).

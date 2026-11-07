@@ -91,6 +91,14 @@ public struct TerminalCapabilities: Sendable, Equatable {
 /// Wraps pre-wrapped logical lines to the width (never splits inside a
 /// grapheme cluster — Swift String indices). Content roles never change
 /// with width or capabilities (DX-01); only layout does.
+///
+/// B5 bounds: the queue is the only unbounded input (status, agent,
+/// approval, inspection rows are structurally small; candidates cap
+/// at maxCandidates). Queue rows past the cap collapse into one
+/// visible marker — truncation is never silent.
+public let maxQueueRows = 64
+/// Absolute post-wrap safety bound (grapheme clusters, not bytes).
+public let maxFrameLines = 512
 public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilities) -> RenderFrame {
     let safeWidth = max(20, width)
     var lines: [SemanticLine] = []
@@ -106,7 +114,8 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
     case .completedBudgetBoundary(let detail):
         lines.append(SemanticLine(id: "status-budget-boundary", runs: [StyledRun(text: "completed (budget boundary): \(terminalSafe(detail))", role: .status)]))
     }
-    for entry in state.queue {
+    let queueRows = state.queue.prefix(maxQueueRows)
+    for entry in queueRows {
         var text = "\(entry.kind) \(entry.state)\(entry.pending ? " (pending)" : "")"
         if entry.staleTarget {
             text += " [stale target]"
@@ -117,6 +126,13 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
         lines.append(SemanticLine(
             id: "queue-\(entry.entryID)",
             runs: [StyledRun(text: terminalSafe(text), role: .normal)]))
+    }
+    if state.queue.count > maxQueueRows {
+        lines.append(SemanticLine(
+            id: "queue-truncated",
+            runs: [StyledRun(
+                text: "+\(state.queue.count - maxQueueRows) more queued (list bounded at \(maxQueueRows))",
+                role: .normal)]))
     }
     if let agent = state.activeAgent {
         lines.append(SemanticLine(
@@ -277,7 +293,14 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
                     role: view.divergent ? .errorNotice : .status)]))
         }
     }
-    let wrapped = lines.flatMap { wrapLine($0, width: safeWidth) }
+    var wrapped = lines.flatMap { wrapLine($0, width: safeWidth) }
+    // Absolute safety bound: drop tail lines (never the status line at
+    // index 0) and mark the cut visibly.
+    if wrapped.count > maxFrameLines {
+        wrapped = Array(wrapped.prefix(maxFrameLines - 1)) + [SemanticLine(
+            id: "frame-truncated",
+            runs: [StyledRun(text: "+lines truncated (frame bounded at \(maxFrameLines))", role: .normal)])]
+    }
     // Dumb/non-addressable terminals get an inline composer (no overlay);
     // content is identical either way (DX-01 capability fallback).
     if capabilities.cursorAddressing {
