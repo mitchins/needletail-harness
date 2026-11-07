@@ -152,42 +152,58 @@ re-review READY).
   + new maxFrameLines/dumb-mode coverage.
 - Linux `quick` green (exit 0).
 
-## B6 — deferred integration/native completion (review pending)
+## B6 — deferred integration/native completion (in review)
 
-Scope per plan §8: M4-due integration legs (UX-QUEUE-01/02/03/04/
-05/07/11/12, UX-UNDO-06/08/09) executed on the final M4-B tree;
-M2-due leftovers with zero prior coverage (QUEUE-06/09/10,
-MENTION-09/10/12 integration) executed; M2-exited lanes mapped,
-not duplicated.
-- New `QueueIntegrationTests` (actor-level, InMemory store +
-  scripted/gated transports, deterministic barriers): 9 tests —
-  streaming follow-up, durable double-submit, steer boundary,
-  FIFO order, edit/reorder/withdraw, cancel-hold-no-autosend,
-  headless approval hold, failed-run hold, crash-boundary
-  replay-exactly-once.
-- New `QueueAttachmentActorTests` MENTION cases: -09 mutation
-  holds with zero half-composed context; -10 real-capture
-  2 MiB bounded excerpt + sealed refusal; -12 epoch-switch hold,
-  explicit re-consent, redispatch with manifest.
-- New `QueueContractTests.UX_QUEUE_09_capsRefuse` (21st entry +
-  64 KiB budget refusal, typed denial).
-- UNDO native legs: existing UndoFilesTests/UndoJournalTests
-  green on final tree (no new tests needed; mapped in §8 table).
-- M2 integration tiers mapped to executing suites (no duplicates):
-  QUEUE-06→D0 boundary 1/2/3 + new case test; QUEUE-08→existing
-  "stale head holds" test; QUEUE-09→new pure test; QUEUE-10→D3 C2/C3
-  epoch-switch lanes; MENTION-09/10/12→new tests above.
-- Linux `quick` + targeted suites green (exit 0); full `offline`
-  gate green at close (see Closeout).
-- macOS (same host/toolchain), final code tree (HEAD differs from
-  the executed tree by receipt only):
-  - Keepers battery green (debug): C2 21/21, TOOL10 8/8,
-    B2 12/12 + 15/15, B3 30/30, C1 8/8, CrossRunGate 20/20.
-  - `-O` green with test-only gates lifted: QueueIntegration 9/9,
-    QueueAttachment 7/7, QueueContract 7/7, QueueDurability 25/25,
-    QueueCrashActor 8/8. All reverted byte-identical;
-    QueueAttachment/QueueIntegration/QueueContract/QueueDurability
-    crash the Darwin-debug runner (SIGBUS, G14-class) → B2/B6-era
-    suite gates; Linux-debug covers them.
-  - Evidence under `.needletail-dev/m4b-b6/` (keeper logs,
-    lifted `-O` logs, revert check).
+Scope per plan §8: M4-due integration legs executed on the final
+tree; M2-due leftovers with zero prior coverage executed or
+explicitly mapped; no duplicates of M2-exited lanes.
+- New `QueueIntegrationTests` (10 tests, actor-level, InMemory store,
+  scripted/gated transports, deterministic barriers; G14-gated on
+  Darwin-debug): QUEUE-01 (busy-run admission), QUEUE-02 (durable
+  double-submit + idempotent ack), QUEUE-03 (steer boundary),
+  QUEUE-04 (FIFO order incl. reorder), QUEUE-05
+  (edit/reorder/withdraw + edited-bytes-in-context),
+  QUEUE-07 (cancel-hold, no auto-send, explicit resume),
+  QUEUE-11 (headless approval holds with approvalPending, zero
+  tool execution), QUEUE-12 (failed run holds, explicit resume),
+  QUEUE-06 (crash boundary: no auto-resend, exactly one
+  explicit redispatch), QUEUE-10 (live epoch switch holds;
+  re-consent releases; redispatch carries new-epoch bytes).
+- New `QueueAttachmentActorTests` MENTION cases (real temp files,
+  scripted validator seam): MENTION-09 (mutated file held, no
+  half-composed context), MENTION-10 (real-capture 2 MiB bounded
+  excerpt at 4 KiB + manifest; sealed attach refused with no ack),
+  MENTION-12 (epoch-switch hold, explicit re-consent via retarget,
+  redispatch carries re-consented excerpt). File: G14-gated.
+- New `QueueContractTests.UX_QUEUE_09_capsRefuse` (21st-entry
+  count cap + cumulative 64 KiB budget cap, typed denials).
+- New native undo coverage: `UndoFilesTests.UX_UNDO_06_...`
+  (exec-touched file gains no ledger member even with a successful
+  exec outcome; recorded file restores, exec-touched bytes intact);
+  `UndoActorTests.UX_UNDO_08_dirtyWorktreeForkLeavesFilesIntact`
+  (actor-level lineage fork with real workspace files; fork commits
+  exactly one record, zero bytes change). UNDO-08 integration leg:
+  no separate integration tier exists in the catalogue beyond these;
+  recorded as covered via native + pure legs.
+- Per-case status (M4-due unless noted):
+  - QUEUE-01/02/03/04/05/07/11/12: pure (B1/B2) + integration (B6) — FULL.
+  - QUEUE-06 (M2): D0 boundary lanes + B6 crash test — FULL.
+  - QUEUE-08 (M2): existing `staleHeadHoldsAndFixRedispatches` — FULL (mapped, not duplicated).
+  - QUEUE-09 (M2 pure): new B6 pure test — FULL.
+  - QUEUE-10 (M2): new B6 case-named actor test — FULL (D3 C2/C3 lanes cover the same mechanism; not duplicated).
+  - MENTION-09/10/12 (M2): new B6 integration tests — FULL.
+  - UNDO-06: pure (B4) + native (B6) — FULL; integration leg N/A (no actor-mediated path beyond these).
+  - UNDO-08: pure (B4) + native (B6 actor + state) — FULL.
+  - UNDO-09: M2-exited lanes + B4 pure + B6 re-verified — FULL.
+  - QUEUE-01/03 streaming/tool-call variants: pure tests use the busy-run admission path (same `admitToQueueState` for requesting/streaming); PTY/stream-chunk physical legs remain M4-D. Marked PARTIAL for physical streaming only.
+- Linux evidence (this tree): per-suite logs under
+  `.needletail-dev/m4b-b6-linux/` (QueueIntegration 10/10,
+  QueueAttachment 7/7 incl. new MENTION tests, QueueContract,
+  QueueDurability, QueueCrashActor, UndoFiles, UndoTests,
+  UndoJournalTests, UndoActorTests) + `./dev test case` per ID.
+- macOS evidence (same host/toolchain): debug crashes with SIGBUS
+  (signal 10, G14-class) for QueueIntegration, QueueAttachment,
+  QueueCrashActor, UndoTests, QueueContract, QueueDurability —
+  all B2/B6-era gated; UndoFilesTests + UndoJournalTests pass
+  natively. `-O` runs with test-only G14 lifts (see Closeout for
+  final matrix). Evidence under `.needletail-dev/m4b-b6/`.
