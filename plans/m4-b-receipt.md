@@ -112,13 +112,19 @@ re-review READY).
   Views request; the actor reconciles/validates/records.
 - Render: diff/undo/rewind branches with stable IDs; approval
   exec-identity lines.
-- Tests: 7 UX RED→GREEN (UNDO-06/08/09 pure legs, NAV-07,
-  approval identity); undo golden + manifest `m4-b-b4`;
-  BDD-06 run-intent probe (`plans/m4-b-b4-probe-undorun.log`).
+- Tests: 8 UX RED→GREEN (UNDO-06/08/09 pure legs, NAV-07 incl.
+  hostile-path neutralization, approval identity); undo golden +
+  manifest `m4-b-b4`; BDD-06 run-intent probe
+  (`plans/m4-b-b4-probe-undorun.log`).
 - Linux `quick` green (exit 0).
 - macOS R7 (same host/toolchain): `swift build` clean;
   Presentation 78/78 debug green; QueueReorderTests 6/6 `-O`
   green with test-only gate lifted on the exact tree
-  (file restored byte-identical after). Evidence logs:
+  (`m4b-b4-opt-reorder2.log`: exit 0; file restored byte-identical,
+  sha `dcdc810f…` before/after). Evidence logs:
   `.needletail-dev/m4b-b4/`.
+- Reviewed at `0223f21` (delta re-review); B4 fixes landed after.
+  Final B4 HEAD is the commit carrying this receipt section
+  (branch `m4-a` tip at B4 close; resolve via `git log`, since a
+  file cannot name its own commit hash).
 
