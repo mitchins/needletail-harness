@@ -55,6 +55,18 @@ struct HeadlessConsumerTests {
         for (action, label, isSend) in script() {
             if isSend { consumer.send(action, label: label) }
             else { receiveEffects.append(consumer.receive(action, label: label)) }
+            // Cap 4 pinned inline: each authoritative projection moves
+            // observable state (removing any of them fails the test).
+            if label == "admitted" {
+                guard case .busy = consumer.state.status else {
+                    Issue.record("admitted projects busy, got \(consumer.state.status)"); return
+                }
+            }
+            if label == "agent" {
+                guard consumer.state.activeAgent?.modelAlias == "m" else {
+                    Issue.record("agent projection applied"); return
+                }
+            }
         }
         // Cap 1: complete projection — queue + hold + approval present.
         #expect(consumer.state.queue.count == 2 && consumer.state.queue.allSatisfy({ !$0.isOptimistic }))

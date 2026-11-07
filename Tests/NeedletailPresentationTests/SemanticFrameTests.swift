@@ -65,42 +65,65 @@ struct SemanticFrameTests {
     func B5_hostileBytesInert() throws {
         let evil = "x\u{1b}]0;pwned\u{07}y\u{202E}z"
         var state = UIState()
+        func checkClean(_ state: UIState, _ where_: String = #function) {
+            for caps in [TerminalCapabilities(), TerminalCapabilities.dumb] {
+                let frame = render(state, width: 200, capabilities: caps)
+                var blobs = frame.lines.flatMap(\.runs).map(\.text)
+                blobs.append(contentsOf: frame.lines.map(\.id))
+                if let overlay = frame.composerOverlay {
+                    blobs.append(overlay.text)
+                }
+                for blob in blobs {
+                    #expect(!blob.contains("\u{1b}"), "no escape survives (\(where_)): \(blob.debugDescription)")
+                    #expect(!blob.contains("\u{202E}"), "no bidi survives (\(where_))")
+                    #expect(!blob.contains("\u{07}"), "no BEL survives (\(where_))")
+                }
+            }
+        }
         _ = apply(&state, .input(.insertText(evil)))
+        checkClean(state, "composer")
         _ = apply(&state, .queueSync(QueueSyncSnapshot(
-            entries: [], activeRequest: nil, queueHeld: false, heldReason: nil,
+            entries: [QueueEntry(entryID: evil, commandID: CommandID(evil), kind: .followUp,
+                state: .queued, revision: 1, text: evil, targetEpochID: EpochID(evil),
+                orderKey: 1, rank: 1.0)],
+            activeRequest: nil, queueHeld: true, heldReason: .error(evil),
             pendingApproval: ApprovalRequestView(
                 requestID: RequestID("r-1"), generation: Revision(1), operation: evil,
                 requiredGrant: evil, protectedPaths: [evil],
                 execIdentities: [ExecIdentitySummary(resolvedPath: evil, contentDigest: evil)],
                 sandbox: false),
             admittedCommandIDs: [], liveEpoch: EpochID("e-1"))))
+        checkClean(state, "queue+approval")
         _ = apply(&state, .inspectResult(.diff(files: [
             UIDiffFile(path: evil + ".md", provenance: .user, hunks: ["\u{1b}[3J" + evil]),
         ])))
+        checkClean(state, "diff")
         _ = apply(&state, .inspectResult(.undoPreview(preview: UIUndoPreview(
             groupID: evil, files: [UIUndoFile(path: evil, eligible: false, conflict: evil)],
             canRun: false, notice: evil))))
+        checkClean(state, "undo")
         _ = apply(&state, .inspectResult(.sessions(rows: [
             UISessionRow(sessionID: SessionID(evil), phase: evil, lastActivityMillis: nil,
                 routeAlias: evil, locality: evil, modelAlias: evil, isLive: false),
         ], asOfMillis: 1)))
+        checkClean(state, "sessions")
         _ = apply(&state, .inspectResult(.models(routes: [
             UIModelRoute(alias: evil, locality: evil, kind: .local, models: [evil])])))
+        checkClean(state, "models")
+        _ = apply(&state, .inspectResult(.agents(rows: [
+            UIAgentRow(alias: evil, phase: evil, childActivity: evil)])))
+        checkClean(state, "agents")
+        _ = apply(&state, .inspectResult(.compact(preview: UICompactPreview(
+            estimatedTokens: 1, wouldReplaceEpoch: true, note: evil))))
+        checkClean(state, "compact")
         _ = apply(&state, .inspectResult(.epochs(rows: [
             UIEpochRow(epochID: evil, parentID: evil, checkpoint: .failed(reason: evil), prefill: evil)])))
-        for caps in [TerminalCapabilities(), TerminalCapabilities.dumb] {
-            let frame = render(state, width: 200, capabilities: caps)
-            var blobs = frame.lines.flatMap(\.runs).map(\.text)
-            blobs.append(contentsOf: frame.lines.map(\.id))
-            if let overlay = frame.composerOverlay {
-                blobs.append(overlay.text)
-            }
-            for blob in blobs {
-                #expect(!blob.contains("\u{1b}"), "no escape survives, got: \(blob.debugDescription)")
-                #expect(!blob.contains("\u{202E}"), "no bidi survives")
-                #expect(!blob.contains("\u{07}"), "no BEL survives")
-            }
-        }
+        checkClean(state, "epochs")
+        // Mention popup with hostile path + hostile range error.
+        state.suggestion = MentionSuggestionState(query: evil, revision: 1,
+            candidates: [CandidateFile(path: evil)],
+            selectedIndex: 0, rangeError: evil)
+        checkClean(state, "suggestion")
     }
 
     @Test("B5 same query twice requests completions once")
