@@ -370,8 +370,9 @@ struct UndoActorTests {
         // commit atomically; a second sweep is a pure no-op.
         let transport = ScriptedTransport()
         transport.script = [ActorFixtures.finalResponse(requestID: RequestID("scripted"), generation: Revision(0))]
+        let tmpDir = FilePath(FileManager.default.temporaryDirectory.path)
         let actor = try Self.makeActor(
-            dir: FilePath("/tmp"), store: store, state: rebuilt,
+            dir: tmpDir, store: store, state: rebuilt,
             transport: transport,
             executor: NativeToolExecutor(
                 resolver: try WorkspaceResolver(workspace: nil, readRoots: []),
@@ -446,8 +447,9 @@ struct UndoActorTests {
             unresolvedOperations: [OperationRef(
                 operationID: OperationID("eff-0/c0"), callID: "c0",
                 state: .unknown, mutating: true)])
+        let tmpDir2 = FilePath(FileManager.default.temporaryDirectory.path)
         let actor = try Self.makeActor(
-            dir: FilePath("/tmp"), store: store, state: held,
+            dir: tmpDir2, store: store, state: held,
             transport: ScriptedTransport(),
             executor: NativeToolExecutor(
                 resolver: try WorkspaceResolver(workspace: nil, readRoots: []),
