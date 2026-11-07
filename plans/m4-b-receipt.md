@@ -214,11 +214,11 @@ explicitly mapped; no duplicates of M2-exited lanes.
   debug). `-O` runs with test-only G14 lifts were green for the
   gated suites (see Closeout). Evidence under `.needletail-dev/m4b-b6/`.
 
-## Closeout — final gate at HEAD 5ec3ba2 (2026-11-08, round-2 fixes)
+## Closeout — final gate at HEAD (this commit, 2026-11-08, round-2 fixes)
 
-Branch `m4-a` local-only; HEAD `5ec3ba2` (no push/PR/merge). M4-A
-baseline `32d2226`/`29af6f0` unchanged; this receipt is the only
-file that names its own commit (resolve via `git log`).
+Branch `m4-a` local-only; HEAD is this commit (no push/PR/merge;
+resolve via `git log --oneline -1`). M4-A baseline `32d2226`/`29af6f0`
+unchanged.
 
 - Linux offline gate (this HEAD, no network, no provider):
   - `quick` 199+34+267+96+77+28 tests green (exit 0; `.needletail-dev/logs/dev-quick.log` at 53 s).
@@ -236,13 +236,14 @@ file that names its own commit (resolve via `git log`).
   `nmap -Pn` Host is up / 22 filtered at 08:20–08:22 AEDT). The final
   `run-b6final.sh` precise-lift battery was staged
   (`.needletail-dev/m4a-final/m4b-review2.tar` + `run-b6final.sh` at
-  HEAD `5ec3ba2`) but could not be executed on the host before the
-  partition. Round-2 Linux re-verification at `5ec3ba2`: `quick`
-  green, QueueIntegration 10/10 (Q10 stale-attachment), QueueContract
-  7/7 (byte+count typed denial), UndoFiles 11/11. Evidence carried
-  forward from the last successful mac run at `89bf90d` (8 commits
-  behind HEAD; diff to HEAD is test-only + receipt/comment — no Source
-  logic change; `git diff 89bf90d..HEAD -- Sources/` empty):
+  this HEAD, plus `m4b-closeout.tar` at prior HEAD) but could not be
+  executed on the host before the partition. Round-2 Linux
+  re-verification at this HEAD: `quick` green, QueueIntegration 10/10
+  (Q10 stale-attachment), QueueContract 7/7 (byte+count typed denial),
+  UndoFiles 11/11. Evidence carried forward from the last successful
+  mac run at `89bf90d` (9 commits behind HEAD; diff to HEAD is
+  test-only + receipt/comment — no Source logic change;
+  `git diff 89bf90d..HEAD -- Sources/` empty):
   - Keepers (debug) green: C2 21/21, TOOL10 8/8, B2 12/12+15/15, B3 30/30, C1 8/8, CrossRun 20/20 (`.needletail-dev/m4b-b6/m4b-b6k-*.log`, `m4b-b6k-run.log`).
   - Gated suites: at `89bf90d`, QueueIntegration / QueueCrash / UndoTests
     crashed debug (SIGBUS, G14, ungated) and went `-O` green;
@@ -279,7 +280,6 @@ file that names its own commit (resolve via `git log`).
 - Reviews: B0 READY×2, B1 READY×2, B2 READY, B3 READY, B4 READY,
   B5 READY. B6 delta re-review round 1 NEEDS-CHANGES addressed
   (Q10 stale barrier, Q01/Q03 partial, Q09 denial, UNDO-06 mode,
-  receipt honesty); round 2 queued (this Closeout at `5ec3ba2`);
-  Linux gate is green end-to-end, mac keepers from `89bf90d` are
-  valid for this source tree, final mac `-O` rerun pending host
-  reachability.
+  receipt honesty); round 2 at this HEAD queued; Linux gate is green
+  end-to-end, mac keepers from `89bf90d` are valid for this source
+  tree, final mac `-O` rerun pending host reachability.
