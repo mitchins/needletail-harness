@@ -204,22 +204,23 @@ explicitly mapped; no duplicates of M2-exited lanes.
   `.needletail-dev/m4b-b6-linux/` (QueueIntegration 10/10,
   QueueAttachment 7/7 incl. new MENTION tests, QueueContract,
   QueueDurability, QueueCrashActor, UndoFiles, UndoTests,
-  UndoJournalTests, UndoActorTests) + `./dev test case` per ID.
+  UndoJournalTests, UndoActorTests) + selected `./dev test case` per ID
+  (see Closeout for selected IDs).
  - macOS evidence (same host/toolchain): debug behavior at last
   successful run (89bf90d): QueueCrashActor / UndoTests crashed
   SIGBUS (signal 10, G14-class, ungated at that tree);
   QueueIntegration / QueueAttachment / QueueContract /
-  QueueDurability were already G14-gated and reported 0 tests in
-  debug (Linux debug covers them; QueueIntegration gate was
-  `c8aa3f2`, 4 commits before `89bf90d`). UndoFilesTests (10/10 at
-  `89bf90d`, 11/11 at this HEAD) + UndoJournalTests (5/5) were not
-  run on mac in `.needletail-dev/m4b-b6/` (Linux debug covers them).
-  `-O` runs with test-only lifts were green for
-  QueueContract/QueueDurability/QueueCrash at `89bf90d`
-  (b6k `opt-*.log`); QueueIntegration 9/9 `-O` was green at the
-  pre-gate tree (`m4b-b6-opt-integ.log` at 20:11, before `c8aa3f2`).
-  Current HEAD gates are test-only (see Closeout). Evidence under
-  `.needletail-dev/m4b-b6/`.
+  QueueDurability were already G14-gated and filtered out at compile
+  time in debug (suite absent; Linux debug covers them;
+  QueueIntegration gate was `c8aa3f2`, 4 commits before `89bf90d`).
+  UndoFilesTests (10/10 at `89bf90d`, 11/11 at this HEAD) +
+  UndoJournalTests (5/5) were not run on mac in
+  `.needletail-dev/m4b-b6/` (Linux debug covers them). `-O` runs with
+  test-only lifts were green for QueueContract/QueueDurability/
+  QueueCrash at `89bf90d` (b6k `opt-*.log`); QueueIntegration 9/9
+  `-O` was green at the pre-gate tree (`m4b-b6-opt-integ.log` at
+  20:11, before `c8aa3f2`). Current HEAD gates are test-only (see
+  Closeout). Evidence under `.needletail-dev/m4b-b6/`.
 
 ## Closeout — final gate at HEAD (this commit, 2026-11-08, round-2 fixes)
 
@@ -249,11 +250,13 @@ unchanged.
   (Q10 stale-attachment), QueueContract 7/7 (byte+count typed denial),
   UndoFiles 11/11. Evidence carried forward from the last successful
   mac run at `89bf90d` (see `git log --oneline 89bf90d..HEAD` for count; diff to HEAD is
-  test-only + receipt/comment — no Source logic change;
+  test-only + receipt/comment + dev script — no Source logic change;
   `git diff 89bf90d..HEAD -- Sources/` empty):
   - Keepers (debug) green: C2 21/21, TOOL10 8/8, B2 12/12+15/15, B3 30/30, C1 8/8, CrossRun 20/20 (`.needletail-dev/m4b-b6/m4b-b6k-*.log`, `m4b-b6k-run.log`).
-  - Gated suites: at `89bf90d`, QueueCrashActor / UndoTests crashed
-    debug (SIGBUS, G14, ungated) and went `-O` green; QueueIntegration
+  - Gated suites: at `89bf90d`, QueueCrashActor crashed debug
+    (SIGBUS, G14, ungated) and went `-O` green; UndoTests crashed
+    debug (ungated, no separate `-O` log at `89bf90d`; Linux debug
+    covers it); QueueIntegration
     / QueueAttachment / QueueContract / QueueDurability were already
     gated and reported 0 tests in debug (Linux debug covers them);
     QueueContract / QueueDurability / QueueCrash were `-O` green with
