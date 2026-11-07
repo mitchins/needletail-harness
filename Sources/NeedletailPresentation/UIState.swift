@@ -150,9 +150,13 @@ public struct AgentSummary: Sendable, Equatable {
 }
 
 public enum InspectionView: Sendable, Equatable {
-    case context(lines: [String])
+    case context(usage: UIContextUsage)
     case queue(ids: [String])
-    case epochs(ids: [String])
+    case epochs(rows: [UIEpochRow])
+    case sessions(rows: [UIDisplaySession])
+    case agents(rows: [UIAgentRow])
+    case models(routes: [UIModelRoute])
+    case compact(preview: UICompactPreview)
 }
 
 public enum UIStatus: Sendable, Equatable {
@@ -160,6 +164,9 @@ public enum UIStatus: Sendable, Equatable {
     case busy(operation: String)
     case held(reason: String)
     case failed(cause: String)
+    /// Clean completion exhausted the turn/operation budget: finished,
+    /// but explicitly NOT a clean completion (UX run-boundary rule).
+    case completedBudgetBoundary(detail: String)
 }
 
 public struct UIState: Sendable, Equatable {

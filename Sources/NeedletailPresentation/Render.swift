@@ -103,6 +103,8 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
         lines.append(SemanticLine(id: "status-held", runs: [StyledRun(text: "held: \(terminalSafe(reason))", role: .status)]))
     case .failed(let cause):
         lines.append(SemanticLine(id: "status-failed", runs: [StyledRun(text: terminalSafe(cause), role: .errorNotice)]))
+    case .completedBudgetBoundary(let detail):
+        lines.append(SemanticLine(id: "status-budget-boundary", runs: [StyledRun(text: "completed (budget boundary): \(terminalSafe(detail))", role: .status)]))
     }
     for entry in state.queue {
         var text = "\(entry.kind) \(entry.state)\(entry.pending ? " (pending)" : "")"
@@ -143,6 +145,82 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
             lines.append(SemanticLine(
                 id: "mention-range-error",
                 runs: [StyledRun(text: terminalSafe(error), role: .errorNotice)]))
+        }
+    }
+    if let inspection = state.inspection {
+        switch inspection {
+        case .sessions(let rows):
+            for row in rows {
+                lines.append(SemanticLine(
+                    id: "session-\(row.row.sessionID.raw)",
+                    runs: [StyledRun(
+                        text: "\(row.row.sessionID.raw) \(row.liveness.rawValue) \(terminalSafe(row.row.modelAlias))",
+                        role: .normal)]))
+            }
+        case .agents(let rows):
+            for (index, agent) in rows.enumerated() {
+                lines.append(SemanticLine(
+                    id: "agent-\(index)",
+                    runs: [StyledRun(
+                        text: "\(terminalSafe(agent.alias)) · \(terminalSafe(agent.phase))",
+                        role: .status)]))
+                if let child = agent.childActivity {
+                    lines.append(SemanticLine(
+                        id: "agent-\(index)-child",
+                        runs: [StyledRun(text: "child: \(terminalSafe(child))", role: .normal)]))
+                }
+            }
+        case .models(let routes):
+            for route in routes {
+                lines.append(SemanticLine(
+                    id: "model-\(route.alias)",
+                    runs: [StyledRun(
+                        text: "\(terminalSafe(route.alias)) [\(route.kind.rawValue)] \(terminalSafe(route.locality))",
+                        role: .normal)]))
+            }
+        case .context(let usage):
+            let tokens = usage.inputTokens.map(String.init) ?? "estimated"
+            let cache: String
+            if usage.cacheUnknown {
+                cache = "cache unknown"
+            } else if let hits = usage.cacheHits {
+                cache = "cache \(hits) hits"
+            } else {
+                cache = "cache unknown"
+            }
+            lines.append(SemanticLine(
+                id: "context-usage",
+                runs: [StyledRun(
+                    text: "tokens \(tokens)\(usage.estimated ? " (estimated)" : "") · \(cache) · receipts \(usage.receipts) · unverified \(usage.unverifiedClaims)",
+                    role: .normal)]))
+        case .epochs(let rows):
+            for row in rows {
+                let checkpoint: String
+                switch row.checkpoint {
+                case .none: checkpoint = "no checkpoint"
+                case .success(let cost): checkpoint = "checkpoint ok (\(cost)ms)"
+                case .failed(let reason): checkpoint = "failed: \(reason)"
+                }
+                var text = "\(row.epochID) <- \(row.parentID ?? "-") · \(checkpoint)"
+                if let prefill = row.prefill {
+                    text += " · prefill \(prefill)"
+                }
+                lines.append(SemanticLine(
+                    id: "epoch-\(row.epochID)",
+                    runs: [StyledRun(text: terminalSafe(text), role: .normal)]))
+            }
+        case .compact(let preview):
+            lines.append(SemanticLine(
+                id: "compact-estimate",
+                runs: [StyledRun(
+                    text: "compact dry-run: ~\(preview.estimatedTokens) tokens, \(preview.wouldReplaceEpoch ? "would replace epoch" : "no epoch change"), 0 provider calls",
+                    role: .normal)]))
+        case .queue(let ids):
+            for id in ids {
+                lines.append(SemanticLine(
+                    id: "inspect-queue-\(id)",
+                    runs: [StyledRun(text: id, role: .normal)]))
+            }
         }
     }
     let wrapped = lines.flatMap { wrapLine($0, width: safeWidth) }

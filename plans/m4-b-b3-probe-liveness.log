@@ -1,0 +1,17 @@
+# M4-B B3 BDD-06 probe log — session liveness rule
+
+Date: 2026-11-07 UTC. Tree: `m4-a` B3 working tree (pre-commit).
+Oracle: `swift test --filter "UX_NAV_01_sessionLiveness"`.
+
+Probe (disposable, `Sources/NeedletailPresentation/SessionViews.swift`):
+replaced the live-session branch guard with unconditional false:
+  `if false { // BDD-06 PROBE: liveness forced idle`
+
+Result: oracle FAILS as required —
+  live-busy renders stale instead of active, live-idle renders stale
+  instead of idle. The liveness rule is the load-bearing guard for
+  UX-NAV-01 (a missing/forced rule silently mislabels heartbeats).
+
+Restore: exact inverse replacement; `grep -c PROBE` returns 0;
+oracle green after restore. No production fault switches added;
+no tree changes retained from the probe.

@@ -81,6 +81,19 @@ enum GoldenFixtures {
         return render(state, width: 80, capabilities: TerminalCapabilities())
     }
 
+    static func sessionsScenario() -> RenderFrame {
+        var state = UIState()
+        (state, _) = reduce(state, .inspectResult(.sessions(rows: [
+            UISessionRow(sessionID: SessionID("s1"), phase: "requesting",
+                lastActivityMillis: 999_000, routeAlias: "local-coder",
+                locality: "local", modelAlias: "m", isLive: true),
+            UISessionRow(sessionID: SessionID("s2"), phase: "idle",
+                lastActivityMillis: 100, routeAlias: "local-coder",
+                locality: "local", modelAlias: "m", isLive: false),
+        ], asOfMillis: 1_000_000)))
+        return render(state, width: 80, capabilities: TerminalCapabilities())
+    }
+
     static func scenario() -> RenderFrame {
         var state = UIState()
         state.suggestion = MentionSuggestionState(query: "src/", revision: 5, candidates: [])
@@ -132,6 +145,22 @@ struct GoldenTests {
         let golden = try JSONDecoder().decode(
             GoldenFrame.self, from: GoldenFixtures.load("queue-held.json"))
         let frame = GoldenFixtures.queueScenario()
+        #expect(frame.width == golden.width)
+        #expect(frame.lines.count == golden.lines.count,
+                "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
+        for (actual, expected) in zip(frame.lines, golden.lines) {
+            #expect(actual.id == expected.id, "line id: \(actual.id) vs \(expected.id)")
+            #expect(actual.runs.map(\.text) == expected.runs.map(\.text), "text for \(expected.id)")
+            #expect(actual.runs.map(\.role.rawValue) == expected.runs.map(\.role),
+                    "roles for \(expected.id)")
+        }
+    }
+
+    @Test("DX-07 sessions view renders liveness labels")
+    func DX_07_sessionsGoldenFramesMatch() throws {
+        let golden = try JSONDecoder().decode(
+            GoldenFrame.self, from: GoldenFixtures.load("sessions-basic.json"))
+        let frame = GoldenFixtures.sessionsScenario()
         #expect(frame.width == golden.width)
         #expect(frame.lines.count == golden.lines.count,
                 "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")

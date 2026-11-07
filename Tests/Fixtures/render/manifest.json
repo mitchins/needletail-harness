@@ -1,8 +1,9 @@
 {
-  "reviewed_rev": "m4-b-b2",
+  "reviewed_rev": "m4-b-b3",
   "files": [
     {"path": "basic-chat.json", "sha256": "fc54d113d696ffedfd4b1e5f219a797d189fdd1f2d9ac58de54119db36d021ba"},
     {"path": "mention-popup.json", "sha256": "1b9e1845ce617f1910c0b2ec387c3642ae8bc038e2b81f9ec86a169bbfe30cd8"},
-    {"path": "queue-held.json", "sha256": "b9b80c47cb67e7a5a001cd1948dff358f0efee46292b502d7d24b69a41e2d209"}
+    {"path": "queue-held.json", "sha256": "b9b80c47cb67e7a5a001cd1948dff358f0efee46292b502d7d24b69a41e2d209"},
+    {"path": "sessions-basic.json", "sha256": "088a527795d4626b560ecf4a6ef38a2fe051af76079db2ad8acce0ab3223992c"}
   ]
 }

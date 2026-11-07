@@ -68,3 +68,26 @@ re-review READY).
   still runs them fully). These suites were not M4-A macOS
   keepers, so no qualified result changes. Evidence logs:
   `.needletail-dev/m4b-b2/` (mac build + debug + -O logs).
+## B3 — session, model, context, epoch views (review pending)
+
+- `SessionViews.swift` (new): `UISessionRow` + `sessionLiveness`
+  (active/idle/stale/unknown, 5-min explicit rule), `UIAgentRow`
+  (consult child), `UIModelRoute` (local/cloud), `UIContextUsage`
+  (actual vs estimated, UNKNOWN cache), `UIEpochRow` + checkpoint
+  states, `UICompactPreview` (providerCalls always 0),
+  `InspectionResult` typed payloads.
+- Reducer: `inspect` intent (local-read effect only) +
+  `inspectResult` projection; `run_finished` outcome mapping
+  (budget-boundary distinct from clean completion); typed
+  `InspectionView` replaces untyped strings; held-clear preserved.
+- Render: per-view branches with stable IDs; budget-boundary line.
+- Tests: 7 UX-NAV RED→GREEN (NAV-07 diff deferred to B4);
+  sessions golden + manifest `m4-b-b3`; BDD-06 liveness probe
+  (`plans/m4-b-b3-probe-liveness.log`).
+- Linux `quick` green (exit 0).
+
+Branch `m4-a` (local-only; no push/PR/merge without authorization).
+Baselines: M4-A qualified code `32d2226` (receipt `29af6f0`), boundary
+`plans/m4-a-boundary.md`, plan `plans/m4-b-plan.md` (DeepSeek READY,
+re-review READY).
+

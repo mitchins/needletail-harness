@@ -21,6 +21,13 @@ public func reduce(_ state: UIState, _ action: UIAction) -> (UIState, [UIEffect]
         return reduceQueueOp(state, operation)
     case .queueSync(let snapshot):
         return reduceQueueSync(state, snapshot)
+    case .inspectResult(let result):
+        return reduceInspectResult(state, result)
+    case .inspect(let command):
+        // Local read only: the edge fetches from the store/actor and
+        // returns an inspectResult. No provider traffic is possible —
+        // no such effect exists in this layer.
+        return (state, [.inspect(command)])
     case .mention(let mention):
         return reduceMention(state, mention)
     }
@@ -149,6 +156,17 @@ private func reduceSession(_ state: UIState, _ projection: SessionEventProjectio
             } else {
                 next.status = .busy(operation: projection.detail)
             }
+        } else if projection.kind == "run_finished" {
+            // Terminal envelope: the outcome distinguishes clean
+            // completion from budget-boundary exhaustion (B3).
+            if projection.outcome == "completed-budget-boundary" {
+                next.status = .completedBudgetBoundary(detail: projection.detail)
+            } else if projection.outcome == "completed" {
+                next.status = .idle
+            } else if projection.outcome == "failed" {
+                next.status = .failed(cause: projection.detail)
+            }
+            next.activeAgent = nil
         }
     }
     return (next, [])
@@ -267,8 +285,30 @@ private func reduceQueueSync(_ state: UIState, _ snapshot: QueueSyncSnapshot) ->
     return (next, [])
 }
 
-private func reduceMention(_ state: UIState, _ mention: MentionAction) -> (UIState, [UIEffect]) {
-    switch mention {
+/// Maps a typed edge payload to its inspection view (B3). Pure
+/// projection — views never fetch, never mutate, never call providers.
+private func reduceInspectResult(_ state: UIState, _ result: InspectionResult) -> (UIState, [UIEffect]) {
+    var next = state
+    switch result {
+    case .sessions(let rows, let asOf):
+        next.inspection = .sessions(rows: rows.map {
+            UIDisplaySession(row: $0, liveness: sessionLiveness(row: $0, asOfMillis: asOf))
+        })
+    case .agents(let rows):
+        next.inspection = .agents(rows: rows)
+    case .models(let routes):
+        next.inspection = .models(routes: routes)
+    case .context(let usage):
+        next.inspection = .context(usage: usage)
+    case .epochs(let rows):
+        next.inspection = .epochs(rows: rows)
+    case .compact(let preview):
+        next.inspection = .compact(preview: preview)
+    }
+    return (next, [])
+}
+
+private func reduceMention(_ state: UIState, _ mention: MentionAction) -> (UIState, [UIEffect]) {    switch mention {
     case .selectNext, .selectPrevious:
         guard var current = state.suggestion, !current.candidates.isEmpty else {
             return (state, [])

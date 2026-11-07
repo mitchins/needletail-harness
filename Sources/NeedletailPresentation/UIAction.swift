@@ -15,6 +15,12 @@ public enum UIAction: Sendable, Equatable {
     /// Authoritative queue snapshot from Core (built by the impure edge
     /// via `QueueSyncSnapshot.from`). The ONLY writer of `UIState.queue`.
     case queueSync(QueueSyncSnapshot)
+    /// Typed inspection payload from the edge (local store/actor reads
+    /// only — never a provider call). Maps to `InspectionView`.
+    case inspectResult(InspectionResult)
+    /// Inspection intent: the edge performs a LOCAL store/actor read
+    /// and feeds back an `inspectResult`. Never a provider request.
+    case inspect(InspectionCommand)
 }
 
 public enum MentionAction: Sendable, Equatable {
@@ -104,5 +110,9 @@ public enum InspectionCommand: Sendable, Equatable {
     case context
     case queue
     case epochs
+    case sessions
+    case agents
+    case models
+    case compactDryRun
     case dismiss
 }
