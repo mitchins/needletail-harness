@@ -8,6 +8,9 @@ import NeedletailTestSupport
 /// InMemory store + scripted/gated transports. Every interleaving is
 /// barrier-synchronized (no auto-dispatch assumptions beyond what the
 /// test itself observes); sleeps never appear.
+/// Darwin-debug: suite gated (B2/B6 G14-class — the debug runner SIGBUSes
+/// on these deep transition chains; Linux-debug + Darwin `-O` green).
+#if canImport(Glibc)
 struct QueueIntegrationTests {
 
     private static func gatedPair() throws -> (
@@ -341,3 +344,4 @@ struct QueueIntegrationTests {
         continuation.finish()
     }
 }
+#endif
