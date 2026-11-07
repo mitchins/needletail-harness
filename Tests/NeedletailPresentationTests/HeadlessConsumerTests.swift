@@ -52,6 +52,10 @@ struct HeadlessConsumerTests {
     func B5_headlessLoop() throws {
         var consumer = HeadlessConsumer()
         var receiveEffects: [[UIEffect]] = []
+        // Unconditional oracle flags: deleting a script entry must fail
+        // the test (label-guarded checks alone would silently skip).
+        var sawAdmittedBusy = false
+        var sawAgentFields = false
         for (action, label, isSend) in script() {
             if isSend { consumer.send(action, label: label) }
             else { receiveEffects.append(consumer.receive(action, label: label)) }
@@ -61,13 +65,18 @@ struct HeadlessConsumerTests {
                 guard case .busy = consumer.state.status else {
                     Issue.record("admitted projects busy, got \(consumer.state.status)"); return
                 }
+                sawAdmittedBusy = true
             }
             if label == "agent" {
-                guard consumer.state.activeAgent?.modelAlias == "m" else {
+                guard consumer.state.activeAgent?.modelAlias == "m",
+                      consumer.state.activeAgent?.phase == "requesting" else {
                     Issue.record("agent projection applied"); return
                 }
+                sawAgentFields = true
             }
         }
+        #expect(sawAdmittedBusy, "admitted leg executed")
+        #expect(sawAgentFields, "agent leg executed")
         // Cap 1: complete projection — queue + hold + approval present.
         #expect(consumer.state.queue.count == 2 && consumer.state.queue.allSatisfy({ !$0.isOptimistic }))
         if case .held = consumer.state.status { Issue.record("hold released by confirm sync"); return }
