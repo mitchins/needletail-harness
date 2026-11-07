@@ -133,8 +133,10 @@ struct QueueContractTests {
         var ids = StateFixtures.ids()
         let (admitting, _) = try StateFixtures.admitted("run", ids: &ids)
         var state = transition(admitting, .requestDispatched(requestID: admitting.activeRun!.requestID, atMillis: 1001), &ids).state
-        // 64 KiB single text refused on the BYTE budget from a nearly
-        // empty queue (count cap not involved: only 2 entries present).
+        // CUMULATIVE byte budget: 2 small entries plus a 64 KiB
+        // submission exceeds maxQueueTextBytes (count cap not involved).
+        // (Exactly maxQueueTextBytes alone would admit: the rule is
+        // cumulative, `undispatched + text <= max`.)
         state = transition(state, StateFixtures.input("t-1", id: "c-1", kind: .followUp), &ids).state
         state = transition(state, StateFixtures.input("t-2", id: "c-2", kind: .followUp), &ids).state
         let big = transition(state, StateFixtures.input(String(repeating: "x", count: 65_536), id: "c-big", kind: .followUp), &ids)
