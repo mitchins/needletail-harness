@@ -480,6 +480,11 @@ struct QueueAttachmentActorTests {
         await actor2.submitText(commandID: CommandID("q-2"), text: "behind", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(actor2, { $0.queue.count == 2 }, "current entry queued behind stale head")
         continuation2.yield(.respond(ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0))))
+        for _ in 0..<2000 { await Task.yield() }
+        do {
+            let st = await actor2.currentState()
+            print("M12-POST-R1 held=\(st.queueHeld) q=\(st.queue.map { "\($0.commandID.raw):\($0.state)" }) inv=\(gate2.invocations.count) phase=\(st.phase) active=\(String(describing: st.activeRun?.runID))")
+        }
         try await ActorFixtures.awaitPhase(actor2, { $0.queueHeld }, "stale head blocks the queue")
         let held = await actor2.currentState()
         // The barrier holds the QUEUE (entries stay queued, nothing

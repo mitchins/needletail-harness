@@ -7,6 +7,9 @@ import NeedletailCore
 /// crash-boundary journal reconciliation — through the real reducer only
 /// (no I/O). Filesystem fidelity (hashing, identity, no-follow, modes)
 /// belongs to the Runtime UndoFiles tests; the actor loop to UndoActorTests.
+/// Darwin-debug: suite gated (B6 G14-class — the debug runner SIGBUSes
+/// on these deep transition chains; Linux-debug + Darwin `-O` green).
+#if canImport(Glibc)
 struct UndoTests {
 
     // MARK: - Fixtures
@@ -877,3 +880,4 @@ struct UndoTests {
         #expect(try Data(contentsOf: url.appendingPathComponent("b.bin")) == Data([0, 1, 2, 255]), "binary bytes intact")
     }
 }
+#endif

@@ -357,5 +357,56 @@ struct QueueIntegrationTests {
         #expect(Set(links).count == 1, "both linkages bind the same entry (no duplicate)")
         continuation.finish()
     }
+
+    @Test("UX-QUEUE-10 epoch switch holds queued entries; re-consent releases")
+    func UX_QUEUE_10_epochSwitchHoldsForReconsent() async throws {
+        // Two-alias snapshot so a live model switch is possible.
+        let configJSON = "{\"version\":1,\"default_model\":\"local-coder\",\"allow_http_origins\":[\"http://127.0.0.1:11434\",\"http://127.0.0.1:11435\"],\"models\":[{\"alias\":\"local-coder\",\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11434\",\"model\":\"qwen\",\"context_window\":262144,\"max_output\":4096,\"locality\":\"local\",\"credential\":{\"env\":\"NT_M2_X_KEY\"},\"connect_timeout_s\":10,\"read_idle_timeout_s\":300,\"request_timeout_s\":1800,\"max_in_flight\":1},{\"alias\":\"local-reviewer\",\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11435\",\"model\":\"qwen\",\"context_window\":262144,\"max_output\":4096,\"locality\":\"local\",\"credential\":{\"env\":\"NT_M2_X_KEY\"},\"connect_timeout_s\":10,\"read_idle_timeout_s\":300,\"request_timeout_s\":1800,\"max_in_flight\":1}],\"tools\":{\"read\":true,\"search\":true,\"edit\":true,\"write\":true,\"exec\":\"ask\",\"consult\":false}}"
+        let snapshot = try validateConfig(Data(configJSON.utf8))
+        let profile = try #require(snapshot.profiles["local-coder"])
+        let caps = effectiveCapabilities(
+            build: .allAllowed, userConfig: snapshot.tools,
+            workspaceGrant: .allAllowed, invocationMask: .allAllowed,
+            sealed: SealedRestrictions(sealed: false))
+        let route = selectRoute(snapshot: snapshot, requestedAlias: "local-coder", sealed: false)
+        let epochA = EpochDescriptor(epochID: EpochID("epoch-a"), parentEpochID: nil,
+            configSnapshot: snapshot, profile: profile,
+            effectiveCaps: caps, route: route)
+        let idle = SessionState(sessionID: SessionID("s-q10"), epoch: epochA, trustMode: .workspace, phase: .idle)
+        let store = InMemorySessionStore()
+        let gate = GatedTransport()
+        let (stream, continuation) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        gate.gate = stream
+        var rids = DeterministicIDSource(prefix: "q10")
+        let actor = try SessionActor(
+            state: idle, ids: rids, clock: VirtualClock(now: 1_000_000),
+            transport: gate, executor: ScriptedExecutor(), store: store,
+            approvals: ScriptedApprovals(), writer: "q10-writer")
+        await actor.submitText(commandID: CommandID("run-1"), text: "run", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitInvocations(gate, count: 1)
+        await actor.submitText(commandID: CommandID("q-1"), text: "queued", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitPhase(actor, { $0.queue.count == 1 }, "queued under epoch A")
+        // Live epoch switch: the queued entry's target goes stale and the
+        // whole queue holds. Nothing dispatches on the stale epoch.
+        await actor.switchModel(alias: "local-reviewer")
+        try await ActorFixtures.awaitPhase(actor, { $0.queueHeld }, "epoch switch holds the queue")
+        let held = await actor.currentState()
+        #expect(held.queue.first?.targetEpochID != held.epoch.epochID, "target predates the live epoch")
+        #expect(gate.invocations.count == 1, "no dispatch on the stale epoch")
+        // Explicit re-consent (retarget) + resume releases exactly once.
+        let entryID = try #require(held.queue.first?.entryID)
+        await actor.retargetQueueEntry(entryID: entryID)
+        try await ActorFixtures.awaitPhase(actor, {
+            $0.queue.first?.attachmentConsentEpoch == nil || $0.queue.first?.targetEpochID == $0.epoch.epochID
+        }, "entry re-targeted to the live epoch")
+        await actor.resumeQueue()
+        continuation.yield(.respond(ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0))))
+        continuation.yield(.respond(ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0))))
+        try await ActorFixtures.awaitPhase(actor, {
+            $0.queue.allSatisfy { $0.state == .admittedToHistory }
+        }, "re-consented queue drains")
+        #expect(gate.invocations.count == 2, "exactly one post-switch dispatch")
+        continuation.finish()
+    }
 }
 #endif
