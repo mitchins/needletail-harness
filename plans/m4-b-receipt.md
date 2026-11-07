@@ -38,7 +38,7 @@ re-review READY).
   discrimination (empirically verified), range-retention pin.
 - Linux `quick` green (exit 0) at commit.
 
-## B2 — queue, interruption, recovery (review pending)
+## B2 — queue, interruption, recovery (DeepSeek READY)
 
 - Core: `QueueEntry.rank` (required param, backward-compat decode
   falls back to `Double(orderKey)`); `SessionEvent.queueReorder`;
@@ -93,12 +93,7 @@ re-review READY).
   (`plans/m4-b-b3-probe-liveness.log`).
 - Linux `quick` green (exit 0).
 
-Branch `m4-a` (local-only; no push/PR/merge without authorization).
-Baselines: M4-A qualified code `32d2226` (receipt `29af6f0`), boundary
-`plans/m4-a-boundary.md`, plan `plans/m4-b-plan.md` (DeepSeek READY,
-re-review READY).
-
-## B4 — diff, undo, rewind, approval views (review pending)
+## B4 — diff, undo, rewind, approval views (DeepSeek READY)
 
 - `UndoDiffViews.swift` (new): `UIUndoFile/Preview/Outcome`
   (eligibility, conflicts, partials, unknown-outcome notices),
@@ -129,7 +124,7 @@ re-review READY).
   file cannot name its own commit hash).
 
 
-## B5 — semantic frame + headless consumer gate (review pending)
+## B5 — semantic frame + headless consumer gate (DeepSeek READY)
 
 - `Render` bounds: `maxQueueRows` (64, oldest kept, `queue-truncated`
   marker with hidden count), `maxFrameLines` (512 post-wrap safety +
@@ -207,9 +202,69 @@ explicitly mapped; no duplicates of M2-exited lanes.
   QueueAttachment 7/7 incl. new MENTION tests, QueueContract,
   QueueDurability, QueueCrashActor, UndoFiles, UndoTests,
   UndoJournalTests, UndoActorTests) + `./dev test case` per ID.
-- macOS evidence (same host/toolchain): debug crashes with SIGBUS
+ - macOS evidence (same host/toolchain): debug crashes with SIGBUS
   (signal 10, G14-class) for QueueIntegration, QueueAttachment,
   QueueCrashActor, UndoTests, QueueContract, QueueDurability —
   all B2/B6-era gated; UndoFilesTests + UndoJournalTests pass
   natively. `-O` runs with test-only G14 lifts (see Closeout for
   final matrix). Evidence under `.needletail-dev/m4b-b6/`.
+
+## Closeout — final gate at HEAD f9797f4 (2026-11-08)
+
+Branch `m4-a` local-only; HEAD `f9797f4` (no push/PR/merge). M4-A
+baseline `32d2226`/`29af6f0` unchanged; this receipt is the only
+file that names its own commit (resolve via `git log`).
+
+- Linux offline gate (this HEAD, no network, no provider):
+  - `quick` 199+34+267+96+77+28 tests green (exit 0; `.needletail-dev/logs/dev-quick.log` at 53 s).
+  - `native` 267 tests green (CLOSURE 01…15 + sqlite contention; exit 0; 53 s).
+  - `timing` 8 tests green (NET-04 cancellation/readiness; exit 0; 6 s).
+  - `e2e` 239 tests green (13 suites including B5CEndToEnd, TOOL10, C2/C3 etc; exit 0; 515 s at 08:09 AEDT; `.needletail-dev/logs/dev-e2e.log`, `.needletail-dev/xunit/results-e2e-swift-testing.xml`).
+  - `feasibility` 12 tests green (M0-C PTY + B5-C gateway; exit 0; 0.5 s).
+  - `coverage` reconcile green: XUNIT MERGE bulk=494 timing=8 e2e=239 merged=741 failures=0 unsatisfied=14 missing=146 satisfied=40 executed=741 labeled=163 skipped=1 failed=0; BDD-01 ingestion 3/3 green (`.needletail-dev/logs/dev-coverage.log`).
+  - B6 per-suite logs at this HEAD (`.needletail-dev/m4b-b6-linux/`): QueueIntegration 10/10, QueueAttachment 7/7, QueueContract 7/7, QueueDurability 25/25, QueueCrashActor 8/8, UndoFiles 11/11, UndoTests 34/34, UndoJournal 5/5, UndoActor 6/6; SemanticFrame+Headless 18/18; `quick` aggregate 96 presentation tests green.
+  - Cases via `./dev test case` per ID: UX-QUEUE-01/02/03/04/05/06/07/10/11/12, UX-MENTION-09/10/12, UX-UNDO-06/08/09 + RENDER-01…08 + DX-09/10 all green (see Linux B6 logs and `FINAL-*.log`).
+
+- macOS R7 (Builds-Mac-Pro.local, same host/toolchain as M4-A;
+  Swift 6.3.3, Xcode 26.x). Network partition at closeout:
+  `192.168.2.106`   filtered (`No route to host` via `192.168.1.1`;
+  `nmap -Pn` Host is up / 22 filtered at 08:20–08:22 AEDT). The final
+  `run-b6final.sh` precise-lift battery was staged
+  (`.needletail-dev/m4a-final/m4b-final.tar` + `run-b6final.sh` at
+  HEAD `f9797f4`) but could not be executed on the host before the
+  partition. Evidence carried forward from the last successful mac
+  run at `89bf90d` (6 commits behind HEAD; diff to HEAD is test-only
+  + receipt/comment — no Source logic change; `git diff 89bf90d..HEAD -- Sources/` empty):
+  - Keepers (debug) green: C2 21/21, TOOL10 8/8, B2 12/12+15/15, B3 30/30, C1 8/8, CrossRun 20/20 (`.needletail-dev/m4b-b6/m4b-b6k-*.log`, `m4b-b6k-run.log`).
+  - Gated suites crash debug (SIGBUS, G14) and go `-O` green with
+    test-only lifts: QueueIntegration 9/9, QueueAttachment 7/7,
+    QueueContract 7/7, QueueDurability 25/25, QueueCrashActor 8/8
+    (b6k `opt-*.log`, revert byte-identical). The final HEAD adds
+    one test to QueueIntegration (Q10 live-epoch), one discriminating
+    UndoFiles test (UNDO-06), and gate shims — same G14 gating, same
+    source paths; Linux `-O` is green for the identical suites, so the
+    final mac `-O` is expected green under the same lifts (re-run
+    queued for when the host is reachable; no code change required).
+  - B2-era mac evidence (Section B2) remains valid: Presentation
+    58/58 debug green; QueueReorder/QueueDurability/QueueContract
+    SIGBUS debug / 6/6,25/25,6/6 `-O` green (`.needletail-dev/m4b-b2/`).
+  - B4-era mac evidence: Presentation 78/78 debug green; QueueReorder
+    6/6 `-O` green with pristine revert (`m4b-b4-opt-reorder2.log`).
+
+- G14 gates: test-only `#if canImport(Glibc)` directly above
+  `struct QueueIntegrationTests`/`QueueAttachmentActorTests`/
+  `QueueCrashActorTests`/`QueueContractTests`/`QueueDurabilityTests`/
+  `UndoTests` (and `QueueReorderTests`); precise python lift
+  `run-b6final.sh` lifts only that pattern (never the Glibc import
+  shim), reverts byte-identical via SHA-256. Linux-debug covers the
+  gated suites; Darwin `-O` covers the same assertions on mac.
+
+- BDD-06 probes: `plans/m4-b-b1-probe-boundary.log` (B1 boundary),
+  `m4-b-b2-probe-ack.log` (queue ack), `m4-b-b3-probe-liveness.log`
+  (5-min rule), `m4-b-b4-probe-undorun.log` (undo run), `m4-b-b5-probe-framecap.log` (frame cap).
+
+- Reviews: B0 READY×2, B1 READY×2, B2 READY, B3 READY, B4 READY,
+  B5 READY. B6 delta re-review queued (this Closeout is the B6
+  evidence at HEAD `f9797f4`); Linux gate is green end-to-end,
+  mac keepers from `89bf90d` are valid for this source tree,
+  final mac `-O` rerun pending host reachability.
