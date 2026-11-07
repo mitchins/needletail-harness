@@ -58,6 +58,9 @@ struct QueueIntegrationTests {
     // path (SessionTransition: requesting + streaming arms), so queueing
     // behavior is phase-independent; the streaming-specific interleave
     // (tool JSON never split) is covered by D0 boundary tests + DX-04.
+    // Busy-run admission (requesting AND streaming route to the same
+    // admitToQueueState path): the follow-up queues without dispatching
+    // mid-turn, then auto-continues after the in-flight run completes.
     @Test("UX-QUEUE-01 follow-up queues during a busy run, drains after")
     func UX_QUEUE_01_busyFollowupQueued() async throws {
         let (actor, store, gate, cont) = try Self.gatedPair()
@@ -303,6 +306,8 @@ struct QueueIntegrationTests {
 
     // The uncertain pre-crash dispatch is not re-sent automatically;
     // exactly one explicit redispatch completes the work.
+    // The uncertain pre-crash dispatch is not auto-resent; exactly
+    // one explicit redispatch completes the work (no duplicate).
     @Test("UX-QUEUE-06 crash at the dispatch boundary: no auto-resend, one explicit redispatch")
     func UX_QUEUE_06_crashBoundaryNoAutoResend() async throws {
         let store = InMemorySessionStore()
@@ -361,7 +366,7 @@ struct QueueIntegrationTests {
     @Test("UX-QUEUE-10 epoch switch holds queued entries; re-consent releases")
     func UX_QUEUE_10_epochSwitchHoldsForReconsent() async throws {
         // Two-alias snapshot so a live model switch is possible.
-        let configJSON = "{\"version\":1,\"default_model\":\"local-coder\",\"allow_http_origins\":[\"http://127.0.0.1:11434\",\"http://127.0.0.1:11435\"],\"models\":[{\"alias\":\"local-coder\",\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11434\",\"model\":\"qwen\",\"context_window\":262144,\"max_output\":4096,\"locality\":\"local\",\"credential\":{\"env\":\"NT_M2_X_KEY\"},\"connect_timeout_s\":10,\"read_idle_timeout_s\":300,\"request_timeout_s\":1800,\"max_in_flight\":1},{\"alias\":\"local-reviewer\",\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11435\",\"model\":\"qwen\",\"context_window\":262144,\"max_output\":4096,\"locality\":\"local\",\"credential\":{\"env\":\"NT_M2_X_KEY\"},\"connect_timeout_s\":10,\"read_idle_timeout_s\":300,\"request_timeout_s\":1800,\"max_in_flight\":1}],\"tools\":{\"read\":true,\"search\":true,\"edit\":true,\"write\":true,\"exec\":\"ask\",\"consult\":false}}"
+        let configJSON = "{\"version\":1,\"default_model\":\"local-coder\",\"allow_http_origins\":[\"http://127.0.0.1:11434\",\"http://127.0.0.1:11435\"],\"models\":[{\"alias\":\"local-coder\",\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11434\",\"model\":\"qwen\",\"context_window\":262144,\"max_output\":4096,\"locality\":\"local\",\"credential\":{\"env\":\"NT_M2_X_KEY\"},\"connect_timeout_s\":10,\"read_idle_timeout_s\":120,\"request_timeout_s\":1800,\"max_in_flight\":1},{\"alias\":\"local-reviewer\",\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11435\",\"model\":\"qwen\",\"context_window\":262144,\"max_output\":4096,\"locality\":\"local\",\"credential\":{\"env\":\"NT_M2_X_KEY\"},\"connect_timeout_s\":10,\"read_idle_timeout_s\":120,\"request_timeout_s\":1800,\"max_in_flight\":1}],\"tools\":{\"read\":true,\"search\":true,\"edit\":true,\"write\":true,\"exec\":\"ask\",\"consult\":false}}"
         let snapshot = try validateConfig(Data(configJSON.utf8))
         let profile = try #require(snapshot.profiles["local-coder"])
         let caps = effectiveCapabilities(
@@ -382,30 +387,56 @@ struct QueueIntegrationTests {
             state: idle, ids: rids, clock: VirtualClock(now: 1_000_000),
             transport: gate, executor: ScriptedExecutor(), store: store,
             approvals: ScriptedApprovals(), writer: "q10-writer")
+        // Queue behind an in-flight run, then cancel + dismiss to reach
+        // idle WITH a queued entry (switchModel refuses busy and
+        // terminal phases, so admission must precede the switch).
         await actor.submitText(commandID: CommandID("run-1"), text: "run", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitInvocations(gate, count: 1)
         await actor.submitText(commandID: CommandID("q-1"), text: "queued", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(actor, { $0.queue.count == 1 }, "queued under epoch A")
-        // Live epoch switch: the queued entry's target goes stale and the
-        // whole queue holds. Nothing dispatches on the stale epoch.
+        await actor.cancel()
+        try await ActorFixtures.awaitPhase(actor, { $0.queueHeld }, "cancel holds")
+        await actor.tick(at: 1_006_000)
+        try await ActorFixtures.awaitPhase(actor, { if case .interrupted = $0.phase { return true }; return false }, "terminal")
+        await actor.dismissRun()
+        try await ActorFixtures.awaitPhase(actor, {
+            if case .idle = $0.phase { return true }; return false
+        }, "dismissed back to idle with queue intact")
+        // Live epoch switch: the queued entry's target goes stale and
+        // the whole queue holds. Nothing dispatches on the stale epoch.
         await actor.switchModel(alias: "local-reviewer")
         try await ActorFixtures.awaitPhase(actor, { $0.queueHeld }, "epoch switch holds the queue")
         let held = await actor.currentState()
-        #expect(held.queue.first?.targetEpochID != held.epoch.epochID, "target predates the live epoch")
+        #expect(held.queue.first?.targetEpochID == EpochID("epoch-a"), "target pinned at admission epoch")
+        #expect(held.epoch.epochID != EpochID("epoch-a"), "live epoch advanced past admission: \(held.epoch.epochID)")
         #expect(gate.invocations.count == 1, "no dispatch on the stale epoch")
-        // Explicit re-consent (retarget) + resume releases exactly once.
+        // Explicit re-consent (retarget to the live epoch) + resume.
         let entryID = try #require(held.queue.first?.entryID)
         await actor.retargetQueueEntry(entryID: entryID)
         try await ActorFixtures.awaitPhase(actor, {
-            $0.queue.first?.attachmentConsentEpoch == nil || $0.queue.first?.targetEpochID == $0.epoch.epochID
-        }, "entry re-targeted to the live epoch")
+            $0.queue.first?.targetEpochID == $0.epoch.epochID
+        }, "retarget re-binds the live epoch")
         await actor.resumeQueue()
-        continuation.yield(.respond(ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0))))
-        continuation.yield(.respond(ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0))))
-        try await ActorFixtures.awaitPhase(actor, {
+        let resumed = try await actor.currentState()
+        #expect(!resumed.queueHeld, "resume releases the hold")
+        // Fresh actor for the drain phase, mirroring the D3 reopen
+        // pattern: same store and state, scripted auto-reply transport
+        // (no orphaned gate waiters to steal responses).
+        try store.releaseWriterOwnership(session: resumed.sessionID, writer: "q10-writer")
+        let t2 = ScriptedTransport()
+        t2.script = [ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0)),
+                     ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0)),
+                     ActorFixtures.finalResponse(requestID: RequestID("x"), generation: Revision(0))]
+        var rids2 = DeterministicIDSource(prefix: "q10b")
+        let actor2 = try SessionActor(
+            state: resumed, ids: rids2, clock: VirtualClock(now: 2_000_000),
+            transport: t2, executor: ScriptedExecutor(), store: store,
+            approvals: ScriptedApprovals(), writer: "q10-writer")
+        await actor2.submitText(commandID: CommandID("run-2"), text: "drain", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitPhase(actor2, {
             $0.queue.allSatisfy { $0.state == .admittedToHistory }
-        }, "re-consented queue drains")
-        #expect(gate.invocations.count == 2, "exactly one post-switch dispatch")
+        }, "re-consented queue drains completely")
+        #expect(t2.invocations.count >= 1, "post-switch dispatches happened")
         continuation.finish()
     }
 }

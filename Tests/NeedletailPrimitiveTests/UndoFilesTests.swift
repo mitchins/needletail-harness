@@ -448,13 +448,25 @@ struct UndoFilesTests {
         // execution fidelity; undo sees only recorded vs unrecorded bytes).
         try "g0-shelled\n".write(to: url.appendingPathComponent("g.txt"), atomically: true, encoding: .utf8)
         // The batch carried an exec proposal alongside the edit.
+        // Even a *successful* exec outcome for g.txt (as if the exec
+        // had written it and reported success) must never become a
+        // member: exec effects are not natively undoable, only
+        // native-tool preimages are.
+        let execOutcome = ToolCallOutcome(
+            callID: "c2", status: "success", summary: "ok", data: "",
+            artifactID: nil, secondaryArtifactIDs: [], truncated: false, warnings: [],
+            error: nil, path: "g.txt", mode: nil,
+            beforeHash: Self.sha("g0\n"), afterHash: Self.sha("g0-shelled\n"),
+            started: true, mutating: true,
+            deviceBefore: 7, inodeBefore: 9, deviceAfter: 7, inodeAfter: 9,
+            created: false, grantedRoot: fp.string)
         let mixed = ToolBatch(batch.proposals + [ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d",
             arguments: "{\"command\":\"touch g.txt\"}")])
         let group = try #require(buildChangeGroup(
             groupID: "chg-1", runID: RunID("r1"), effectID: EffectID("eff-1"),
-            proposals: mixed.proposals, outcomes: ["c1": outcome], doneCallIDs: ["c1"]))
+            proposals: mixed.proposals, outcomes: ["c1": outcome, "c2": execOutcome], doneCallIDs: ["c1", "c2"]))
         #expect(group.members.count == 1 && group.members[0].path == "f.txt",
-            "exec-touched file gains no ledger member: \(group.members.map(\.path))")
+            "even a successful exec outcome gains no member: \(group.members.map(\.path))")
         #expect(group.hadExecProposals, "mixed batch marks exec participation for the notice")
         // Undo restores the recorded file and leaves the exec-touched one byte-identical.
         let inverses = undoInverses(undoCommandID: "undo-1", group: group)
