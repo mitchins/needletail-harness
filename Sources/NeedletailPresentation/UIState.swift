@@ -131,7 +131,9 @@ public struct UIState: Sendable, Equatable {
     public var composer: ComposerState
     public var suggestion: MentionSuggestionState?
     /// Accepted file tokens (B1): display text is in the composer,
-    /// structured identity here. Never submitted implicitly.
+    /// structured identity here. Never submitted implicitly. Tokens
+    /// belong to the current draft: submit resets them; mid-draft edits
+    /// retain them (attach re-validates path/identity in Core at submit).
     public var tokens: [MentionToken]
     public var queue: [QueueSummary]
     public var activeAgent: AgentSummary?

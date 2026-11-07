@@ -142,10 +142,16 @@ struct MentionGrammarTests {
         let big = (0..<100_000).map { "src/f\($0).swift" }
         // The seam contract: callers filter secrets/out-of-root BEFORE the
         // source (product confinement is Runtime's job, proven in B6).
+        // Discriminating check: the unfiltered source SEES the secret, the
+        // filtered one does not — dropping `excluded` fails this test.
+        let raw = ScriptedCandidates(catalog: big + [".secrets/key"])
+        #expect(raw.candidates(query: "key", revision: 1).contains(where: { $0.path == ".secrets/key" }),
+            "unfiltered source sees the secret")
         let source = ScriptedCandidates(catalog: big + [".secrets/key"], excluded: [".secrets/key"])
         let found = source.candidates(query: "f", revision: 1)
         #expect(found.count == maxCandidates, "hard cap holds")
-        #expect(!found.contains(where: { $0.path.contains(".secrets") }), "excluded entries never surface")
+        #expect(source.candidates(query: "key", revision: 1).isEmpty,
+            "excluded entries never surface even on exact match")
     }
 
     @Test("UX-MENTION-06 preview sanitized, truncated, no provider request")
@@ -216,6 +222,23 @@ struct MentionGrammarTests {
             if case .submit = e { Issue.record("attach must never submit"); }
         }
         #expect(fx.count == 1, "single attach intent, no grant, no submit")
+    }
+
+    @Test("UX-MENTION-08 range-only edit keeps candidates without refetch")
+    func UX_MENTION_08_rangeEditRetains() throws {
+        var state = UIState()
+        _ = apply(&state, .input(.insertText("see @doc")))
+        let rev = state.suggestion!.revision
+        _ = apply(&state, .completion(CompletionResult(queryRevision: rev,
+            candidates: [CandidateFile(path: "doc.md"), CandidateFile(path: "doc2.md")])))
+        _ = apply(&state, .mention(.selectNext))
+        let fx = apply(&state, .input(.insertText("#L10")))
+        #expect(state.suggestion?.candidates.count == 2, "candidates survive range suffix")
+        #expect(state.suggestion?.selectedIndex == 1, "selection survives range suffix")
+        #expect(!fx.contains(where: {
+            if case .requestCompletions = $0 { return true }
+            return false
+        }), "range-only edit emits no refetch")
     }
 
     @Test("UX-MENTION-08 reversed range accept records validation failure")
