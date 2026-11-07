@@ -24,6 +24,26 @@ struct MentionGrammarTests {
         }), "fetch requested once")
     }
 
+    @Test("UX-MENTION-01 @ after comma, quote, and CR opens a query")
+    func UX_MENTION_01_punctuationBoundaries() throws {
+        for prefix in ["a,@", "\"@", "line1\r\n@", "(@"] {
+            var state = UIState()
+            _ = apply(&state, .input(.insertText(prefix + "sr")))
+            #expect(state.suggestion?.query == "sr", "\(prefix.debugDescription) is a boundary")
+        }
+    }
+
+    @Test("UX-MENTION-01 fetch key strips the range suffix")
+    func UX_MENTION_01_fetchStripsRange() throws {
+        var state = UIState()
+        let fx = apply(&state, .input(.insertText("see @doc#L1")))
+        #expect(state.suggestion?.query == "doc#L1", "full query kept for accept")
+        #expect(fx.contains(where: {
+            if case .requestCompletions(let q, _) = $0 { return q == "doc" }
+            return false
+        }), "fetch carries the path key only, got \(fx)")
+    }
+
     @Test("UX-MENTION-01 email address is not a mention trigger")
     func UX_MENTION_01_emailIsNotTrigger() throws {
         var state = UIState()
@@ -49,6 +69,7 @@ struct MentionGrammarTests {
         _ = apply(&state, .input(.insertText("x")))
         // After a real keystroke the (text,cursor) grammar rules again.
         #expect(state.composer.text == "@secretx")
+        #expect(state.suggestion?.query == "secretx", "typed text re-derives; paste stays literal")
     }
 
     @Test("UX-MENTION-03 accept inserts unicode path token and moves cursor")
@@ -59,9 +80,45 @@ struct MentionGrammarTests {
             candidates: [CandidateFile(path: "docs/ünïcode notes.md")])))
         let fx = apply(&state, .mention(.acceptSelected))
         #expect(state.composer.text.contains("docs/ünïcode notes.md"), "token text landed, got \(state.composer.text)")
+        let expectedCursor = "see ".unicodeScalars.count + "docs/ünïcode notes.md".unicodeScalars.count
+        #expect(state.composer.cursor == expectedCursor, "cursor after token, got \(state.composer.cursor)")
         #expect(state.suggestion == nil, "popup dismissed after accept")
         #expect(state.tokens.count == 1 && state.tokens[0].path == "docs/ünïcode notes.md", "structured token recorded")
         #expect(!fx.contains(where: { if case .submit = $0 { return true }; return false }), "accept never submits")
+    }
+
+    @Test("UX-MENTION-03 mid-token accept replaces the whole span")
+    func UX_MENTION_03_midTokenAccept() throws {
+        var state = UIState()
+        _ = apply(&state, .input(.insertText("see @longquery tail")))
+        _ = apply(&state, .input(.moveCursor(-9)))
+        _ = apply(&state, .completion(CompletionResult(queryRevision: state.suggestion!.revision,
+            candidates: [CandidateFile(path: "f.md")])))
+        _ = apply(&state, .mention(.acceptSelected))
+        #expect(state.composer.text == "see f.md tail", "no query tail left, got \(state.composer.text)")
+    }
+
+    @Test("UX-MENTION-08 valid range accept records token and cursor")
+    func UX_MENTION_08_validRangeAccept() throws {
+        var state = UIState()
+        _ = apply(&state, .input(.insertText("see @doc#L10-L30")))
+        _ = apply(&state, .completion(CompletionResult(queryRevision: state.suggestion!.revision,
+            candidates: [CandidateFile(path: "doc.md")])))
+        let fx = apply(&state, .mention(.acceptSelected))
+        #expect(state.tokens.count == 1 && state.tokens[0].lineRange == 10...30, "range recorded")
+        #expect(state.composer.text == "see doc.md#L10-L30", "display carries range, got \(state.composer.text)")
+        #expect(fx.isEmpty, "accept emits no effects")
+    }
+
+    @Test("UX-MENTION-11 submit clears accepted tokens with the draft")
+    func UX_MENTION_11_submitClearsTokens() throws {
+        var state = UIState()
+        _ = apply(&state, .input(.insertText("@a ")))
+        state.tokens = [MentionToken(path: "a", revision: 1)]
+        let fx = apply(&state, .input(.submitDraft(commandID: CommandID("s-1"))))
+        #expect(fx.count == 1, "submit still emits")
+        #expect(state.tokens.isEmpty, "tokens belong to the submitted draft")
+        #expect(state.composer.text.isEmpty && state.suggestion == nil)
     }
 
     @Test("UX-MENTION-04 late completion preserves newer selection")
@@ -80,13 +137,15 @@ struct MentionGrammarTests {
         #expect(!(state.suggestion?.candidates.contains(where: { $0.path == "stale" }) ?? true), "stale candidates dropped")
     }
 
-    @Test("UX-MENTION-05 catalogue caps and secret names excluded")
+    @Test("UX-MENTION-05 catalogue caps and exclusions are caller-enforced")
     func UX_MENTION_05_capsAndExclusions() throws {
         let big = (0..<100_000).map { "src/f\($0).swift" }
-        let source = ScriptedCandidates(catalog: big + [".secrets/key"])
-        let found = source.candidates(query: "src/f", revision: 1)
+        // The seam contract: callers filter secrets/out-of-root BEFORE the
+        // source (product confinement is Runtime's job, proven in B6).
+        let source = ScriptedCandidates(catalog: big + [".secrets/key"], excluded: [".secrets/key"])
+        let found = source.candidates(query: "f", revision: 1)
         #expect(found.count == maxCandidates, "hard cap holds")
-        #expect(!found.contains(where: { $0.path.contains(".secrets") }), "secrets never surface")
+        #expect(!found.contains(where: { $0.path.contains(".secrets") }), "excluded entries never surface")
     }
 
     @Test("UX-MENTION-06 preview sanitized, truncated, no provider request")
@@ -130,11 +189,13 @@ struct MentionGrammarTests {
         #expect(fx[0] == .attachFile(path: "docs/a.md", range: 1...3), "attach intent, actor decides")
     }
 
-    @Test("UX-MENTION-10 sealed context refuses attach at intent validation")
-    func UX_MENTION_10_sealedRefusesAttach() throws {
-        let state = UIState()
-        // Empty path is never a valid attachment: refused purely, no effect.
-        let (_, fx) = reduce(state, .queueOp(.attachFile(path: "", range: nil)))
+    @Test("UX-MENTION-10 invalid attach refused purely; sealed is actor-side")
+    func UX_MENTION_10_emptyAttachRefusedPurely() throws {
+        // Pure leg: an empty path is refused with no effect. Sealed-mode
+        // refusal is an actor decision (Core re-validates route/consent);
+        // the intent must therefore carry no grant — only path+range.
+        var state = UIState()
+        let fx = apply(&state, .queueOp(.attachFile(path: "", range: nil)))
         #expect(fx.isEmpty, "invalid attach emits nothing")
     }
 

@@ -8,10 +8,19 @@ import NeedletailCore
 public struct MentionQuery: Sendable, Equatable {
     /// Scalar index of the `@`.
     public var at: Int
+    /// Full query text (may include a `#L` range suffix for accept).
     public var query: String
+    /// Fetch key: query up to the first `#` (range suffixes never reach
+    /// the candidate source — UX-MENTION-08 flow would otherwise starve).
+    public var pathQuery: String
     public init(at: Int, query: String) {
         self.at = at
         self.query = query
+        if let hash = query.firstIndex(of: "#") {
+            self.pathQuery = String(query[..<hash])
+        } else {
+            self.pathQuery = query
+        }
     }
 }
 
@@ -31,10 +40,12 @@ public func mentionQuery(text: String, cursor: Int) -> MentionQuery? {
                 if i == 0 { return true }
                 let p = scalars[i - 1]
                 if p == "\\" { return false }
-                // ASCII boundary set (documented contract): start of text,
-                // space/tab/newline, or open paren. Anything else — word
-                // characters (emails), slashes, punctuation — is literal.
-                return p == " " || p == "\n" || p == "\t" || p == "("
+                // Spec §2.2: beginning or after whitespace/allowed
+                // punctuation. Unicode whitespace plus an explicit ASCII
+                // punctuation set; word characters, slashes, dots and
+                // `@` itself stay literal (emails, paths, code).
+                if p.properties.isWhitespace { return true }
+                return "([{\"'`,;:".unicodeScalars.contains(p)
             }()
             if prevIsBoundary {
                 at = i
@@ -50,6 +61,14 @@ public func mentionQuery(text: String, cursor: Int) -> MentionQuery? {
     return MentionQuery(at: found, query: query)
 }
 
+/// Fetch key for a raw query string: text up to the first `#`.
+public func mentionPathQuery(_ query: String) -> String {
+    if let hash = query.firstIndex(of: "#") {
+        return String(query[..<hash])
+    }
+    return query
+}
+/// reversed, zero, or absurd (>1M) ranges return nil (UX-MENTION-08).
 /// Parses a `#L10` / `#L10-L30` range suffix. Lines are 1-based;
 /// reversed, zero, or absurd (>1M) ranges return nil (UX-MENTION-08).
 public func parseMentionRange(_ suffix: String) -> ClosedRange<Int>? {

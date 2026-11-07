@@ -32,7 +32,7 @@ struct PermutationTests {
 
     static func script(seed: UInt64, length: Int) -> [ScriptOp] {
         var rng = XorShift(state: seed == 0 ? 0x9E37 : seed)
-        let texts = ["a", "bb", " x ", "y"]
+        let texts = ["a", "bb", " x ", "y", "@m"]
         return (0..<length).map { _ in
             switch rng.next(bound: 6) {
             case 0: return .typeText(texts[rng.next(bound: texts.count)])
@@ -97,14 +97,17 @@ struct PermutationTests {
             case .completion(let rev):
                 let before = state.composer.text
                 let beforeSuggestion = state.suggestion
+                // Stale means: no live suggestion, or revision mismatch
+                // against the LIVE suggestion (not a fixed seed number —
+                // typing re-derives revisions, so rev 2 can be stale too).
+                let isStale = beforeSuggestion == nil || rev != beforeSuggestion!.revision
                 let (next, emitted) = reduce(state, .completion(CompletionResult(
                     queryRevision: rev, candidates: [CandidateFile(path: "late")])))
                 state = next
                 effects += emitted.count
-                if rev != 2 {
+                if isStale {
                     // Stale completions change nothing: neither the draft
-                    // nor the live suggestion (B1: an unrepresentable seed
-                    // is dismissed by typing before any completion lands).
+                    // nor the live suggestion.
                     if state.composer.text != before {
                         violations.append("stale completion touched the draft")
                     }

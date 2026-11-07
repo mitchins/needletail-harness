@@ -57,6 +57,10 @@ private func reduceInput(_ state: UIState, _ input: InputAction) -> (UIState, [U
         var next = state
         next.composer = ComposerState()
         next.suggestion = nil
+        // Tokens belong to the submitted draft: a fresh composer starts
+        // with no accepted file identity. Mid-draft edits retain tokens
+        // (attach re-validates path/identity in Core at submit).
+        next.tokens = []
         return (next, [effect])
     case .newline:
         return reduceInput(state, .insertText("\n"))
@@ -98,10 +102,18 @@ private func deriveMention(_ state: UIState) -> (UIState, [UIEffect]) {
     if next.suggestion?.query == found.query {
         return (next, [])
     }
-    next.suggestion = MentionSuggestionState(
-        query: found.query, revision: next.composer.revision,
-        candidates: [], selectedIndex: 0)
-    return (next, [.requestCompletions(query: found.query, revision: next.composer.revision)])
+    // A changed path restarts the query (fresh revision + fetch). A
+    // range-suffix-only change keeps candidates/selection silently.
+    if next.suggestion.map({ mentionPathQuery($0.query) }) != found.pathQuery {
+        next.suggestion = MentionSuggestionState(
+            query: found.query, revision: next.composer.revision,
+            candidates: [], selectedIndex: 0)
+        return (next, [.requestCompletions(query: found.pathQuery, revision: next.composer.revision)])
+    }
+    var current = next.suggestion!
+    current.query = found.query
+    next.suggestion = current
+    return (next, [])
 }
 
 private func reduceSession(_ state: UIState, _ projection: SessionEventProjection) -> (UIState, [UIEffect]) {
@@ -218,14 +230,21 @@ private func reduceMention(_ state: UIState, _ mention: MentionAction) -> (UISta
         guard let found = mentionQuery(text: state.composer.text, cursor: state.composer.cursor) else {
             return (state, [])
         }
+        // Replace the whole token span, not just the typed prefix: scan
+        // forward from the cursor to whitespace/end so a mid-token accept
+        // cannot leave a query tail behind.
+        let scalars = Array(state.composer.text.unicodeScalars)
+        var tokenEnd = state.composer.cursor
+        while tokenEnd < scalars.count && !scalars[tokenEnd].properties.isWhitespace {
+            tokenEnd += 1
+        }
         var display = candidate.path
         if let range = lineRange {
             display += range.lowerBound == range.upperBound
                 ? "#L\(range.lowerBound)" : "#L\(range.lowerBound)-L\(range.upperBound)"
         }
-        let scalars = Array(state.composer.text.unicodeScalars)
         let prefix = String(String.UnicodeScalarView(scalars[..<found.at]))
-        let suffix = String(String.UnicodeScalarView(scalars[state.composer.cursor...]))
+        let suffix = String(String.UnicodeScalarView(scalars[tokenEnd...]))
         var composer = state.composer
         composer.text = prefix + display + suffix
         composer.cursor = found.at + display.unicodeScalars.count
