@@ -6,6 +6,9 @@ import NeedletailCore
 /// boundary (C2): same commandID replays the same ack while indexed; the
 /// 512th+1 admission prunes oldest-first and a pruned retry admits as a NEW
 /// entry with a visibly different ack (never silent).
+/// Darwin-debug: suite gated (B2 G14-class — the debug runner SIGBUSes
+/// on these deep transition chains; Linux-debug + Darwin `-O` green).
+#if canImport(Glibc)
 struct QueueContractTests {
 
     private static func busyState(ids: inout DeterministicIDSource) throws -> SessionState {
@@ -125,3 +128,4 @@ struct QueueContractTests {
         }
     }
 }
+#endif

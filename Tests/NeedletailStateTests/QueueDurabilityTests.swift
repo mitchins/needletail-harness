@@ -6,6 +6,9 @@ import NeedletailTestSupport
 /// M2-D D0: durable queue admission/hold/reconcile, dispatch linkage,
 /// head barrier, retarget/reconcile — reducer level (fast, deterministic).
 /// Actor + store fault-injection legs live in QueueCrashMatrixTests.
+/// Darwin-debug: suite gated (B2 G14-class — the debug runner SIGBUSes
+/// on these deep transition chains; Linux-debug + Darwin `-O` green).
+#if canImport(Glibc)
 struct QueueDurabilityTests {
 
     private static func streamingWithQueue(
@@ -546,3 +549,4 @@ struct QueueDurabilityTests {
         #expect(texts.contains("keep"), "surviving entry proceeds")
     }
 }
+#endif
