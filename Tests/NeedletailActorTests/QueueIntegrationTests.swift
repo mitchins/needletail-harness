@@ -52,15 +52,12 @@ struct QueueIntegrationTests {
         Dictionary(uniqueKeysWithValues: state.queue.map { ($0.entryID, $0.commandID.raw) })
     }
 
-    // NOTE (B6 review): the GatedTransport suspends before
-    // requestStarted, so the run sits in requesting, not streaming.
-    // Both phases route operatorInput to the identical admitToQueueState
-    // path (SessionTransition: requesting + streaming arms), so queueing
-    // behavior is phase-independent; the streaming-specific interleave
-    // (tool JSON never split) is covered by D0 boundary tests + DX-04.
     // Busy-run admission (requesting AND streaming route to the same
-    // admitToQueueState path): the follow-up queues without dispatching
-    // mid-turn, then auto-continues after the in-flight run completes.
+    // admitToQueueState path; the GatedTransport suspends before
+    // requestStarted so runs here sit in requesting): the follow-up
+    // queues without dispatching mid-turn, then auto-continues after
+    // the in-flight run completes. Physical stream-chunk and tool-JSON
+    // interleave behavior is covered by D0 boundary tests + DX-04.
     @Test("UX-QUEUE-01 follow-up queues during a busy run, drains after")
     func UX_QUEUE_01_busyFollowupQueued() async throws {
         let (actor, store, gate, cont) = try Self.gatedPair()

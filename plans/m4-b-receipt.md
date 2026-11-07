@@ -150,6 +150,12 @@ re-review READY).
   text, ids and overlay (both capability modes).
 - BDD-06 probes: frame-cap marker (`plans/m4-b-b5-probe-framecap.log`)
   + new maxFrameLines/dumb-mode coverage.
+- M4-due pure RENDER/DX case IDs closed here (36/36 pure set
+  complete): UX-RENDER-01…08 (semantic stability, literal markup,
+  diff exactness, control neutralization, cluster-safe wrap,
+  plain-mode parity, bounded no-loss, canonical bytes intact) and
+  DX-09 (PTY-safe output) + DX-10 (deterministic replay, no sleeps)
+  in `SemanticFrameTests.swift`.
 - Linux `quick` green (exit 0).
 
 ## B6 — deferred integration/native completion (in review)
