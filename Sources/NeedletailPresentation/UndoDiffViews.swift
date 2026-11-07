@@ -77,7 +77,8 @@ public enum UIDiffProvenance: String, Sendable, Equatable {
 public struct UIDiffFile: Sendable, Equatable {
     public var path: String
     public var provenance: UIDiffProvenance
-    /// Bounded, terminal-safe hunks (edge caps count/bytes).
+    /// Hunks are terminal-sanitized at render; count/byte caps are
+    /// enforced by the edge (B5 bounds the frame queues).
     public var hunks: [String]
 
     public init(path: String, provenance: UIDiffProvenance, hunks: [String]) {

@@ -112,7 +112,7 @@ re-review READY).
   Views request; the actor reconciles/validates/records.
 - Render: diff/undo/rewind branches with stable IDs; approval
   exec-identity lines.
-- Tests: 8 UX RED→GREEN (UNDO-06/08/09 pure legs, NAV-07,
+- Tests: 7 UX RED→GREEN (UNDO-06/08/09 pure legs, NAV-07,
   approval identity); undo golden + manifest `m4-b-b4`;
   BDD-06 run-intent probe (`plans/m4-b-b4-probe-undorun.log`).
 - Linux `quick` green (exit 0).

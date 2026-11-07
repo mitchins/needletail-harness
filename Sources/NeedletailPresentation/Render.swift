@@ -137,7 +137,7 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
             lines.append(SemanticLine(
                 id: "approval-exec-\(index)",
                 runs: [StyledRun(
-                    text: "exec: \(terminalSafe(identity.resolvedPath))#\(terminalSafe(String(identity.contentDigest.prefix(12))))",
+                    text: "exec: \(terminalSafe(identity.resolvedPath))#\(terminalSafe(identity.contentDigest))",
                     role: .normal)]))
         }
     }
@@ -232,14 +232,18 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
             }
         case .diff(let files):
             for file in files {
+                // Paths are untrusted (dirty-tree filenames can carry
+                // control/format scalars): sanitize the text AND derive
+                // the id from the sanitized form.
+                let safePath = terminalSafe(file.path)
                 lines.append(SemanticLine(
-                    id: "diff-\(file.path)",
+                    id: "diff-\(safePath)",
                     runs: [StyledRun(
-                        text: "\(file.path) [\(file.provenance.rawValue)]",
+                        text: "\(safePath) [\(file.provenance.rawValue)]",
                         role: .normal)]))
                 for (index, hunk) in file.hunks.enumerated() {
                     lines.append(SemanticLine(
-                        id: "diff-\(file.path)#\(index)",
+                        id: "diff-\(safePath)#\(index)",
                         runs: [StyledRun(text: terminalSafe(hunk), role: .normal)]))
                 }
             }
@@ -254,8 +258,9 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
                 if let conflict = file.conflict {
                     text += " (\(conflict))"
                 }
+                let safePath = terminalSafe(file.path)
                 lines.append(SemanticLine(
-                    id: "undo-file-\(file.path)",
+                    id: "undo-file-\(safePath)",
                     runs: [StyledRun(text: terminalSafe(text), role: file.eligible ? .normal : .errorNotice)]))
             }
         case .undoOutcome(let outcome):
