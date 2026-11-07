@@ -15,3 +15,9 @@ Result: oracle FAILS as required —
 Restore: exact inverse replacement; `grep -c PROBE` returns 0;
 oracle green after restore. No production fault switches added;
 no tree changes retained from the probe.
+
+Probe 2 (same session): `maxFrameLines` 512 → 100000. Oracle
+`B5_frameAbsoluteBound` fails (no `frame-truncated` marker under
+wrap overflow in either capability mode). Restored identically;
+oracle green. The absolute cap — not just the queue marker — is
+load-bearing and pinned.

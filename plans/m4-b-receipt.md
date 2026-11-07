@@ -131,17 +131,23 @@ re-review READY).
 
 ## B5 — semantic frame + headless consumer gate (review pending)
 
-- `Render` bounds: `maxQueueRows` (64 + `queue-truncated` marker),
-  `maxFrameLines` (512 post-wrap safety + marker); composer overlay
-  never truncated. Terminal input fully neutralized across roles.
+- `Render` bounds: `maxQueueRows` (64, oldest kept, `queue-truncated`
+  marker with hidden count), `maxFrameLines` (512 post-wrap safety +
+  marker; dumb-mode reserves the inline-composer slot).
+  Every untrusted boundary sanitized (composer, queue/session/model/
+  epoch/undo/diff/approval text AND derived ids).
 - `HeadlessConsumer` (test-only, Foundation+Presentation+Core):
-  send/receive/replay; import gate pins the module boundary.
-- Six capabilities proven: complete projection intake; action
-  sequence → exact recorded (unexecuted) effects; authoritative
-  responses applied with no requested work; replay equality;
-  queue/permissions/undo/epoch inspection without terminal import.
-- Frame-level pins: same state → same frame; same query never
-  refetches; render purity (no state change, no effects possible);
-  hostile bytes inert in text and ids.
-- BDD-06 frame-cap probe (`plans/m4-b-b5-probe-framecap.log`).
+  send/receive(reported effects)/replay(state+effects); import gate
+  pins the module boundary.
+- Six capabilities proven with exact oracles: complete projection
+  intake; action sequence → EXACT recorded (unexecuted) effect list;
+  authoritative receives request nothing (fail-closed, no assert);
+  admitted+agent applied; optimistic rollback byte-exact;
+  double replay → identical states AND effect lists;
+  queue/permissions/undo/epoch inspection via real result payloads.
+- Frame-level pins: same state → same full frame (ids+texts+roles);
+  same query never refetches; render purity; hostile bytes inert in
+  text, ids and overlay (both capability modes).
+- BDD-06 probes: frame-cap marker (`plans/m4-b-b5-probe-framecap.log`)
+  + new maxFrameLines/dumb-mode coverage.
 - Linux `quick` green (exit 0).

@@ -92,10 +92,13 @@ public struct TerminalCapabilities: Sendable, Equatable {
 /// grapheme cluster — Swift String indices). Content roles never change
 /// with width or capabilities (DX-01); only layout does.
 ///
-/// B5 bounds: the queue is the only unbounded input (status, agent,
-/// approval, inspection rows are structurally small; candidates cap
-/// at maxCandidates). Queue rows past the cap collapse into one
-/// visible marker — truncation is never silent.
+/// B5 bounds: the queue is the largest unbounded input (inspection
+/// arrays arrive edge-bounded by catalogue caps; candidates cap at
+/// maxCandidates). The absolute frame cap below backstops everything.
+/// Queue rows past the cap collapse into one visible marker —
+/// truncation is never silent. The OLDEST rows are kept and the newest
+/// dropped (operator context over backlog); the marker reports the
+/// hidden count so the direction is explicit.
 public let maxQueueRows = 64
 /// Absolute post-wrap safety bound (grapheme clusters, not bytes).
 public let maxFrameLines = 512
@@ -124,7 +127,7 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
             text += " [attachments]"
         }
         lines.append(SemanticLine(
-            id: "queue-\(entry.entryID)",
+            id: "queue-\(terminalSafe(entry.entryID))",
             runs: [StyledRun(text: terminalSafe(text), role: .normal)]))
     }
     if state.queue.count > maxQueueRows {
@@ -177,9 +180,9 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
         case .sessions(let rows):
             for row in rows {
                 lines.append(SemanticLine(
-                    id: "session-\(row.row.sessionID.raw)",
+                    id: "session-\(terminalSafe(row.row.sessionID.raw))",
                     runs: [StyledRun(
-                        text: "\(row.row.sessionID.raw) \(row.liveness.rawValue) \(terminalSafe(row.row.modelAlias))",
+                        text: "\(terminalSafe(row.row.sessionID.raw)) \(row.liveness.rawValue) \(terminalSafe(row.row.modelAlias))",
                         role: .normal)]))
             }
         case .agents(let rows):
@@ -198,7 +201,7 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
         case .models(let routes):
             for route in routes {
                 lines.append(SemanticLine(
-                    id: "model-\(route.alias)",
+                    id: "model-\(terminalSafe(route.alias))",
                     runs: [StyledRun(
                         text: "\(terminalSafe(route.alias)) [\(route.kind.rawValue)] \(terminalSafe(route.locality))",
                         role: .normal)]))
@@ -231,7 +234,7 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
                     text += " · prefill \(prefill)"
                 }
                 lines.append(SemanticLine(
-                    id: "epoch-\(row.epochID)",
+                    id: "epoch-\(terminalSafe(row.epochID))",
                     runs: [StyledRun(text: terminalSafe(text), role: .normal)]))
             }
         case .compact(let preview):
@@ -243,8 +246,8 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
         case .queue(let ids):
             for id in ids {
                 lines.append(SemanticLine(
-                    id: "inspect-queue-\(id)",
-                    runs: [StyledRun(text: id, role: .normal)]))
+                    id: "inspect-queue-\(terminalSafe(id))",
+                    runs: [StyledRun(text: terminalSafe(id), role: .normal)]))
             }
         case .diff(let files):
             for file in files {
@@ -265,9 +268,9 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
             }
         case .undoPreview(let preview):
             lines.append(SemanticLine(
-                id: "undo-preview-\(preview.groupID)",
+                id: "undo-preview-\(terminalSafe(preview.groupID))",
                 runs: [StyledRun(
-                    text: "undo \(preview.groupID): \(preview.canRun ? "ready" : "blocked") — \(terminalSafe(preview.notice))",
+                    text: "undo \(terminalSafe(preview.groupID)): \(preview.canRun ? "ready" : "blocked") — \(terminalSafe(preview.notice))",
                     role: preview.canRun ? .status : .errorNotice)]))
             for file in preview.files {
                 var text = "\(file.path): \(file.eligible ? "eligible" : "ineligible")"
@@ -281,23 +284,25 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
             }
         case .undoOutcome(let outcome):
             lines.append(SemanticLine(
-                id: "undo-outcome-\(outcome.groupID)",
+                id: "undo-outcome-\(terminalSafe(outcome.groupID))",
                 runs: [StyledRun(
-                    text: "undo \(outcome.groupID): \(outcome.applied.count) applied, \(outcome.refused.count) refused, \(outcome.failed.count) failed — \(terminalSafe(outcome.notice))",
+                    text: "undo \(terminalSafe(outcome.groupID)): \(outcome.applied.count) applied, \(outcome.refused.count) refused, \(outcome.failed.count) failed — \(terminalSafe(outcome.notice))",
                     role: outcome.failed.isEmpty ? .status : .errorNotice)]))
         case .rewind(let view):
             lines.append(SemanticLine(
-                id: "rewind-\(view.boundaryEpoch)",
+                id: "rewind-\(terminalSafe(view.boundaryEpoch))",
                 runs: [StyledRun(
-                    text: "rewind to \(view.boundaryEpoch)#\(view.throughSequence)\(view.divergent ? " DIVERGENT" : ""): \(terminalSafe(view.warning))",
+                    text: "rewind to \(terminalSafe(view.boundaryEpoch))#\(view.throughSequence)\(view.divergent ? " DIVERGENT" : ""): \(terminalSafe(view.warning))",
                     role: view.divergent ? .errorNotice : .status)]))
         }
     }
     var wrapped = lines.flatMap { wrapLine($0, width: safeWidth) }
-    // Absolute safety bound: drop tail lines (never the status line at
-    // index 0) and mark the cut visibly.
-    if wrapped.count > maxFrameLines {
-        wrapped = Array(wrapped.prefix(maxFrameLines - 1)) + [SemanticLine(
+    // Absolute safety bound on content lines. In dumb mode the inline
+    // composer is appended after the cap, so reserve its slot: the
+    // bound covers the total frame either way.
+    let contentCap = capabilities.cursorAddressing ? maxFrameLines : maxFrameLines - 1
+    if wrapped.count > contentCap {
+        wrapped = Array(wrapped.prefix(contentCap - 1)) + [SemanticLine(
             id: "frame-truncated",
             runs: [StyledRun(text: "+lines truncated (frame bounded at \(maxFrameLines))", role: .normal)])]
     }

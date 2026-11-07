@@ -26,21 +26,24 @@ public struct HeadlessConsumer: Sendable {
     }
 
     /// Core-side response: apply an authoritative projection or sync.
-    public mutating func receive(_ action: UIAction, label: String) {
+    /// Returns any effects the reducer emits (authoritative inputs must
+    /// request nothing — the caller asserts emptiness; no assert() here
+    /// so the check holds under -O too).
+    public mutating func receive(_ action: UIAction, label: String) -> [UIEffect] {
         let (next, fx) = reduce(state, action)
         state = next
-        assert(fx.isEmpty, "authoritative inputs must not request work")
         applied.append("receive:\(label)")
+        return fx
     }
 
-    /// Replay check: a fresh consumer applying the recorded script
-    /// (sends only; receives re-applied in order) reaches the same state.
-    public func replayed(with script: [(UIAction, String, Bool)]) -> UIState {
+    /// Replay check: two fresh consumers applying the recorded script
+    /// reach states and effect lists identical to each other and live.
+    public func replayed(with script: [(UIAction, String, Bool)]) -> (state: UIState, requested: [UIEffect]) {
         var fresh = HeadlessConsumer()
         for (action, label, isSend) in script {
             if isSend { fresh.send(action, label: label) }
-            else { fresh.receive(action, label: label) }
+            else { _ = fresh.receive(action, label: label) }
         }
-        return fresh.state
+        return (fresh.state, fresh.requested)
     }
 }
