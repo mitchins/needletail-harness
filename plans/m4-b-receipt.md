@@ -205,16 +205,18 @@ explicitly mapped; no duplicates of M2-exited lanes.
   QueueAttachment 7/7 incl. new MENTION tests, QueueContract,
   QueueDurability, QueueCrashActor, UndoFiles, UndoTests,
   UndoJournalTests, UndoActorTests) + `./dev test case` per ID.
- - macOS evidence (same host/toolchain): debug crashes with SIGBUS
-  (signal 10, G14-class) for QueueIntegration, QueueAttachment,
-  QueueCrashActor, UndoTests, QueueContract, QueueDurability —
-  all B2/B6-era gated; UndoFilesTests + UndoJournalTests pass
-  natively. `-O` runs with test-only G14 lifts (see Closeout for
-  final matrix). Evidence under `.needletail-dev/m4b-b6/`.
+ - macOS evidence (same host/toolchain): debug behavior at last
+  successful run (89bf90d): QueueIntegration / QueueCrashActor /
+  UndoTests crashed SIGBUS (signal 10, G14-class, ungated);
+  QueueAttachment / QueueContract / QueueDurability were already
+  G14-gated and reported 0 tests (Linux debug covers them); 
+  UndoFilesTests + UndoJournalTests pass natively (8/11 + 5/5 in
+  debug). `-O` runs with test-only G14 lifts were green for the
+  gated suites (see Closeout). Evidence under `.needletail-dev/m4b-b6/`.
 
-## Closeout — final gate at HEAD f9797f4 (2026-11-08)
+## Closeout — final gate at HEAD 5ec3ba2 (2026-11-08, round-2 fixes)
 
-Branch `m4-a` local-only; HEAD `f9797f4` (no push/PR/merge). M4-A
+Branch `m4-a` local-only; HEAD `5ec3ba2` (no push/PR/merge). M4-A
 baseline `32d2226`/`29af6f0` unchanged; this receipt is the only
 file that names its own commit (resolve via `git log`).
 
@@ -233,22 +235,28 @@ file that names its own commit (resolve via `git log`).
   `192.168.2.106`   filtered (`No route to host` via `192.168.1.1`;
   `nmap -Pn` Host is up / 22 filtered at 08:20–08:22 AEDT). The final
   `run-b6final.sh` precise-lift battery was staged
-  (`.needletail-dev/m4a-final/m4b-final.tar` + `run-b6final.sh` at
-  HEAD `f9797f4`) but could not be executed on the host before the
-  partition. Evidence carried forward from the last successful mac
-  run at `89bf90d` (6 commits behind HEAD; diff to HEAD is test-only
-  + receipt/comment — no Source logic change; `git diff 89bf90d..HEAD -- Sources/` empty):
+  (`.needletail-dev/m4a-final/m4b-review2.tar` + `run-b6final.sh` at
+  HEAD `5ec3ba2`) but could not be executed on the host before the
+  partition. Round-2 Linux re-verification at `5ec3ba2`: `quick`
+  green, QueueIntegration 10/10 (Q10 stale-attachment), QueueContract
+  7/7 (byte+count typed denial), UndoFiles 11/11. Evidence carried
+  forward from the last successful mac run at `89bf90d` (8 commits
+  behind HEAD; diff to HEAD is test-only + receipt/comment — no Source
+  logic change; `git diff 89bf90d..HEAD -- Sources/` empty):
   - Keepers (debug) green: C2 21/21, TOOL10 8/8, B2 12/12+15/15, B3 30/30, C1 8/8, CrossRun 20/20 (`.needletail-dev/m4b-b6/m4b-b6k-*.log`, `m4b-b6k-run.log`).
-  - Gated suites crash debug (SIGBUS, G14) and go `-O` green with
-    test-only lifts: QueueIntegration 9/9, QueueAttachment 7/7,
-    QueueContract 7/7, QueueDurability 25/25, QueueCrashActor 8/8
-    (b6k `opt-*.log`, revert byte-identical). The final HEAD adds
-    one test to QueueIntegration (Q10 live-epoch), one discriminating
-    UndoFiles test (UNDO-06), and gate shims — same G14 gating, same
-    source paths; Linux debug is green for the identical suites
-    (Linux `-O` not run; debug covers them), so the final mac `-O`
-    is expected green under the same lifts (re-run queued for when
-    the host is reachable; no code change required).
+  - Gated suites: at `89bf90d`, QueueIntegration / QueueCrash / UndoTests
+    crashed debug (SIGBUS, G14, ungated) and went `-O` green;
+    QueueAttachment / QueueContract / QueueDurability were already
+    gated and reported 0 tests in debug (Linux debug covers them) and
+    went `-O` green with lifts (QueueIntegration 9/9, QueueAttachment
+    7/7, QueueContract 7/7, QueueDurability 25/25, QueueCrash 8/8 in
+    b6k `opt-*.log`, revert byte-identical). The final HEAD adds the
+    Q10 stale-attachment fix, Q09 byte typed denial, UNDO-06 mode, and
+    gate shims — same G14 gating, same source paths; Linux debug is
+    green for the identical suites (Linux `-O` not run; debug covers
+    them), so the final mac `-O` is expected green under the same
+    lifts (re-run queued for when the host is reachable; no code
+    change required).
   - B2-era mac evidence (Section B2) remains valid: Presentation
     58/58 debug green; QueueReorder/QueueDurability/QueueContract
     SIGBUS debug / 6/6,25/25,6/6 `-O` green (`.needletail-dev/m4b-b2/`).
@@ -269,7 +277,9 @@ file that names its own commit (resolve via `git log`).
   (5-min rule), `m4-b-b4-probe-undorun.log` (undo run), `m4-b-b5-probe-framecap.log` (frame cap).
 
 - Reviews: B0 READY×2, B1 READY×2, B2 READY, B3 READY, B4 READY,
-  B5 READY. B6 delta re-review queued (this Closeout is the B6
-  evidence at HEAD `f9797f4`); Linux gate is green end-to-end,
-  mac keepers from `89bf90d` are valid for this source tree,
-  final mac `-O` rerun pending host reachability.
+  B5 READY. B6 delta re-review round 1 NEEDS-CHANGES addressed
+  (Q10 stale barrier, Q01/Q03 partial, Q09 denial, UNDO-06 mode,
+  receipt honesty); round 2 queued (this Closeout at `5ec3ba2`);
+  Linux gate is green end-to-end, mac keepers from `89bf90d` are
+  valid for this source tree, final mac `-O` rerun pending host
+  reachability.

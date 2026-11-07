@@ -12,7 +12,7 @@ LOG=$HOME/m4bfinal-run.log
 echo "=== 0. tree identity ===" | tee -a $LOG
 git rev-parse HEAD 2>/dev/null | tee -a $LOG || echo "(no git; tarball tree)" | tee -a $LOG
 echo "=== 1. debug behavior ===" | tee -a $LOG
-for s in QueueIntegrationTests QueueAttachmentActorTests QueueCrashActorTests UndoFilesTests UndoTests UndoJournalTests QueueContractTests QueueDurabilityTests QueueReorderTests; do
+for s in QueueIntegrationTests QueueAttachmentActorTests QueueCrashActorTests UndoFilesTests UndoTests UndoJournalTests UndoActorTests QueueContractTests QueueDurabilityTests QueueReorderTests; do
   swift test --filter "$s" > "$HOME/m4bfinal-dbg-$s.log" 2>&1
   code=$?
   line=$(grep -a "Test run with" "$HOME/m4bfinal-dbg-$s.log" | head -1)
@@ -42,7 +42,7 @@ print(n)
 PYEOF
 done | tee -a $LOG
 echo "=== 3. -O battery ===" | tee -a $LOG
-for s in QueueIntegrationTests QueueAttachmentActorTests QueueCrashActorTests QueueContractTests QueueDurabilityTests UndoTests QueueReorderTests; do
+for s in QueueIntegrationTests QueueAttachmentActorTests QueueCrashActorTests QueueContractTests QueueDurabilityTests UndoTests UndoActorTests QueueReorderTests; do
   swift test -c release --filter "$s" > "$HOME/m4b-final-opt-$s.log" 2>&1
   code=$?
   line=$(grep -a "Test run with" "$HOME/m4b-final-opt-$s.log" | head -1)
