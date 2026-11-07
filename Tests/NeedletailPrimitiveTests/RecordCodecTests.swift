@@ -312,10 +312,12 @@ struct RecordCodecTests {
         let encoded = try RecordCodec.encode(.queueAdmitted(bare))
         var outer = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         // The associated-value wrapper nests the entry one level deeper.
+        // B2: pre-rank rows (no `rank` key) fall back to Double(orderKey).
         func strip(_ dict: [String: Any]) -> [String: Any] {
             var dict = dict
             dict.removeValue(forKey: "attachments")
             dict.removeValue(forKey: "attachmentConsentEpoch")
+            dict.removeValue(forKey: "rank")
             for (key, value) in dict {
                 if let nested = value as? [String: Any] {
                     dict[key] = strip(nested)
@@ -329,6 +331,7 @@ struct RecordCodecTests {
         guard case .queueAdmitted(let entry) = decoded else {
             Issue.record("legacy row must decode as queueAdmitted"); return
         }
+        #expect(entry.rank == Double(entry.orderKey), "pre-B2 rows fall back to orderKey rank")
         #expect(entry.attachments.isEmpty, "missing key defaults to no snapshots")
         #expect(entry.attachmentConsentEpoch == nil, "missing key defaults to no consent")
         #expect(entry.text == "old text", "other fields intact")

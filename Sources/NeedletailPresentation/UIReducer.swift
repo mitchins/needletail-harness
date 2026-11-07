@@ -126,7 +126,10 @@ private func reduceSession(_ state: UIState, _ projection: SessionEventProjectio
     case "denied":
         next.status = .failed(cause: projection.detail)
         // Roll back unconfirmed optimistic rows: Core refused, so they
-        // never became truth. Authoritative rows stay (sync owns them).
+        // never became truth. Denial projections carry no commandID, so
+        // ALL optimistic rows clear (a sibling in-flight submit flickers
+        // out until the next sync restores its authoritative row).
+        // Authoritative rows stay — only sync owns them.
         next.queue.removeAll(where: { $0.isOptimistic })
     case "agent":
         let parts = projection.detail.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
@@ -199,14 +202,13 @@ private func reduceQueueOp(_ state: UIState, _ operation: QueueOperation) -> (UI
         return (state, [.queueReorder(entryID: entryID, beforeID: beforeID)])
     case .grantApproval:
         // IDs come from the Core-minted view; invent nothing. Sandbox
-        // contexts preserve the sandbox decision kind (never recorded
-        // as a human approval).
-        guard let view = state.pendingApproval else { return (state, []) }
-        let decision: ApprovalDecision = view.sandbox
-            ? .sandboxGrant(note: "operator-confirmed") : .approve
-        return (state, [.decideApproval(decision, requestID: view.requestID, generation: view.generation)])
+        // contexts are display-only: sandbox-policy decisions come from
+        // the SandboxPolicyGateway, never the UI — granting here would
+        // record a fabricated sandbox grant, so it emits nothing.
+        guard let view = state.pendingApproval, !view.sandbox else { return (state, []) }
+        return (state, [.decideApproval(.approve, requestID: view.requestID, generation: view.generation)])
     case .denyApproval(let reason):
-        guard let view = state.pendingApproval else { return (state, []) }
+        guard let view = state.pendingApproval, !view.sandbox else { return (state, []) }
         return (state, [.decideApproval(.deny(reason), requestID: view.requestID, generation: view.generation)])
     case .cancelRun:
         return (state, [.cancelCurrent])
@@ -257,6 +259,10 @@ private func reduceQueueSync(_ state: UIState, _ snapshot: QueueSyncSnapshot) ->
         case .approvalPending: reason = "queue held: approval pending"
         }
         next.status = .held(reason: reason)
+    } else if case .held = next.status {
+        // Authoritative release clears a projected hold; anything else
+        // (busy/failed/idle) is owned by its own projection.
+        next.status = .idle
     }
     return (next, [])
 }

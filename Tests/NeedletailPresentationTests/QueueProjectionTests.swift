@@ -127,15 +127,44 @@ struct QueueProjectionTests {
         #expect(fx2 == [.decideApproval(.deny("no"), requestID: RequestID("r-1"), generation: Revision(3))])
     }
 
-    @Test("UX-QUEUE-11 sandbox approval routes sandboxGrant, never human approve")
-    func UX_QUEUE_11_sandboxGrantKind() throws {
+    @Test("UX-QUEUE-11 sandbox context is display-only: no grant, no deny")
+    func UX_QUEUE_11_sandboxDisplayOnly() throws {
         var state = UIState()
         _ = apply(&state, sync(approval: ApprovalRequestView(
             requestID: RequestID("r-2"), generation: Revision(4), operation: "exec",
             requiredGrant: "exec", protectedPaths: [], sandbox: true)))
-        let fx = apply(&state, .queueOp(.grantApproval))
-        #expect(fx == [.decideApproval(.sandboxGrant(note: "operator-confirmed"), requestID: RequestID("r-2"), generation: Revision(4))],
-            "sandbox context preserves decision kind, got \(fx)")
+        #expect(state.pendingApproval?.sandbox == true, "sandbox view projected")
+        #expect(apply(&state, .queueOp(.grantApproval)).isEmpty,
+            "UI must never record a sandbox grant")
+        #expect(apply(&state, .queueOp(.denyApproval(reason: "no"))).isEmpty,
+            "sandbox refusal belongs to the gateway, not the UI")
+        let frame = render(state, width: 80, capabilities: TerminalCapabilities())
+        #expect(frame.lines.contains(where: { $0.id == "approval-request" }),
+            "sandbox request still displayed")
+    }
+
+    @Test("UX-QUEUE-02 denial clears all optimistic rows; sync heals")
+    func UX_QUEUE_02_denialFlickerDocumented() throws {
+        var state = UIState()
+        _ = apply(&state, .queueOp(.submitFollowUp(text: "a", commandID: CommandID("a"))))
+        _ = apply(&state, .queueOp(.submitFollowUp(text: "b", commandID: CommandID("b"))))
+        #expect(state.queue.count == 2)
+        // Denial projections carry no commandID: both optimistic rows
+        // clear (documented flicker). The next sync restores any row
+        // Core actually confirmed.
+        _ = apply(&state, .session(.denied(cause: "policy")))
+        #expect(state.queue.isEmpty, "all optimistic rows roll back")
+        _ = apply(&state, sync(entries: [entry("q-1", command: "a", order: 1)], acked: [CommandID("a")]))
+        #expect(state.queue.count == 1 && !state.queue[0].isOptimistic, "sync heals the confirmed row")
+    }
+
+    @Test("UX-QUEUE-07 authoritative release clears the held status")
+    func UX_QUEUE_07_releaseClearsHeld() throws {
+        var state = UIState()
+        _ = apply(&state, sync(entries: [entry("q-1", command: "a", state: .held)], held: true, reason: .cancelled(sinceMillis: 9)))
+        guard case .held = state.status else { Issue.record("must be held"); return }
+        _ = apply(&state, sync(entries: [entry("q-1", command: "a", state: .queued)], held: false))
+        if case .held = state.status { Issue.record("authoritative release must clear held") }
     }
 
     @Test("UX-QUEUE-12 failed run keeps queue visible with no auto-resume")
@@ -162,6 +191,9 @@ struct QueueProjectionTests {
 
     @Test("UX-QUEUE-08 stale target entry is marked and rendered")
     func UX_QUEUE_08_staleTargetMarked() throws {
+        // Pure-leg evidence only (QUEUE-08's integration leg is B6):
+        // an entry whose target epoch differs from live is flagged and
+        // the marker renders. Hold/release behavior is Core-owned.
         var state = UIState()
         var old = entry("q-1", command: "a", order: 1)
         old = QueueEntry(entryID: old.entryID, commandID: old.commandID, kind: old.kind,

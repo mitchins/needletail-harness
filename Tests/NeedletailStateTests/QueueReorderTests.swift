@@ -55,8 +55,30 @@ struct QueueReorderTests {
             "unknown entry: loud refusal, got \(unknown.effects)")
     }
 
-    @Test("B2 rank survives withdraw tombstone and replay")
-    func B2_rankSurvivesTombstone() throws {
+    @Test("B2 reorder anchors must be live undispatched entries")
+    func B2_reorderAnchorRules() throws {
+        var ids = StateFixtures.ids()
+        var state = try Self.busyState(ids: &ids)
+        state = transition(state, StateFixtures.input("a", id: "a-1", kind: .followUp), &ids).state
+        state = transition(state, StateFixtures.input("b", id: "b-1", kind: .followUp), &ids).state
+        let queueBefore = state.queue
+        // Unknown anchor refuses.
+        let unknownAnchor = transition(state, .queueReorder(entryID: state.queue[0].entryID, beforeID: "nope", atMillis: 1002), &ids)
+        #expect(unknownAnchor.state.queue == queueBefore, "unknown anchor: queue untouched")
+        #expect(unknownAnchor.effects == [.emitUI(.denied(cause: "unknown reorder anchor"))])
+        // Self anchor is an idempotent no-op ack.
+        let selfAnchor = transition(state, .queueReorder(entryID: state.queue[0].entryID, beforeID: state.queue[0].entryID, atMillis: 1003), &ids)
+        #expect(selfAnchor.state.queue == queueBefore, "self anchor: no move")
+        // Dispatched anchor refuses: dispatch b via a fresh run is heavy
+        // here; withdraw-then-anchor covers the non-live path instead.
+        let withdrawn = transition(state, .queueWithdraw(entryID: state.queue[1].entryID, atMillis: 1004), &ids).state
+        let deadAnchor = transition(withdrawn, .queueReorder(entryID: withdrawn.queue[0].entryID, beforeID: withdrawn.queue[1].entryID, atMillis: 1005), &ids)
+        #expect(deadAnchor.state.queue == withdrawn.queue, "withdrawn anchor: queue untouched")
+        #expect(deadAnchor.effects == [.emitUI(.denied(cause: "unknown reorder anchor"))])
+    }
+
+    @Test("B2 rank survives withdraw tombstone (live)")
+    func B2_rankSurvivesTombstoneLive() throws {
         var ids = StateFixtures.ids()
         var state = try Self.busyState(ids: &ids)
         state = transition(state, StateFixtures.input("a", id: "a-1", kind: .followUp), &ids).state
@@ -66,5 +88,29 @@ struct QueueReorderTests {
         let withdrawn = transition(state, .queueWithdraw(entryID: state.queue[0].entryID, atMillis: 1003), &ids)
         #expect(withdrawn.state.queue[0].rank == movedRank, "tombstone keeps rank")
         #expect(withdrawn.state.queue[0].state == .withdrawn)
+    }
+
+    @Test("B2 reorder survives reopen via rank-ordered replay")
+    func B2_reorderSurvivesReopen() throws {
+        var ids = StateFixtures.ids()
+        var state = try Self.busyState(ids: &ids)
+        state = transition(state, StateFixtures.input("a", id: "a-1", kind: .followUp), &ids).state
+        state = transition(state, StateFixtures.input("b", id: "b-1", kind: .followUp), &ids).state
+        state = transition(state, StateFixtures.input("c", id: "c-1", kind: .followUp), &ids).state
+        // Move c first: live order becomes c,a,b.
+        let moved = transition(state, .queueReorder(entryID: state.queue[2].entryID, beforeID: state.queue[0].entryID, atMillis: 1002), &ids)
+        #expect(moved.state.queue.map(\.commandID) == [CommandID("c-1"), CommandID("a-1"), CommandID("b-1")])
+        // Rebuild the durable stream the journal would hold: admissions
+        // in admission order plus the reorder's queueUpdated record.
+        let byID = Dictionary(uniqueKeysWithValues: moved.state.queue.map { ($0.commandID, $0) })
+        let records: [DurableRecord] = [
+            .queueAdmitted(byID[CommandID("a-1")]!),
+            .queueAdmitted(byID[CommandID("b-1")]!),
+            .queueAdmitted(byID[CommandID("c-1")]!),
+            .queueUpdated(byID[CommandID("c-1")]!),
+        ]
+        let recon = try reconcileQueue(records)
+        #expect(recon.entries.map(\.commandID) == [CommandID("c-1"), CommandID("a-1"), CommandID("b-1")],
+            "reopen preserves the operator reorder, got \(recon.entries.map(\.commandID))")
     }
 }

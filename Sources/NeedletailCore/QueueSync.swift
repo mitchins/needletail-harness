@@ -62,8 +62,9 @@ public struct QueueSyncSnapshot: Sendable, Equatable {
 
     /// Convenience: snapshot straight from live state. `sandbox` comes
     /// from the edge's approval-gateway wiring (sandbox gateways mark
-    /// their decisions); Presentation defaults it false when unknown.
-    public static func from(_ state: SessionState, sandbox: Bool = false) -> QueueSyncSnapshot {
+    /// their decisions); it has no default — defaulting false would
+    /// fail open by miswiring a sandbox request as human-grantable.
+    public static func from(_ state: SessionState, sandbox: Bool) -> QueueSyncSnapshot {
         QueueSyncSnapshot(
             entries: state.queue,
             activeRequest: state.activeRequest,

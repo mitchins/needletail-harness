@@ -172,7 +172,7 @@ struct SessionExportTests {
             "eventSeq", "eventKind", "digest",
             "operationID", "callID", "state", "mutating", "outcome",
             "action", "entryID", "commandID", "queueKind", "state", "revision",
-            "targetEpochID", "orderKey", "sealed", "redacted", "text",
+            "targetEpochID", "orderKey", "rank", "sealed", "redacted", "text",
             "attachments", "path", "grantedRoot", "device", "inode", "size",
             "contentHash", "totalLines", "intent", "captureEpochID", "alias",
             "locality", "admissionSealed", "lineStart", "lineEnd", "content",

@@ -1324,12 +1324,18 @@ private func reorderQueueEntry<I: IDSource>(_ state: SessionState, entryID: Stri
         let (s1, prefix) = sequenced(state, kind: "queue-reordered", digest: eventDigest("reorder", entryID), ids: &ids)
         return Transition(
             state: s1,
-            effects: [.emitUI(.admitted(commandID: entry.commandID, revision: entry.revision))],
+            effects: [.emitUI(.runUpdate(phase: "queue", detail: "reordered \(entryID): already in place"))],
             records: prefix)
     }
-    if let beforeID, state.queue.firstIndex(where: { $0.entryID == beforeID }) == nil {
-        let (s1, prefix) = sequenced(state, kind: "queue-reorder-unknown-anchor", digest: eventDigest("reorder", entryID, beforeID), ids: &ids)
-        return Transition(state: s1, effects: [.emitUI(.denied(cause: "unknown reorder anchor"))], records: prefix)
+    // Anchors must be live undispatched entries: reordering relative to
+    // a dispatched/withdrawn/history entry is meaningless, so it refuses
+    // exactly like an unknown anchor.
+    if let beforeID {
+        guard let anchor = state.queue.first(where: { $0.entryID == beforeID }),
+              anchor.state == .queued || anchor.state == .held else {
+            let (s1, prefix) = sequenced(state, kind: "queue-reorder-unknown-anchor", digest: eventDigest("reorder", entryID, beforeID), ids: &ids)
+            return Transition(state: s1, effects: [.emitUI(.denied(cause: "unknown reorder anchor"))], records: prefix)
+        }
     }
     var queue = state.queue
     queue.remove(at: position)
@@ -1353,9 +1359,11 @@ private func reorderQueueEntry<I: IDSource>(_ state: SessionState, entryID: Stri
     queue.insert(moved, at: insertAt)
     let (s1, prefix) = sequenced(state, kind: "queue-reordered", digest: eventDigest("reorder", entryID), ids: &ids)
     let next = s1.replacing(queue: queue)
+    // A reorder is a display-order change, not an admission: the ack is
+    // untouched and the projection is a queue status line, not "admitted".
     return Transition(
         state: next,
-        effects: [.emitUI(.admitted(commandID: entry.commandID, revision: entry.revision))],
+        effects: [.emitUI(.runUpdate(phase: "queue", detail: "reordered \(entryID): moved by explicit operator decision"))],
         records: prefix + [.queueUpdated(moved)])
 }
 

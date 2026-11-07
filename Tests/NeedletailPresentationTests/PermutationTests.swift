@@ -162,11 +162,10 @@ struct PermutationTests {
     private static func isSessionOp(_ op: ScriptOp) -> Bool {
         switch op {
         case .sessionAdmit, .sessionDeny: return true
-        // cancelNotice and completion both carry session projections
-        // (denied clears optimistic rows; completions are display
-        // hints). Their queue effects are projection effects, pinned
-        // separately — never silent product mutation.
-        case .cancelNotice, .completion: return true
+        // cancelNotice forwards `.session(.denied)`, so its queue effects
+        // (optimistic rollback) are session-projection effects. Plain
+        // completions never touch the queue — no exemption for them.
+        case .cancelNotice: return true
         default: return false
         }
     }
