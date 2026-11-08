@@ -82,6 +82,20 @@ private func reduceInput(_ state: UIState, _ input: InputAction) -> (UIState, [U
         let total = composer.text.unicodeScalars.count
         composer.cursor = min(max(0, composer.cursor + offset), total)
         composer.pasting = false
+    case .replaceDraft(let text):
+        // Exact-sync boundary: over-cap text is rejected whole (the
+        // adapter pre-checks and keeps its buffer); suggestion and
+        // tokens reset like a submit boundary.
+        guard text.utf8.count <= maxComposerBytes else { return (state, []) }
+        composer.text = text
+        composer.cursor = text.unicodeScalars.count
+        composer.revision += 1
+        composer.pasting = false
+        var next = state
+        next.composer = composer
+        next.suggestion = nil
+        next.tokens = []
+        return (next, [])
     case .submitDraft(let commandID):
         guard !composer.text.isEmpty else { return (state, []) }
         let effect = UIEffect.submit(OperatorInput(text: composer.text, commandID: commandID))

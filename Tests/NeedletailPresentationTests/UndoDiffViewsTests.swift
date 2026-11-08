@@ -107,8 +107,8 @@ struct UndoDiffViewsTests {
         ])))
         let frame = render(state, width: 80, capabilities: TerminalCapabilities())
         let text = frame.lines.flatMap(\.runs).map(\.text).joined()
-        #expect(!text.contains("\u{1b}"), "escape neutralized")
-        #expect(!text.contains("\u{202E}"), "bidi neutralized")
+        #expect(!text.unicodeScalars.contains("\u{1b}"), "escape neutralized")
+        #expect(!text.unicodeScalars.contains("\u{202E}"), "bidi neutralized")
         #expect(!frame.lines.contains(where: { $0.id.contains("\u{1b}") || $0.id.contains("\u{202E}") }),
             "ids derived from sanitized paths")
     }

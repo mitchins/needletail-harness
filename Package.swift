@@ -35,6 +35,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-system.git", from: "1.8.1"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "5.0.0"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.11.1"),
+        // M4-C: completed-block terminal rendering. CONDITIONAL adoption
+        // per plans/m4-c-plan.md (C0 hard gate: Linux + macOS build/link/
+        // behavior before landing; fallback is bounded literal rendering).
+        // `.exact` (not a `from:` range) + committed Package.resolved.
+        .package(url: "https://github.com/swiftlang/swift-markdown.git", exact: "0.9.0"),
     ],
     targets: [
         .target(
@@ -80,6 +85,19 @@ let package = Package(
             name: "NeedletailPresentation",
             dependencies: ["NeedletailCore"]
         ),
+        // M4-C terminal adapter (reviewed plan plans/m4-c-plan.md).
+        // Owns display only: ANSI/span rendering, the single output
+        // owner, replxx composer bridging, plain-mode caps. Never owns
+        // agent/session/queue state (that stays in Core/Presentation).
+        .target(
+            name: "NeedletailTerminal",
+            dependencies: [
+                "NeedletailCore",
+                "NeedletailPresentation",
+                "NeedletailLineEditor",
+                .product(name: "Markdown", package: "swift-markdown"),
+            ]
+        ),
         .target(
             name: "CReplxx",
             dependencies: [],
@@ -100,6 +118,8 @@ let package = Package(
                 "NeedletailCore",
                 "NeedletailRuntime",
                 "NeedletailProviders",
+                "NeedletailTerminal",
+                "NeedletailLineEditor",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "NIOCore", package: "swift-nio"),
@@ -146,6 +166,8 @@ let package = Package(
                 "NeedletailCore",
                 "NeedletailRuntime",
                 "NeedletailLineEditor",
+                "NeedletailTerminal",
+                "NeedletailPresentation",
                 "PTYShim",
             ]
         ),

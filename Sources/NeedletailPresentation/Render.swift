@@ -14,6 +14,23 @@ public enum StyleRole: String, Sendable, Equatable, Codable {
     case candidate
     case candidateSelected
     case errorNotice
+    // M4-C additive terminal roles (pure vocabulary only — `Render`
+    // semantic output is unchanged; the NeedletailTerminal adapter maps
+    // these to ANSI spans or plain text).
+    case heading
+    case strong
+    case emphasis
+    case code
+    case codeBlock
+    case listMarker
+    case taskCheckbox
+    case filePath
+    case quote
+    case diffAdd
+    case diffDel
+    case diffHunk
+    case toolReceipt
+    case warning
 }
 
 public struct StyledRun: Sendable, Equatable {

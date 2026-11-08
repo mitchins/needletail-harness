@@ -40,6 +40,14 @@ public enum InputAction: Sendable, Equatable {
     case insertText(String)
     case deleteBackward(Int)
     case moveCursor(Int)
+    /// Exact-sync boundary (M4-C submit/clear only — never the live
+    /// keystroke mirror, which uses fine-grained actions so the mention
+    /// popup survives typing). Rejects over-`maxComposerBytes` text
+    /// (same 64 KiB rule as `insertText`, never silent truncation);
+    /// clears suggestion AND tokens (submit-boundary semantics, like
+    /// `submitDraft`'s reset — the mention flow restarts after a
+    /// boundary).
+    case replaceDraft(String)
     /// The commandID is minted by the impure edge (one UUID per submission;
     /// retries reuse it) so the pure reducer can dedup without randomness.
     case submitDraft(commandID: CommandID)

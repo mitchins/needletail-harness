@@ -74,9 +74,9 @@ struct SemanticFrameTests {
                     blobs.append(overlay.text)
                 }
                 for blob in blobs {
-                    #expect(!blob.contains("\u{1b}"), "no escape survives (\(where_)): \(blob.debugDescription)")
-                    #expect(!blob.contains("\u{202E}"), "no bidi survives (\(where_))")
-                    #expect(!blob.contains("\u{07}"), "no BEL survives (\(where_))")
+                    #expect(!blob.unicodeScalars.contains("\u{1b}"), "no escape survives (\(where_)): \(blob.debugDescription)")
+                    #expect(!blob.unicodeScalars.contains("\u{202E}"), "no bidi survives (\(where_))")
+                    #expect(!blob.unicodeScalars.contains("\u{07}"), "no BEL survives (\(where_))")
                 }
             }
         }

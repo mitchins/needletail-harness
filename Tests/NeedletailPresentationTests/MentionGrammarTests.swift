@@ -160,8 +160,8 @@ struct MentionGrammarTests {
         let (lines, truncated) = sanitizePreview(hostile + (0..<20).map { "pad\($0)" })
         #expect(lines.count <= 8, "8-line cap")
         #expect(lines.joined().utf8.count <= 4 * 1_024, "4-KiB cap")
-        #expect(!lines.joined().contains("\u{1b}"), "escape neutralized")
-        #expect(!lines.joined().contains("\u{202E}"), "bidi neutralized")
+        #expect(!lines.joined().unicodeScalars.contains("\u{1b}"), "escape neutralized")
+        #expect(!lines.joined().unicodeScalars.contains("\u{202E}"), "bidi neutralized")
         #expect(truncated, "truncation flagged")
     }
 
