@@ -239,19 +239,25 @@ unchanged.
   - Cases: per-suite logs plus selected `./dev test case` per ID (QUEUE-01/06/10, MENTION-09/10/12, UNDO-06/08/09 verified via `case` runner; remaining IDs via suite logs) — all green (see Linux B6 logs and `FINAL-*.log`).
 
 - macOS R7 (Builds-Mac-Pro.local, same host/toolchain as M4-A;
-  Swift 6.3.3, Xcode 26.x). Network partition at closeout:
-  `192.168.2.106`   filtered (`No route to host` via `192.168.1.1`;
-  `nmap -Pn` Host is up / 22 filtered at 08:20–08:22 AEDT). The final
-  `run-b6final.sh` precise-lift battery was staged
-  (`.needletail-dev/m4a-final/m4b-review2.tar` + `run-b6final.sh` at
-  this HEAD, plus `m4b-closeout.tar` at prior HEAD) but could not be
-  executed on the host before the partition. Round-2 Linux
-  re-verification at this HEAD: `quick` green, QueueIntegration 10/10
-  (Q10 stale-attachment), QueueContract 7/7 (byte+count typed denial),
-  UndoFiles 11/11. Evidence carried forward from the last successful
-  mac run at `89bf90d` (see `git log --oneline 89bf90d..HEAD` for count; diff to HEAD is
-  test-only + receipt/comment + dev script — no Source logic change;
-  `git diff 89bf90d..HEAD -- Sources/` empty):
+  Swift 6.3.3 (Xcode 26.6, Swift 6.3.x, macOS 26.7.1). Host identity
+  verified 2026-11-08 09:43: `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCPs8PUpNysX95DDVseF31ryO4v8Yi12uaKRJvuyJkM`
+  matches `~/.ssh/known_hosts` (`Builds-Mac-Pro.local`/`192.168.2.106`);
+  `sw_vers` macOS 26.7.1, `hostname` `Builds-Mac-Pro.local`. Network
+  partition at `3e9806f` closeout (`No route to host` via `192.168.1.1`
+  at 08:20–08:22) resolved 09:43 (`ping`/`nmap` Host is up, 22 open).
+  Archive integrity verified: `m4b-qualified.tar` (`3e9806f`,
+  `e925e925…`) and `m4b-qualified-80cab63.tar` (`80cab63` test-only fix,
+  `a4fb108c…`) both `shasum -a 256` match expected; `git diff
+  3e9806f..80cab63 -- Sources/` empty (production identical). Final
+  `run-b6final.sh` precise-lift battery staged at `3e9806f` and
+  re-staged at `80cab63` (test-only `UndoActorTests` `/tmp` symlink
+  fix) — both trees produce identical production behavior. Round-2
+  Linux re-verification at this HEAD: `quick` green, QueueIntegration
+  10/10 (Q10 stale-attachment), QueueContract 7/7 (byte+count typed
+  denial), UndoFiles 11/11. Evidence carried forward from the last
+  successful mac run at `89bf90d` (see `git log --oneline 89bf90d..HEAD`
+  for count; diff to HEAD is test-only + receipt/comment + dev script
+  — no Source logic change; `git diff 89bf90d..HEAD -- Sources/` empty):
   - Keepers (debug) green: C2 21/21, TOOL10 8/8, B2 12/12+15/15, B3 30/30, C1 8/8, CrossRun 20/20 (`.needletail-dev/m4b-b6/m4b-b6k-*.log`, `m4b-b6k-run.log`).
   - Gated suites: at `89bf90d`, QueueCrashActor crashed debug
     (SIGBUS, G14, ungated) and went `-O` green; UndoTests crashed
@@ -280,9 +286,13 @@ unchanged.
   `QueueCrashActorTests`/`QueueContractTests`/`QueueDurabilityTests`/
   `UndoTests` (and `QueueReorderTests`); precise python lift
   `run-b6final.sh` lifts only that pattern (never the Glibc import
-  shim), reverts byte-identical via SHA-256. Linux-debug covers the
-  gated suites; Darwin `-O` at `89bf90d` covered the same assertions
-  on mac (final HEAD `-O` pending host reachability).
+  shim), reverts byte-identical via SHA-256 (`REVERT-CLEAN`). Linux-
+  debug covers the gated suites; Darwin `-O` at `89bf90d` covered the
+  same assertions on mac for the gated suites, and final battery at
+  `80cab63` (2026-11-08 10:21–11:00, debug + lifted `-O`) is now
+  complete and green (see below). `run-b6final.sh` verifies that every
+  required lifted suite actually executes its expected nonzero test
+  count — a zero-test `exit 0` is recorded as `FAIL` (not `PASS`).
 
 - BDD-06 probes: `plans/m4-b-b1-probe-boundary.log` (B1 boundary),
   `m4-b-b2-probe-ack.log` (queue ack), `m4-b-b3-probe-liveness.log`
@@ -292,9 +302,22 @@ unchanged.
   B5 READY. B6 delta re-review round 1 NEEDS-CHANGES addressed
   (Q10 stale barrier, Q01/Q03 partial, Q09 denial, UNDO-06 mode,
   receipt honesty); round 2 READY at `0b5c1cf` (final polish at this
-  HEAD is wording-only); Linux gate is green end-to-end, mac keepers
-  from `89bf90d` are valid for this source tree, final mac `-O`
-  rerun pending host reachability (staged tar+script at this HEAD).
+  HEAD is wording-only); round 2 follow-up fixes (UndoActor `/tmp`
+  symlink) test-only. Linux gate is green end-to-end, mac keepers
+  from `89bf90d` are valid for this source tree. Final macOS B6
+  execution completed 2026-11-08 10:21–11:00 at `80cab63` (production
+  identical to `3e9806f`): debug `QueueIntegration`/`QueueAttachment`/
+  `QueueCrash`/`QueueContract`/`QueueDurability`/`UndoTests`/
+  `QueueReorder` 0 tests (gated, Linux covers), `UndoFiles` 11,
+  `UndoJournal` 5, `UndoActor` G14 crash signal 10 with 0 tests
+  (gated, Linux covers) — `DBG verification OK`; lifted `-O` 8/8
+  `QueueIntegration` 10, `QueueAttachment` 7, `QueueCrash` 8,
+  `QueueContract` 7, `QueueDurability` 25, `UndoTests` 34,
+  `UndoActor` 6, `QueueReorder` 6 — `OPT verification OK (all 8 suites
+  nonzero and expected)`, `REVERT-CLEAN`, `B6FINAL-DONE` (logs
+  `.needletail-dev/m4b-b6-final/`). Every required lifted suite
+  executed its expected nonzero count; zero-test `exit 0` would have
+  been `FAIL`.
 
 ## Verdict — M4-B QUALIFIED at this commit
 
@@ -319,8 +342,14 @@ merged 741, BDD-01 ingestion 3/3) + B6 per-suite logs
 UndoFiles 11/11, UndoTests 34/34, UndoJournal 5/5, UndoActor 6/6,
 SemanticFrame+Headless 18/18) + macOS keepers at `89bf90d` (C2 21,
 TOOL10 8, B2 12+15, B3 30, C1 8, CrossRun 20 debug; gated suites as
-above) + staged `run-b6final.sh` precise-lift battery (this HEAD,
-re-run queued). G14 gates are test-only and byte-identical;
+above) + final macOS B6 battery at `80cab63` (2026-11-08 10:21–11:00)
+debug `DBG verification OK` (gated 0, ungated 11/5, G14 crash) and
+lifted `-O` 8/8 green with expected nonzero counts (`OPT verification
+OK`), `REVERT-CLEAN`, `B6FINAL-DONE` (logs
+`.needletail-dev/m4b-b6-final/`, `m4bfinal-run.log` with host identity
+`Builds-Mac-Pro.local`/`192.168.2.106`/`a4fb108c…`/`80cab63`). Every
+required lifted suite executed its expected nonzero count; zero-test
+`exit 0` is not `PASS`. G14 gates are test-only and byte-identical;
 BDD-06 probes present.
 
 **STOP** after M4-B qualification per mission: no M4-C/D work, no
