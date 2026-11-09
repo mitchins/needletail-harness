@@ -37,7 +37,7 @@ struct ChatLoopTests {
     }
 
     @Test("same text retried reuses the command ID (no duplicate submission)")
-    func retryReusesID() async {
+    func retryReusesID() async throws {
         let written = LockedBox()
         let effects = LockedEffects()
         guard let editor = LineEditorSession() else { Issue.record("replxx_init failed headless"); return }
@@ -53,7 +53,22 @@ struct ChatLoopTests {
             onEffects: { fx in await effects.append(fx) },
             mintCommandID: { var id = 0; n.mutate { $0 += 1; id = $0 }; return CommandID("cmd-\(id)") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
-        await loop.run(scriptedInput: ["same", "same", nil])
+        // First submit marks busy optimistically (M4-D D2: closes the
+        // submit-to-first-projection Ctrl+C window); a terminal
+        // projection returns to idle; the retry then resubmits (not
+        // queues) with the SAME command ID.
+        let task = Task { await loop.run(scriptedInput: []) }
+        #expect(waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        loop.post(.inputLine("same"))
+        #expect(waitFor(marker: "same", in: written, timeout: 5), "submit never dispatched")
+        // Drive the terminal transition directly: admitted then completed.
+        loop.post(.projection(.admitted(commandID: CommandID("cmd-1"), revision: 1)))
+        loop.post(.projection(.runUpdate(phase: "completed", detail: "done")))
+        try await Task.sleep(nanoseconds: 200_000_000)
+        loop.post(.inputLine("same"))
+        try await Task.sleep(nanoseconds: 200_000_000)
+        loop.post(.inputLine(nil))
+        await task.value
         let fx = await effects.all()
         #expect(fx.count == 2)
         // Both submissions carry the SAME command ID (Core admission
@@ -63,16 +78,16 @@ struct ChatLoopTests {
         owner.close()
     }
 
-    @Test("serveCompletion applies the display-safe rule on the live path")
-    func serveCompletionFilters() async throws {
+    @Test("Tab accepts the live suggestion into a token; second Tab is a no-op (M4-D D2)")
+    func tabAcceptsSuggestion() async throws {
         let written = LockedBox()
         let effects = LockedEffects()
         guard let editor = LineEditorSession() else { Issue.record("replxx_init failed headless"); return }
         let owner = TerminalOutputOwner(
             caps: ownerCaps(), writer: { written.append($0) })
         let empty = QueueSyncSnapshot(entries: [], activeRequest: nil, queueHeld: false,
-                                      heldReason: nil, pendingApproval: nil,
-                                      admittedCommandIDs: [], liveEpoch: EpochID("e"))
+                                       heldReason: nil, pendingApproval: nil,
+                                       admittedCommandIDs: [], liveEpoch: EpochID("e"))
         let config = ChatLoop.Config(
             caps: ownerCaps(), sessionID: "sess",
             snapshotProvider: { empty },
@@ -81,8 +96,8 @@ struct ChatLoopTests {
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let task = Task { await loop.run(scriptedInput: []) }
         try await Task.sleep(nanoseconds: 100_000_000)
-        // Seed a live suggestion via mirror, then deliver completions
-        // including a hostile filename: the sync serve must drop it.
+        // Type a mention query; the edge fetch is simulated by posting
+        // completions (the reducer fills the suggestion popup).
         loop.post(.mirror(text: "@e", cursor: 2))
         try await Task.sleep(nanoseconds: 200_000_000)
         loop.post(.completions(query: "e", revision: 1, candidates: [
@@ -90,7 +105,49 @@ struct ChatLoopTests {
             CandidateFile(path: "ev\u{1B}.swift"),
         ]))
         try await Task.sleep(nanoseconds: 200_000_000)
-        #expect(loop.serveCompletion(input: "@e") == ["ok.swift"])
+        // Gate open on the safe selected candidate (hostile entries never
+        // gate acceptance of the selected one).
+        guard let snap = loop.acceptSnapshot() else {
+            Issue.record("accept gate must open on a live safe suggestion"); return
+        }
+        loop.post(.tabAccept(base: snap.base, display: snap.display, cursor: snap.cursor))
+        try await Task.sleep(nanoseconds: 200_000_000)
+        // Consumed: suggestion cleared, gate closed, token minted (the
+        // attach composition test proves the token captures).
+        #expect(loop.acceptSnapshot() == nil, "second Tab must be a no-op after accept")
+        // Selection keys with no suggestion are safe no-ops.
+        loop.post(.key(.up))
+        loop.post(.key(.down))
+        try await Task.sleep(nanoseconds: 100_000_000)
+        loop.post(.inputLine(nil))
+        await task.value
+        owner.close()
+    }
+
+    @Test("Tab with no suggestion and arrows without popup are no-ops (M4-D D2)")
+    func tabArrowsNoopWithoutSuggestion() async throws {
+        let written = LockedBox()
+        let effects = LockedEffects()
+        guard let editor = LineEditorSession() else { Issue.record("replxx_init failed headless"); return }
+        let owner = TerminalOutputOwner(
+            caps: ownerCaps(), writer: { written.append($0) })
+        let empty = QueueSyncSnapshot(entries: [], activeRequest: nil, queueHeld: false,
+                                       heldReason: nil, pendingApproval: nil,
+                                       admittedCommandIDs: [], liveEpoch: EpochID("e"))
+        let config = ChatLoop.Config(
+            caps: ownerCaps(), sessionID: "sess",
+            snapshotProvider: { empty },
+            onEffects: { fx in await effects.append(fx) },
+            mintCommandID: { CommandID("cmd-1") })
+        let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
+        #expect(loop.acceptSnapshot() == nil, "no suggestion ⇒ closed gate")
+        let task = Task { await loop.run(scriptedInput: []) }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        loop.post(.key(.tab))
+        loop.post(.key(.up))
+        loop.post(.key(.down))
+        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(await effects.all().isEmpty, "no-op keys must emit no effects")
         loop.post(.inputLine(nil))
         await task.value
         owner.close()
@@ -144,6 +201,156 @@ struct ChatLoopTests {
         // submit of "y", never a polluted draft.
         let fx = await effects.all()
         #expect(fx.count == 1)
+        #expect(fx[0] == [.submit(OperatorInput(text: "second", commandID: CommandID("cmd-1")))])
+        owner.close()
+    }
+
+    @Test("idle-empty Ctrl+C exits the run (M4-D D2.5)")
+    func idleEmptyCtrlCExits() async throws {
+        let written = LockedBox()
+        guard let editor = LineEditorSession() else { Issue.record("replxx_init failed headless"); return }
+        let owner = TerminalOutputOwner(
+            caps: ownerCaps(), writer: { written.append($0) })
+        let config = ChatLoop.Config(
+            caps: ownerCaps(), sessionID: "sess",
+            snapshotProvider: { QueueSyncSnapshot(entries: [], activeRequest: nil, queueHeld: false, heldReason: nil, pendingApproval: nil, admittedCommandIDs: [], liveEpoch: EpochID("e")) },
+            onEffects: { _ in },
+            mintCommandID: { CommandID("cmd-1") })
+        let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
+        let runTask = Task { await loop.run(scriptedInput: []) }
+        // Readiness: the initial frame must exist before the key post
+        // (posts before the inbox exists drop).
+        let ready = waitFor(marker: "idle", in: written, timeout: 5)
+        #expect(ready, "loop never rendered initial frame")
+        loop.post(.key(.ctrlC))
+        // Bounded join: a failed exit must fail the test, never hang it.
+        let exited = await join(task: runTask, timeout: 5)
+        #expect(exited, "idle-empty Ctrl+C did not shut the run down")
+        owner.close()
+    }
+
+    @Test("idle-empty Ctrl+C with queued work warns once, exits twice (M4-D D2.5)")
+    func queuedCtrlCWarnsThenExits() async throws {
+        let written = LockedBox()
+        guard let editor = LineEditorSession() else { Issue.record("replxx_init failed headless"); return }
+        let owner = TerminalOutputOwner(
+            caps: ownerCaps(), writer: { written.append($0) })
+        let entry = QueueEntry(
+            entryID: "e1", commandID: CommandID("c1"), kind: .followUp,
+            state: .queued, revision: 1, text: "pending", targetEpochID: EpochID("e"),
+            orderKey: 1, rank: 1.0)
+        let config = ChatLoop.Config(
+            caps: ownerCaps(), sessionID: "sess",
+            snapshotProvider: { QueueSyncSnapshot(entries: [entry], activeRequest: nil, queueHeld: true, heldReason: nil, pendingApproval: nil, admittedCommandIDs: [], liveEpoch: EpochID("e")) },
+            onEffects: { _ in },
+            mintCommandID: { CommandID("cmd-1") })
+        let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
+        let runTask = Task { await loop.run(scriptedInput: []) }
+        // Readiness: the queue row (kind + state) renders in the
+        // initial frame (status is not idle with a held queue).
+        #expect(waitFor(marker: "followUp queued", in: written, timeout: 5), "loop never rendered initial frame")
+        loop.post(.key(.ctrlC))
+        #expect(waitFor(marker: "queued work pending", in: written, timeout: 5), "first Ctrl+C must warn, not exit")
+        // Any other input disarms the latch: typing clears it.
+        loop.post(.inputLine("hello"))
+        _ = waitFor(marker: "hello", in: written, timeout: 5)
+        loop.post(.key(.ctrlC))
+        #expect(waitFor(marker: "queued work pending", in: written, timeout: 5), "latch must disarm on other input")
+        // Second consecutive press exits.
+        loop.post(.key(.ctrlC))
+        let exited = await join(task: runTask, timeout: 5)
+        #expect(exited, "second Ctrl+C did not shut the run down")
+        owner.close()
+    }
+
+    private func waitFor(marker: String, in box: LockedBox, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if box.joined().contains(marker) { return true }
+            usleep(10_000)
+        }
+        return false
+    }
+
+    private func join(task: Task<Void, Never>, timeout: TimeInterval) async -> Bool {
+        final class Flag: @unchecked Sendable {
+            let lock = NSLock()
+            var done = false
+        }
+        let flag = Flag()
+        Task {
+            await task.value
+            flag.lock.withLock { flag.done = true }
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if flag.lock.withLock({ flag.done }) { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
+    }
+
+    @Test("turn-terminal projection set: terminal phases retire, hints and denials do not (M4-D D1 + D7 review B4)")
+    func turnTerminalSet() {
+        #expect(ChatLoop.isTurnTerminal(.runFinished(outcome: "completed", detail: "d")), "run_finished must retire")
+        // `denied` is NOT terminal (D7 review B4): Core emits denials
+        // for non-terminal mid-run refusals (queue ops while busy,
+        // stale revisions, unquiescent undo, reconcile blocks —
+        // SessionTransition emits `.emitUI(.denied)` from ~20 such
+        // sites). Retiring on them would drop in-flight commits, hide
+        // progress, and fire the turn hook for a turn that never
+        // ended.
+        #expect(!ChatLoop.isTurnTerminal(.denied(cause: "c")), "denied must not retire (mid-run refusals are not outcomes)")
+        for phase in ["completed", "failed", "interrupted", "budget-boundary"] {
+            #expect(ChatLoop.isTurnTerminal(.runUpdate(phase: phase, detail: "d")), "run:\(phase) must retire")
+        }
+        for phase in ["queue", "model", "epoch", "tool-exec", "undo", "authorising", "cancelling"] {
+            #expect(!ChatLoop.isTurnTerminal(.runUpdate(phase: phase, detail: "d")), "run:\(phase) must not retire")
+        }
+        #expect(!ChatLoop.isTurnTerminal(.delta(requestID: RequestID("r"), text: "t")), "delta must not retire")
+        #expect(!ChatLoop.isTurnTerminal(.admitted(commandID: CommandID("c"), revision: 1)), "admitted must not retire")
+        #expect(!ChatLoop.isTurnTerminal(.agent(alias: "a", locality: "l", phase: "p")), "agent must not retire")
+    }
+
+    @Test("confirm-armed paste denies fail-closed; draft preserved; no auto-confirm (M4-D D2)")
+    func confirmArmedPasteDenies() async throws {
+        let written = LockedBox()
+        let effects = LockedEffects()
+        guard let editor = LineEditorSession() else { Issue.record("replxx_init failed headless"); return }
+        let owner = TerminalOutputOwner(
+            caps: ownerCaps(), writer: { written.append($0) })
+        let empty = QueueSyncSnapshot(entries: [], activeRequest: nil, queueHeld: false,
+                                       heldReason: nil, pendingApproval: nil,
+                                       admittedCommandIDs: [], liveEpoch: EpochID("e"))
+        let config = ChatLoop.Config(
+            caps: ownerCaps(), sessionID: "sess",
+            snapshotProvider: { empty },
+            onEffects: { fx in await effects.append(fx) },
+            mintCommandID: { CommandID("cmd-1") })
+        let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
+        let runTask = Task { await loop.run(scriptedInput: []) }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let gateway = ReplxxApprovalGateway { req, box in
+            loop.prepareConfirm(box: box)
+            loop.post(.approvalArmed(req))
+        }
+        let req = ApprovalRequest(requestID: RequestID("r"), runID: RunID("r"), generation: Revision(1),
+                                  operation: "op", requiredGrant: "read")
+        async let decision = gateway.decide(req)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        // A pasted multi-line block arrives as one line (bracketed paste
+        // collapses to the readLine result): not y/yes ⇒ deny, never
+        // auto-confirm, never submit.
+        loop.post(.inputLine("pasted line one\nrm -rf /\nline three"))
+        let final = await decision
+        #expect(final == .deny("operator did not explicitly approve"), "armed paste must deny fail-closed, got \(final)")
+        // Draft mirror restored; follow-up submits cleanly.
+        loop.post(.inputLine("second"))
+        try await Task.sleep(nanoseconds: 200_000_000)
+        loop.post(.inputLine(nil))
+        await runTask.value
+        let fx = await effects.all()
+        #expect(fx.count == 1, "only the follow-up submits, got \(fx.count) effect batches")
         #expect(fx[0] == [.submit(OperatorInput(text: "second", commandID: CommandID("cmd-1")))])
         owner.close()
     }

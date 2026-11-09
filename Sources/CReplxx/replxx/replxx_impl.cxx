@@ -2406,6 +2406,13 @@ Replxx::ACTION_RESULT Replxx::ReplxxImpl::bracketed_paste( char32_t ) {
 			c = '\n';
 		} else if ( c == KEY::control( 'I' ) ) {
 			c = '\t';
+		} else if ( c == KEY::control( 'J' ) ) {
+			/* M4-D Needletail patch: pasted line feeds arrive
+			 * control-mapped (Terminal::read_char maps C0); decode back
+			 * so multiline pastes round-trip byte-exact. Without this,
+			 * the out-of-range key code encodes as U+FFFD on output.
+			 * Upstream handles CR and TAB the same way; LF was missed. */
+			c = '\n';
 		}
 		buf.push_back( c );
 	}

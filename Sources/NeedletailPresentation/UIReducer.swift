@@ -43,6 +43,8 @@ public func reduce(_ state: UIState, _ action: UIAction) -> (UIState, [UIEffect]
         switch intent {
         case .preview(let groupID):
             return (state, [.undoPreview(groupID: groupID)])
+        case .previewLatest:
+            return (state, [.undoPreviewLatest])
         case .run(let groupID):
             // Explicit run only; the actor reconciles, validates, and
             // records idempotently. The UI never runs inverses itself.
@@ -106,6 +108,11 @@ private func reduceInput(_ state: UIState, _ input: InputAction) -> (UIState, [U
         // with no accepted file identity. Mid-draft edits retain tokens
         // (attach re-validates path/identity in Core at submit).
         next.tokens = []
+        // Optimistic busy (M4-D D2): the request dispatches immediately;
+        // without this, a Ctrl+C in the submit-to-first-projection window
+        // would read idle-empty and exit instead of cancelling. Sync
+        // projections replace this with authoritative status.
+        next.status = .busy(operation: composer.text)
         return (next, [effect])
     case .newline:
         return reduceInput(state, .insertText("\n"))

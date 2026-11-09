@@ -42,29 +42,87 @@ struct ComposerBridgeTests {
         }
     }
 
-    @Test("ctrlC decision matrix: armed always clears (even busy)")
+    @Test("ctrlC decision matrix: armed clears, busy cancels, idle-empty exits or warns (M4-D D2.5)")
     func ctrlCMatrix() {
         // Armed confirm: clear even mid-run (cancelling would deny the
         // pending request the prompt asks about).
-        #expect(ComposerBridge.ctrlCAction(busy: true, armed: true, draftNonEmpty: true) == .clearBuffer)
-        #expect(ComposerBridge.ctrlCAction(busy: false, armed: true, draftNonEmpty: false) == .clearBuffer)
-        #expect(ComposerBridge.ctrlCAction(busy: true, armed: false, draftNonEmpty: true) == .cancelRun)
-        #expect(ComposerBridge.ctrlCAction(busy: false, armed: false, draftNonEmpty: true) == .clearBuffer)
-        #expect(ComposerBridge.ctrlCAction(busy: false, armed: false, draftNonEmpty: false) == .hint)
+        #expect(ComposerBridge.ctrlCAction(busy: true, armed: true, draftNonEmpty: true, queuePending: true, exitArmed: false) == .clearBuffer)
+        #expect(ComposerBridge.ctrlCAction(busy: false, armed: true, draftNonEmpty: false, queuePending: false, exitArmed: false) == .clearBuffer)
+        #expect(ComposerBridge.ctrlCAction(busy: true, armed: false, draftNonEmpty: true, queuePending: false, exitArmed: false) == .cancelRun)
+        #expect(ComposerBridge.ctrlCAction(busy: false, armed: false, draftNonEmpty: true, queuePending: false, exitArmed: false) == .clearBuffer)
+        // Idle-empty: exit when nothing pending; warn once then exit
+        // when queued work exists (two-press latch).
+        #expect(ComposerBridge.ctrlCAction(busy: false, armed: false, draftNonEmpty: false, queuePending: false, exitArmed: false) == .exit)
+        #expect(ComposerBridge.ctrlCAction(busy: false, armed: false, draftNonEmpty: false, queuePending: false, exitArmed: true) == .exit)
+        #expect(ComposerBridge.ctrlCAction(busy: false, armed: false, draftNonEmpty: false, queuePending: true, exitArmed: false) == .warnPending)
+        #expect(ComposerBridge.ctrlCAction(busy: false, armed: false, draftNonEmpty: false, queuePending: true, exitArmed: true) == .exit)
     }
 
-    @Test("key map: ctrlC/ctrlJ/esc")
+    @Test("key map: ctrlC is loop-owned; ctrlJ/esc dispatch")
     func keyMap() {
-        #expect(ComposerBridge.actionsForKey(.ctrlC, state: busyState()) == [.queueOp(.cancelRun)])
-        #expect(ComposerBridge.actionsForKey(.ctrlC, state: UIState(composer: ComposerState(text: "draft", cursor: 5)))
-            == [.input(.replaceDraft(""))])
+        // Ctrl+C is decided by the loop (latch-aware ctrlCAction), not
+        // the pure key map — the map returns nothing for it.
+        #expect(ComposerBridge.actionsForKey(.ctrlC, state: busyState()) == [])
         #expect(ComposerBridge.actionsForKey(.ctrlC, state: idleState()) == [])
-        #expect(ComposerBridge.idleEmptyHint.contains("/keys"))
+        #expect(ComposerBridge.pendingExitWarning.contains("Ctrl+C"))
         #expect(ComposerBridge.actionsForKey(.ctrlJ, state: idleState()) == [.input(.newline)])
         // Esc always dispatches dismiss (reducer noops with no popup).
         #expect(ComposerBridge.actionsForKey(.esc, state: idleState()) == [.mention(.dismissSuggestion)])
         let suggesting = UIState(suggestion: MentionSuggestionState(query: "@a", revision: 1))
         #expect(ComposerBridge.actionsForKey(.esc, state: suggesting) == [.mention(.dismissSuggestion)])
+    }
+
+    @Test("queue subcommands map indices to entry IDs (M4-D D2)")
+    func queueSubcommands() {
+        let cid = CommandID("q-sub")
+        func queuedState() -> UIState {
+            var s = UIState()
+            s.queue = [
+                QueueSummary(entryID: "e1", commandID: cid, kind: "followUp", state: "held", revision: 3, delivery: .queued, pending: false, isOptimistic: false, staleTarget: false, hasAttachments: false),
+                QueueSummary(entryID: "e2", commandID: cid, kind: "steer", state: "held", revision: 5, delivery: .queued, pending: false, isOptimistic: false, staleTarget: false, hasAttachments: false),
+            ]
+            return s
+        }
+        let qs = queuedState()
+        // resume
+        guard case .actions(let resume) = ComposerBridge.actionsForSubmitLine("/queue resume", state: qs, commandID: cid) else {
+            Issue.record("resume must produce actions"); return
+        }
+        #expect(resume.contains(.queueOp(.resumeQueue)))
+        // withdraw maps 1-based index → entry ID
+        guard case .actions(let wd) = ComposerBridge.actionsForSubmitLine("/queue withdraw 2", state: qs, commandID: cid) else {
+            Issue.record("withdraw must produce actions"); return
+        }
+        #expect(wd.contains(.queueOp(.withdrawEntry(entryID: "e2"))))
+        // edit carries text + base revision
+        guard case .actions(let ed) = ComposerBridge.actionsForSubmitLine("/queue edit 1 new text here", state: qs, commandID: cid) else {
+            Issue.record("edit must produce actions"); return
+        }
+        #expect(ed.contains(.queueOp(.editEntry(entryID: "e1", newText: "new text here", baseRevision: 3))))
+        // reorder before m
+        guard case .actions(let ro) = ComposerBridge.actionsForSubmitLine("/queue reorder 2 before 1", state: qs, commandID: cid) else {
+            Issue.record("reorder must produce actions"); return
+        }
+        #expect(ro.contains(.queueOp(.reorderEntry(entryID: "e2", beforeID: "e1"))))
+        // reorder bare moves to head
+        guard case .actions(let roTop) = ComposerBridge.actionsForSubmitLine("/queue reorder 2", state: qs, commandID: cid) else {
+            Issue.record("bare reorder must produce actions"); return
+        }
+        #expect(roTop.contains(.queueOp(.reorderEntry(entryID: "e2", beforeID: nil))))
+        // unknown indices are usage notices, never actions
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/queue withdraw 9", state: qs, commandID: cid) else {
+            Issue.record("out-of-range index must be a usage notice"); return
+        }
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/queue edit 0 x", state: qs, commandID: cid) else {
+            Issue.record("zero index must be a usage notice"); return
+        }
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/queue frobnicate", state: qs, commandID: cid) else {
+            Issue.record("unknown subcommand must be a usage notice"); return
+        }
+        // empty queue: indices unusable
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/queue withdraw 1", state: idleState(), commandID: cid) else {
+            Issue.record("empty-queue withdraw must be a usage notice"); return
+        }
     }
 
     @Test("slash commands map to existing vocabulary")
@@ -94,8 +152,8 @@ struct ComposerBridgeTests {
     @Test("slash errors and deferrals are explicit notices")
     func slashEdge() {
         let cid = commandID
-        for cmd in ["/", "/steer", "/rewind nope", "/preview x", "/diff", "/bogus q",
-                    "/queue resume", "/undo", "/compact extra-ok"] {
+        for cmd in ["/", "/steer", "/rewind nope", "/bogus q",
+                    "/compact extra-ok"] {
             let outcome = ComposerBridge.actionsForSubmitLine(cmd, state: idleState(), commandID: cid)
             switch outcome {
             case .notice(let text, let actions):
@@ -107,6 +165,10 @@ struct ComposerBridgeTests {
             case .rejected:
                 Issue.record("unexpected reject for \(cmd)")
             }
+        }
+        // /queue with an unknown subcommand is a usage notice, never silent.
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/queue frobnicate", state: idleState(), commandID: cid) else {
+            Issue.record("/queue frobnicate must be a usage notice"); return
         }
     }
 
@@ -132,14 +194,34 @@ struct ComposerBridgeTests {
         #expect(ComposerBridge.actionsForMirror(text: "axc", cursor: 0, state: base) == [.input(.moveCursor(-2))])
     }
 
-    @Test("hostile candidates never reach the live line (injection rule)")
-    func hostileCandidatesDropped() {
-        var cache = ComposerBridge.CompletionCache()
-        cache.store([CandidateFile(path: "ok.swift"), CandidateFile(path: "ev\u{1B}[31mil.swift")], revision: 9)
-        let state = UIState(
-            composer: ComposerState(text: "@e", cursor: 2, revision: 9),
-            suggestion: MentionSuggestionState(query: "e", revision: 9))
-        #expect(ComposerBridge.completionCandidates(input: "@e", cursor: 2, cache: cache, state: state) == ["ok.swift"])
+    @Test("accept gate opens on safe candidates, refuses hostile ones (M4-D D2)")
+    func acceptPreviewGate() {
+        func suggested(_ text: String, _ candidates: [CandidateFile], selected: Int? = nil) -> UIState {
+            UIState(
+                composer: ComposerState(text: text, cursor: text.unicodeScalars.count, revision: 9),
+                suggestion: MentionSuggestionState(query: "e", revision: 9, candidates: candidates, selectedIndex: selected))
+        }
+        // Safe candidate: gate opens with the accepted display text.
+        let open = suggested("@e", [CandidateFile(path: "ok.swift"), CandidateFile(path: "other.swift")])
+        guard let accepted = ComposerBridge.acceptPreview(state: open) else {
+            Issue.record("accept gate must open on a live safe suggestion"); return
+        }
+        #expect(accepted.text == "ok.swift", "display text replaces the query span, got \(accepted.text)")
+        #expect(accepted.cursor == accepted.text.unicodeScalars.count)
+        // No suggestion / empty candidates ⇒ closed.
+        #expect(ComposerBridge.acceptPreview(state: idleState()) == nil)
+        #expect(ComposerBridge.acceptPreview(state: suggested("@e", [])) == nil)
+        // Hostile selected path ⇒ closed (never reaches the live line;
+        // the popup still lists it — render path unaffected).
+        let hostile = suggested("@e", [CandidateFile(path: "ev\u{1B}[31mil.swift")])
+        #expect(ComposerBridge.acceptPreview(state: hostile) == nil, "hostile path must not gate accept")
+        // Selected index honored.
+        let second = suggested("@e", [CandidateFile(path: "a.swift"), CandidateFile(path: "b.swift")], selected: 1)
+        #expect(ComposerBridge.acceptPreview(state: second)?.text == "b.swift")
+        // Range suffix carried into the display text.
+        var ranged = suggested("@e#L10-L20", [CandidateFile(path: "ok.swift")])
+        ranged.suggestion = MentionSuggestionState(query: "e#L10-L20", revision: 9, candidates: [CandidateFile(path: "ok.swift")])
+        #expect(ComposerBridge.acceptPreview(state: ranged)?.text == "ok.swift#L10-L20")
     }
 
     @Test("interactive frame drops dumb-inline composer too")
@@ -157,23 +239,15 @@ struct ComposerBridgeTests {
         #expect(adapted.lines.map(\.id) == ["a"])
     }
 
-    @Test("completion cache serves only the live revision+query")
-    func completionCache() {
-        var cache = ComposerBridge.CompletionCache()
-        cache.store([CandidateFile(path: "a.swift"), CandidateFile(path: "b.swift")], revision: 9)
-        var state = UIState(
-            composer: ComposerState(text: "@a", cursor: 2, revision: 9),
-            suggestion: MentionSuggestionState(query: "a", revision: 9))
-        #expect(ComposerBridge.completionCandidates(input: "@a", cursor: 2, cache: cache, state: state)
-            == ["a.swift", "b.swift"])
-        // Stale revision ⇒ nothing.
-        state.composer.revision = 10
-        #expect(ComposerBridge.completionCandidates(input: "@a", cursor: 2, cache: cache, state: state) == [])
-        // Evicted revision ⇒ nothing.
-        cache.store([CandidateFile(path: "c")], revision: 10)
-        cache.store([CandidateFile(path: "d")], revision: 11)
-        state.composer.revision = 9
-        #expect(ComposerBridge.completionCandidates(input: "@a", cursor: 2, cache: cache, state: state) == [])
+    @Test("accept follows the live reducer state (query drift keeps candidates)")
+    func acceptFollowsLiveState() {
+        // Same-path query drift ("@a" → "@ab") keeps the suggestion
+        // (reducer: silent query update); the gate follows the reducer,
+        // so accept stays open on the CURRENT span.
+        let state = UIState(
+            composer: ComposerState(text: "@ab", cursor: 3, revision: 10),
+            suggestion: MentionSuggestionState(query: "ab", revision: 9, candidates: [CandidateFile(path: "abc.swift")]))
+        #expect(ComposerBridge.acceptPreview(state: state)?.text == "abc.swift")
     }
 
     @Test("command IDs reuse on retry, mint on new text")
@@ -206,7 +280,7 @@ struct ComposerBridgeTests {
                 }
             }
         }
-        for key in [ComposerBridge.KeyPress.ctrlC, .ctrlJ, .esc] {
+        for key in [ComposerBridge.KeyPress.ctrlC, .ctrlJ, .esc, .tab, .up, .down] {
             for state in states {
                 for action in ComposerBridge.actionsForKey(key, state: state) {
                     if case .queueOp(.grantApproval) = action { Issue.record("grantApproval from key") }
@@ -225,5 +299,64 @@ struct ComposerBridgeTests {
         let adapted = ComposerBridge.frameForInteractive(frame)
         #expect(adapted.composerOverlay == nil)
         #expect(adapted.lines == frame.lines)
+    }
+
+    @Test("undo slash: bare previews latest, run needs explicit group")
+    func undoSlash() {
+        let cid = commandID
+        guard case .actions(let latest) = ComposerBridge.actionsForSubmitLine("/undo", state: idleState(), commandID: cid) else {
+            Issue.record("bare /undo must produce actions"); return
+        }
+        #expect(latest.contains(.undoIntent(.previewLatest)))
+        guard case .actions(let pv) = ComposerBridge.actionsForSubmitLine("/undo g-7", state: idleState(), commandID: cid) else {
+            Issue.record("/undo g must produce actions"); return
+        }
+        #expect(pv.contains(.undoIntent(.preview(groupID: "g-7"))))
+        guard case .actions(let rn) = ComposerBridge.actionsForSubmitLine("/undo run g-7", state: idleState(), commandID: cid) else {
+            Issue.record("/undo run g must produce actions"); return
+        }
+        #expect(rn.contains(.undoIntent(.run(groupID: "g-7"))))
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/undo run", state: idleState(), commandID: cid) else {
+            Issue.record("bare /undo run must be a usage notice"); return
+        }
+    }
+
+    @Test("inspect verbs map to inspect commands (M4-D D2)")
+    func inspectVerbs() {
+        let cid = commandID
+        let pairs: [(String, InspectionCommand)] = [
+            ("/models", .models), ("/sessions", .sessions), ("/agents", .agents),
+            ("/context", .context), ("/epochs", .epochs),
+            ("/compact", .compactDryRun), ("/diff", .diff),
+        ]
+        for (cmd, expected) in pairs {
+            guard case .actions(let actions) = ComposerBridge.actionsForSubmitLine(cmd, state: idleState(), commandID: cid) else {
+                Issue.record("\(cmd) must produce actions"); continue
+            }
+            #expect(actions.contains(.inspect(expected)), "\(cmd) must inspect \(expected)")
+        }
+        // Trailing text is a usage notice, never a silent inspect.
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/models extra", state: idleState(), commandID: cid) else {
+            Issue.record("/models extra must be a usage notice"); return
+        }
+    }
+
+    @Test("preview slash resolves @path, rejects ranges and empties")
+    func previewSlash() {
+        let cid = commandID
+        guard case .actions(let a1) = ComposerBridge.actionsForSubmitLine("/preview @docs/a.md", state: idleState(), commandID: cid) else {
+            Issue.record("/preview @path must produce actions"); return
+        }
+        #expect(a1.contains(.inspect(.filePreview(path: "docs/a.md"))))
+        guard case .actions(let a2) = ComposerBridge.actionsForSubmitLine("/preview docs/a.md", state: idleState(), commandID: cid) else {
+            Issue.record("/preview path must produce actions"); return
+        }
+        #expect(a2.contains(.inspect(.filePreview(path: "docs/a.md"))))
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/preview", state: idleState(), commandID: cid) else {
+            Issue.record("bare /preview must be a usage notice"); return
+        }
+        guard case .notice = ComposerBridge.actionsForSubmitLine("/preview @a.md#L10", state: idleState(), commandID: cid) else {
+            Issue.record("ranged /preview must be a usage notice"); return
+        }
     }
 }

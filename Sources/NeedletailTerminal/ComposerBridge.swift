@@ -21,6 +21,9 @@ public enum ComposerBridge {
         case ctrlC
         case ctrlJ
         case esc
+        case tab
+        case up
+        case down
     }
 
     public enum SubmitOutcome: Sendable, Equatable {
@@ -44,7 +47,7 @@ public enum ComposerBridge {
             return .rejected(reason: "draft exceeds 64 KiB; edit or clear before submitting")
         }
         if line.hasPrefix("/") {
-            return actionsForSlash(line, commandID: commandID)
+            return actionsForSlash(line, state: state, commandID: commandID)
         }
         if case .busy = state.status {
             // Busy: queue a follow-up, never submit (SPEC ¶744); clear
@@ -69,28 +72,36 @@ public enum ComposerBridge {
     public enum CtrlCAction: Sendable, Equatable {
         case cancelRun
         case clearBuffer
-        case hint
+        case warnPending
+        case exit
     }
 
-    public static func ctrlCAction(busy: Bool, armed: Bool, draftNonEmpty: Bool) -> CtrlCAction {
+    /// M4-D D2.5 (spec §2.1 ¶746): idle-empty Ctrl+C EXITS when there is
+    /// no queued/unsent work, and warns (asks) when there is — a second
+    /// consecutive idle-empty Ctrl+C exits. The M4-C idle-empty hint is
+    /// replaced by this authorized behavior change (receipt as-built
+    /// delta). `exitArmed` is the loop-owned two-press latch.
+    public static func ctrlCAction(busy: Bool, armed: Bool, draftNonEmpty: Bool, queuePending: Bool, exitArmed: Bool) -> CtrlCAction {
         if armed { return .clearBuffer }
         if busy { return .cancelRun }
-        return draftNonEmpty ? .clearBuffer : .hint
+        if draftNonEmpty { return .clearBuffer }
+        if queuePending, !exitArmed { return .warnPending }
+        return .exit
     }
 
-    /// Key map: Ctrl+C → see `ctrlCAction`; Ctrl+J → newline into the
-    /// live buffer (via `set_state`, never a commit); Esc → dismiss
-    /// (reducer noops when no popup is live — same observable as
-    /// suppressing, so always dispatch).
+    /// Key map: Ctrl+J → newline into the live buffer (via `set_state`,
+    /// never a commit); Esc → dismiss (reducer noops when no popup is
+    /// live — same observable as suppressing, so always dispatch).
+    /// Ctrl+C is NOT mapped here: the loop owns the latch-aware
+    /// decision (`ctrlCAction` + two-press exit latch, M4-D D2.5) on
+    /// both the live bindKey path and the scripted `.key` path.
     public static func actionsForKey(_ key: KeyPress, state: UIState) -> [UIAction] {
         switch key {
         case .ctrlC:
-            if case .busy = state.status {
-                return [.queueOp(.cancelRun)]
-            }
-            if !state.composer.text.isEmpty {
-                return [.input(.replaceDraft(""))]
-            }
+            return []
+        case .tab, .up, .down:
+            // Loop-driven (Tab-accept, arrow selection): the loop owns
+            // these via the latch-aware paths, not the pure key map.
             return []
         case .ctrlJ:
             return [.input(.newline)]
@@ -99,8 +110,9 @@ public enum ComposerBridge {
         }
     }
 
-    /// Operator hint for a no-op key (idle-empty Ctrl+C). Adapter-local.
-    public static let idleEmptyHint = "composer empty — type text, /keys for commands"
+    /// Pending-work warning for the two-press exit latch (idle-empty
+    /// Ctrl+C with queued entries). Adapter-local.
+    public static let pendingExitWarning = "queued work pending — submit, withdraw, or Ctrl+C again to exit"
 
     /// Interactive overlay suppression: replxx owns the live line, so
     /// the semantic `composerOverlay` must not double-draw it (and must
@@ -133,6 +145,13 @@ public enum ComposerBridge {
         if text == oldText {
             return cursor == oldCursor ? [] : [.input(.moveCursor(cursor - oldCursor))]
         }
+        // Full clear is a boundary (M4-D D2 review): route through
+        // replaceDraft so tokens/suggestion clear with the draft — a
+        // per-key delete sequence would leave accepted file tokens
+        // attached to an empty composer (stale file on next submit).
+        if text.isEmpty {
+            return [.input(.replaceDraft(""))]
+        }
         let oldScalars = Array(oldText.unicodeScalars)
         let newScalars = Array(text.unicodeScalars)
         var prefix = 0
@@ -163,61 +182,53 @@ public enum ComposerBridge {
         return actions
     }
 
-    // MARK: - Completion cache (revision-keyed, sync serve)
-
-    /// Revision-keyed candidate cache (C3): replxx demands candidates
-    /// synchronously, so the async edge fetch stores here and the sync
-    /// callback serves only the live revision. Bounded (latest two
-    /// revisions); pruned on submit/clear.
-    public struct CompletionCache: Sendable {
-        private var entries: [UInt64: [CandidateFile]] = [:]
-
-        public init() {}
-
-        public mutating func store(_ candidates: [CandidateFile], revision: UInt64) {
-            entries[revision] = candidates
-            while entries.count > 2 {
-                entries.removeValue(forKey: entries.keys.min()!)
-            }
-        }
-
-        public mutating func dropAll() { entries.removeAll() }
-
-        public func candidates(forRevision revision: UInt64) -> [CandidateFile]? {
-            entries[revision]
+    /// M4-D D3 review: pending-queue predicate for the exit latch.
+    /// Dispatched/history/withdrawn rows are DONE — only queued, held,
+    /// heldUnknown, pending, or optimistic (unconfirmed) rows block
+    /// exit. (state.queue retains history rows, so a bare non-empty
+    /// check would warn forever after the first queued turn.)
+    public static func hasPendingQueueEntries(state: UIState) -> Bool {
+        state.queue.contains { entry in
+            entry.isOptimistic || entry.pending
+                || entry.state == "queued" || entry.state == "held"
+                || entry.state == "heldUnknown"
         }
     }
 
-    /// Serves the sync completion callback: candidates ONLY when the
-    /// cached revision equals the live composer revision AND the input
-    /// still matches the live suggestion query (otherwise stale —
-    /// DX-02: serve nothing). Tab before the async fetch returns serves
-    /// nothing. Returns display paths.
-    ///
-    /// Injection rule: candidates render DIRECTLY in replxx (no
-    /// sanitizer on that path), so only display-safe paths are served:
-    /// any path the sanitizer would rewrite (control/Cf bytes, e.g. a
+    /// M4-D D2 Tab-accept gate (pure, shared by the input-thread
+    /// buffer sync and the main-task dispatch): what `acceptSelected`
+    /// WOULD produce, or nil when there is nothing safe to accept.
+    /// Computed THROUGH the pure reducer (no duplicated span logic).
+    /// The inserted candidate segment must be display-safe (M4-C
+    /// injection rule: hostile paths never reach the live line; the
+    /// semantic popup still lists everything through `terminalSafe`).
+    /// A nil gate means "leave text and state untouched".
+    public static func acceptPreview(state: UIState) -> (text: String, cursor: Int)? {
+        guard state.suggestion != nil else { return nil }
+        let before = state.tokens.count
+        let (next, _) = reduce(state, .mention(.acceptSelected))
+        guard next.tokens.count == before + 1, let token = next.tokens.last else { return nil }
+        var inserted = token.path
+        if let range = token.lineRange {
+            inserted += range.lowerBound == range.upperBound
+                ? "#L\(range.lowerBound)" : "#L\(range.lowerBound)-L\(range.upperBound)"
+        }
+        guard isDisplaySafePath(inserted) else { return nil }
+        return (next.composer.text, next.composer.cursor)
+    }
+
+    /// Injection rule (M4-C, retained and enforced by `acceptPreview`
+    /// in M4-D D2): candidates render DIRECTLY in replxx (no sanitizer
+    /// on that path), so only display-safe paths are accepted: any
+    /// path the sanitizer would rewrite (control/Cf bytes, e.g. a
     /// model-written hostile filename) — or containing LF, which
     /// `displaySafe` preserves but which would split the live line —
-    /// is dropped, never inserted. The semantic popup (rendered
+    /// is refused, never inserted. The semantic popup (rendered
     /// frames) still lists everything through `terminalSafe`.
+    /// (The M4-C revision-keyed sync-serve cache is retired: Tab is
+    /// loop-driven now. This comment anchors the removal for review.)
     public static func isDisplaySafePath(_ path: String) -> Bool {
         path == displaySafe(path) && !path.contains("\n")
-    }
-    public static func completionCandidates(
-        input: String,
-        cursor: Int,
-        cache: CompletionCache,
-        state: UIState
-    ) -> [String] {
-        guard let suggestion = state.suggestion,
-              suggestion.revision == state.composer.revision,
-              let live = mentionQuery(text: state.composer.text, cursor: state.composer.cursor),
-              live.query == suggestion.query,
-              live.query == mentionQuery(text: input, cursor: cursor)?.query,
-              let cached = cache.candidates(forRevision: suggestion.revision)
-        else { return [] }
-        return cached.map(\.path).filter(isDisplaySafePath)
     }
 
     // MARK: - Command IDs (retry reuses the same ID)
@@ -256,11 +267,11 @@ public enum ComposerBridge {
 
     private static func clearMirror() -> UIAction { .input(.replaceDraft("")) }
 
-    private static func actionsForSlash(_ line: String, commandID: CommandID) -> SubmitOutcome {
+    private static func actionsForSlash(_ line: String, state: UIState, commandID: CommandID) -> SubmitOutcome {
         let body = String(line.dropFirst())
         let parts = body.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true).map(String.init)
         guard let verb = parts.first?.lowercased() else {
-            return .notice("usage: /steer /queue /undo /rewind /compact /cancel /keys", actions: [clearMirror()])
+            return .notice("usage: /steer /queue /undo /preview /models /sessions /agents /context /epochs /compact /diff /rewind /cancel /keys", actions: [clearMirror()])
         }
         let rest = parts.count > 1 ? parts[1] : ""
         switch verb {
@@ -270,17 +281,21 @@ public enum ComposerBridge {
             }
             return .actions([.queueOp(.submitSteer(text: rest, commandID: commandID)), clearMirror()])
         case "queue":
-            guard rest.isEmpty else {
-                // /queue resume|edit|withdraw are deferred (explicit
-                // message, never silent inspect).
-                return .notice("/queue resume|edit|withdraw are not yet in interactive mode", actions: [clearMirror()])
-            }
-            return .actions([.inspect(.queue), clearMirror()])
-        case "undo":
             guard !rest.isEmpty else {
-                // PARTIAL: latest-eligible-group resolution edge-side via
-                // UndoLedger reconcile is deferred, not in M4-C.
-                return .notice("usage: /undo <group>", actions: [clearMirror()])
+                return .actions([.inspect(.queue), clearMirror()])
+            }
+            return queueSubcommand(rest, state: state)
+        case "undo":
+            if rest.isEmpty {
+                // Bare `/undo`: latest-eligible-group preview (read-only;
+                // runs always need an explicit group — never guessed).
+                return .actions([.undoIntent(.previewLatest), clearMirror()])
+            }
+            if rest == "run" {
+                return .notice("usage: /undo run <group> (runs need an explicit group)", actions: [clearMirror()])
+            }
+            if rest.hasPrefix("run ") {
+                return .actions([.undoIntent(.run(groupID: String(rest.dropFirst(4)))), clearMirror()])
             }
             return .actions([.undoIntent(.preview(groupID: rest)), clearMirror()])
         case "rewind":
@@ -294,8 +309,52 @@ public enum ComposerBridge {
             return .actions([.queueOp(.cancelRun), clearMirror()])
         case "keys":
             return .notice(slashHelp, actions: [clearMirror()])
-        case "preview", "diff", "agents", "context", "epochs", "sessions", "models", "help":
-            return .notice("/\(verb) is not yet in interactive mode", actions: [clearMirror()])
+        case "preview":
+            // Spec §2.2 keyboard/dumb-terminal fallback: `/preview @path`
+            // or `/preview path`. Ranges belong to attach, not preview.
+            var target = rest
+            if target.hasPrefix("@") { target = String(target.dropFirst()) }
+            guard !target.isEmpty, !target.contains("#") else {
+                return .notice("usage: /preview @path", actions: [clearMirror()])
+            }
+            return .actions([.inspect(.filePreview(path: target)), clearMirror()])
+        case "models":
+            guard rest.isEmpty else {
+                return .notice("usage: /models", actions: [clearMirror()])
+            }
+            return .actions([.inspect(.models), clearMirror()])
+        case "sessions":
+            guard rest.isEmpty else {
+                return .notice("usage: /sessions", actions: [clearMirror()])
+            }
+            return .actions([.inspect(.sessions), clearMirror()])
+        case "agents":
+            guard rest.isEmpty else {
+                return .notice("usage: /agents", actions: [clearMirror()])
+            }
+            return .actions([.inspect(.agents), clearMirror()])
+        case "context":
+            guard rest.isEmpty else {
+                return .notice("usage: /context", actions: [clearMirror()])
+            }
+            return .actions([.inspect(.context), clearMirror()])
+        case "epochs":
+            guard rest.isEmpty else {
+                return .notice("usage: /epochs", actions: [clearMirror()])
+            }
+            return .actions([.inspect(.epochs), clearMirror()])
+        case "compact":
+            guard rest.isEmpty else {
+                return .notice("usage: /compact", actions: [clearMirror()])
+            }
+            return .actions([.inspect(.compactDryRun), clearMirror()])
+        case "diff":
+            guard rest.isEmpty else {
+                return .notice("usage: /diff", actions: [clearMirror()])
+            }
+            return .actions([.inspect(.diff), clearMirror()])
+        case "help":
+            return .notice("not yet in interactive mode: /help — see /keys", actions: [clearMirror()])
         default:
             return .notice("unknown command /\(verb) — " + slashHelp, actions: [clearMirror()])
         }
@@ -307,6 +366,58 @@ public enum ComposerBridge {
         return LineageBoundary(epochID: EpochID(parts[0]), throughSequence: seq)
     }
 
+    /// M4-D D2: `/queue` subcommands. Indexing is 1-based over the
+    /// displayed queue order (`state.queue`, the same rows Render
+    /// shows). Unknown indices and malformed shapes are usage notices;
+    /// entry existence/revision conflicts are Core's to judge (the
+    /// edge passes IDs through, never invents them).
+    private static func queueSubcommand(_ rest: String, state: UIState) -> SubmitOutcome {
+        let parts = rest.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true).map(String.init)
+        guard let verb = parts.first?.lowercased() else {
+            return .notice("usage: /queue [resume|edit <n> <text>|withdraw <n>|reorder <n> [before <m>]]", actions: [clearMirror()])
+        }
+        switch verb {
+        case "resume":
+            guard parts.count == 1 else {
+                return .notice("usage: /queue resume", actions: [clearMirror()])
+            }
+            return .actions([.queueOp(.resumeQueue), clearMirror()])
+        case "withdraw", "edit", "reorder":
+            guard parts.count >= 2, let index = Int(parts[1]), index >= 1, index <= state.queue.count else {
+                let count = state.queue.count
+                let shape = verb == "edit" ? " <text>" : verb == "reorder" ? " [before <m>]" : ""
+                return .notice("usage: /queue \(verb) <n>\(shape) (1…\(count) queued)", actions: [clearMirror()])
+            }
+            let entry = state.queue[index - 1]
+            if verb == "withdraw" {
+                guard parts.count == 2 else {
+                    return .notice("usage: /queue withdraw <n>", actions: [clearMirror()])
+                }
+                return .actions([.queueOp(.withdrawEntry(entryID: entry.entryID)), clearMirror()])
+            }
+            if verb == "edit" {
+                guard parts.count == 3, !parts[2].isEmpty, parts[2].utf8.count <= maxComposerBytes else {
+                    return .notice("usage: /queue edit <n> <text> (≤ 64 KiB)", actions: [clearMirror()])
+                }
+                return .actions([.queueOp(.editEntry(entryID: entry.entryID, newText: parts[2], baseRevision: entry.revision)), clearMirror()])
+            }
+            // reorder <n> [before <m>]: m omitted moves to the head.
+            var beforeID: String? = nil
+            if parts.count == 3 {
+                let tail = parts[2].split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+                guard tail.count == 2, tail[0].lowercased() == "before", let m = Int(tail[1]), m >= 1, m <= state.queue.count, m != index else {
+                    return .notice("usage: /queue reorder <n> [before <m>]", actions: [clearMirror()])
+                }
+                beforeID = state.queue[m - 1].entryID
+            } else if parts.count > 3 {
+                return .notice("usage: /queue reorder <n> [before <m>]", actions: [clearMirror()])
+            }
+            return .actions([.queueOp(.reorderEntry(entryID: entry.entryID, beforeID: beforeID)), clearMirror()])
+        default:
+            return .notice("usage: /queue [resume|edit <n> <text>|withdraw <n>|reorder <n> [before <m>]]", actions: [clearMirror()])
+        }
+    }
+
     private static let slashHelp =
-        "commands: /steer <text> /queue /undo <group> /rewind <epoch>#<seq> /compact /cancel /keys"
+        "commands: /steer <text> /queue [resume|edit|withdraw|reorder] /undo [run <group>] /preview @path /models /sessions /agents /context /epochs /compact /diff /rewind <epoch>#<seq> /cancel /keys"
 }

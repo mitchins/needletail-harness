@@ -169,6 +169,14 @@ let package = Package(
                 "NeedletailTerminal",
                 "NeedletailPresentation",
                 "PTYShim",
+                // M4-D D1: composition tests drive the shared CLI factory
+                // (@testable import NeedletailCLI) against the loopback
+                // server (NeedletailTestSupport). Depending on the
+                // executable target makes `swift test` build it fresh, so
+                // factory tests can never pass against a stale binary
+                // (same rationale as NeedletailPrimitiveTests).
+                "NeedletailCLI",
+                "NeedletailTestSupport",
             ]
         ),
         .testTarget(

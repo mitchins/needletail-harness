@@ -5,13 +5,25 @@ Pinned commit: 1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2 (DEPENDENCIES.md candida
 Licence: replxx/LICENSE.md (BSD-style, copyright retained, unmodified)
 C++ standard: C++11 (upstream CMakeLists); threads via libpthread.
 
-Files in `replxx/` are UNMODIFIED upstream sources from the pinned commit
-(headers, .cxx sources, ConvertUTF.cpp, wcwidth.cpp). Only these bridge
+Files in `replxx/` are upstream sources from the pinned commit
+(headers, .cxx sources, ConvertUTF.cpp, wcwidth.cpp), EXCEPT the
+single documented local patch below. Only these bridge
 files are Needletail's: `include/shim.h`, `include/module.modulemap`,
 `SHA256SUMS-vendored`, this file.
 Integrity: `./dev vendor-check` compares per-file SHA-256 against the
 recorded manifest `SHA256SUMS-vendored`; upstream ref `ThirdParty/replxx`
 (a full clone used for the comparison) is gitignored and never committed.
+
+## Local patches (each independently reviewed; manifest updated)
+
+1. `replxx/replxx_impl.cxx` — `bracketed_paste`: decode pasted
+   `KEY::control('J')` (LF) back to `'\n'`. Terminal::read_char
+   control-maps C0 bytes; the paste path converted CR and TAB but not
+   LF, so a pasted newline arrived as the out-of-range key code
+   0x200004A and UTF-8-encoded as U+FFFD on output — multiline pastes
+   lost every line break (found by M4-D PTY-02 development evidence).
+   Mirrors the adjacent CR/TAB handling, same style. Required by
+   COMPLETE-SPEC PTY-02 (exact submitted text).
 
 Swift boundary: `shim.h` exposes only the C API (`extern "C"` in
 replxx/replxx.h). C++ interoperability does not cross into Swift.

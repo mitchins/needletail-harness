@@ -162,6 +162,7 @@ struct HeadlessConsumerTests {
         case .queueReorder: return "queueReorder"
         case .decideApproval: return "decideApproval"
         case .undoPreview: return "undoPreview"
+        case .undoPreviewLatest: return "undoPreviewLatest"
         case .runUndo: return "runUndo"
         case .requestLineageFork: return "requestLineageFork"
         }

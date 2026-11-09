@@ -124,6 +124,58 @@ public final class LineEditorSession: @unchecked Sendable {
         }
     }
 
+    /// Replaces the live buffer (M4-D D2 Tab-accept: the loop syncs the
+    /// accepted display text after `acceptSelected`). Cursor is a
+    /// UTF-32/scalar offset like `insertNewline`. Call from the input
+    /// thread (a bound-key handler) so the input loop repaints
+    /// immediately; the key-handler trampoline re-syncs the mirror.
+    public func replaceBuffer(text: String, cursor: Int) {
+        let scalars = Array(text.unicodeScalars)
+        let at = min(max(0, cursor), scalars.count)
+        text.withCString { cstr in
+            var next = ReplxxState(text: cstr, cursorPosition: Int32(at))
+            replxx_set_state(handle, &next)
+        }
+    }
+
+    /// Reads the live buffer WITHOUT modifying it (M4-D D7 review
+    /// B3: the bound Tab handler compares the live line against the
+    /// published accept snapshot on-thread, so a stale snapshot can
+    /// never drive a buffer rewrite). Call only from the input thread.
+    public func currentBufferText() -> String {
+        var state = ReplxxState(text: nil, cursorPosition: 0)
+        replxx_get_state(handle, &state)
+        return state.text.map { String(cString: $0) } ?? ""
+    }
+
+    /// Replicates replxx's default Up/Down (history recall) from inside a
+    /// bound handler (M4-D D2 arrow selection: Up/Down select while a
+    /// suggestion is live, history-navigate otherwise). Bound keys
+    /// replace the default, so the fallback must be invoked explicitly.
+    public func invokeHistoryPrevious() {
+        _ = replxx_invoke(handle, REPLXX_ACTION_HISTORY_MOVE_PREVIOUS, 0)
+    }
+
+    public func invokeHistoryNext() {
+        _ = replxx_invoke(handle, REPLXX_ACTION_HISTORY_MOVE_NEXT, 0)
+    }
+
+    /// replxx key codes for loop-side binding (M4-D D2 review /
+    /// PTY-04 finding: `Terminal::read_char` control-maps C0 bytes AND
+    /// runs escape-sequence dispatch BEFORE the bound-key lookup, so
+    /// handlers must bind the MAPPED codes — raw byte values never
+    /// match. Tab/Up/Down already used the mapped C constants; Ctrl+C /
+    /// Ctrl+J / Esc did not, so the live keys silently fell through to
+    /// replxx defaults (default abort) while only the scripted paths
+    /// were tested).
+    public static var ctrlCKeyCode: Int32 { Int32(REPLXX_KEY_BASE_CONTROL) | 67 } // control('C')
+    public static var ctrlJKeyCode: Int32 { Int32(REPLXX_KEY_BASE_CONTROL) | 74 } // control('J')
+    public static var escKeyCode: Int32 { Int32(REPLXX_KEY_ESCAPE) } // lone ESC (if unmapped)
+    public static var escControlKeyCode: Int32 { Int32(REPLXX_KEY_BASE_CONTROL) | 91 } // control('[')
+    public static var tabKeyCode: Int32 { Int32(REPLXX_KEY_TAB) }
+    public static var upKeyCode: Int32 { Int32(REPLXX_KEY_UP) }
+    public static var downKeyCode: Int32 { Int32(REPLXX_KEY_DOWN) }
+
     /// Inserts a newline at the live cursor (M4-C Ctrl+J multiline).
     /// replxx positions are UTF-32 code points = Swift scalar offsets.
     public func insertNewline() {
@@ -159,6 +211,77 @@ public final class LineEditorSession: @unchecked Sendable {
     /// via the `pasteLiteral` mirror path).
     public func enableBracketedPaste() {
         replxx_enable_bracketed_paste(handle)
+    }
+
+    /// Restores a sane cooked+echo termios on stdin (M4-D D3 PTY-07:
+    /// catchable-signal cleanup). Pure termios syscall — touches NO
+    /// replxx state, so it is safe to call while the input thread is
+    /// blocked in `readLine` (replxx teardown would race). Only acts
+    /// when stdin is a TTY.
+    public func restoreSaneTermios() {
+#if canImport(Glibc)
+        let fd: Int32 = STDIN_FILENO
+        guard isatty(fd) != 0 else { return }
+        var term = termios()
+        guard tcgetattr(fd, &term) == 0 else { return }
+        // `stty sane` subset: cooked input, echo, signals, output
+        // post-processing; keep all other flags as-is.
+        term.c_lflag |= UInt32(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL)
+        term.c_oflag |= UInt32(OPOST | ONLCR)
+        term.c_iflag |= UInt32(ICRNL)
+        _ = tcsetattr(fd, TCSANOW, &term)
+#elseif canImport(Darwin)
+        let fd: Int32 = STDIN_FILENO
+        guard isatty(fd) != 0 else { return }
+        var term = termios()
+        guard tcgetattr(fd, &term) == 0 else { return }
+        term.c_lflag |= UInt32(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL)
+        term.c_oflag |= UInt32(OPOST | ONLCR)
+        term.c_iflag |= UInt32(ICRNL)
+        _ = tcsetattr(fd, TCSANOW, &term)
+#endif
+    }
+
+    /// History snapshot, oldest-first (M4-D D2.7 hygiene probe). Thin
+    /// forwarding of the C scan API; empty when replxx holds nothing.
+    public func historyEntries() -> [String] {
+        var out: [String] = []
+        guard let scan = replxx_history_scan_start(handle) else { return out }
+        defer { replxx_history_scan_stop(handle, scan) }
+        var entry = ReplxxHistoryEntry(timestamp: nil, text: nil)
+        while replxx_history_scan_next(handle, scan, &entry) == 0 {
+            if let text = entry.text { out.append(String(cString: text)) }
+        }
+        return out
+    }
+
+    /// Commits an accepted line to history (M4-D D7 review B2):
+    /// replxx stages only a scratch entry per read — the application
+    /// owns the commit, and the input loop calls this for every
+    /// accepted non-empty line right after `readLine` returns. Unit
+    /// tests use it to seed the exact tail the drop path must remove.
+    /// Additive seam; no behavior change to existing seam functions.
+    /// Call from the thread that just left `readLine`.
+    public func addHistoryEntry(_ line: String) {
+        line.withCString { replxx_history_add(handle, $0) }
+    }
+
+    /// Drops the newest history entry IFF it equals `line` (M4-D D2.7:
+    /// confirm-decision lines must not persist). Scan → verify tail →
+    /// clear → re-add prefix. Returns false (history untouched) when the
+    /// tail differs — fail-safe, never drops an unrelated entry.
+    /// Call from the thread that just left `readLine` (the input thread
+    /// on the live path); the next accept happens after, so no entry
+    /// is lost between clear and re-add in practice.
+    @discardableResult
+    public func dropLastHistoryEntry(matching line: String) -> Bool {
+        let entries = historyEntries()
+        guard entries.last == line else { return false }
+        replxx_history_clear(handle)
+        for existing in entries.dropLast() {
+            existing.withCString { replxx_history_add(handle, $0) }
+        }
+        return true
     }
 
     /// Preloads the buffer (M4-C draft restore after confirm mode).

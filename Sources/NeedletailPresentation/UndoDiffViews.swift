@@ -106,6 +106,9 @@ public struct UIRewindView: Sendable, Equatable {
 public enum UndoIntent: Sendable, Equatable {
     /// Dry-run preview (no mutation); the actor reconciles the group.
     case preview(groupID: String)
+    /// Latest-eligible-group preview (bare `/undo`; read-only).
+    /// Runs still require an explicit group ID — never guessed.
+    case previewLatest
     /// Explicit run (idempotent by undo command ID in Core).
     case run(groupID: String)
 }

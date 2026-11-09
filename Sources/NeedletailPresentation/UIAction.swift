@@ -109,6 +109,9 @@ public enum UIEffect: Sendable, Equatable {
     case queueReorder(entryID: String, beforeID: String?)
     case decideApproval(ApprovalDecision, requestID: RequestID, generation: Revision)
     case undoPreview(groupID: String)
+    /// Latest-eligible-group preview (M4-D D2: bare `/undo`). The edge
+    /// resolves the group; never a sentinel string.
+    case undoPreviewLatest
     case runUndo(groupID: String)
     case requestLineageFork(boundary: LineageBoundary)
 }
@@ -133,6 +136,9 @@ public enum InspectionCommand: Sendable, Equatable {
     case compactDryRun
     case diff
     case undoPreview(groupID: String)
+    /// Dumb-terminal/keyboard fallback preview (spec §2.2 `/preview @path`):
+    /// bounded local file text, never provider-bound.
+    case filePreview(path: String)
     case rewind(epochID: EpochID, throughSequence: UInt64)
     case dismiss
 }
