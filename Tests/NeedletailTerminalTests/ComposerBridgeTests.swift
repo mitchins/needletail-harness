@@ -250,13 +250,22 @@ struct ComposerBridgeTests {
         #expect(ComposerBridge.acceptPreview(state: state)?.text == "abc.swift")
     }
 
-    @Test("command IDs reuse on retry, mint on new text")
+    @Test("command IDs mint fresh per submission event, even for identical text")
     func commandIDs() {
         var store = ComposerBridge.CommandIDStore()
         let first = store.id(for: "hello") { CommandID("id-1") }
         #expect(first == CommandID("id-1"))
-        #expect(store.id(for: "hello") { CommandID("id-2") } == CommandID("id-1"))
+        // An identical-text resubmission is a NEW explicit event: it
+        // must mint fresh (same-ID reuse made Core swallow the second
+        // turn as a silent no-op — M4-D residual fix). Retries reuse the
+        // already-minted ID below this layer, never through the store.
+        #expect(store.id(for: "hello") { CommandID("id-2") } == CommandID("id-2"))
         #expect(store.id(for: "other") { CommandID("id-3") } == CommandID("id-3"))
+        // Non-consecutive repeat mints fresh as well (no text-keyed
+        // memory anywhere in the path).
+        #expect(store.id(for: "hello") { CommandID("id-4") } == CommandID("id-4"))
+        #expect(store.lastSubmission?.text == "hello")
+        #expect(store.lastSubmission?.id == CommandID("id-4"))
     }
 
     @Test("interactive map never produces decideApproval")

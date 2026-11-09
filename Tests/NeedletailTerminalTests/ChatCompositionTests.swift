@@ -241,6 +241,50 @@ struct ChatCompositionTests {
         try await requireStoreClean(session)
     }
 
+    @Test("D2 resubmission: two explicit identical submits mint distinct command IDs and admit twice; same-ID retry replays")
+    func identicalTextResubmitsAdmitTwice() async throws {
+        let env = try makeEnv(tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+        defer { tearDown(env) }
+        env.server.enqueue(ChatLoopback.textTurn("first identical answer", splits: 1))
+        env.server.enqueue(ChatLoopback.textTurn("second identical answer", splits: 1))
+        let session = try await ChatCommand.compose(
+            config: env.configPath, trace: nil, alias: nil, maxTurns: 10,
+            allowExec: false, workspace: nil, readRoot: [],
+            sandboxGrant: nil, acknowledgedDetermination: nil,
+            writer: { env.written.append($0) })
+        let task = Task { await session.run(scriptedInput: []) }
+        guard await requireReady(env, session, task: task) else { return }
+        // Two EXPLICIT submissions (two Enter events) carrying
+        // byte-identical text. The edge must mint a fresh command ID per
+        // submission event: reusing the ID makes Core admission
+        // idempotency replay the prior admission without dispatching —
+        // a silent no-op (M4-D residual).
+        session.loop.post(.inputLine("same question twice"))
+        #expect(waitUntil(env, "first identical answer"), "first turn never rendered; tail: \(env.written.joined().suffix(400))")
+        session.loop.post(.inputLine("same question twice"))
+        #expect(waitUntil(env, "second identical answer"), "identical resubmit never dispatched — silent no-op; tail: \(env.written.joined().suffix(400))")
+        let admitted = await session.actor.currentState().admittedCommands
+        #expect(admitted.count >= 2, "two genuine admissions expected, got \(admitted.count)")
+        #expect(Set(admitted.keys).count == admitted.count, "command IDs must be distinct per submission event")
+        // Same-ID retry through the same actor replays the recorded ack
+        // and dispatches nothing new (Core admission contract, preserved).
+        guard let replayID = admitted.keys.first else {
+            Issue.record("no admitted command to retry")
+            await finishRun(session, task: task)
+            return
+        }
+        let ackBefore = admitted[replayID]
+        await session.actor.submitText(commandID: replayID, text: "same question twice", kind: .followUp, sealed: false)
+        let admittedAfter = await session.actor.currentState().admittedCommands
+        #expect(admittedAfter[replayID] == ackBefore, "retry must replay the identical ack")
+        await finishRun(session, task: task)
+        requireBearer(env)
+        #expect(env.server.requests.count == 2, "expected exactly two provider requests (no drop, no double), got \(env.server.requests.count)")
+        let bodies = env.server.requests.map { String(decoding: $0.body, as: UTF8.self) }
+        #expect(bodies.allSatisfy { $0.contains("same question twice") }, "both turns must carry the submitted text")
+        try await requireStoreClean(session)
+    }
+
     @Test("D1 cancel during a busy turn holds the queue; EOF exits cleanly")
     func cancelHoldsQueue() async throws {        let env = try makeEnv(tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
         defer { tearDown(env) }

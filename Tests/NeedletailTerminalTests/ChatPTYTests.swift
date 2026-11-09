@@ -839,11 +839,13 @@ extension ChatPTYTests {
             driver.expect("approval required:", timeoutMS: 20_000)
             driver.send("y\r")
             driver.expect("after write", timeoutMS: 20_000)
-            // Up-arrow recalls history; append one character (a
-            // byte-identical resubmit would hit Core's admittedCommands
-            // idempotency — same text reuses the command ID and the
-            // actor replays the prior admission without dispatching —
-            // so the proof submit carries a suffix) and Enter resubmits.
+            // Up-arrow recalls history; append one character (the
+            // recall proof below needs a body oracle distinct from the
+            // earlier "write the note" request) and Enter resubmits.
+            // Resubmission mints a FRESH command ID per Enter event, so
+            // even a byte-identical recall dispatches a genuine second
+            // turn (M4-D residual fix — the old same-text ID reuse made
+            // Core replay the prior admission as a silent no-op).
             // The fourth provider request proves WHAT was recalled.
             driver.send([0x1B, 0x5B, 0x41]) // Up
             usleep(500_000)
@@ -927,6 +929,60 @@ extension ChatPTYTests {
             #expect(err.contains("needletail run"), "refusal must redirect to headless run, got: \(err.suffix(200))")
             #expect(!out.contains("\u{1B}") && !err.contains("\u{1B}"), "refusal output must carry zero ANSI escapes")
             #expect(server.requests.isEmpty, "refused chat must send zero provider traffic")
+        }
+    }
+
+    @Test("RESUBMIT byte-identical second Enter dispatches a genuine second turn")
+    func identicalResubmitAdmitsTwice() async throws {
+        // Release-PTY proof for the M4-D residual fix: two EXPLICIT
+        // Enter events carrying byte-identical text must produce two
+        // provider dispatches (two genuine Core admissions with distinct
+        // command IDs). The old same-text ID reuse replayed the first
+        // admission without dispatching — requests stayed at 1.
+        try await Self.withCredentialKey {
+            let env = try Self.makeEnv(withServer: true, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+            defer { Self.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+            guard let server = env.server else { Issue.record("no loopback"); return }
+            server.enqueue(ChatLoopback.textTurn("first same answer", splits: 1))
+            server.enqueue(ChatLoopback.textTurn("second same answer", splits: 1))
+            let driver = ChatPTYDriver(
+                executable: Self.releaseBinary(),
+                args: ["chat", "--config", env.configPath],
+                extraEnv: Self.childEnv(env))
+            defer { driver.stop() }
+            driver.preserveTranscript = { Self.preserve("pty-resubmit-timeout", transcript: $0) }
+            guard driver.start() else { Issue.record("pty spawn failed"); return }
+            driver.expect("needletail> ", timeoutMS: 30_000)
+            driver.send("same question twice\r")
+            driver.expect("first same answer", timeoutMS: 20_000)
+            // Byte-identical second Enter AFTER the first turn finished
+            // (a queued follow-up would also dispatch twice, so the
+            // answer wait above is the non-vacuous resubmission proof).
+            driver.send("same question twice\r")
+            driver.expect("second same answer", timeoutMS: 20_000)
+            if server.requests.count != 2 {
+                Self.preserve("pty-resubmit", transcript: driver.fullTranscript())
+                Issue.record("identical resubmit must dispatch twice, got \(server.requests.count) requests")
+                return
+            }
+            let bodies = server.requests.map { String(decoding: $0.body, as: UTF8.self) }
+            #expect(bodies.allSatisfy { $0.contains("same question twice") }, "both turns must carry the submitted text")
+            // Settle-then-exit (same turn-finalization race as PTY-02).
+            driver.send([3])
+            usleep(2_000_000)
+            driver.send([3])
+            guard let status = driver.waitExit(timeoutMS: 15_000) else {
+                Self.preserve("pty-resubmit", transcript: driver.fullTranscript())
+                Issue.record("PTY resubmit release chat did not exit"); return
+            }
+            #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
+            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            let transcript = driver.fullTranscript()
+            if let v = Self.allowlistViolation(transcript, "PTY-resubmit") {
+                Self.preserve("pty-resubmit", transcript: transcript)
+                Issue.record(Comment(rawValue: v))
+            }
+            if let b = Self.bearerViolation(server) { Issue.record("credential: \(b)") }
         }
     }
 }

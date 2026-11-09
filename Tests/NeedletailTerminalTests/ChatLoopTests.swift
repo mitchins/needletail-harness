@@ -36,7 +36,7 @@ struct ChatLoopTests {
         owner.close()
     }
 
-    @Test("same text retried reuses the command ID (no duplicate submission)")
+    @Test("same text resubmitted mints a distinct command ID per Enter (no silent no-op)")
     func retryReusesID() async throws {
         let written = LockedBox()
         let effects = LockedEffects()
@@ -55,8 +55,10 @@ struct ChatLoopTests {
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         // First submit marks busy optimistically (M4-D D2: closes the
         // submit-to-first-projection Ctrl+C window); a terminal
-        // projection returns to idle; the retry then resubmits (not
-        // queues) with the SAME command ID.
+        // projection returns to idle; the resubmit then dispatches a
+        // SECOND genuine turn with a FRESH command ID (M4-D residual
+        // fix — same-ID reuse made Core replay the prior admission
+        // without dispatching).
         let task = Task { await loop.run(scriptedInput: []) }
         #expect(waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
         loop.post(.inputLine("same"))
@@ -71,10 +73,13 @@ struct ChatLoopTests {
         await task.value
         let fx = await effects.all()
         #expect(fx.count == 2)
-        // Both submissions carry the SAME command ID (Core admission
-        // idempotency dedups; the adapter never mints a second ID for a
-        // retry of the same text).
-        #expect(fx[0] == fx[1])
+        // Two explicit submissions carry DISTINCT command IDs: each
+        // Enter is a genuine admission (Core same-ID idempotency only
+        // replays true retries, which reuse the minted ID below this
+        // layer — never through the store).
+        #expect(fx[0] != fx[1])
+        #expect(fx[0] == [.submit(OperatorInput(text: "same", commandID: CommandID("cmd-1")))])
+        #expect(fx[1] == [.submit(OperatorInput(text: "same", commandID: CommandID("cmd-2")))])
         owner.close()
     }
 

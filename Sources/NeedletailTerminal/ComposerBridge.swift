@@ -6,8 +6,9 @@ import NeedletailPresentation
 ///
 /// The bridge proposes `UIAction`s from committed replxx lines and key
 /// events. It never touches `SessionActor`, never mints queue identity
-/// (commandIDs arrive edge-minted; retries reuse the same ID — dedup is
-/// Core admission idempotency), never approves natively. Approval rows
+/// (commandIDs are edge-minted fresh per submission event; retries
+/// reuse the already-minted ID below this layer — dedup is Core
+/// admission idempotency), never approves natively. Approval rows
 /// are non-actionable here: the bridge produces NO `.decideApproval`
 /// path (C5 asserts this); the interactive approval decision flows
 /// solely through `ReplxxApprovalGateway`.
@@ -231,12 +232,21 @@ public enum ComposerBridge {
         path == displaySafe(path) && !path.contains("\n")
     }
 
-    // MARK: - Command IDs (retry reuses the same ID)
+    // MARK: - Command IDs (fresh ID per explicit submission)
 
-    /// Deduplication aid: the edge mints one UUID per submission; a
-    /// retry of the SAME text reuses its ID (dedup is Core admission
-    /// idempotency — the adapter just keeps the mapping). New text
-    /// mints and remembers.
+    /// Deduplication aid: the edge mints one UUID per submission EVENT
+    /// (one committed line = one Enter). Two explicit submissions of
+    /// byte-identical text mint DISTINCT IDs, so Core admits both as
+    /// genuine turns — reusing the ID would make admission idempotency
+    /// replay the prior admission without dispatching (silent no-op;
+    /// M4-D residual fix). Retries reuse the already-minted ID BELOW
+    /// this layer (same effect re-dispatched; Core `admittedCommands`
+    /// replays the ack), so the store never needs a same-text branch.
+    /// History recall is safe by construction: a recalled line submitted
+    /// via Enter is a new event and mints fresh — the historical ID is
+    /// never consulted. Single delivery per event is structural (one
+    /// input thread → serialized main-task `.inputLine`), so per-event
+    /// minting cannot double-admit.
     public struct CommandIDStore: Sendable {
         private var lastText: String?
         private var lastID: CommandID?
@@ -244,11 +254,17 @@ public enum ComposerBridge {
         public init() {}
 
         public mutating func id(for text: String, mint: () -> CommandID) -> CommandID {
-            if text == lastText, let lastID { return lastID }
             let fresh = mint()
             lastText = text
             lastID = fresh
             return fresh
+        }
+
+        /// Most-recent submission record (diagnostic introspection only;
+        /// never consulted for minting).
+        public var lastSubmission: (text: String, id: CommandID)? {
+            guard let lastText, let lastID else { return nil }
+            return (lastText, lastID)
         }
     }
 
