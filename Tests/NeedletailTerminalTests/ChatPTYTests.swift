@@ -985,6 +985,68 @@ extension ChatPTYTests {
             if let b = Self.bearerViolation(server) { Issue.record("credential: \(b)") }
         }
     }
+
+    @Test("PARITY fixed scenario renders in the release binary exactly what the semantic frames say")
+    func parityFixedScenario() async throws {
+        // D4.3 release-binary vs semantic-frame parity (PTY side). The
+        // semantic side is pinned deterministically in
+        // `ChatRenderParityTests` (submitted state + tap block +
+        // candidate rows); this leg drives the RELEASE binary through
+        // the same fixed scenario and asserts the transcript carries
+        // the same hand-written strings in order. Agreement by
+        // construction, never by generation.
+        try await Self.withCredentialKey {
+            let env = try Self.makeEnv(withServer: true, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+            defer { Self.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+            guard let server = env.server else { Issue.record("no loopback"); return }
+            server.enqueue(ChatLoopback.textTurn("parity line one\n\nparity line two", splits: 1))
+            let driver = ChatPTYDriver(
+                executable: Self.releaseBinary(),
+                args: ["chat", "--config", env.configPath],
+                extraEnv: Self.childEnv(env))
+            defer { driver.stop() }
+            driver.preserveTranscript = { Self.preserve("pty-parity-timeout", transcript: $0) }
+            guard driver.start() else { Issue.record("pty spawn failed"); return }
+            driver.expect("needletail> ", timeoutMS: 30_000)
+            driver.send("parity probe\r")
+            driver.expect("parity line one", timeoutMS: 20_000)
+            driver.expect("parity line two", timeoutMS: 20_000)
+            await Task.yield()
+            let transcript = driver.fullTranscript()
+            // Ordered containment of the hand-written semantic strings:
+            // echoed probe, then the two answer lines.
+            let marks = ["parity probe", "parity line one", "parity line two"]
+            var cursor = transcript.startIndex
+            for mark in marks {
+                guard let range = transcript.range(of: mark, range: cursor..<transcript.endIndex) else {
+                    Self.preserve("pty-parity", transcript: transcript)
+                    Issue.record("parity mark missing in order: \(mark)")
+                    return
+                }
+                cursor = range.upperBound
+            }
+            if server.requests.count != 1 {
+                Self.preserve("pty-parity", transcript: transcript)
+                Issue.record("parity scenario must dispatch exactly once, got \(server.requests.count)")
+            }
+            // Settle-then-exit (same turn-finalization race as PTY-02).
+            driver.send([3])
+            usleep(2_000_000)
+            driver.send([3])
+            guard let status = driver.waitExit(timeoutMS: 15_000) else {
+                Self.preserve("pty-parity", transcript: driver.fullTranscript())
+                Issue.record("PTY parity release chat did not exit"); return
+            }
+            #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
+            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            let final = driver.fullTranscript()
+            if let v = Self.allowlistViolation(final, "PTY-parity") {
+                Self.preserve("pty-parity", transcript: final)
+                Issue.record(Comment(rawValue: v))
+            }
+            if let b = Self.bearerViolation(server) { Issue.record("credential: \(b)") }
+        }
+    }
 }
 
 

@@ -40,7 +40,7 @@ for N in 01 02 03 04 05 06 07 08; do
 done
 # Residual-acceptance legs (hygiene, byte-identical resubmission,
 # TERM-04 refusal) must likewise have started.
-for LEG in "confirm hygiene" "byte-identical second Enter" "TERM-04"; do
+for LEG in "confirm hygiene" "byte-identical second Enter" "TERM-04" "PARITY fixed scenario"; do
     COUNT=$(echo "$OUT" | grep -ac "$LEG")
     if [ "$COUNT" -eq 0 ]; then
         echo "FAIL: PTY leg '$LEG' never started (see $LOG)"
