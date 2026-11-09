@@ -108,7 +108,7 @@ struct ChatWidthTests {
     @Test("D4.2 TAB in the draft renders as a visible escape, counted literally")
     func tabRendersVisible() {
         // TAB never reaches the terminal as a control: terminalSafe
-        // escapes it ("\\u{9}", six units), and wrap counts the escape.
+        // escapes it ("\\u{9}", five units), and wrap counts the escape.
         let parts = Self.statusParts("a\tb", width: 40)
         #expect(parts.count == 1)
         #expect(parts[0] == "a\\u{9}b")

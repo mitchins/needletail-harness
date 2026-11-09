@@ -60,7 +60,7 @@ struct ChatStressTests {
     }
 
     @Test("D4.1 droppable quota accounting is exact under a gated writer with concurrent producers")
-    func droppableQuotaGatedWriter() async {
+    func droppableQuotaGatedWriter() async throws {
         let written = LockedBox()
         // The writer gate stays closed while two tasks enqueue 300
         // droppable lines each. Writer-thread drain timing decides HOW
@@ -73,6 +73,16 @@ struct ChatStressTests {
             written.append($0)
         })
         let gen = owner.currentGeneration
+        // Barrier: park the writer on a control-lane sentinel BEFORE
+        // producers start, so the first grab is exactly the sentinel
+        // and all 600 droppable enqueues accumulate against the quota
+        // (truncatedTotal == 88 deterministically, never a flake).
+        _ = owner.emitText("qbarrier", generation: gen, lane: .control)
+        let barrierDeadline = Date().addingTimeInterval(5)
+        while !gate.didEnter, Date() < barrierDeadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(gate.didEnter, "writer must park on the sentinel before producers start")
         let truncatedBox = LockedValue(0)
         let trimmingEmitsBox = LockedValue(0)
         await withTaskGroup(of: Void.self) { group in
@@ -239,10 +249,16 @@ struct ChatStressTests {
 }
 
 /// Test-local writer gate (blocks the owner writer thread until opened).
+/// Records first entry so a test can prove the writer is parked
+/// before producers start (D7 residual review: without the barrier
+/// the writer's first grab size decides whether the quota engages).
 private final class LockedGate: @unchecked Sendable {
     private let lock = NSLock()
     private var open = false
+    private var entered = false
+    var didEnter: Bool { lock.withLock { entered } }
     func wait() {
+        lock.withLock { entered = true }
         while true {
             let isOpen = lock.withLock { open }
             if isOpen { return }
