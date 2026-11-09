@@ -97,6 +97,16 @@ jobs:
       - name: Build
         run: ./dev build
 
+      - name: Build the release product (M4 PTY legs execute the release binary)
+        run: |
+          # The NeedletailTerminalTests PTY legs (PTY-01…08, hygiene,
+          # resubmit, parity) spawn `.build/release/needletail` and
+          # fail-closed on a missing binary (no silent skips, BDD-04).
+          # Same command as run-m4d-pty.sh so CI tests the identical
+          # artifact the local gate qualifies.
+          swift build -c release --product needletail
+          test -x .build/release/needletail
+
       - name: Full offline gate (quick/native/PTY/case-bound integrations)
         run: ./dev test offline
 
