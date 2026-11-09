@@ -31,7 +31,11 @@ struct ChatLoopTests {
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         await loop.run(scriptedInput: ["hello", nil])
         let fx = await effects.all()
-        #expect(fx.count == 1)
+        guard fx.count == 1 else {
+            Issue.record("expected 1 effect batch, got \(fx.count)")
+            owner.close()
+            return
+        }
         #expect(fx[0] == [.submit(OperatorInput(text: "hello", commandID: CommandID("cmd-1")))])
         owner.close()
     }
@@ -60,9 +64,9 @@ struct ChatLoopTests {
         // fix — same-ID reuse made Core replay the prior admission
         // without dispatching).
         let task = Task { await loop.run(scriptedInput: []) }
-        #expect(waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
         loop.post(.inputLine("same"))
-        #expect(waitFor(marker: "same", in: written, timeout: 5), "submit never dispatched")
+        #expect(await waitFor(marker: "same", in: written, timeout: 5), "submit never dispatched")
         // Drive the terminal transition directly: admitted then completed.
         loop.post(.projection(.admitted(commandID: CommandID("cmd-1"), revision: 1)))
         loop.post(.projection(.runUpdate(phase: "completed", detail: "done")))
@@ -72,7 +76,15 @@ struct ChatLoopTests {
         loop.post(.inputLine(nil))
         await task.value
         let fx = await effects.all()
-        #expect(fx.count == 2)
+        // Guard BEFORE indexing: #expect records but does not return,
+        // and indexing a short array traps (ud2/SIGILL), killing the
+        // whole runner binary. A short batch list is a clean failure,
+        // never a crash.
+        guard fx.count == 2 else {
+            Issue.record("expected 2 effect batches, got \(fx.count)")
+            owner.close()
+            return
+        }
         // Two explicit submissions carry DISTINCT command IDs: each
         // Enter is a genuine admission (Core same-ID idempotency only
         // replays true retries, which reuse the minted ID below this
@@ -205,7 +217,11 @@ struct ChatLoopTests {
         // exactly one submit (for "second") was produced — never a
         // submit of "y", never a polluted draft.
         let fx = await effects.all()
-        #expect(fx.count == 1)
+        guard fx.count == 1 else {
+            Issue.record("expected 1 effect batch, got \(fx.count)")
+            owner.close()
+            return
+        }
         #expect(fx[0] == [.submit(OperatorInput(text: "second", commandID: CommandID("cmd-1")))])
         owner.close()
     }
@@ -225,7 +241,7 @@ struct ChatLoopTests {
         let runTask = Task { await loop.run(scriptedInput: []) }
         // Readiness: the initial frame must exist before the key post
         // (posts before the inbox exists drop).
-        let ready = waitFor(marker: "idle", in: written, timeout: 5)
+        let ready = await waitFor(marker: "idle", in: written, timeout: 5)
         #expect(ready, "loop never rendered initial frame")
         loop.post(.key(.ctrlC))
         // Bounded join: a failed exit must fail the test, never hang it.
@@ -253,14 +269,14 @@ struct ChatLoopTests {
         let runTask = Task { await loop.run(scriptedInput: []) }
         // Readiness: the queue row (kind + state) renders in the
         // initial frame (status is not idle with a held queue).
-        #expect(waitFor(marker: "followUp queued", in: written, timeout: 5), "loop never rendered initial frame")
+        #expect(await waitFor(marker: "followUp queued", in: written, timeout: 5), "loop never rendered initial frame")
         loop.post(.key(.ctrlC))
-        #expect(waitFor(marker: "queued work pending", in: written, timeout: 5), "first Ctrl+C must warn, not exit")
+        #expect(await waitFor(marker: "queued work pending", in: written, timeout: 5), "first Ctrl+C must warn, not exit")
         // Any other input disarms the latch: typing clears it.
         loop.post(.inputLine("hello"))
-        _ = waitFor(marker: "hello", in: written, timeout: 5)
+        _ = await waitFor(marker: "hello", in: written, timeout: 5)
         loop.post(.key(.ctrlC))
-        #expect(waitFor(marker: "queued work pending", in: written, timeout: 5), "latch must disarm on other input")
+        #expect(await waitFor(marker: "queued work pending", in: written, timeout: 5), "latch must disarm on other input")
         // Second consecutive press exits.
         loop.post(.key(.ctrlC))
         let exited = await join(task: runTask, timeout: 5)
@@ -268,11 +284,11 @@ struct ChatLoopTests {
         owner.close()
     }
 
-    private func waitFor(marker: String, in box: LockedBox, timeout: TimeInterval) -> Bool {
+    private func waitFor(marker: String, in box: LockedBox, timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if box.joined().contains(marker) { return true }
-            usleep(10_000)
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return false
     }
@@ -355,7 +371,11 @@ struct ChatLoopTests {
         loop.post(.inputLine(nil))
         await runTask.value
         let fx = await effects.all()
-        #expect(fx.count == 1, "only the follow-up submits, got \(fx.count) effect batches")
+        guard fx.count == 1 else {
+            Issue.record("only the follow-up submits, got \(fx.count) effect batches")
+            owner.close()
+            return
+        }
         #expect(fx[0] == [.submit(OperatorInput(text: "second", commandID: CommandID("cmd-1")))])
         owner.close()
     }

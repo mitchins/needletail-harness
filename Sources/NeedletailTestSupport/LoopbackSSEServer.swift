@@ -136,11 +136,16 @@ public final class LoopbackSSEServer: @unchecked Sendable {
     /// Test side: bounded wait until the server is actually withholding
     /// a chunk at the named gate. The true return is the non-vacuity
     /// proof that subsequent input lands mid-stream.
-    public func waitUntilGateArmed(_ name: String, timeout: TimeInterval) -> Bool {
+    /// Polls cooperatively: `Task.sleep` yields the Swift
+    /// concurrency executor thread instead of burning it in `usleep`.
+    /// Under parallel CI load, spinning polls starve the very tasks
+    /// they wait for (observed as readiness timeouts + a runner
+    /// crash); yielding polls do not.
+    public func waitUntilGateArmed(_ name: String, timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if lock.withLock({ gates[name]?.armed == true }) { return true }
-            usleep(10_000)
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return false
     }

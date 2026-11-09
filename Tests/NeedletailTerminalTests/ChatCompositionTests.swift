@@ -68,11 +68,11 @@ struct ChatCompositionTests {
         try? FileManager.default.removeItem(at: env.stateDir.deletingLastPathComponent())
     }
 
-    private func waitUntil(_ env: Env, _ marker: String, timeout: TimeInterval = 20) -> Bool {
+    private func waitUntil(_ env: Env, _ marker: String, timeout: TimeInterval = 20) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if env.written.joined().contains(marker) { return true }
-            usleep(10_000)
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return false
     }
@@ -85,7 +85,7 @@ struct ChatCompositionTests {
     /// The loop drops posts before its inbox exists; the first render
     /// (status line) is the deterministic readiness signal.
     private func requireReady(_ env: Env, _ session: ChatCommand.ComposedSession, task: Task<Void, Never>) async -> Bool {
-        guard waitUntil(env, "idle") else {
+        guard await waitUntil(env, "idle") else {
             Issue.record("loop never rendered initial frame; tail: \(env.written.joined().suffix(300))")
             session.loop.post(.inputLine(nil))
             await task.value
@@ -129,14 +129,14 @@ struct ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("say hi"))
-        #expect(env.server.waitUntilGateArmed("s1", timeout: 20), "gate never armed — stream may have finished before the turn")
+        #expect(await env.server.waitUntilGateArmed("s1", timeout: 20), "gate never armed — stream may have finished before the turn")
         #expect(env.server.requests.count == 1, "provider request must be open while the gate holds")
         #expect(!env.written.joined().contains("hello world from loopback"), "full text must not render before the gate releases")
         env.server.releaseGate("s1")
-        #expect(waitUntil(env, "hello world from loopback"), "streamed text never rendered; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "hello world from loopback"), "streamed text never rendered; tail: \(env.written.joined().suffix(400))")
         await finishRun(session, task: task)
         requireBearer(env)
-        #expect(env.server.requests.count == 1, "expected exactly one provider request, got \(env.server.requests.count)")
+        try #require(env.server.requests.count == 1, "expected exactly one provider request, got \(env.server.requests.count)")
         try await requireStoreClean(session)
     }
 
@@ -163,12 +163,12 @@ struct ChatCompositionTests {
         // auto-execute via dispatchTrustedBatch (batchNeedsApproval ==
         // false) — NO approval prompt. D2.4 turn-finished display renders
         // the transcript tool message verbatim in scrollback.
-        #expect(waitUntil(env, "tool result"), "tool result never displayed; tail: \(env.written.joined().suffix(500))")
+        #expect(await waitUntil(env, "tool result"), "tool result never displayed; tail: \(env.written.joined().suffix(500))")
         #expect(env.written.joined().contains("workspace file bytes"), "tool payload missing from display")
         #expect(!env.written.joined().contains("approval required:"), "trusted read must not prompt")
         await finishRun(session, task: task)
         requireBearer(env)
-        #expect(env.server.requests.count == 2, "expected tool turn + follow-up, got \(env.server.requests.count)")
+        try #require(env.server.requests.count == 2, "expected tool turn + follow-up, got \(env.server.requests.count)")
         let followup = String(decoding: env.server.requests[1].body, as: UTF8.self)
         #expect(followup.contains("workspace file bytes"), "tool receipt bytes must reach the provider")
         try await requireStoreClean(session)
@@ -192,14 +192,14 @@ struct ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("write the file"))
-        #expect(waitUntil(env, "approval required:"), "approval prompt never rendered; tail: \(env.written.joined().suffix(500))")
+        #expect(await waitUntil(env, "approval required:"), "approval prompt never rendered; tail: \(env.written.joined().suffix(500))")
         #expect(env.written.joined().contains("note.txt"), "approval must show the requested path")
         session.loop.post(.inputLine("y"))
         // Scrollback receipt display (D2.4): the transcript tool message
         // renders verbatim after the turn finishes. (Oracle keys on the
         // hook's "tool result" prefix: the raw arguments also contain the
         // payload bytes via the approval prompt.)
-        #expect(waitUntil(env, "tool result"), "tool result never displayed; tail: \(env.written.joined().suffix(500))")
+        #expect(await waitUntil(env, "tool result"), "tool result never displayed; tail: \(env.written.joined().suffix(500))")
         #expect(env.written.joined().contains("written bytes"), "tool payload missing from display")
         #expect((try? String(contentsOf: base.appendingPathComponent("note.txt"), encoding: .utf8)) == "written bytes", "native write must land")
         await finishRun(session, task: task)
@@ -227,14 +227,14 @@ struct ChatCompositionTests {
         // Wait until the provider request is in flight AND the server is
         // withholding the gated chunk: anything injected now is
         // provably mid-stream (non-vacuous concurrency proof).
-        #expect(env.server.waitUntilGateArmed("t1", timeout: 20), "loopback gate never armed — stream may have finished before injection")
+        #expect(await env.server.waitUntilGateArmed("t1", timeout: 20), "loopback gate never armed — stream may have finished before injection")
         session.loop.post(.inputLine("second"))
         // The follow-up must queue, never send during the busy turn:
         // only one provider request exists while the gate holds.
-        usleep(300_000)
+        try? await Task.sleep(nanoseconds: 300_000_000)
         #expect(env.server.requests.count == 1, "follow-up auto-sent during busy turn: \(env.server.requests.count) requests")
         env.server.releaseGate("t1")
-        #expect(waitUntil(env, "second-turn-answer"), "queued follow-up never dispatched; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "second-turn-answer"), "queued follow-up never dispatched; tail: \(env.written.joined().suffix(400))")
         await finishRun(session, task: task)
         requireBearer(env)
         #expect(env.server.requests.count == 2, "expected two provider requests, got \(env.server.requests.count)")
@@ -260,9 +260,9 @@ struct ChatCompositionTests {
         // idempotency replay the prior admission without dispatching —
         // a silent no-op (M4-D residual).
         session.loop.post(.inputLine("same question twice"))
-        #expect(waitUntil(env, "first identical answer"), "first turn never rendered; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "first identical answer"), "first turn never rendered; tail: \(env.written.joined().suffix(400))")
         session.loop.post(.inputLine("same question twice"))
-        #expect(waitUntil(env, "second identical answer"), "identical resubmit never dispatched — silent no-op; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "second identical answer"), "identical resubmit never dispatched — silent no-op; tail: \(env.written.joined().suffix(400))")
         let admitted = await session.actor.currentState().admittedCommands
         #expect(admitted.count >= 2, "two genuine admissions expected, got \(admitted.count)")
         #expect(Set(admitted.keys).count == admitted.count, "command IDs must be distinct per submission event")
@@ -299,9 +299,9 @@ struct ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("first"))
-        #expect(env.server.waitUntilGateArmed("c1", timeout: 20), "gate never armed")
+        #expect(await env.server.waitUntilGateArmed("c1", timeout: 20), "gate never armed")
         session.loop.post(.inputLine("queued-while-busy"))
-        usleep(300_000)
+        try? await Task.sleep(nanoseconds: 300_000_000)
         // Cancel through the LOOP key path (busy Ctrl+C): exercises the
         // decided-cancel event end to end, not just the actor authority.
         session.loop.post(.key(.ctrlC))
@@ -314,7 +314,7 @@ struct ChatCompositionTests {
             while Date() < deadline {
                 let state = await session.actor.currentState()
                 if case .interrupted = state.phase { return true }
-                usleep(50_000)
+                try? await Task.sleep(nanoseconds: 50_000_000)
             }
             return false
         }()
@@ -327,7 +327,7 @@ struct ChatCompositionTests {
         await session.actor.resumeQueue()
         env.server.releaseGate("c1")
         session.loop.post(.inputLine("nudge"))
-        #expect(waitUntil(env, "after-resume"), "queue never resumed; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "after-resume"), "queue never resumed; tail: \(env.written.joined().suffix(400))")
         await finishRun(session, task: task)
         requireBearer(env)
         try await requireStoreClean(session)
@@ -358,13 +358,13 @@ struct ChatCompositionTests {
             guard await requireReady(env, session, task: task) else { return }
             #expect(env.written.joined().contains("limit=1"), "startup budget line must show the configured limit")
             session.loop.post(.inputLine("first"))
-            #expect(waitUntil(env, "first answer"), "first turn never completed; tail: \(env.written.joined().suffix(300))")
+            #expect(await waitUntil(env, "first answer"), "first turn never completed; tail: \(env.written.joined().suffix(300))")
             // Second submit: translate-level refusal (no consume, no
             // dispatch) with an explicit held-queue notice.
             session.loop.post(.inputLine("second"))
-            #expect(waitUntil(env, "budget exhausted"), "refusal notice missing; tail: \(env.written.joined().suffix(300))")
+            #expect(await waitUntil(env, "budget exhausted"), "refusal notice missing; tail: \(env.written.joined().suffix(300))")
             // The refused turn must never reach the provider.
-            usleep(300_000)
+            try? await Task.sleep(nanoseconds: 300_000_000)
             #expect(env.server.requests.count == 1, "exhausted budget sent provider traffic: \(env.server.requests.count)")
             await finishRun(session, task: task)
             requireBearer(env)
@@ -386,7 +386,7 @@ struct ChatCompositionTests {
             let taskA = Task { await first.run(scriptedInput: []) }
             guard await requireReady(env, first, task: taskA) else { return }
             first.loop.post(.inputLine("go"))
-            #expect(waitUntil(env, "only answer"), "first session never completed")
+            #expect(await waitUntil(env, "only answer"), "first session never completed")
             await finishRun(first, task: taskA)
             // Session B shares the state dir: the counter persists, so
             // the very first submit refuses without provider traffic.
@@ -399,37 +399,37 @@ struct ChatCompositionTests {
                 sandboxGrant: nil, acknowledgedDetermination: nil,
                 writer: { writtenB.append($0) })
             let taskB = Task { await second.run(scriptedInput: []) }
-            let readyB: Bool = {
+            let readyB: Bool = await {
                 let deadline = Date().addingTimeInterval(5)
                 while Date() < deadline {
                     if writtenB.joined().contains("idle") { return true }
-                    usleep(10_000)
+                    try? await Task.sleep(nanoseconds: 10_000_000)
                 }
                 return false
             }()
             guard readyB else { Issue.record("session B never rendered"); return }
             second.loop.post(.inputLine("go again"))
-            let refused: Bool = {
+            let refused: Bool = await {
                 let deadline = Date().addingTimeInterval(20)
                 while Date() < deadline {
                     if writtenB.joined().contains("budget exhausted") { return true }
-                    usleep(10_000)
+                    try? await Task.sleep(nanoseconds: 10_000_000)
                 }
                 return false
             }()
             #expect(refused, "sticky exhaustion not refused; tail: \(writtenB.joined().suffix(300))")
-            usleep(300_000)
+            try? await Task.sleep(nanoseconds: 300_000_000)
             #expect(env.server.requests.count == 1, "second session sent provider traffic on an exhausted budget")
             await finishRun(second, task: taskB)
             requireBearer(env)
         }
     }
 
-    private func waitForAccept(_ session: ChatCommand.ComposedSession, timeout: TimeInterval = 10) -> Bool {
+    private func waitForAccept(_ session: ChatCommand.ComposedSession, timeout: TimeInterval = 10) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if session.loop.acceptSnapshot() != nil { return true }
-            usleep(10_000)
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return false
     }
@@ -457,7 +457,7 @@ struct ChatCompositionTests {
         // Type the query: the edge fetch finds hello.txt in the
         // workspace (suggestion fills via the completions event).
         session.loop.post(.mirror(text: "@he", cursor: 3))
-        #expect(waitForAccept(session), "suggestion never filled for @he")
+        #expect(await waitForAccept(session), "suggestion never filled for @he")
         // Tab-accept through the shared gate, then submit the accepted
         // buffer text (production Enter submits the mirrored buffer).
         guard let accepted = session.loop.acceptSnapshot() else {
@@ -465,17 +465,17 @@ struct ChatCompositionTests {
         }
         session.loop.post(.tabAccept(base: accepted.base, display: accepted.display, cursor: accepted.cursor))
         session.loop.post(.inputLine(accepted.display))
-        #expect(waitUntil(env, "first answer"), "mention turn never completed; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "first answer"), "mention turn never completed; tail: \(env.written.joined().suffix(400))")
         // The fd-pinned capture rides the provider request as attachment
         // context (byte-exact excerpt, hash-verified at capture).
-        #expect(env.server.requests.count >= 1, "provider never invoked")
+        try #require(env.server.requests.count >= 1, "provider never invoked")
         let firstBody = String(decoding: env.server.requests[0].body, as: UTF8.self)
         #expect(firstBody.contains("attach me bytes"), "captured file bytes missing from provider context")
         // Second submit completes (token clearing itself is qualified
         // reducer behavior — M4-B "submit clears tokens"; turn 2's
         // request legitimately carries turn 1's history bytes).
         session.loop.post(.inputLine("plain follow-up"))
-        #expect(waitUntil(env, "second answer"), "follow-up never completed")
+        #expect(await waitUntil(env, "second answer"), "follow-up never completed")
         await finishRun(session, task: task)
         requireBearer(env)
         #expect(env.server.requests.count == 2, "expected exactly two provider requests")
@@ -499,7 +499,7 @@ struct ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.mirror(text: "@he", cursor: 3))
-        #expect(waitForAccept(session), "suggestion never filled for @he")
+        #expect(await waitForAccept(session), "suggestion never filled for @he")
         guard let accepted = session.loop.acceptSnapshot() else {
             Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await task.value; return
         }
@@ -509,8 +509,8 @@ struct ChatCompositionTests {
         // the turn — never partial admission, never silent loss.
         try FileManager.default.removeItem(at: base.appendingPathComponent("hello.txt"))
         session.loop.post(.inputLine(accepted.display))
-        #expect(waitUntil(env, "attach refused"), "missing file must refuse with a specific notice; tail: \(env.written.joined().suffix(400))")
-        usleep(300_000)
+        #expect(await waitUntil(env, "attach refused"), "missing file must refuse with a specific notice; tail: \(env.written.joined().suffix(400))")
+        try? await Task.sleep(nanoseconds: 300_000_000)
         #expect(env.server.requests.isEmpty, "refused submit must never reach the provider")
         await finishRun(session, task: task)
     }
@@ -541,9 +541,9 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("change the file"))
-        #expect(waitUntil(env, "approval required:"), "approval never rendered")
+        #expect(await waitUntil(env, "approval required:"), "approval never rendered")
         session.loop.post(.inputLine("y"))
-        #expect(waitUntil(env, "changed done"), "write turn never completed")
+        #expect(await waitUntil(env, "changed done"), "write turn never completed")
         #expect((try? String(contentsOf: base.appendingPathComponent("target.txt"), encoding: .utf8)) == "changed bytes", "native write must land")
         // Resolve the group from the durable ledger (same source as the edge).
         let (stored, _) = try session.store.records(session: session.sessionID, since: 0, limit: 10_000)
@@ -554,20 +554,20 @@ extension ChatCompositionTests {
         }
         // Run without preview refuses (read before mutate).
         session.loop.post(.inputLine("/undo run \(gid)"))
-        #expect(waitUntil(env, "preview group \(gid) first"), "unpreviewed run must refuse; tail: \(env.written.joined().suffix(300))")
+        #expect(await waitUntil(env, "preview group \(gid) first"), "unpreviewed run must refuse; tail: \(env.written.joined().suffix(300))")
         // Bare `/undo` previews the latest eligible group (read-only;
         // oracle keys on the eligible-preview notice — hashes wrap).
         session.loop.post(.inputLine("/undo"))
-        #expect(waitUntil(env, "eligible, no mutation"), "bare /undo must preview the latest group; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "eligible, no mutation"), "bare /undo must preview the latest group; tail: \(env.written.joined().suffix(400))")
         // Explicit `/undo run <group>` executes through Core approval +
         // verification (idempotent by undo command ID).
         session.loop.post(.inputLine("/undo run \(gid)"))
-        #expect(waitUntil(env, "dispatched for group \(gid)"), "run dispatch never acknowledged")
-        let restored: Bool = {
+        #expect(await waitUntil(env, "dispatched for group \(gid)"), "run dispatch never acknowledged")
+        let restored: Bool = await {
             let deadline = Date().addingTimeInterval(20)
             while Date() < deadline {
                 if (try? String(contentsOf: base.appendingPathComponent("target.txt"), encoding: .utf8)) == "original bytes" { return true }
-                usleep(50_000)
+                try? await Task.sleep(nanoseconds: 50_000_000)
             }
             return false
         }()
@@ -594,11 +594,11 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("/preview @hello.txt"))
-        #expect(waitUntil(env, "preview me bytes"), "/preview must render bounded text; tail: \(env.written.joined().suffix(300))")
+        #expect(await waitUntil(env, "preview me bytes"), "/preview must render bounded text; tail: \(env.written.joined().suffix(300))")
         session.loop.post(.inputLine("/preview /etc/hostname"))
-        #expect(waitUntil(env, "preview refused: path escapes the pinned roots: /etc/hostname"), "absolute path must refuse")
+        #expect(await waitUntil(env, "preview refused: path escapes the pinned roots: /etc/hostname"), "absolute path must refuse")
         session.loop.post(.inputLine("/preview ../outside.txt"))
-        #expect(waitUntil(env, "preview refused: path escapes the pinned roots: ../outside.txt"), "dot-dot path must refuse")
+        #expect(await waitUntil(env, "preview refused: path escapes the pinned roots: ../outside.txt"), "dot-dot path must refuse")
         await finishRun(session, task: task)
     }
 
@@ -617,16 +617,16 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("first"))
-        #expect(env.server.waitUntilGateArmed("q1", timeout: 20), "gate never armed")
+        #expect(await env.server.waitUntilGateArmed("q1", timeout: 20), "gate never armed")
         session.loop.post(.inputLine("queued-while-busy"))
-        usleep(300_000)
+        try? await Task.sleep(nanoseconds: 300_000_000)
         await session.cancel()
         let terminated: Bool = await {
             let deadline = Date().addingTimeInterval(12)
             while Date() < deadline {
                 let state = await session.actor.currentState()
                 if case .interrupted = state.phase { return true }
-                usleep(50_000)
+                try? await Task.sleep(nanoseconds: 50_000_000)
             }
             return false
         }()
@@ -636,7 +636,7 @@ extension ChatCompositionTests {
         session.loop.post(.inputLine("/queue resume"))
         env.server.releaseGate("q1")
         session.loop.post(.inputLine("nudge"))
-        #expect(waitUntil(env, "after-resume"), "slash resume never dispatched the head; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "after-resume"), "slash resume never dispatched the head; tail: \(env.written.joined().suffix(400))")
         await finishRun(session, task: task)
         requireBearer(env)
         try await requireStoreClean(session)
@@ -661,19 +661,19 @@ extension ChatCompositionTests {
         guard await requireReady(env, session, task: task) else { return }
         // /models: complete from the validated snapshot (alias + kind).
         session.loop.post(.inputLine("/models"))
-        #expect(waitUntil(env, "loop [local]"), "/models must list the loopback route; tail: \(env.written.joined().suffix(300))")
+        #expect(await waitUntil(env, "loop [local]"), "/models must list the loopback route; tail: \(env.written.joined().suffix(300))")
         // /sessions: the live session renders with its route.
         session.loop.post(.inputLine("/sessions"))
-        #expect(waitUntil(env, session.sessionID.raw), "/sessions must list the live session")
+        #expect(await waitUntil(env, session.sessionID.raw), "/sessions must list the live session")
         // /context: estimated totals with unknown cache (never exact).
         session.loop.post(.inputLine("/context"))
-        #expect(waitUntil(env, "cache unknown"), "/context must label cache unknown")
+        #expect(await waitUntil(env, "cache unknown"), "/context must label cache unknown")
         // /epochs: lineage from the durable log.
         session.loop.post(.inputLine("/epochs"))
-        #expect(waitUntil(env, "epoch-chat-"), "/epochs must list the live epoch")
+        #expect(await waitUntil(env, "epoch-chat-"), "/epochs must list the live epoch")
         // /compact: dry-run estimate, zero provider calls.
         session.loop.post(.inputLine("/compact"))
-        #expect(waitUntil(env, "dry-run only"), "/compact must show the dry-run note")
+        #expect(await waitUntil(env, "dry-run only"), "/compact must show the dry-run note")
         await finishRun(session, task: task)
         // All legs are local reads: zero provider traffic expected
         // (offline inspection — the point of the exercise).
@@ -717,7 +717,7 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("/diff"))
-        #expect(waitUntil(env, "line two"), "/diff must render the unstaged hunk; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "line two"), "/diff must render the unstaged hunk; tail: \(env.written.joined().suffix(400))")
         await finishRun(session, task: task)
     }
 
@@ -747,19 +747,19 @@ extension ChatCompositionTests {
         // wrapper) delivers streaming deltas to the trace sink while the
         // loopback holds the stream: an opaque wrapper would silently
         // unwire this (M4-D review blocker 1).
-        #expect(env.server.waitUntilGateArmed("d1", timeout: 20), "gate never armed")
-        let traced: Bool = {
+        #expect(await env.server.waitUntilGateArmed("d1", timeout: 20), "gate never armed")
+        let traced: Bool = await {
             let deadline = Date().addingTimeInterval(10)
             while Date() < deadline {
                 if let text = try? String(contentsOf: traceURL, encoding: .utf8),
                    text.contains("\"kind\":\"delta\"") { return true }
-                usleep(50_000)
+                try? await Task.sleep(nanoseconds: 50_000_000)
             }
             return false
         }()
         #expect(traced, "no delta projection reached the trace sink mid-stream")
         env.server.releaseGate("d1")
-        #expect(waitUntil(env, "streamed Chello"), "turn never completed")
+        #expect(await waitUntil(env, "streamed Chello"), "turn never completed")
         await finishRun(session, task: task)
         requireBearer(env)
     }
@@ -784,7 +784,7 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.mirror(text: "@he", cursor: 3))
-        #expect(waitForAccept(session), "suggestion never filled for @he")
+        #expect(await waitForAccept(session), "suggestion never filled for @he")
         guard let accepted = session.loop.acceptSnapshot() else {
             Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await task.value; return
         }
@@ -793,15 +793,15 @@ extension ChatCompositionTests {
         // draft AND tokens survive (no submit dispatch clears them).
         try FileManager.default.removeItem(at: base.appendingPathComponent("hello.txt"))
         session.loop.post(.inputLine(accepted.display))
-        #expect(waitUntil(env, "attach refused"), "missing file must refuse; tail: \(env.written.joined().suffix(300))")
-        usleep(300_000)
+        #expect(await waitUntil(env, "attach refused"), "missing file must refuse; tail: \(env.written.joined().suffix(300))")
+        try? await Task.sleep(nanoseconds: 300_000_000)
         #expect(env.server.requests.isEmpty, "refused submit must never reach the provider")
         // Recreate and resubmit the SAME line without re-accepting: the
         // preserved tokens attach on the second attempt.
         try "v1 bytes".write(to: base.appendingPathComponent("hello.txt"), atomically: true, encoding: .utf8)
         session.loop.post(.inputLine(accepted.display))
-        #expect(waitUntil(env, "gate answer"), "resubmit after fix never completed")
-        #expect(env.server.requests.count == 1, "expected exactly one provider request")
+        #expect(await waitUntil(env, "gate answer"), "resubmit after fix never completed")
+        try #require(env.server.requests.count == 1, "expected exactly one provider request")
         let body = String(decoding: env.server.requests[0].body, as: UTF8.self)
         #expect(body.contains("v1 bytes"), "preserved tokens must attach on resubmit")
         await finishRun(session, task: task)
@@ -831,15 +831,15 @@ extension ChatCompositionTests {
         // the token must die with the draft — the next submit is plain
         // text with NO attachment (privacy: no stale file sent).
         session.loop.post(.mirror(text: "@he", cursor: 3))
-        #expect(waitForAccept(session), "suggestion never filled for @he")
+        #expect(await waitForAccept(session), "suggestion never filled for @he")
         guard let accepted = session.loop.acceptSnapshot() else {
             Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await task.value; return
         }
         session.loop.post(.tabAccept(base: accepted.base, display: accepted.display, cursor: accepted.cursor))
         session.loop.post(.mirror(text: "", cursor: 0))
         session.loop.post(.inputLine("plain text"))
-        #expect(waitUntil(env, "plain answer"), "submit never completed")
-        #expect(env.server.requests.count == 1, "expected exactly one provider request")
+        #expect(await waitUntil(env, "plain answer"), "submit never completed")
+        try #require(env.server.requests.count == 1, "expected exactly one provider request")
         let body = String(decoding: env.server.requests[0].body, as: UTF8.self)
         #expect(!body.contains("secret bytes"), "cleared token must not attach (stale file sent!)")
         await finishRun(session, task: task)
@@ -862,7 +862,7 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("line one\nline two"))
-        #expect(waitUntil(env, "ok"))
+        #expect(await waitUntil(env, "ok"))
         await finishRun(session, task: task)
         let body = String(decoding: env.server.requests[0].body, as: UTF8.self)
         #expect(body.contains("line one\\nline two"), "newlines must survive submit byte-exact")
@@ -886,9 +886,9 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("go"))
-        #expect(waitUntil(env, "tail", timeout: 20), "hostile first turn never rendered")
+        #expect(await waitUntil(env, "tail", timeout: 20), "hostile first turn never rendered")
         session.loop.post(.inputLine("next"))
-        #expect(waitUntil(env, "second done", timeout: 20), "second turn never completed")
+        #expect(await waitUntil(env, "second done", timeout: 20), "second turn never completed")
         await finishRun(session, task: task)
         let out = env.written.joined()
         var sawZWJ = false
@@ -924,13 +924,13 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("first"))
-        #expect(env.server.waitUntilGateArmed("i1", timeout: 20), "gate never armed — stream finished before the inspect")
+        #expect(await env.server.waitUntilGateArmed("i1", timeout: 20), "gate never armed — stream finished before the inspect")
         // Inspect DURING the stream: retire-liveness must survive
         // (D7 review B4) — the turn still commits after release.
         session.loop.post(.inputLine("/context"))
-        #expect(waitUntil(env, "tokens estimated"), "inspect must render mid-stream; tail: \(env.written.joined().suffix(300))")
+        #expect(await waitUntil(env, "tokens estimated"), "inspect must render mid-stream; tail: \(env.written.joined().suffix(300))")
         env.server.releaseGate("i1")
-        #expect(waitUntil(env, "streamed-and-committed"), "mid-stream inspect dropped the commit; tail: \(env.written.joined().suffix(400))")
+        #expect(await waitUntil(env, "streamed-and-committed"), "mid-stream inspect dropped the commit; tail: \(env.written.joined().suffix(400))")
         await finishRun(session, task: task)
         requireBearer(env)
         #expect(env.server.requests.count == 1, "inspect must not send provider traffic, got \(env.server.requests.count)")
@@ -960,7 +960,7 @@ extension ChatCompositionTests {
         // then advance the draft past it (the scripted analogue of a
         // fast Tab racing unprocessed keystrokes, D7 review B3).
         session.loop.post(.mirror(text: "@he", cursor: 3))
-        #expect(waitForAccept(session), "suggestion never filled for @he")
+        #expect(await waitForAccept(session), "suggestion never filled for @he")
         guard let snap = session.loop.acceptSnapshot() else {
             Issue.record("accept gate closed"); await finishRun(session, task: task); return
         }
@@ -978,10 +978,10 @@ extension ChatCompositionTests {
         // submit the CURRENT draft plus only the newer input — never
         // the unaccepted preview.
         session.loop.post(.inputLine(snap.display + " plus"))
-        #expect(waitUntil(env, "stale submit done"), "reconciled submit never completed")
+        #expect(await waitUntil(env, "stale submit done"), "reconciled submit never completed")
         await finishRun(session, task: task)
         requireBearer(env)
-        #expect(env.server.requests.count == 1, "expected exactly one provider request, got \(env.server.requests.count)")
+        try #require(env.server.requests.count == 1, "expected exactly one provider request, got \(env.server.requests.count)")
         let body = String(decoding: env.server.requests[0].body, as: UTF8.self)
         #expect(body.contains("@hex plus"), "submit must carry the reconciled draft, got: \(body.suffix(300))")
         #expect(!body.contains(snap.display + " plus"), "stale preview must never submit as text")

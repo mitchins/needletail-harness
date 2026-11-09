@@ -170,12 +170,12 @@ extension ChatPTYTests {
             guard driver.start() else { Issue.record("pty spawn failed"); return }
             driver.expect("needletail> ", timeoutMS: 30_000)
             driver.send("first\r")
-            #expect(server.waitUntilGateArmed("p2", timeout: 20), "gate never armed")
+            #expect(await server.waitUntilGateArmed("p2", timeout: 20), "gate never armed")
             // Multiline shell-looking paste INCLUDING a slash line:
             // literal, never executed, never submitted early.
             let paste = "line one\nrm -rf /\n/cancel\nline four"
             driver.send("\u{1B}[200~" + paste + "\u{1B}[201~")
-            usleep(300_000)
+            try? await Task.sleep(nanoseconds: 300_000_000)
             if server.requests.count != 1 {
                 Self.preserve("pty-02", transcript: driver.fullTranscript())
             }
@@ -209,7 +209,7 @@ extension ChatPTYTests {
             // second exits once idle. A truly wedged loop still fails
             // the waitExit deadline below.
             driver.send([3])
-            usleep(2_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             driver.send([3])
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 Self.preserve("pty-02", transcript: driver.fullTranscript())
@@ -250,7 +250,7 @@ extension ChatPTYTests {
             guard driver.start() else { Issue.record("pty spawn failed"); return }
             driver.expect("needletail> ", timeoutMS: 30_000)
             driver.send("describe it\r")
-            #expect(server.waitUntilGateArmed("p3", timeout: 20), "gate never armed")
+            #expect(await server.waitUntilGateArmed("p3", timeout: 20), "gate never armed")
             // Type a mention mid-stream: the popup must list the
             // candidate with its bounded preview while output flows.
             driver.send("@he")
@@ -258,7 +258,7 @@ extension ChatPTYTests {
             // Tab accepts exactly (token, not string parsing), Enter
             // submits the accepted line.
             driver.send("\t")
-            usleep(500_000)
+            try? await Task.sleep(nanoseconds: 500_000_000)
             server.releaseGate("p3")
             driver.expect("streaming output here", timeoutMS: 20_000)
             driver.send("\r")
@@ -277,7 +277,7 @@ extension ChatPTYTests {
             // second exits once idle. A truly wedged loop still fails
             // the waitExit deadline below.
             driver.send([3])
-            usleep(2_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             driver.send([3])
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 Self.preserve("pty-03", transcript: driver.fullTranscript())
@@ -317,11 +317,11 @@ extension ChatPTYTests {
             guard driver.start() else { Issue.record("pty spawn failed"); return }
             driver.expect("needletail> ", timeoutMS: 30_000)
             driver.send("first\r")
-            #expect(server.waitUntilGateArmed("p4", timeout: 20), "gate never armed")
+            #expect(await server.waitUntilGateArmed("p4", timeout: 20), "gate never armed")
             // Queue a follow-up mid-stream (Enter while busy queues,
             // never sends): exactly one provider request in flight.
             driver.send("queued-while-busy\r")
-            usleep(300_000)
+            try? await Task.sleep(nanoseconds: 300_000_000)
             if server.requests.count != 1 {
                 Self.preserve("pty-04", transcript: driver.fullTranscript())
                 Issue.record("expected exactly one provider request, got \(server.requests.count)"); return
@@ -338,7 +338,7 @@ extension ChatPTYTests {
             }
             // The cancel grace is a deterministic 5 s timer: resume needs
             // the settled interrupted+held state.
-            usleep(7_000_000)
+            try? await Task.sleep(nanoseconds: 7_000_000_000)
             // Ctrl+U clears the proven draft (explicit operator action),
             // then resume unholds and the gate release frees the server
             // from the dead gated stream. A fresh submit dispatches
@@ -367,10 +367,10 @@ extension ChatPTYTests {
             driver.send([21])
             // Inspect the queue before exit (diagnostic for the exit path).
             driver.send("/queue\r")
-            usleep(1_000_000)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
             // Settle-then-exit (same turn-finalization race as PTY-02).
             driver.send([3])
-            usleep(2_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             driver.send([3])
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 Self.preserve("pty-04", transcript: driver.fullTranscript())
@@ -419,7 +419,7 @@ extension ChatPTYTests {
             // second exits once idle. A truly wedged loop still fails
             // the waitExit deadline below.
             driver.send([3])
-            usleep(2_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             driver.send([3])
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 ChatPTYTests.preserve("pty-05", transcript: driver.fullTranscript())
@@ -486,7 +486,7 @@ extension ChatPTYTests {
             // second exits once idle. A truly wedged loop still fails
             // the waitExit deadline below.
             driver.send([3])
-            usleep(2_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             driver.send([3])
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 Self.preserve("pty-06", transcript: driver.fullTranscript())
@@ -541,7 +541,7 @@ extension ChatPTYTests {
             server.enqueue(ChatLoopback.textTurn("persist me", splits: 1))
             server.enqueue(ChatLoopback.textTurn("second", splits: 1))
             let traceURL = env.stateDir.appendingPathComponent("trace.jsonl")
-            let sessionID: String = try {
+            let sessionID: String = try await {
                 let driver = ChatPTYDriver(
                     executable: Self.releaseBinary(),
                     args: ["chat", "--config", env.configPath, "--trace", traceURL.path],
@@ -580,7 +580,7 @@ extension ChatPTYTests {
                     probe.waitUntilExit()
                     if let text = try? String(contentsOf: preURL, encoding: .utf8),
                        text.contains("\"text\":\"remember this\"") { committed = true }
-                    if !committed { usleep(200_000) }
+                    if !committed { try? await Task.sleep(nanoseconds: 200_000_000) }
                 }
                 #expect(committed, "turn must commit durably before SIGTERM")
                 // Catchable SIGTERM: restores termios, exits 143.
@@ -651,7 +651,7 @@ extension ChatPTYTests {
                 exported = (try? String(contentsOf: exportURL, encoding: .utf8)) ?? ""
                 exportedOnce = true
                 if exported.contains("persist me") { break }
-                usleep(200_000)
+                try? await Task.sleep(nanoseconds: 200_000_000)
             }
             _ = exportedOnce
             if !exported.contains("persist me") {
@@ -740,7 +740,7 @@ extension ChatPTYTests {
                     lastPane = pane
                     // capture-pane trims the prompt's trailing space.
                     if pane.contains("needletail>") { ready = true; break }
-                    usleep(100_000)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
                 }
                 if !ready {
                     Self.preserve("pty-08-tmux-noprompt", transcript: lastPane)
@@ -752,7 +752,7 @@ extension ChatPTYTests {
                     let pane = try tmux("capture-pane", "-t", tmuxName, "-p")
                     lastPane = pane
                     if pane.contains("tmux turn ok") { done = true; break }
-                    usleep(100_000)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
                 }
                 if !done {
                     Self.preserve("pty-08-tmux-noturn", transcript: lastPane)
@@ -763,7 +763,7 @@ extension ChatPTYTests {
                 // tmux is covered by the direct-PTY legs; here the
                 // composition proof is prompt + turn + cleanup.
                 _ = try tmux("send-keys", "-t", tmuxName, "C-c")
-                usleep(1_000_000)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
                 _ = try? tmux("kill-session", "-t", tmuxName)
                 if let b = Self.bearerViolation(server) { Issue.record("credential: \(b)") }
             } catch {
@@ -848,7 +848,7 @@ extension ChatPTYTests {
             // Core replay the prior admission as a silent no-op).
             // The fourth provider request proves WHAT was recalled.
             driver.send([0x1B, 0x5B, 0x41]) // Up
-            usleep(500_000)
+            try? await Task.sleep(nanoseconds: 500_000_000)
             driver.send("?")
             driver.send("\r")
             driver.expect("recall done", timeoutMS: 20_000)
@@ -862,7 +862,7 @@ extension ChatPTYTests {
             #expect(!recall.contains("\"content\":\"y"), "decision line must not persist in history")
             // Settle-then-exit (same turn-finalization race as PTY-02).
             driver.send([3])
-            usleep(2_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             driver.send([3])
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 Self.preserve("pty-hygiene", transcript: driver.fullTranscript())
@@ -969,7 +969,7 @@ extension ChatPTYTests {
             #expect(bodies.allSatisfy { $0.contains("same question twice") }, "both turns must carry the submitted text")
             // Settle-then-exit (same turn-finalization race as PTY-02).
             driver.send([3])
-            usleep(2_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             driver.send([3])
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 Self.preserve("pty-resubmit", transcript: driver.fullTranscript())
@@ -1031,7 +1031,7 @@ extension ChatPTYTests {
             }
             // Settle-then-exit (same turn-finalization race as PTY-02).
             driver.send([3])
-            usleep(2_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             driver.send([3])
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 Self.preserve("pty-parity", transcript: driver.fullTranscript())
