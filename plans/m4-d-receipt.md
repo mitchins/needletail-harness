@@ -13,13 +13,16 @@ amendments recorded in-plan).
 
 - Qualified production baseline: `3e9806f` (M4-B).
 - M4-C code HEAD: `6e73568`; M4-C receipt: `c18fa54`.
-- M4-D work HEAD: `c18fa54` + uncommitted working tree (this receipt
-  describes the tree, not a commit; STOP rule — no commit/push).
-  Closeout fingerprint: 18 tracked-modified + 11 untracked paths;
-  `git diff` sha256
+- M4-D work HEAD (M4-D closeout): `bd87724` committed locally
+  (the M4-D implementation commit; `c18fa54` is the M4-C RECEIPT and
+  must never be cited as the M4-D implementation SHA). Prior
+  closeout fingerprint (pre-commit tree): 18 tracked-modified + 11
+  untracked paths; `git diff` sha256
   `26e842ebb6662b5e54c81c57a37318c878500f0ded2575efcc5367ddc56794bb`.
-  Untracked: 7 terminal-test files + `run-m4d-pty.sh` +
-  `plans/m4-d-plan.md` + this receipt + `plans/m4-report.md`.
+- Residual closure commits (all local, no push): `ba723b0`
+  (resubmission fix + evidence), `63c637d` (D4 suites + PTY legs),
+  `06a9bae` (review fixes). Residual receipt updates committed as
+  §11 (this section); final SHA recorded in §11.1 at closeout.
 - `git diff 3e9806f -- Sources/NeedletailCore/ Sources/NeedletailRuntime/`
   is EMPTY (verified repeatedly, last at closeout): no Core/Runtime
   production change. A needed Core/Runtime change was and remains a
@@ -305,27 +308,33 @@ Recorded defects (minor, non-blocking, no redesign):
 `/queue` shows empty — noisy but truthful, no loss, no wedge;
 (b) startup says "unbounded", `/queue` says "unbudgeted" (wording
 inconsistency only).
-New finding from smoke preparation (integration-relevant, kept):
-resubmitting a byte-identical completed line reuses the command ID
-and the actor replays the prior admission WITHOUT dispatching
-(Core `admittedCommands` idempotency, qualified M4-B). Up-arrow
-recall PROVES the draft returns; Enter on the identical text is a
-silent no-op by that qualified semantic — recorded as a known
-limitation, not changed (Core change = plan blocker).
+RESIDUAL CLOSURE — FIXED (was a known limitation, §11.2):
+resubmitting a byte-identical completed line reused the command ID
+(via the adapter's `CommandIDStore` same-text branch) and the actor
+replayed the prior admission WITHOUT dispatching. Root cause was
+adapter-tier, NOT Core: each `.inputLine` is one explicit submission
+event, so the store now mints fresh per call. Core
+`admittedCommands` idempotency is untouched (same-ID retries still
+replay). Two explicit identical submits now admit twice; the silent
+no-op is gone, proven deterministic + release-PTY.
 
 ## 9. Known limitations and explicit deferrals
 
 1. macOS evidence: none (environment-blocked, §5).
-2. D4 named suites unbuilt: `ChatStressTests` (seeded fuzz),
-   `ChatWidthTests` (wcwidth fixtures), `ChatRenderParityTests`
-   (dedicated parity file — parity enforced per PTY leg instead),
-   `ChatAttachTests`/`ChatUndoTests`/`ChatInspectTests` (behaviors
-   covered in `ChatCompositionTests`, not as named files),
-   `GoldenRegenerationProbe` (BDD-07). D4.2 backpressure and D4.4
-   full history-integrity triple are open rows.
+2. D4 named suites: BUILT in residual closure (§11.3):
+   `ChatStressTests` (concurrent owner stress + boundedness, seeded
+   fuzz), `ChatWidthTests` (grapheme-rule width fixtures —
+   wcwidth-2 stays out of scope by the M4-B rule, pinned +
+   recorded), `ChatRenderParityTests` (+ PTY parity leg),
+   `ChatLifecycleTests` (draft/cursor + stale callbacks).
+   `ChatAttachTests`/`ChatUndoTests`/`ChatInspectTests` remain
+   covered inside `ChatCompositionTests` (named-file split not
+   required by the residual scope). `GoldenRegenerationProbe`
+   executed as disposable BDD-07 probes P1/P2 (§11.5), not a
+   committed suite (review-process evidence per BDD-06 precedent).
 3. `/compact` trigger: explicit non-case (plan D0.3.6).
-4. Resubmit-identical-text silent no-op (§8 finding; qualified
-   Core semantic).
+4. Resubmit-identical-text silent no-op: FIXED in residual
+   closure (§11.2) — was an adapter defect, not a Core semantic.
 5. Stale-Tab ignore requires re-tab (no flicker, no clobber; the
    divergence reconcile covers buffer/state convergence).
 6. TERM-04 as-built delta (§3 table).
@@ -342,3 +351,211 @@ because: (a) macOS acceptance is missing (environment, not
 product); (b) D4 named stress/width/parity/probe suites are
 unbuilt (behaviors partially covered, rows open); (c) BDD-07
 probe unbuilt. No M5, no live traffic, no push/PR/merge.
+
+## 11. Residual acceptance closure
+
+Branch `m4-a`, all commits LOCAL (no push/PR/merge). No live model
+traffic. macOS policy (revised): Linux is primary; no repeated
+polling; one native gate when accessible.
+
+### 11.1 Commit map and identity
+
+- `bd87724` M4-D terminal adapter implementation + M4-D evidence and
+  receipts (29 files). This — not `c18fa54` — is the M4-D
+  implementation commit (`c18fa54` is the M4-C receipt).
+- `ba723b0` Residual resubmission fix + deterministic/release-PTY
+  evidence (6 files).
+- `63c637d` Residual D4 suites + PTY legs (6 files).
+- `06a9bae` Residual review fixes: quota-test writer barrier,
+  width-comment count (2 files).
+- this residual section + `plans/m4-report.md` §§7–9 (committed on
+  `m4-a` as the residual receipt commit closing this section; hash
+  reported at closeout in §11.9). Final tree clean.
+- `git diff 3e9806f -- Sources/NeedletailCore Sources/NeedletailRuntime`
+  EMPTY at residual closeout (re-verified): Core/Runtime untouched
+  end to end, including the resubmission fix (adapter-tier only).
+
+### 11.2 Identical-prompt resubmission — FIXED
+
+- Reproduction (TDD, pre-fix RED through the real adapter):
+  `ChatCompositionTests.identicalTextResubmitsAdmitTwice` failed
+  with "identical resubmit never dispatched — silent no-op",
+  `admitted.count == 1`, `server.requests.count == 1`.
+- Root cause: `ComposerBridge.CommandIDStore` returned the SAME
+  command ID for same text. Each `.inputLine` is exactly one
+  explicit submission event (serialized main task; single input
+  thread; stale-arm posts once with the slot taken), so the reuse
+  branch was pure defect — no retry path ever consults the store
+  (retries reuse the already-minted ID below this layer; Core
+  `SessionTransition.swift:940` replay intact).
+- Fix (smallest adapter defect):
+  `ComposerBridge.swift` `id(for:)` mints fresh per call; store
+  keeps only a diagnostic `lastSubmission` record. Doc comments
+  corrected (header + MARK + call-site semantics). Core untouched.
+- Verified contract:
+  - Two explicit identical submits → two genuine admissions (2
+    provider dispatches, 2 distinct admitted command IDs).
+  - Same-ID retry through the same actor replays the identical ack
+    with zero new dispatch (Core contract preserved).
+  - Up-arrow recall submits via Enter as a new event with a fresh
+    ID (store keeps no text→ID map); hygiene PTY leg proves the
+    4th request dispatches.
+  - Exactly 2 requests for 2 events: no drop, no double (delivery
+    is structurally single per event).
+- Evidence: composition test (above) + `ComposerBridgeTests`
+  `commandIDs` rewritten (fresh per call incl. non-consecutive
+  repeat) + `ChatLoopTests.retryReusesID` rewritten (distinct
+  `cmd-1`/`cmd-2` effects) + PTY `identicalResubmitAdmitsTwice`
+  (release binary, byte-identical second Enter after first answer,
+  2 requests both carrying the text, clean exit, allowlist +
+  bearer clean) + hygiene comment refreshed.
+
+### 11.3 D4 suites built
+
+Deterministic tests live in `Tests/NeedletailTerminalTests`; PTY
+evidence lives in `ChatPTYTests`/runners — never mixed.
+
+- `ChatStressTests.swift` (4 tests, D4.1/D4.4):
+  `concurrentControlStormExact` (8 tasks × 50 control emits: all
+  400 written exactly once, stale generation drops);
+  `droppableQuotaGatedWriter` (gated writer + 2×300 producers:
+  exact accounting `written + truncated == 600 + markerDrops`,
+  marker iff engaged; writer-park barrier added per delta review);
+  `concurrentSubmitsDistinct` (64 concurrent posts → 64 effects,
+  64 distinct IDs); `seededSubmissionFuzz` (frozen 200-event
+  interleaving: one effect batch per non-empty line, submits ==
+  plain lines, all IDs distinct).
+- `ChatWidthTests.swift` (6 tests, D4.2): the as-built
+  grapheme-cluster rule through `render()` status-busy carrier —
+  CJK counts 1 unit (not wcwidth-2; edge moves whole), combining
+  pairs never split, flags wrap whole, mixed-script exact
+  boundary, TAB renders as visible `\u{9}` counted literally.
+  wcwidth-2 stays OUT of scope by the M4-B rule (limitation
+  recorded, UX-RENDER-05 closed as grapheme-rule fixtures).
+- `ChatLifecycleTests.swift` (1 test, D4.4): superseded
+  completions drop with draft byte-exact and gate closed; live
+  revision populates the gate.
+- `ChatRenderParityTests.swift` (3 tests, D4.3 semantic side) +
+  PTY `parityFixedScenario` (release side): the SAME hand-written
+  strings (`parity probe`, `parity line one`, `parity line two`)
+  asserted against `render()`/tap-block/candidate rows AND in
+  ordered containment in the release transcript (+ exactly one
+  request). Parity by construction, never generation. Soft-break
+  join is the pinned markdown contract.
+- `run-m4d-pty.sh` required-legs extended: PTY-01…08 start gate
+  plus `confirm hygiene`, `byte-identical second Enter`,
+  `TERM-04`, `PARITY fixed scenario`. Final runner result at
+  closeout tree: **M4D-PTV-OK: ChatPTYTests 13 tests green, all
+  PTY-01…08 started** (11 M4-D legs + resubmit + parity).
+
+### 11.4 Terminal-control and lifecycle counterfactuals (BDD-06 method)
+
+Disposable patches, NAMED oracles, RED captured, byte-identical
+restore verified by sha256, oracle re-run green. Full logs in
+`.needletail-dev/logs/cf-{a,b,c}-red.log` (local retention);
+verbatim RED cores below.
+
+| Probe | Guard removed | Named oracle | RED (verbatim core) | Restore |
+|---|---|---|---|---|
+| CF-A | non-TTY refusal bypass (`ChatCommand.swift:67` → `if false`) | TERM-04 contract (exit 2 + guidance + zero traffic) | shell `chat </dev/null`: exit **0** (not 2), no guidance; session machinery engaged (`note: proceeding read-only with history in session(s) …`, status + budget lines) — refusal proven load-bearing (non-TTY boot even scans the session store) | `bd2c790d…e300dc3f2` match; `term04NonTTYRefusalAndHelp` green |
+| CF-B | EOF `shutdown = true` removed (`ChatLoop.swift:820`) | `scriptedSubmit` (["hello", nil] must terminate) | `timeout 90 swift test --filter scriptedSubmit` → exit **124** (run never terminates without the guard) | `7b287fee…217eb0b7` match; `scriptedSubmit` green (<1 s) |
+| CF-C | stale-strip removed (`ChatLoop.swift:812-816` → `if false`) | `staleTabAcceptDropsCleanly` body oracles | `body.contains("@hex plus")` FAIL (stale preview submitted as text); `!body.contains(snap.display + " plus")` FAIL | `7b287fee…217eb0b7` match; oracle green |
+
+### 11.5 BDD-07 deliberately-wrong golden fixture probes
+
+Baselines (`.needletail-dev/cf-baseline-digests.txt`):
+`ChatLoop.swift 7b287fee…217eb0b7`,
+`ChatCommand.swift bd2c790d…e300dc3f2`,
+`basic-chat.json fc54d113…9dbf2d`,
+`manifest.json 80e5cb9c…3a5a5e5`,
+`GoldenTests.swift fc7ea2a4…f32513`.
+
+- P1 (wrong fixture): `admitted q-1:1` → `q-1:2`. RED: frame
+  test (`actual.runs… == expected.runs…` fail) AND manifest test
+  (`digest == entry.sha256` fail). Log
+  `.needletail-dev/logs/bdd07-p1-red.log`. Restored digest-identical.
+- P2 (same-run regeneration): keys reordered
+  (`{"lines":…,"width":80}`, indent 1) — same semantics, new
+  bytes. Single run: frame test **PASSED** (regeneration
+  self-certifies — the hazard, demonstrated) AND manifest test
+  **FAILED** (`digest == entry.sha256` — the guard catches it).
+  Log `.needletail-dev/logs/bdd07-p2-mixed.log`. Restored
+  digest-identical; `GoldenTests` 6/6 green.
+- Verdict: the manifest sha256 pin is the ONLY barrier between
+  regeneration and silent certification. No auto-regenerated
+  golden certifies itself; baseline restored after every probe.
+
+### 11.6 Review closure and regressions
+
+- Focused DeepSeek delta verification (new work + SIGKILL arming;
+  no broad-review repeat): items 1 (fresh-mint soundness) and 2
+  (SIGKILL arming holds; new legs non-vacuous) PASS. Item 3 found
+  one real flake (quota-test first-grab race) — FIXED with the
+  writer-park barrier (sentinel + `didEnter`), stable 5/5; width
+  comment count fixed; lifecycle sleeps acknowledged as
+  settling-only. Item 4 (receipt/probe-evidence mismatch) fixed
+  by this section. Overall: NEEDS-CHANGES(minor) → all items
+  addressed with evidence; no product-code issue found.
+- Targeted regressions at residual closeout tree:
+  `NeedletailTerminalTests` **143 tests / 21 suites green** (126
+  M4-D + 1 composition resubmit + 4 stress + 6 width + 1
+  lifecycle + 3 parity + 13 PTY legs, incl. resubmit + parity);
+  `NeedletailPresentationTests` **100 / 14 green** (incl.
+  `GoldenTests` 6/6).
+- Full `./dev test offline` at closeout tree: **OFFLINE OK: all
+  scheduled offline layers passed** (93 executed test-run lines,
+  zero `✘`/failures; log
+  `.needletail-dev/logs/m4d-residual-offline.log`). HEAD-01 green
+  in this run.
+- NET-03 provider-integration parallel flake: did NOT manifest in
+  this gate run (HEAD-01 green); REMAINS a standing known issue
+  from M4-D closeout (35/36 at HEAD then, reproduced on pristine
+  `6e73568`) — kept visible, never green-washed.
+
+### 11.7 macOS release acceptance
+
+Single availability check per revised policy (no polling, no
+network/security changes): `Builds-Mac-Pro.local` now resolves
+but fails host-key verification; `192.168.2.106` is reachable but
+denies auth (`Permission denied (publickey…)` in BatchMode).
+Reached-but-inaccessible ≠ acceptance-capable; key/host-key
+handling is out of scope to touch. Verdict: ENVIRONMENT-BLOCKED
+(reachable-but-inaccessible). Linux remains the qualified
+primary; the one complete macOS release-acceptance matrix stays
+outstanding against the frozen candidate (see §11.9). G14
+debug limitations and Intel-vs-Apple-Silicon qualification stay
+as recorded in M4-A/B/C (no macOS evidence added or altered).
+
+### 11.8 Remaining limitations (corrected)
+
+1. macOS release acceptance: outstanding (environment-blocked).
+2. `ChatAttachTests`/`ChatUndoTests`/`ChatInspectTests` as named
+   files: behaviors covered in composition; split not required.
+3. `/compact` trigger: explicit non-case (unchanged).
+4. wcwidth-2 layout: out of scope by M4-B rule; grapheme rule
+   pinned by `ChatWidthTests` (limitation, not a gap).
+5. Provider-integration parallel flake (NET-03 class): visible,
+   pristine-reproducible, never green-washed.
+6. `dev vendor-check` secondary: single documented replxx patch
+   (unchanged).
+7. Stale-Tab ignore needs re-tab (unchanged); resubmit finding
+   from smoke is FIXED (§11.2).
+
+### 11.9 Verdict: M4 PARTIAL — STOP
+
+Linux acceptance is COMPLETE: identical-resubmit fixed with
+deterministic + release-PTY proof; D4 stress/width/lifecycle/
+parity suites built and green (143 terminal, 100 presentation,
+13 PTY, offline OFFLINE OK); counterfactuals CF-A/B/C and BDD-07
+P1/P2 executed with byte-identical restores; focused delta
+review closed (no product-code issue); Core/Runtime still
+byte-identical to `3e9806f`. PARTIAL — not READY — for one
+reason only: the macOS release-acceptance matrix never executed
+(environment-blocked: reachable-but-inaccessible, §11.7). That
+single native gate is the remaining M4 requirement; run it once
+against the frozen candidate when the Mac is accessible, then
+rerun only affected tests. The branch is READY FOR PUSH/PR (separate
+authorization required — NOT performed here) and for aggregate
+CodeRabbit review; merge/close waits on the macOS gate.
+
+No M5, no live traffic, no push/PR/merge.

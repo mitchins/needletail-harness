@@ -1,6 +1,6 @@
 # M4 Milestone Report — Interactive Terminal Integration
 
-Date: 2026-11-09. Branch `m4-a`, local only. No push/PR/merge (STOP).
+Date: 2026-11-09 (residual closure same day). Branch `m4-a`, local only. No push/PR/merge (STOP).
 
 ## 1. What M4 set out to prove
 
@@ -52,13 +52,15 @@ with targeted regression tests.
   filters, zero failures; see receipt §6).
 - Reviews: 6-blocker D7 round closed (Tab race, inspect/denied
   retire, hygiene model, bearer gaps, tautological bound, timeout
-  transcripts) + delta re-review closed (1 remainder fixed).
+  transcripts) + delta re-review closed (1 remainder fixed) +
+  residual delta review closed (focused: fresh-mint soundness PASS,
+  SIGKILL arming holds PASS, 1 test flake + receipt mismatch fixed).
 - Review-found product defects fixed: stale Tab-accept clobber
   path, mid-stream inspect commit-drop, `denied`-as-terminal,
   submit-time liveness retire, empty-history (replxx never
   auto-commits; input loop now commits), missing bearer oracles.
 
-## 5. Gaps (why PARTIAL, not READY)
+## 5. Gaps at M4-D closeout (SUPERSEDED by residual §§7–9 below; retained for history)
 
 - macOS acceptance: none (host unreachable; single check, no
   re-poll). Real-SSH path outstanding; Linux real-tmux stands as
@@ -76,9 +78,63 @@ with targeted regression tests.
   instead); resubmit-identical-text silent no-op (qualified Core
   idempotency).
 
-## 6. Recommendation: M4 PARTIAL — STOP
+## 6. Recommendation at M4-D closeout (SUPERSEDED by §9 below; retained for history)
 
 Merge/close M4-D Linux evidence as the qualified interactive
 baseline; carry macOS acceptance, D4 stress rows, and the BDD-07
 probe as the explicit M5 prerequisites (no M5 work started).
 Full detail: `plans/m4-d-receipt.md`.
+
+## 7. Residual closure (same branch, local commits, no push)
+
+Implementation commits: `bd87724` (M4-D adapter — the M4-D
+implementation SHA; `c18fa54` is the M4-C receipt and must never be
+cited for M4-D code), `ba723b0` (identical-resubmit fix),
+`63c637d` (D4 suites + PTY legs), `06a9bae` (review fixes),
+plus the receipt/report commit (see receipt §11.1). Core/Runtime
+still byte-identical to `3e9806f`.
+
+- Identical-prompt resubmission FIXED (adapter `CommandIDStore`
+  now mints per submission event; Core contract preserved):
+  composition repro RED → green (2 admissions, same-ID retry
+  replays), unit + loop tests rewritten, PTY
+  `identicalResubmitAdmitsTwice` green.
+- D4 built: `ChatStressTests` (4: control-storm exact, quota
+  accounting, 64-submit storm, seeded fuzz),
+  `ChatWidthTests` (6: grapheme rule, CJK/combining/flags/mixed/TAB;
+  wcwidth-2 out of scope recorded),
+  `ChatLifecycleTests` (stale completions),
+  `ChatRenderParityTests` (3) + PTY `parityFixedScenario`;
+  runner 13/13. Counterfactuals CF-A/B/C RED→restore-verified;
+  BDD-07 P1/P2 executed (frame self-certifies, manifest catches).
+  Full detail + digests + verbatim RED cores: receipt §11.
+- macOS: single check — host now reachable-but-inaccessible
+  (host-key verification fails; auth denied). No changes, no
+  retries. ENVIRONMENT-BLOCKED; Linux primary per revised policy.
+
+## 8. Gaps (residual-corrected)
+
+- macOS release-acceptance matrix: outstanding
+  (environment-blocked; the single remaining M4 gate — run once
+  against the frozen candidate when accessible).
+- Attach/undo/inspect as named files: behaviors covered in
+  composition (split not required).
+- Standing limitations (unchanged): NET-03-class parallel flake
+  (visible, pristine-reproducible); vendor-check secondary
+  (single documented patch); `/compact` non-case; stale-Tab
+  re-tab; wcwidth-2 out of scope.
+
+## 9. Recommendation: M4 PARTIAL — STOP
+
+Linux acceptance is complete (resubmit fixed + proven; D4 suites
+green: 143 terminal / 100 presentation / 13 PTY / offline OFFLINE
+OK; CF-A/B/C + BDD-07 P1/P2 with verified restores; delta review
+closed; Core/Runtime byte-identical to `3e9806f`). PARTIAL solely
+because the macOS release-acceptance matrix never executed
+(reachable-but-inaccessible host; single remaining gate — run once
+against the frozen candidate when accessible). The branch is ready
+for push/PR (authorization required, not performed) and aggregate
+CodeRabbit review; merge/close waits on the macOS gate. No M5, no
+live traffic, no push/PR/merge.
+
+Full detail: `plans/m4-d-receipt.md` (§11 residual closure).
