@@ -107,10 +107,16 @@ stream_bounded() {
     _sb_log="$root_dir/.needletail-dev/logs/dev-$_sb_label.log"
     mkdir -p "$root_dir/.needletail-dev/logs"
     : > "$_sb_log"
-    # A stale timeout flag from an earlier run must never fail this one.
+    # A stale timeout flag can never fail a later run.
     rm -f "$_sb_log.timeout"
-    tail -n +1 -f "$_sb_log" 2>/dev/null &
+    # Live stream with wall-clock prefixes (awk is POSIX-portable):
+    # CI forensics needs to know WHEN each line landed, not just its
+    # order — the 60-minute silent feasibility stall was ambiguous
+    # between "hung test" and "slow suite" without timestamps.
+    tail -n +1 -f "$_sb_log" 2>/dev/null | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' &
     _sb_tail=$!
+    "$@" > "$_sb_log" 2>&1 &
+    _sb_pid=$!
     "$@" > "$_sb_log" 2>&1 &
     _sb_pid=$!
     (
@@ -164,9 +170,12 @@ stream_bounded() {
     else
         _sb_rc=$?
     fi
-    # Let the follower drain the final bytes before it is reaped.
+    # Let the follower drain the final bytes before it is reaped, then
+    # reap the whole follower pipeline (awk is $!; its tail feeds it
+    # and would linger forever on the open log otherwise).
     sleep 2
     kill "$_sb_killer" "$_sb_watch" "$_sb_tail" 2>/dev/null || true
+    pkill -f "tail -n +1 -f $_sb_log" 2>/dev/null || true
     wait 2>/dev/null || true
     if [ -f "$_sb_log.timeout" ]; then
         echo "FAIL [$_sb_label]: deadline kill after ${_sb_secs}s (exit $_sb_rc). Diagnostics:"
