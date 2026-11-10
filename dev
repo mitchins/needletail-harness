@@ -89,14 +89,16 @@ require_test_result() {
     fi
 }
 # Bounded, streaming phase runner (CI logging + per-phase bounds): the
-# command's output goes to the phase log AND to stdout live (tail -f),
-# so a stall is visible instead of silent. A heartbeat names the last
-# active output every 5 min while the phase runs. A hard deadline kills
-# the phase with diagnostics (process tree + log tail + last-active
-# lines) plus best-effort cleanup of owned children (direct test
-# runners via pkill -P; daemonized tmux legs by session prefix — the
-# in-test defers are the primary cleanup). Returns the command's exit
-# code, or 124 on deadline kill (like timeout(1)). POSIX sh only.
+# command's output goes to the phase log AND to stdout live (tail -f
+# with wall-clock prefixes, so a hang names its last-active suite),
+# a heartbeat names the last output every 5 min, and a hard deadline
+# kills the phase with pre-kill diagnostics (process tree + threads +
+# wchan + log tail) plus best-effort cleanup of owned children
+# (pid-snapshot tree kill). In-test defers are the primary cleanup;
+# this runner deliberately performs no tmux-specific cleanup (a
+# `tmux ls` probe would itself hang on a wedged server). Returns the
+# command's exit code, or 124 on deadline kill (like timeout(1)).
+# POSIX sh only.
 # All descendant pids of $1 (recursive walk; used for timeout kills —
 # pids are snapshotted BEFORE any signal, so later reparenting cannot
 # hide a victim from the KILL pass).
@@ -121,8 +123,6 @@ stream_bounded() {
     # between "hung test" and "slow suite" without timestamps.
     tail -n +1 -f "$_sb_log" 2>/dev/null | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' &
     _sb_tail=$!
-    "$@" > "$_sb_log" 2>&1 &
-    _sb_pid=$!
     "$@" > "$_sb_log" 2>&1 &
     _sb_pid=$!
     (

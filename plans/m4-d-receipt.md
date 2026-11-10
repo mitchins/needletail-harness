@@ -624,12 +624,15 @@ candidate; diffLeg Glibc-gated + hermetic git; PTYDriver EOF-hit
 fix (the `count < 0` break REJECTED: `nt_pty_read` returns −1 on
 routine select-timeout per `nt_pty.c:114-116` — breaking would fail
 every >250 ms output gap; all expect paths are deadline-bounded);
-tmux `kill-session` deferred + PATH-resolved + bounded `tmux()`
-(caller-side 30 s poll — no spawned watchdog thread on the hang
-path — plus bounded pipe read: a daemonized tmux server can hold
-the client stdout pipe open forever; CI orphan fingerprint) +
-10 min leg deadline that throws to the loud catch path (validated
-locally against a wedged-tmux stub: loud failure in 31 s);
+tmux `kill-session` deferred (registered before `new-session`) +
+PATH-resolved + bounded `tmux()` (caller-side 30 s poll, SIGTERM
+then SIGKILL escalation, then loud throw — no spawned watchdog
+thread on the hang path) with stdout captured to a FILE, never a
+pipe (a daemonized tmux server can inherit the client's stdout
+and hold a pipe open forever — the actual CI orphan mechanism;
+verified: file capture cannot block) + 10 min leg deadline that
+throws to the loud catch path (validated locally against a
+wedged-tmux stub: loud failure in 31 s);
 coalescing assertion timing-independent; CSI empty params
 positional; ChatLoop/ChatLifecycle sleeps converted to readiness
 waits (markers, effect batches, gate snapshots, bounded joins);
@@ -644,16 +647,20 @@ run-m4d-pty mkdir order + `#!/usr/bin/env bash`.
 
 ### 12.3 CI schedule changes (`dev` + workflows)
 
-- `stream_bounded`: every phase streams live (`tail -f`), heartbeats
-  every 5 min, and dies on a hard per-phase deadline with process
-  tree + log tail + owned-process cleanup (pid-snapshot tree kill —
-  verified twice: rc 124, zero strays; daemonized tmux legs killed
-  by session prefix). A stale timeout flag can never fail a later
-  run (deleted at phase start). In-test unbounded joins eliminated:
-  ChatLoopTests/ChatLifecycleTests use bounded joins; ChatPTYTests
-  uses settleThenExit with positional freshness polling +
-  non-recording drain reads; ChatCompositionTests uses bounded
-  joinRun (the CI feasibility stall was an unbounded
+- `stream_bounded`: every phase streams live (`tail -f` with
+  wall-clock prefixes), heartbeats every 5 min, and dies on a hard
+  per-phase deadline (set BELOW the step timeout so diagnostics land
+  first) with pre-kill forensics (process tree + threads + wchan +
+  fd counts + log tail) plus best-effort cleanup of owned children
+  (pid-snapshot tree kill — verified: rc 124, zero strays). A stale
+  timeout flag can never fail a later run (deleted at phase start).
+  All test invocations route through one line-buffered runner
+  (`stdbuf` where available), so a hang always names its last test.
+  In-test unbounded joins eliminated: ChatLoopTests/ChatLifecycleTests/
+  ChatStressTests use bounded joins; ChatPTYTests uses settleThenExit
+  with positional freshness polling + non-recording drain reads and
+  file-captured (never piped) tmux output; ChatCompositionTests uses
+  bounded joinRun (the CI feasibility stall was an unbounded
   `await task.value` in finishRun/requireReady — now a loud ≤50 s
   failure naming the wedged test instead of a silent hang).
 - Redundancy removed: `test native` dropped from the aggregate
@@ -697,3 +704,31 @@ standalone green, file untouched by this change).
 Remaining M4 requirement: macOS native matrix only (unchanged).
 Targeted Darwin `tcflag_t` correction does not authorize another
 Mac campaign — single final matrix against the frozen tree.
+
+### 12.5 Independent adversarial review (DeepSeek, post-remediation)
+
+Two read-only review passes ran over the finished remediation;
+both sets of findings were actioned before push:
+
+- Operational review: the bare `tmux kill-server` incidents were
+  diagnosed as a capability-retention failure (promises without
+  enforcement, tail-end habit completion, no pre-execution check).
+  Standing rule adopted: no unscoped destructive commands, ever —
+  no bare `tmux kill*`, no `pkill -f` patterns (also removed as a
+  pattern from `dev`), one destructive action per invocation max,
+  confirm-before-destroy with ownership proof.
+- Code review: found one CRITICAL self-inflicted defect — the
+  streaming edit had duplicated the phase command launch in
+  `stream_bounded`, so every bounded phase ran its suite TWICE
+  (second PID untracked; the bare `wait` could block on the
+  untracked copy and defeat the phase bound). Fixed by deleting
+  the duplicate line; verified single-launch by inspection.
+  Also corrected: `readTmuxPipe`'s `availableData` is a blocking
+  read (the 10 s deadline could never fire mid-block), so tmux
+  output capture moved to a temp file (files never block);
+  no SIGKILL escalation after `terminate()`; the kill-session
+  `defer` was registered only after `new-session` (moved before
+  it); `-L` hermetic tmux investigated and REVERTED (deterministic
+  local new-session hang with test-spawned tmux, mechanism
+  unproven — default socket retained; CI hang occurs without it,
+  so `-L` was not the CI fix).

@@ -2,6 +2,11 @@ import Testing
 import Foundation
 import NeedletailCore
 import NeedletailTestSupport
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 /// M4-D D3 physical PTY acceptance: the ACTUAL release `needletail
 /// chat` binary under a real terminal process (PTYShim forkpty),
@@ -105,30 +110,6 @@ struct ChatPTYTests {
         let dir = repoRoot() + "/.needletail-dev/m4d-pty"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try? transcript.write(toFile: dir + "/\(name).log", atomically: true, encoding: .utf8)
-    }
-
-    /// Bounded pipe read for the tmux helper below. Never blocks:
-    /// a daemonized tmux server can hold the client's stdout pipe
-    /// open across its daemon fork, so readDataToEndOfFile would wait
-    /// forever for an EOF that never comes (the CI feasibility stall
-    /// fingerprint). Returns what arrived within the grace; tmux
-    /// client output is small and prompt.
-    private static func readTmuxPipe(_ pipe: Pipe) -> String {
-        var out = Data()
-        let handle = pipe.fileHandleForReading
-        var quietRounds = 0
-        let deadline = Date().addingTimeInterval(10)
-        while quietRounds < 3, Date() < deadline {
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                quietRounds += 1
-                if quietRounds < 3 { Thread.sleep(forTimeInterval: 0.1) }
-            } else {
-                out.append(chunk)
-                quietRounds = 0
-            }
-        }
-        return String(decoding: out, as: UTF8.self)
     }
 
     /// Settle-then-exit without a blind sleep. The first Ctrl+C exits an
@@ -759,8 +740,21 @@ extension ChatPTYTests {
                 // /usr/bin/tmux misses Homebrew (/opt/homebrew, /usr/local).
                 proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
                 proc.arguments = ["tmux"] + args
-                let pipe = Pipe()
-                proc.standardOutput = pipe
+                // Capture to a FILE, never a pipe: a daemonized tmux
+                // server can inherit the client's stdout and hold a pipe
+                // open forever, so no pipe read (blocking or polling) is
+                // a safe join primitive here. Files never block.
+                let outURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("m4d-pty08-out-\(UUID().uuidString).log")
+                FileManager.default.createFile(atPath: outURL.path, contents: nil)
+                guard let outHandle = FileHandle(forWritingAtPath: outURL.path) else {
+                    throw TestSkip.tmuxFailed("cannot open capture file")
+                }
+                defer {
+                    try? outHandle.close()
+                    try? FileManager.default.removeItem(at: outURL)
+                }
+                proc.standardOutput = outHandle
                 try proc.run()
                 // Bounded join, polled by the CALLER (never a spawned
                 // watchdog thread — thread creation must not be on the
@@ -771,24 +765,30 @@ extension ChatPTYTests {
                     Thread.sleep(forTimeInterval: 0.1)
                 }
                 if proc.isRunning {
+                    // SIGTERM first (clean exit path); escalate to SIGKILL:
+                    // a client wedged in an uninterruptible server wait
+                    // must not survive as an orphan, and waitUntilExit
+                    // must have a dead child to reap.
                     proc.interrupt()
                     proc.terminate()
+                    Thread.sleep(forTimeInterval: 1)
+                    if proc.isRunning {
+                        kill(proc.processIdentifier, SIGKILL)
+                    }
                     throw TestSkip.tmuxFailed("tmux hung: \(args.joined(separator: " "))")
                 }
                 proc.waitUntilExit()
                 guard proc.terminationStatus == 0 else { throw TestSkip.tmuxFailed(args.joined(separator: " ")) }
-                // Bounded read (never readDataToEndOfFile: a daemonized
-                // tmux server can hold this pipe open forever).
-                return Self.readTmuxPipe(pipe)
+                return (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
             }
+            // Cleanup on EVERY exit path, registered BEFORE the first
+            // tmux call: a new-session failure must still attempt the
+            // kill (no-op if the session was never created).
+            defer { _ = try? tmux("kill-session", "-t", tmuxName) }
             do {
                 _ = try tmux("new-session", "-d", "-s", tmuxName, "-x", "80", "-y", "24",
                                "-e", "NEEDLETAIL_STATE_DIR=\(env.stateDir.path)",
                                "-e", "\(ChatLoopback.credentialEnv)=\(ChatLoopback.credentialValue)")
-                // Cleanup on EVERY exit path: a thrown tmux() call or a
-                // failed #expect below must not leak the detached session
-                // (and its live chat child) past tearDown.
-                defer { _ = try? tmux("kill-session", "-t", tmuxName) }
                 // Leg deadline: with a sick tmux server every call can
                 // burn its 30 s watchdog (150+200 iterations would exceed
                 // any step budget silently). A deadline breach throws to
