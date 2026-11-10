@@ -80,7 +80,7 @@ struct ChatLoopTests {
         loop.post(.inputLine("same"))
         #expect(await waitForEffects(2, in: effects, timeout: 5), "resubmit never dispatched")
         loop.post(.inputLine(nil))
-        await task.value
+        #expect(await join(task: task, timeout: 5), "loop did not exit")
         let fx = await effects.all()
         // Guard BEFORE indexing: #expect records but does not return,
         // and indexing a short array traps (ud2/SIGILL), killing the
@@ -228,7 +228,7 @@ struct ChatLoopTests {
         loop.post(.inputLine("second"))
         #expect(await waitForEffects(1, in: effects, timeout: 5), "follow-up never dispatched")
         loop.post(.inputLine(nil))
-        await runTask.value
+        #expect(await join(task: runTask, timeout: 5), "loop did not exit")
         let final = await decision
         #expect(final == .approve)
         // The decision line was consumed as a confirm, not a submit:
@@ -457,7 +457,7 @@ struct ChatLoopTests {
         loop.post(.inputLine("second"))
         #expect(await waitForEffects(1, in: effects, timeout: 5), "follow-up never dispatched")
         loop.post(.inputLine(nil))
-        await runTask.value
+        #expect(await join(task: runTask, timeout: 5), "loop did not exit")
         let fx = await effects.all()
         guard fx.count == 1 else {
             Issue.record("only the follow-up submits, got \(fx.count) effect batches")

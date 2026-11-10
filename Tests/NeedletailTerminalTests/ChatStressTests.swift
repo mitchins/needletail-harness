@@ -17,6 +17,26 @@ struct ChatStressTests {
         TerminalCaps(color: false, cursorAddressing: false, width: 80)
     }
 
+    /// Bounded run-task join: a wedged loop fails the test instead of
+    /// hanging the suite (same class as the CI feasibility stall).
+    private func join(task: Task<Void, Never>, timeout: TimeInterval) async -> Bool {
+        final class Flag: @unchecked Sendable {
+            let lock = NSLock()
+            var done = false
+        }
+        let flag = Flag()
+        Task {
+            await task.value
+            flag.lock.withLock { flag.done = true }
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if flag.lock.withLock({ flag.done }) { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
+    }
+
     private static func emptySnapshot() -> QueueSyncSnapshot {
         QueueSyncSnapshot(entries: [], activeRequest: nil, queueHeld: false,
                           heldReason: nil, pendingApproval: nil,
@@ -151,7 +171,7 @@ struct ChatStressTests {
         guard written.joined().contains("idle") else {
             Issue.record("loop never rendered initial frame")
             loop.post(.inputLine(nil))
-            await runTask.value
+            _ = await join(task: runTask, timeout: 5)
             return
         }
         // 64 submissions race into the thread-safe inbox from 64
@@ -164,7 +184,7 @@ struct ChatStressTests {
             }
         }
         loop.post(.inputLine(nil))
-        await runTask.value
+        #expect(await join(task: runTask, timeout: 30), "loop did not exit after the storm")
         let fx = await effects.all()
         #expect(fx.count == 64, "expected 64 effect batches, got \(fx.count)")
         var ids: [CommandID] = []

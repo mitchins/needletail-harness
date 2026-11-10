@@ -57,7 +57,15 @@ swift_test() {
     # One test worker at a time: loopback suites share process/OS
     # resources, and multi-worker Swift Testing showed cross-suite
     # connection flakes on this Linux builder. Filter semantics stay exact.
-    "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"
+    # Line-buffered runner output when stdbuf exists (CI Ubuntu):
+    # block-buffered file output hides the last-started test inside a
+    # hang — heartbeats and timeout diagnostics must name it. macOS
+    # has no stdbuf; the fallback is plain (buffered) execution.
+    if command -v stdbuf >/dev/null 2>&1; then
+        stdbuf -o0 -e0 "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"
+    else
+        "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"
+    fi
 }
 
 # False-pass guards (M0-D):
