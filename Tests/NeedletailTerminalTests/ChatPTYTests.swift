@@ -762,15 +762,19 @@ extension ChatPTYTests {
                 let pipe = Pipe()
                 proc.standardOutput = pipe
                 try proc.run()
-                // Bounded join: a wedged tmux server must fail this leg,
-                // never hang the suite (the CI feasibility stall fingerprint
-                // was a live runner + live tmux server with zero output).
-                let watchdog = Thread {
-                    Thread.sleep(forTimeInterval: 30)
-                    if proc.isRunning { proc.interrupt(); proc.terminate() }
+                // Bounded join, polled by the CALLER (never a spawned
+                // watchdog thread — thread creation must not be on the
+                // critical path of a hang bound). A wedged tmux server
+                // must fail this leg loudly, never hang the suite.
+                let tmuxDeadline = Date().addingTimeInterval(30)
+                while proc.isRunning, Date() < tmuxDeadline {
+                    Thread.sleep(forTimeInterval: 0.1)
                 }
-                watchdog.name = "pty08-tmux-watchdog"
-                watchdog.start()
+                if proc.isRunning {
+                    proc.interrupt()
+                    proc.terminate()
+                    throw TestSkip.tmuxFailed("tmux hung: \(args.joined(separator: " "))")
+                }
                 proc.waitUntilExit()
                 guard proc.terminationStatus == 0 else { throw TestSkip.tmuxFailed(args.joined(separator: " ")) }
                 // Bounded read (never readDataToEndOfFile: a daemonized
