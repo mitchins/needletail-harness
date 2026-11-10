@@ -98,6 +98,19 @@ echo "DBG verification OK" | tee -a $LOG
 
 echo "=== 2. precise G14-only lift ===" | tee -a $LOG
 FILES="Tests/NeedletailActorTests/QueueIntegrationTests.swift Tests/NeedletailActorTests/QueueAttachmentActorTests.swift Tests/NeedletailActorTests/QueueCrashActorTests.swift Tests/NeedletailStateTests/QueueContractTests.swift Tests/NeedletailStateTests/QueueDurabilityTests.swift Tests/NeedletailStateTests/UndoTests.swift Tests/NeedletailStateTests/QueueReorderTests.swift"
+# Restore-on-any-exit: the -O verification below exits non-zero on
+# mismatch, which would otherwise strand the lifted edits in the tree
+# (breaking the byte-identical-restore promise). The trap restores
+# every pristine backup and drops the derived .sha artifacts on EVERY
+# exit path; step 4 keeps its own restore+verify for the normal path
+# (idempotent — guards skip already-restored files).
+restore_all() {
+  for f in $FILES; do
+    if [ -f "$f.pristine-b6final" ]; then mv "$f.pristine-b6final" "$f"; fi
+    rm -f "$f.sha-b6final"
+  done
+}
+trap restore_all EXIT
 for f in $FILES; do
   [ -f "$f" ] || { echo "MISSING $f" | tee -a $LOG; continue }
   cp "$f" "$f.pristine-b6final"

@@ -120,9 +120,10 @@ struct VTProjection {
         guard j < scalars.endIndex else { sawUnsupported = true; return j }
         let final = scalars[j]
         let after = scalars.index(after: j)
-        let numbers = params.split(separator: ";").map { Int($0) ?? 0 }
+        let fields = params.split(separator: ";", omittingEmptySubsequences: false)
         func n(_ index: Int, default def: Int) -> Int {
-            index < numbers.count && !(index == numbers.count - 1 && params.hasSuffix(";")) ? numbers[index] : def
+            guard index < fields.count, !fields[index].isEmpty else { return def }
+            return Int(fields[index]) ?? def
         }
         switch final {
         case "A": cursorRow = max(1, cursorRow - max(1, n(0, default: 1)))

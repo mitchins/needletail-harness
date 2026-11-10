@@ -319,8 +319,6 @@ public enum ComposerBridge {
                 return .notice("usage: /rewind <epochID>#<throughSequence>", actions: [clearMirror()])
             }
             return .actions([.rewindRequest(boundary: boundary), clearMirror()])
-        case "compact":
-            return .actions([.inspect(.compactDryRun), clearMirror()])
         case "cancel":
             return .actions([.queueOp(.cancelRun), clearMirror()])
         case "keys":
@@ -418,6 +416,9 @@ public enum ComposerBridge {
                 return .actions([.queueOp(.editEntry(entryID: entry.entryID, newText: parts[2], baseRevision: entry.revision)), clearMirror()])
             }
             // reorder <n> [before <m>]: m omitted moves to the head.
+            // Core treats a nil anchor as "append at end", so the bare
+            // form anchors on the first live (queued/held) entry other
+            // than the moved entry. No such entry: already at head.
             var beforeID: String? = nil
             if parts.count == 3 {
                 let tail = parts[2].split(separator: " ", omittingEmptySubsequences: true).map(String.init)
@@ -427,6 +428,13 @@ public enum ComposerBridge {
                 beforeID = state.queue[m - 1].entryID
             } else if parts.count > 3 {
                 return .notice("usage: /queue reorder <n> [before <m>]", actions: [clearMirror()])
+            } else {
+                guard let head = state.queue.first(where: {
+                    ($0.state == "queued" || $0.state == "held") && $0.entryID != entry.entryID
+                }) else {
+                    return .notice("queue entry \(index) is already at the head", actions: [clearMirror()])
+                }
+                beforeID = head.entryID
             }
             return .actions([.queueOp(.reorderEntry(entryID: entry.entryID, beforeID: beforeID)), clearMirror()])
         default:

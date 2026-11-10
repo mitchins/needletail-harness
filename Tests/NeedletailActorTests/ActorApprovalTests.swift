@@ -122,18 +122,31 @@ struct ActorApprovalTests {
     @Test("POLICY-04 trustedExec auto-allows; observe denies upfront")
     func POLICY_04_modesEndToEnd() async throws {
         // TrustedExec with an edit batch: no approval request is emitted.
+        // Hold the executor gate open: without it `executing` is
+        // transient (the canned executor auto-completes in one burst)
+        // and the test races the scheduler for the observation window —
+        // under load the window is missed and the single-response
+        // non-final script then wedges the continuation pump
+        // (POLICY-04 CI flake). The gate keeps `executing` observable;
+        // `isFinal: true` describes the single complete turn (no phantom
+        // continuation for the script to exhaust).
         let trustedApprovals = ScriptedApprovals()
         trustedApprovals.script = [.deny("must never be asked")]
         let tTransport = ScriptedTransport()
-        let (tActor, _) = try ActorFixtures.makeActor(mode: .trustedExec, permissive: true, transport: tTransport, executor: ScriptedExecutor(), approvals: trustedApprovals)
+        let tExecutor = ScriptedExecutor()
+        let (gateStream, releaseGate) = AsyncStream<Void>.makeStream()
+        tExecutor.gate = gateStream
+        let (tActor, _) = try ActorFixtures.makeActor(mode: .trustedExec, permissive: true, transport: tTransport, executor: tExecutor, approvals: trustedApprovals)
         tTransport.script = [ProviderResponse(
             requestID: RequestID("s"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
                 ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
-            ], isFinal: false))]
+            ], isFinal: true))]
         await tActor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(tActor, { $0.phase == .executing }, "trustedExec executing")
         #expect(trustedApprovals.requests.isEmpty, "no approval asked in trustedExec")
+        #expect(tTransport.invocations.count == 1, "single turn, single invocation")
+        releaseGate.finish()
     }
 
     @Test("HEAD-03 approval precedence: ask-gated schema-valid exec still asks")

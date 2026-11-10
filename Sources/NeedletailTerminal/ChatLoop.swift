@@ -372,10 +372,12 @@ public final class ChatLoop: @unchecked Sendable {
                 self.owner.emitText(ComposerBridge.pendingExitWarning, generation: self.owner.currentGeneration)
                 return .continue
             case .exit:
-                self.lock.withLock {
-                    self.ctrlCExitArmed = false
-                    self.shutdown = true
-                }
+                // `.abort` bails `readLine`, which returns nil; the
+                // input thread then posts `.inputLine(nil)` and exits,
+                // and the main task sets `shutdown` in
+                // `handleSubmitLine` (main-owned — never written here,
+                // so the input thread cannot race the main-task read).
+                self.lock.withLock { self.ctrlCExitArmed = false }
                 return .abort
             }
         }
@@ -460,7 +462,15 @@ public final class ChatLoop: @unchecked Sendable {
         }
         guard let (box, saved) = slot else { return }
         if box.isSettled {
-            // Stale arm (cancelled/superseded): normal submission path.
+            // Stale arm (cancelled/superseded): normal submission path —
+            // but the decision line was already auto-committed to history
+            // on accept, so drop it first (D2.7: no persisted decision
+            // lines on ANY path through the confirm gate).
+            if let line, !line.isEmpty, !fromMain {
+                if !lineEditor.dropLastHistoryEntry(matching: line) {
+                    post(.notice("confirm hygiene: decision line not found in history; it may persist — press Up-arrow to check", .warning))
+                }
+            }
             post(.inputLine(line))
             return
         }

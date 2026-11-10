@@ -11,7 +11,7 @@ qualified M4-B pure contracts. No M4-D work; no push/PR/merge (STOP).
 - M4-C code HEAD: `6e73568cb5b1e30466af8f98c7b9889a4e69540c`;
   receipt HEAD: resolve via `git rev-parse HEAD` (this commit adds
   only `plans/m4-c-receipt.md` on top of the code commit).
-- `git diff 3e9806f..HEAD -- Sources/NeedletailCore/ Sources/NeedletailRuntime/` is EMPTY except NOTHING — no Core/Runtime production change. (Verify at commit.)
+- `git diff 3e9806f..6e73568 -- Sources/NeedletailCore/ Sources/NeedletailRuntime/` is EMPTY — no Core/Runtime production change (verified 2026-11-10: empty output, zero stat lines).
 - Change set (vs `fce17a3`):
   - `Package.swift` / `Package.resolved`: new `NeedletailTerminal`
     target + `.exact("0.9.0")` swift-markdown edge; CLI gains

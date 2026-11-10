@@ -74,16 +74,139 @@ require_test_result() {
         exit 1
     fi
 }
+# Bounded, streaming phase runner (CI logging + per-phase bounds): the
+# command's output goes to the phase log AND to stdout live (tail -f),
+# so a stall is visible instead of silent. A heartbeat names the last
+# active output every 5 min while the phase runs. A hard deadline kills
+# the phase with diagnostics (process tree + log tail + last-active
+# lines) plus best-effort cleanup of owned children (direct test
+# runners via pkill -P; daemonized tmux legs by session prefix — the
+# in-test defers are the primary cleanup). Returns the command's exit
+# code, or 124 on deadline kill (like timeout(1)). POSIX sh only.
+# All descendant pids of $1 (recursive walk; used for timeout kills —
+# pids are snapshotted BEFORE any signal, so later reparenting cannot
+# hide a victim from the KILL pass).
+_sb_tree() {
+    _t_root="$1"
+    for _t_c in $(ps -o pid=,ppid= 2>/dev/null | awk -v p="$_t_root" '$2==p {print $1}'); do
+        echo "$_t_c"
+        _sb_tree "$_t_c"
+    done
+}
+
+stream_bounded() {
+    _sb_label="$1"; _sb_secs="$2"; shift 2
+    _sb_log="$root_dir/.needletail-dev/logs/dev-$_sb_label.log"
+    mkdir -p "$root_dir/.needletail-dev/logs"
+    : > "$_sb_log"
+    # A stale timeout flag from an earlier run must never fail this one.
+    rm -f "$_sb_log.timeout"
+    tail -n +1 -f "$_sb_log" 2>/dev/null &
+    _sb_tail=$!
+    "$@" > "$_sb_log" 2>&1 &
+    _sb_pid=$!
+    (
+        _sb_slept=0
+        while kill -0 "$_sb_pid" 2>/dev/null; do
+            if [ "$_sb_slept" -ge "$_sb_secs" ]; then
+                echo "TIMEOUT [$_sb_label]: exceeded ${_sb_secs}s — terminating owned processes."
+                touch "$_sb_log.timeout"
+                # Snapshot the tree BEFORE signalling: a toolchain shim
+                # may defer TERM while waiting for its child, and KILL
+                # reparents survivors to init — pid-list kills land
+                # regardless of reparenting.
+                _sb_victims=$( _sb_tree "$_sb_pid" )
+                kill -TERM "$_sb_pid" 2>/dev/null || true
+                for _sb_v in $_sb_victims; do
+                    kill -TERM "$_sb_v" 2>/dev/null || true
+                done
+                sleep 10
+                for _sb_v in $_sb_victims; do
+                    kill -KILL "$_sb_v" 2>/dev/null || true
+                done
+                kill -KILL "$_sb_pid" 2>/dev/null || true
+                # Daemonized tmux legs escape the process tree: kill only
+                # our prefixed sessions (CI runners are ephemeral).
+                if command -v tmux >/dev/null 2>&1; then
+                    tmux ls 2>/dev/null | grep -o 'm4d-pty08-[^ :]*' | while read -r _s; do
+                        tmux kill-session -t "$_s" 2>/dev/null || true
+                    done
+                fi
+                break
+            fi
+            sleep 10
+            _sb_slept=$((_sb_slept + 10))
+        done
+    ) &
+    _sb_killer=$!
+    (
+        while kill -0 "$_sb_pid" 2>/dev/null; do
+            sleep 300
+            kill -0 "$_sb_pid" 2>/dev/null || break
+            # Leading blank line: the follower may be mid-line, so the
+            # header must not glue onto streamed test output.
+            echo ""
+            echo "STILL-RUNNING [$_sb_label]: last output:"
+            tail -5 "$_sb_log" 2>/dev/null || true
+        done
+    ) &
+    _sb_watch=$!
+    if wait "$_sb_pid"; then
+        _sb_rc=0
+    else
+        _sb_rc=$?
+    fi
+    # Let the follower drain the final bytes before it is reaped.
+    sleep 2
+    kill "$_sb_killer" "$_sb_watch" "$_sb_tail" 2>/dev/null || true
+    wait 2>/dev/null || true
+    if [ -f "$_sb_log.timeout" ]; then
+        echo "FAIL [$_sb_label]: deadline kill after ${_sb_secs}s (exit $_sb_rc). Diagnostics:"
+        echo "---- process tree (evidence: $_sb_log) ----"
+        ps -ef 2>/dev/null | grep -a -e swift -e needletail -e tmux | grep -a -v grep | head -20 || true
+        echo "---- last 30 log lines (evidence: $_sb_log) ----"
+        tail -30 "$_sb_log" || true
+        return 124
+    fi
+    return "$_sb_rc"
+}
+
+# Per-phase hard deadlines (seconds, generous: 3-6x the observed
+# local 4-core durations; the CI stall was 5.5 h of silence, so any
+# bound here converts that class into a diagnosed failure).
+# NEEDLETAIL_PHASE_SECS_OVERRIDE (debugging only) replaces every
+# budget — validates the timeout/diagnostic path cheaply.
+phase_secs() {
+    if [ -n "${NEEDLETAIL_PHASE_SECS_OVERRIDE:-}" ]; then
+        echo "$NEEDLETAIL_PHASE_SECS_OVERRIDE"
+        return
+    fi
+    case "$1" in
+        quick) echo 1500 ;;
+        native) echo 900 ;;
+        timing) echo 900 ;;
+        e2e) echo 2700 ;;
+        feasibility) echo 3600 ;;
+        coverage-evidence) echo 2700 ;;
+        coverage-ingest) echo 900 ;;
+        coverage-sonar-serial) echo 1800 ;;
+        coverage-sonar-timing) echo 900 ;;
+        coverage-sonar-e2e) echo 2700 ;;
+        coverage-sonar-feasibility) echo 3600 ;;
+        coverage-sonar-*) echo 1800 ;;
+        cases-*) echo 1800 ;;
+        *) echo 1200 ;;
+    esac
+}
+
 run_swift_test() {
     _label="$1"; shift
     _log="$root_dir/.needletail-dev/logs/dev-$_label.log"
-    mkdir -p "$root_dir/.needletail-dev/logs"
-    if swift_test "$@" > "$_log" 2>&1; then
+    if stream_bounded "$_label" "$(phase_secs "$_label")" swift_test "$@"; then
         _rc=0
     else
         _rc=$?
     fi
-    cat "$_log"
     if [ "$_rc" -ne 0 ]; then
         echo "FAIL [$_label]: test runner exited $_rc (evidence: $_log). Not a pass."
         exit "$_rc"
@@ -186,14 +309,13 @@ test)
         _timing_log="$root_dir/.needletail-dev/logs/dev-timing.log"
         _timing_xunit_base="$root_dir/.needletail-dev/xunit/results-timing.xml"
         _timing_xunit_actual="${_timing_xunit_base%.xml}-swift-testing.xml"
-        mkdir -p "$root_dir/.needletail-dev/logs" "$root_dir/.needletail-dev/xunit"
+        mkdir -p "$root_dir/.needletail-dev/xunit"
         rm -f "$_timing_xunit_base" "$_timing_xunit_actual"
-        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter TransportCancellationTests --xunit-output "$_timing_xunit_base" > "$_timing_log" 2>&1; then
+        if stream_bounded timing "$(phase_secs timing)" "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter TransportCancellationTests --xunit-output "$_timing_xunit_base"; then
             _timing_rc=0
         else
             _timing_rc=$?
         fi
-        cat "$_timing_log"
         if [ "$_timing_rc" -ne 0 ]; then
             echo "FAIL [timing]: test runner exited $_timing_rc (evidence: $_timing_log). Not a pass."
             exit "$_timing_rc"
@@ -223,14 +345,13 @@ test)
         _e2e_log="$root_dir/.needletail-dev/logs/dev-e2e.log"
         _e2e_xunit_base="$root_dir/.needletail-dev/xunit/results-e2e.xml"
         _e2e_xunit_actual="${_e2e_xunit_base%.xml}-swift-testing.xml"
-        mkdir -p "$root_dir/.needletail-dev/logs" "$root_dir/.needletail-dev/xunit"
+        mkdir -p "$root_dir/.needletail-dev/xunit"
         rm -f "$_e2e_xunit_base" "$_e2e_xunit_actual"
-        if "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests --xunit-output "$_e2e_xunit_base" > "$_e2e_log" 2>&1; then
+        if stream_bounded e2e "$(phase_secs e2e)" "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests --xunit-output "$_e2e_xunit_base"; then
             _e2e_rc=0
         else
             _e2e_rc=$?
         fi
-        cat "$_e2e_log"
         if [ "$_e2e_rc" -ne 0 ]; then
             echo "FAIL [e2e]: test runner exited $_e2e_rc (evidence: $_e2e_log). Not a pass."
             exit "$_e2e_rc"
@@ -335,44 +456,73 @@ test)
         ;;
     offline)
         # M1-A aggregate gate over every scheduled offline layer: fast pure
-        # suites, native primitive probes, the bounded PTY feasibility
-        # scenario, catalogue reconciliation, and the nine M1-A case filters
-        # (pure + spawn-binary integration). No live provider, no PTY
-        # product suite, no packaging container. Each stage reuses the
-        # guarded runners above, so a crash/zero-match anywhere fails here.
+        # suites (quick; `native` is a strict filter-subset of quick and
+        # runs standalone only, not in the gate), serialized timing/e2e
+        # lanes, the bounded PTY feasibility scenario, catalogue
+        # reconciliation against the lanes' xunit (each lane executes
+        # EXACTLY once per gate), and the deterministic case filters
+        # (pure + spawn-binary integration). No live provider, no
+        # packaging container. Every stage is bounded and streaming
+        # (stream_bounded), so a crash/stall/zero-match anywhere fails
+        # here with diagnostics instead of silence.
         echo "== offline aggregate: quick =="
         "$0" test quick
-        echo "== offline aggregate: native =="
-        "$0" test native
         echo "== offline aggregate: timing (serialized NET-04 promptness) =="
         "$0" test timing
         echo "== offline aggregate: e2e (serialized OS-heavy suites) =="
         "$0" test e2e
         echo "== offline aggregate: feasibility =="
         "$0" test feasibility
-        echo "== offline aggregate: coverage =="
-        "$0" coverage
-        for _m1a_case in CFG-01 CFG-02 CFG-03 CFG-04 CFG-05 CFG-06 POLICY-02 POLICY-05 NET-01; do
-            echo "== offline aggregate: case $_m1a_case =="
-            run_case "$_m1a_case"
-        done
-        for _m1b_case in CORE-02 CORE-03 CORE-04 POLICY-03 POLICY-04 STATE-01 STATE-04 PORT-02 DX-01 DX-02 DX-03 DX-06 DX-07; do
-            echo "== offline aggregate: case $_m1b_case =="
-            run_case "$_m1b_case"
-        done
-        for _m1c_case in WIRE-01 WIRE-02 WIRE-03 WIRE-04 WIRE-05 WIRE-06 WIRE-07 WIRE-08 WIRE-09 WIRE-10 NET-02 NET-03 NET-04 NET-05 NET-06 DX-04 DX-05; do
-            echo "== offline aggregate: case $_m1c_case =="
-            run_case "$_m1c_case"
-        done
-        # M1-D deterministic headless integration cases. BDD-06 remains
-        # review-process evidence (probe→guard→oracle logs + receipt) and
-        # BDD-08 remains the committed frozen replay, both reconciled by the
-        # slice report rather than counted by this aggregate runner.
-        for _m1d_case in CORE-01 HEAD-01 HEAD-02 HEAD-03; do
-            echo "== offline aggregate: case $_m1d_case =="
-            run_case "$_m1d_case"
-        done
+        echo "== offline aggregate: coverage (bulk evidence + merge + ingest) =="
+        "$0" coverage-from-lanes
+        echo "== offline aggregate: cases m1a =="
+        stream_bounded cases-m1a "$(phase_secs cases-m1a)" "$0" test case-group m1a
+        echo "== offline aggregate: cases m1b =="
+        stream_bounded cases-m1b "$(phase_secs cases-m1b)" "$0" test case-group m1b
+        echo "== offline aggregate: cases m1c =="
+        stream_bounded cases-m1c "$(phase_secs cases-m1c)" "$0" test case-group m1c
+        echo "== offline aggregate: cases m1d =="
+        stream_bounded cases-m1d "$(phase_secs cases-m1d)" "$0" test case-group m1d
         echo "OFFLINE OK: all scheduled offline layers passed."
+        ;;
+    case-group)
+        # Aggregate-internal test subcommand: one deterministic
+        # case-filter group (see `test offline`). Runs under the
+        # caller's stream_bounded.
+        case "${1:?usage: ./dev test case-group {m1a,m1b,m1c,m1d\}}" in
+        m1a)
+            for _c in CFG-01 CFG-02 CFG-03 CFG-04 CFG-05 CFG-06 POLICY-02 POLICY-05 NET-01; do
+                echo "== offline aggregate: case $_c =="
+                run_case "$_c"
+            done
+            ;;
+        m1b)
+            for _c in CORE-02 CORE-03 CORE-04 POLICY-03 POLICY-04 STATE-01 STATE-04 PORT-02 DX-01 DX-02 DX-03 DX-06 DX-07; do
+                echo "== offline aggregate: case $_c =="
+                run_case "$_c"
+            done
+            ;;
+        m1c)
+            for _c in WIRE-01 WIRE-02 WIRE-03 WIRE-04 WIRE-05 WIRE-06 WIRE-07 WIRE-08 WIRE-09 WIRE-10 NET-02 NET-03 NET-04 NET-05 NET-06 DX-04 DX-05; do
+                echo "== offline aggregate: case $_c =="
+                run_case "$_c"
+            done
+            ;;
+        m1d)
+            # M1-D deterministic headless integration cases. BDD-06 remains
+            # review-process evidence (probe→guard→oracle logs + receipt) and
+            # BDD-08 remains the committed frozen replay, both reconciled by the
+            # slice report rather than counted by this aggregate runner.
+            for _c in CORE-01 HEAD-01 HEAD-02 HEAD-03; do
+                echo "== offline aggregate: case $_c =="
+                run_case "$_c"
+            done
+            ;;
+        *)
+            echo "usage: ./dev test case-group {m1a,m1b,m1c,m1d}"
+            exit 2
+            ;;
+        esac
         ;;
     *)
         usage
@@ -380,7 +530,21 @@ test)
         ;;
     esac
     ;;
-coverage)
+    coverage)
+    # Standalone reconciliation: isolated lanes first (fresh xunit —
+    # a stale report can never pass), then evidence + merge + ingest.
+    # The offline aggregate runs the lanes itself and calls
+    # `coverage-from-lanes` so timing/e2e execute EXACTLY once per
+    # gate (they are the slow lanes; re-running them doubled the
+    # gate's longest phases).
+    "$0" test timing
+    "$0" test e2e
+    "$0" coverage-from-lanes
+    ;;
+    coverage-from-lanes)
+    # Aggregate-internal: bulk evidence + merge + ingest against the
+    # lane xunit this gate run just produced. Do not invoke directly
+    # (stale lane xunit from an older run would merge silently).
     # M2-0: join ACTUAL Swift Testing runner output to the catalogue via the
     # single ResultsReconciler (no second reconciler, no invented evidence).
     # Phase 1 runs the evidence suites with --xunit-output. SwiftPM writes
@@ -399,20 +563,13 @@ coverage)
     mkdir -p "$(dirname "$_xunit_base")"
     rm -f "$_xunit_base" "$_xunit_actual" "$_xunit_merged"
     echo "Reconciling executed results ($FILTER_BEHAVIOUR + $FILTER_PRIMITIVE + $FILTER_STATE_PURE) against cases/catalog.json."
-    # FINAL-02 A (CodeRabbit confirmation review): the NET-04 promptness
-    # suite is certified in the isolated `timing` lane, not rerun here —
-    # the bulk run would reintroduce the scheduler contention the lane
-    # removes. FINAL-03: the OS-heavy E2E suites likewise run only in
-    # the isolated `e2e` lane (bulk contention starved them into
-    # infra-shaped flakes). Both lanes' tests remain INGEST evidence:
-    # each lane emits xunit (fresh here, so a stale report can never
-    # pass) and merge-xunit.py joins the union for reconciliation —
-    # disjointness and counts are asserted, a missing lane report fails
-    # closed.
-    echo "== coverage: isolated NET-04 timing evidence =="
-    "$0" test timing
-    echo "== coverage: isolated E2E evidence =="
-    "$0" test e2e
+    # FINAL-02 A / FINAL-03: the NET-04 promptness suite and the OS-heavy
+    # E2E suites run only in their isolated lanes (bulk contention
+    # starved them into infra-shaped flakes). Both lanes' tests remain
+    # INGEST evidence via the lane xunit this gate run just produced
+    # (fresh: each lane deletes its report at start, and the merge
+    # below asserts disjointness + counts while a missing lane report
+    # fails closed).
     run_swift_test coverage-evidence --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_STATE_PURE" $BULK_SKIP --xunit-output "$_xunit_base"
     if [ ! -f "$_xunit_actual" ]; then
         echo "FAIL [coverage]: runner wrote no xunit output at $_xunit_actual. Not a pass."
@@ -437,18 +594,104 @@ coverage)
     echo "COVERAGE OK: executed results reconciled (evidence: $_xunit_merged)."
     ;;
 vendor-check)
-    # Vendored integrity. OFFLINE FIRST: SHA256SUMS-vendored records the
-    # blob hashes of the pinned upstream commit (1f149bfe...), so
-    # `sha256sum -c` verifies the vendored tree on any clean checkout
-    # without a reference clone. The clone check (byte-for-byte against a
-    # local full clone in ThirdParty/replxx) is an optional secondary.
+    # Vendored integrity. OFFLINE FIRST:
+    # - `SHA256SUMS-upstream` records the blob hashes of the pinned
+    #   upstream commit (1f149bfe...) for every file under `replxx/`.
+    # - `patches/*.patch` are the ONLY allowed deviations from
+    #   upstream: each is a reviewed unified diff with repo-rooted
+    #   a/ b/ paths, touching exactly one file under `replxx/`.
+    # The tree file keeps the patched bytes (that is what builds and
+    # what PTY-02 qualifies); the check proves tree == upstream +
+    # registered patches, both directions:
+    #   (R) reverse-applying the patch to the tree file yields bytes
+    #       whose SHA-256 equals the upstream manifest entry, and
+    #   (F) forward-applying the patch to those pristine bytes
+    #       reproduces the tree file byte-for-byte.
+    # Unpatched files must match the upstream manifest directly. A
+    # hand edit anywhere in a patched file breaks (R) or (F); an
+    # unregistered edit breaks the direct check. The manifest is never
+    # rewritten to bless a tree edit. The clone check (byte-for-byte
+    # against a local full clone in ThirdParty/replxx) is optional.
     status=0
-    if (cd "$root_dir/Sources/CReplxx/replxx" && sha256sum -c ../SHA256SUMS-vendored >/dev/null 2>&1); then
-        echo "VENDOR OK (offline): all vendored sources match the pinned upstream blob hashes"
-    else
-        echo "FAIL: vendored sources do not match SHA256SUMS-vendored"
-        (cd "$root_dir/Sources/CReplxx/replxx" && sha256sum -c ../SHA256SUMS-vendored 2>&1 | grep -v ': OK' | head -5)
-        status=1
+    manifest="$root_dir/Sources/CReplxx/SHA256SUMS-upstream"
+    patchdir="$root_dir/Sources/CReplxx/patches"
+    tmpd="$root_dir/.needletail-dev/logs/vendor-check-tmp"
+    rm -rf "$tmpd"
+    mkdir -p "$tmpd/pristine" "$tmpd/roundtrip"
+    for patch in "$patchdir"/*.patch; do
+        [ -f "$patch" ] || continue
+        nfiles=$(grep -c '^+++ b/' "$patch" || true)
+        if [ "$nfiles" != "1" ]; then
+            echo "FAIL: $patch touches $nfiles files (one file per patch)."
+            status=1
+            continue
+        fi
+        rel=$(grep '^+++ b/' "$patch" | sed 's/^\+\+\+ b\///')
+        base=$(basename "$rel")
+        case "$rel" in
+            Sources/CReplxx/replxx/*) ;;
+            *) echo "FAIL: $patch targets $rel outside Sources/CReplxx/replxx/."; status=1; continue ;;
+        esac
+        want=$(awk -v b="$base" '$2 == b {print $1}' "$manifest")
+        if [ -z "$want" ]; then
+            echo "FAIL: $base has no upstream manifest entry."
+            status=1
+            continue
+        fi
+        # (R) reverse direction: tree minus patch must be upstream bytes.
+        mkdir -p "$tmpd/pristine/$(dirname "$rel")"
+        cp "$root_dir/$rel" "$tmpd/pristine/$rel"
+        if ! git -C "$tmpd/pristine" apply --reverse --check "$patch" 2>"$tmpd/reverse-check.err"; then
+            echo "FAIL: $patch does not reverse-apply to the tree file:"
+            cat "$tmpd/reverse-check.err"
+            status=1
+            continue
+        fi
+        git -C "$tmpd/pristine" apply --reverse "$patch"
+        got=$(sha256sum "$tmpd/pristine/$rel" | awk '{print $1}')
+        if [ "$got" != "$want" ]; then
+            echo "FAIL: $rel minus $patch hashes to $got, upstream wants $want."
+            status=1
+            continue
+        fi
+        # (F) forward direction: patch applied to pristine must rebuild the tree file.
+        mkdir -p "$tmpd/roundtrip/$(dirname "$rel")"
+        cp "$tmpd/pristine/$rel" "$tmpd/roundtrip/$rel"
+        git -C "$tmpd/roundtrip" apply --check "$patch" 2>"$tmpd/forward-check.err" || {
+            echo "FAIL: $patch does not forward-apply to pristine $base:"
+            cat "$tmpd/forward-check.err"
+            status=1
+            continue
+        }
+        git -C "$tmpd/roundtrip" apply "$patch"
+        if ! cmp -s "$tmpd/roundtrip/$rel" "$root_dir/$rel"; then
+            echo "FAIL: $patch applied to upstream $base does not reproduce the tree file."
+            status=1
+            continue
+        fi
+        echo "PATCH OK: $rel == upstream + $(basename "$patch") (both directions verified)"
+    done
+    # Direct check for every unpatched manifest entry.
+    while read -r sum name; do
+        [ -n "$sum" ] || continue
+        case "$name" in
+            \#*) continue ;;
+        esac
+        patched=0
+        for patch in "$patchdir"/*.patch; do
+            [ -f "$patch" ] || continue
+            if [ "$(basename "$(grep '^+++ b/' "$patch" | sed 's/^\+\+\+ b\///')")" = "$name" ]; then
+                patched=1
+            fi
+        done
+        if [ "$patched" = "1" ]; then continue; fi
+        if ! (cd "$root_dir/Sources/CReplxx/replxx" && echo "$sum  $name" | sha256sum -c - >/dev/null 2>&1); then
+            echo "FAIL: unpatched vendored file $name does not match SHA256SUMS-upstream"
+            status=1
+        fi
+    done < "$manifest"
+    if [ "$status" -eq 0 ]; then
+        echo "VENDOR OK (offline): tree == pinned upstream + registered patches (reverse + forward verified)"
     fi
     # Secondary check when a reference clone is present. The clone verdict
     # has its own flag: the shared `status` may already be set by the
@@ -474,13 +717,31 @@ vendor-check)
                     clone_ok=0
                     continue
                 fi
-                if ! cmp -s "$f" "$upstream"; then
+                # Patched files compare as pristine (tree minus the
+                # registered patch); everything else compares directly.
+                cmp_src="$f"
+                for patch in "$root_dir/Sources/CReplxx/patches"/*.patch; do
+                    [ -f "$patch" ] || continue
+                    if [ "$(basename "$(grep '^+++ b/' "$patch" | sed 's/^\+\+\+ b\///')")" = "$base" ]; then
+                        rm -rf "$tmpd/clone"
+                        mkdir -p "$tmpd/clone"
+                        cp "$f" "$tmpd/clone/$base"
+                        git -C "$tmpd/clone" apply --reverse -p4 "$patch" 2>/dev/null || {
+                            echo "FAIL: registered patch does not reverse-apply to $base (clone check)"
+                            status=1
+                            clone_ok=0
+                            continue 2
+                        }
+                        cmp_src="$tmpd/clone/$base"
+                    fi
+                done
+                if ! cmp -s "$cmp_src" "$upstream"; then
                     echo "FAIL: $base differs from the pinned upstream clone"
                     status=1
                     clone_ok=0
                 fi
             done
-            [ "$clone_ok" -eq 1 ] && echo "VENDOR OK (clone): byte-identical to the pinned upstream commit"
+            [ "$clone_ok" -eq 1 ] && echo "VENDOR OK (clone): tree matches the pinned upstream commit modulo registered patches"
         fi
     else
         echo "NOTE: no reference clone at $upstream_dir (gitignored); offline manifest check is authoritative."
@@ -590,19 +851,57 @@ coverage-sonar)
         echo "exec \"$_realbin\" \"\$@\""
     } > "$_wrap"
     chmod +x "$_wrap"
-    echo "== coverage-sonar: full instrumented test run (assertions non-blocking) =="
+    echo "== coverage-sonar: lane-structured instrumented runs (assertions non-blocking) =="
     _cov_start=$(date +%s)
-    # --no-parallel: coverage must be deterministic. A SIGPIPE-killed
-    # runner (observed on CI) silently dropped whole modules from the
-    # report and failed the gate on understated coverage; a serialized
-    # run removes that variable entirely.
-    if NEEDLETAIL_BIN="$_wrap" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution --no-parallel > "$_sonar_log" 2>&1; then
-        _sonar_rc=0
+    # Lane structure mirrors the offline gate (same test SET as the old
+    # single serial run, split for bounds + parallelism — never bigger
+    # runners): parallel bulk, serialized actor/integration, serialized
+    # timing, serialized e2e, PTY/feasibility. Every lane shares the
+    # instrumented build and the profraw trees; NEEDLETAIL_BIN routes
+    # every spawned child through the coverage wrapper on every lane
+    # (identical to the old single-invocation behavior).
+    _sonar_rc=0
+    _lane_rc=0
+    # Worst-rc tracking: a signal/interruption death in ANY lane must
+    # fail the lane (interrupted runs understate coverage). Assertion
+    # failures (rc 1) never invalidate executed coverage.
+    note_lane_rc() {
+        _lane_rc=$1
+        if [ "$_lane_rc" -gt "$_sonar_rc" ]; then
+            _sonar_rc="$_lane_rc"
+        fi
+    }
+    echo "== coverage-sonar: bulk (parallel) =="
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-bulk "$(phase_secs coverage-sonar-bulk)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests" $BULK_SKIP; then
+        :
     else
-        _sonar_rc=$?
+        note_lane_rc $?
     fi
-    cat "$_sonar_log"
-    echo "NOTE [coverage-sonar]: test runner exited $_sonar_rc; assertion failures do not invalidate executed coverage (see lane comment)."
+    echo "== coverage-sonar: actor + integration (serialized) =="
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-serial "$(phase_secs coverage-sonar-serial)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter "NeedletailActorTests" --filter "NeedletailConfigIntegrationTests" --filter "NeedletailProviderIntegrationTests"; then
+        :
+    else
+        note_lane_rc $?
+    fi
+    echo "== coverage-sonar: timing (serialized) =="
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-timing "$(phase_secs coverage-sonar-timing)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter TransportCancellationTests; then
+        :
+    else
+        note_lane_rc $?
+    fi
+    echo "== coverage-sonar: e2e (serialized) =="
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-e2e "$(phase_secs coverage-sonar-e2e)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests; then
+        :
+    else
+        note_lane_rc $?
+    fi
+    echo "== coverage-sonar: feasibility (PTY terminal suite) =="
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-feasibility "$(phase_secs coverage-sonar-feasibility)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter NeedletailTerminalTests; then
+        :
+    else
+        note_lane_rc $?
+    fi
+    echo "NOTE [coverage-sonar]: instrumented lanes exited with worst rc $_sonar_rc; assertion failures do not invalidate executed coverage (see lane comment)."
     # Signal/interruption deaths are NOT assertion failures: a runner
     # killed mid-run (128+N) leaves whole modules unmeasured, so the
     # merged report would understate coverage — refuse, do not certify.

@@ -104,11 +104,11 @@ struct ComposerBridgeTests {
             Issue.record("reorder must produce actions"); return
         }
         #expect(ro.contains(.queueOp(.reorderEntry(entryID: "e2", beforeID: "e1"))))
-        // reorder bare moves to head
+        // reorder bare moves to head (anchors before the first live entry)
         guard case .actions(let roTop) = ComposerBridge.actionsForSubmitLine("/queue reorder 2", state: qs, commandID: cid) else {
             Issue.record("bare reorder must produce actions"); return
         }
-        #expect(roTop.contains(.queueOp(.reorderEntry(entryID: "e2", beforeID: nil))))
+        #expect(roTop.contains(.queueOp(.reorderEntry(entryID: "e2", beforeID: "e1"))))
         // unknown indices are usage notices, never actions
         guard case .notice = ComposerBridge.actionsForSubmitLine("/queue withdraw 9", state: qs, commandID: cid) else {
             Issue.record("out-of-range index must be a usage notice"); return
@@ -152,16 +152,14 @@ struct ComposerBridgeTests {
     @Test("slash errors and deferrals are explicit notices")
     func slashEdge() {
         let cid = commandID
-        for cmd in ["/", "/steer", "/rewind nope", "/bogus q",
-                    "/compact extra-ok"] {
+        for cmd in ["/", "/steer", "/rewind nope", "/bogus q"] {
             let outcome = ComposerBridge.actionsForSubmitLine(cmd, state: idleState(), commandID: cid)
             switch outcome {
             case .notice(let text, let actions):
                 #expect(!text.isEmpty)
                 #expect(actions == [.input(.replaceDraft(""))])
             case .actions:
-                // /compact with trailing text still maps (dry-run only).
-                #expect(cmd.hasPrefix("/compact"))
+                Issue.record("unexpected actions for \(cmd)")
             case .rejected:
                 Issue.record("unexpected reject for \(cmd)")
             }
@@ -348,6 +346,10 @@ struct ComposerBridgeTests {
         guard case .notice = ComposerBridge.actionsForSubmitLine("/models extra", state: idleState(), commandID: cid) else {
             Issue.record("/models extra must be a usage notice"); return
         }
+        guard case .notice(let compactUsage, _) = ComposerBridge.actionsForSubmitLine("/compact extra-ok", state: idleState(), commandID: cid) else {
+            Issue.record("/compact extra-ok must be a usage notice"); return
+        }
+        #expect(compactUsage.contains("usage: /compact"))
     }
 
     @Test("preview slash resolves @path, rejects ranges and empties")

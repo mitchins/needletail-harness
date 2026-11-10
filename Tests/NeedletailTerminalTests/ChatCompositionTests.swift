@@ -680,17 +680,32 @@ extension ChatCompositionTests {
         #expect(env.server.requests.isEmpty, "inspect legs must not touch the provider")
     }
 
+#if canImport(Glibc) // GitDiff.run pins cwd via fchdir; Darwin denies (see M4-A G-cwd)
     @Test("D2 /diff renders bounded hunks with mixed provenance (no authorship claim)")
     func diffLeg() async throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("chat-diff-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
+        // Portable git resolution (no hard-coded path: Homebrew and
+        // minimal images disagree) with a hermetic child environment:
+        // inherited GIT_* would redirect the fixture at the caller's
+        // repository, and commit.gpgsign would fail the fixture commit
+        // under a signing configuration (mirrors TOOL10 runGit).
+        guard let gitBin = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].first(where: {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }) else {
+            Issue.record("git fixture setup failed (no git binary found)")
+            return
+        }
         func git(_ args: String...) throws {
             let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            proc.executableURL = URL(fileURLWithPath: gitBin)
             proc.arguments = args
             proc.currentDirectoryURL = base
+            var e = ProcessInfo.processInfo.environment
+            for key in e.keys where key.hasPrefix("GIT_") { e.removeValue(forKey: key) }
+            proc.environment = e
             try proc.run()
             proc.waitUntilExit()
             guard proc.terminationStatus == 0 else { throw TestSkip.gitUnavailable }
@@ -701,7 +716,7 @@ extension ChatCompositionTests {
             try git("config", "user.name", "t")
             try "line one\n".write(to: base.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
             try git("add", "f.txt")
-            try git("commit", "-qm", "base")
+            try git("-c", "commit.gpgsign=false", "commit", "-qm", "base")
             try "line one\nline two\n".write(to: base.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
         } catch {
             Issue.record("git fixture setup failed (git required for the /diff leg): \(error)")
@@ -720,6 +735,7 @@ extension ChatCompositionTests {
         #expect(await waitUntil(env, "line two"), "/diff must render the unstaged hunk; tail: \(env.written.joined().suffix(400))")
         await finishRun(session, task: task)
     }
+#endif
 
     enum TestSkip: Error {
         case gitUnavailable

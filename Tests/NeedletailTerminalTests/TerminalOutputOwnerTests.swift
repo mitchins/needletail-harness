@@ -100,8 +100,11 @@ struct TerminalOutputOwnerTests {
         o2.setProgress("streaming… 50 bytes", generation: o2.currentGeneration)
         o2.flush()
         let writes2 = box2.values()
-        #expect(writes2.count == 1)
-        #expect(writes2[0].contains("50 bytes"))
+        // The writer thread may drain the 40-byte update before the
+        // 50-byte call lands: assert the guaranteed property (the
+        // latest update wins, nothing follows it), never one drain.
+        #expect((1...2).contains(writes2.count))
+        #expect(writes2.last?.contains("50 bytes") == true, "latest update wins")
 
         let plainBox = LockedBox()
         let plain = owner(caps: .plain, written: plainBox)
@@ -119,6 +122,25 @@ struct TerminalOutputOwnerTests {
         noColor.setProgress("streaming… 1 byte", generation: noColor.currentGeneration)
         noColor.flush()
         #expect(noColorBox.values().isEmpty)
+    }
+
+    @Test("content clears a visible progress line before writing")
+    func contentClearsVisibleProgress() {
+        let box = LockedBox()
+        let o = owner(written: box)
+        defer { o.close() }
+        let g = o.currentGeneration
+        o.setProgress("streaming… 10 bytes", generation: g)
+        o.flush()
+        o.emit([RenderedLine(spans: [TextSpan(text: "hello", role: .normal)])], generation: g)
+        o.flush()
+        let writes = box.values()
+        #expect(writes.count == 3)
+        #expect(writes[0].contains("10 bytes"))
+        // The progress line is cleared before the content batch lands,
+        // so stale progress text is never committed to scrollback.
+        #expect(writes[1] == "\r\u{1B}[K")
+        #expect(writes[2].contains("hello"))
     }
 
     @Test("progress path never carries live control bytes (C5.2 partial oracle)")

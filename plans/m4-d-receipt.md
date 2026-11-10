@@ -342,7 +342,7 @@ no-op is gone, proven deterministic + release-PTY.
 8. `dev vendor-check` secondary clone check reports the single
    documented replxx patch (primary manifest check passes).
 
-## 10. Verdict: M4 PARTIAL — STOP
+## 10. Verdict: M4 PARTIAL — STOP (SUPERSEDED by §11 below; retained for history)
 
 Linux M4-D evidence is complete and green (PTY-01…08 on the
 release product, 126-test terminal suite, composition, smoke,
@@ -559,3 +559,130 @@ authorization required — NOT performed here) and for aggregate
 CodeRabbit review; merge/close waits on the macOS gate.
 
 No M5, no live traffic, no push/PR/merge.
+
+## 12. CI + CodeRabbit remediation (PR #10, post-§11)
+
+Authorization: M4 epic PR authorization (push branch, open draft PR
+#10, reconcile CI + aggregate CodeRabbit review; no M5, live
+traffic, merge or release).
+
+### 12.1 The six-hour stall — identified cause
+
+CI run `42606665708` (HEAD `2a6f3ea`): the `offline` job spent
+5 h 39 min (11:30:28 → 17:09:20Z) inside
+`== offline aggregate: feasibility ==` with zero further output,
+then hit the 6 h job cap. Last completed phases: quick 3m03s,
+native 59s, timing 12s, e2e 8m35s. Kill-time orphans:
+`NeedletailTerminalTests-test-runner` + `tmux: server` — the stall
+is inside the terminal suite with a tmux session live (PTY-08's
+tmux leg is the only tmux user).
+
+Three compounding causes, all demonstrated:
+1. Logging defect (construction): `run_swift_test` redirected the
+   whole runner output to a file and catted it only at completion —
+   a stall is invisible by design. The CI log cannot name the
+   in-suite site; the orphans place it in feasibility/PTY-08.
+2. Unbounded waits in the PTY-08 tmux helper (`waitUntilExit` +
+   `readDataToEndOfFile` with no deadline) plus success-path-only
+   `kill-session` cleanup — a wedged tmux server hangs the runner
+   forever and leaks the session + live chat child (the exact
+   orphan fingerprint).
+3. One serial 6 h job with no per-phase bounds: quick/native/
+   timing/e2e/feasibility/coverage/cases ran as a single step, so
+   one stuck suite consumed the whole budget silently.
+
+Fixes (§12.3, §12.4): streaming logs, per-phase hard bounds with
+diagnostics + owned-process cleanup, bounded tmux waits + defer
+cleanup (test tier), phase split into individually bounded CI
+steps (same job — branch protection unchanged).
+
+### 12.2 CodeRabbit 27 findings — dispositions
+
+Critical + Major, both fixed with regression cover:
+- Darwin `tcflag_t` (LineEditorSession): genuine macOS build break
+  (`UInt32` into `tcflag_t`==`UInt` fields); fixed with the fields'
+  own type on both branches (Linux compile-verified; Darwin branch
+  compiles on the final native matrix).
+- Vendored replxx edit: restored provenance honesty via a formal
+  patch process — upstream bytes untouched, `patches/0001-*.patch`
+  + `SHA256SUMS-upstream`, `vendor-check` verifies BOTH directions
+  (tree−patch == upstream hash; patch+pristine == tree bytes).
+  PTY-02 (exact submitted text) still green on identical tree bytes.
+
+Product-code minors (all with regression tests):
+stale-rangeError clear (UIReducer), input-thread shutdown race
+removed (ChatLoop), duplicate `/compact` arm removed, bare
+`/queue reorder` anchors on the first live entry (was: tail),
+stale-arm history drop on the confirm path, progress-line clear
+before content batches.
+
+Test-oracle minors: vacuous file legs stripped from the pure
+UndoTests (actor test carries the violable inverse-op assertion);
+QueueReorder replay seeds pre-move admissions + withdrawn-entry
+refusal leg; TOOL10 `binary()` rejects directories on every
+candidate; diffLeg Glibc-gated + hermetic git; PTYDriver EOF-hit
+fix (the `count < 0` break REJECTED: `nt_pty_read` returns −1 on
+routine select-timeout per `nt_pty.c:114-116` — breaking would fail
+every >250 ms output gap; all expect paths are deadline-bounded);
+tmux `kill-session` deferred + PATH-resolved + 30 s watchdog join;
+coalescing assertion timing-independent; CSI empty params
+positional; ChatLoop/ChatLifecycle sleeps converted to readiness
+waits (markers, effect batches, gate snapshots, bounded joins);
+PTY-04 7 s sleep → bounded resume-retry; 8 settle-then-exit sleeps
+→ `settleThenExit` readiness helper (exit probe + positional
+fresh-idle/warning poll + bounded final join).
+
+Docs/scripts: m4-c diff verified empty (recorded), m4-d §10 marked
+superseded, m4-a toolchain comparison + full tarball digest
+corrected from `transfer.log`, run-b6final trap-restore,
+run-m4d-pty mkdir order + `#!/usr/bin/env bash`.
+
+### 12.3 CI schedule changes (`dev` + workflows)
+
+- `stream_bounded`: every phase streams live (`tail -f`), heartbeats
+  every 5 min, and dies on a hard per-phase deadline with process
+  tree + log tail + owned-process cleanup (pid-snapshot tree kill —
+  verified twice: rc 124, zero strays; daemonized tmux legs killed
+  by session prefix). A stale timeout flag can never fail a later
+  run (deleted at phase start).
+- Redundancy removed: `test native` dropped from the aggregate
+  (strict filter-subset of `quick`); `coverage` split so timing/e2e
+  execute EXACTLY once per gate (`coverage-from-lanes` reuses the
+  lanes' xunit; standalone `coverage` unchanged).
+- `coverage-sonar` lane-structured (same test set as the old serial
+  run: parallel bulk + serialized actor/integration, timing, e2e,
+  feasibility; NEEDLETAIL_BIN wrapper on every lane): genuine
+  instrumented report in one local run (78 files, 12773 covered).
+- Workflows: one step per phase with `timeout-minutes` (same
+  `offline` job — no branch-protection change); Sonar coverage 45
+  + scanner 15 within the 60 min job.
+
+### 12.4 Validation (Linux, 4-core `taskset -c 0-3`)
+
+Full revised gate OFFLINE OK (rc 0). Lane durations (4-core):
+quick 83 s, timing 17 s, e2e 532 s, feasibility 189 s,
+cases m1a/m1b/m1c/m1d 108/54/215/50 s. CI step timeouts are 3–6x
+measured. Full terminal 143/143, presentation 100/100, PTY 13/13
+(`run-m4d-pty.sh` green), composition + TOOL10 green, standalone
+`coverage` + `coverage-sonar` green. One gate flake root-caused
+and fixed during validation (beyond the 27 findings): POLICY-04
+`trustedExec` raced a TRANSIENT `.executing` phase — the canned
+executor auto-completes in one burst, so under load the test task
+missed the observation window and the single-response non-final
+script then wedged the continuation pump (2nd transport invoke →
+`.outOfScript` → stuck in `.requesting`, never `.executing`).
+Fix: hold the executor gate (stable end state, the established
+`POLICY_04_grantContinues` idiom) + `isFinal: true` (no phantom
+continuation); barrier helpers (`awaitPhase`, `awaitInvocations`,
+B0's two barriers) converted from yield-count bounds (which expire
+in microseconds under a starved pool) to 60 s wall-clock deadlines.
+8/8 constrained re-runs green, actor suites green. Two remaining
+observed load flakes in files outside this diff, both green on
+re-run and documented, not blockers: UX-UNDO-01 preflight, and
+the M0-C PTY-05 probe (`narrowerResizeRewrapsComposer` — async
+SIGWINCH-vs-Ctrl+C processing order under shared-box load; 9/9
+standalone green, file untouched by this change).
+
+Remaining M4 requirement: macOS native matrix only (unchanged).
+Targeted Darwin `tcflag_t` correction does not authorize another
+Mac campaign — single final matrix against the frozen tree.

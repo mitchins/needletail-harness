@@ -56,6 +56,12 @@ struct QueueReorderTests {
         #expect(unknown.state.queue == queueBefore, "unknown entry: queue untouched")
         #expect(unknown.effects == [.emitUI(.denied(cause: "unknown queue entry"))],
             "unknown entry: loud refusal, got \(unknown.effects)")
+        // Dispatched/withdrawn entry: withdraw a-1, then reorder it.
+        let withdrawn = transition(state, .queueWithdraw(entryID: state.queue[0].entryID, atMillis: 1003), &ids)
+        let dead = transition(withdrawn.state, .queueReorder(entryID: withdrawn.state.queue[0].entryID, beforeID: nil, atMillis: 1004), &ids)
+        #expect(dead.state.queue == withdrawn.state.queue, "withdrawn entry: queue untouched")
+        #expect(dead.effects == [.emitUI(.denied(cause: "only undispatched entries can be reordered"))],
+            "withdrawn entry: loud refusal, got \(dead.effects)")
     }
 
     @Test("B2 reorder anchors must be live undispatched entries")
@@ -105,11 +111,15 @@ struct QueueReorderTests {
         #expect(moved.state.queue.map(\.commandID) == [CommandID("c-1"), CommandID("a-1"), CommandID("b-1")])
         // Rebuild the durable stream the journal would hold: admissions
         // in admission order plus the reorder's queueUpdated record.
+        // Admissions carry admission-time rank (pre-move `state`), so
+        // replay without the update record yields a,b,c — the test
+        // fails unless the update record is honored.
+        let admitted = Dictionary(uniqueKeysWithValues: state.queue.map { ($0.commandID, $0) })
         let byID = Dictionary(uniqueKeysWithValues: moved.state.queue.map { ($0.commandID, $0) })
         let records: [DurableRecord] = [
-            .queueAdmitted(byID[CommandID("a-1")]!),
-            .queueAdmitted(byID[CommandID("b-1")]!),
-            .queueAdmitted(byID[CommandID("c-1")]!),
+            .queueAdmitted(admitted[CommandID("a-1")]!),
+            .queueAdmitted(admitted[CommandID("b-1")]!),
+            .queueAdmitted(admitted[CommandID("c-1")]!),
             .queueUpdated(byID[CommandID("c-1")]!),
         ]
         let recon = try reconcileQueue(records)

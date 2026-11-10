@@ -253,6 +253,25 @@ struct MentionGrammarTests {
         #expect(fx.isEmpty, "no effects on failed accept")
     }
 
+    @Test("UX-MENTION-08 correcting the range suffix clears the validation failure")
+    func UX_MENTION_08_rangeFixClearsError() throws {
+        var state = UIState()
+        _ = apply(&state, .input(.insertText("see @doc#L30-L10")))
+        _ = apply(&state, .completion(CompletionResult(queryRevision: state.suggestion!.revision,
+            candidates: [CandidateFile(path: "doc.md")])))
+        _ = apply(&state, .mention(.acceptSelected))
+        #expect(state.suggestion?.rangeError != nil, "invalid range fails visibly")
+        // Correct only the range suffix: same path query, no refetch —
+        // the stale error must clear on this branch.
+        let fx = apply(&state, .input(.deleteBackward(8)))
+        _ = apply(&state, .input(.insertText("#L10-L12")))
+        #expect(state.suggestion?.rangeError == nil, "corrected range clears the error")
+        #expect(!fx.contains(where: {
+            if case .requestCompletions = $0 { return true }
+            return false
+        }), "range-only edit emits no refetch")
+    }
+
     @Test("UX-MENTION-03 selection clamps to candidate list")
     func UX_MENTION_03_selectionClamps() throws {
         var state = UIState()

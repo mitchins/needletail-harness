@@ -29,10 +29,10 @@ no arm64 runtime or macOS 14 compatibility claim is made.
 - Xcode 26.6 (17F113), Apple Swift **6.3.3** (swiftlang-6.3.3.1.3),
   target x86_64-apple-macosx26.0, SDK MacOSX26.5.sdk (15.x SDKs also
   installed).
-- Toolchain note: host Swift is 6.3.3, NEWER than the 6.4 Linux CI
-  toolchain in some diagnostics but OLDER in `await`-in-`defer` rules —
-  Xcode 16.3-era (Swift 6.1) rejected `await` in `defer`; this host
-  accepts it. The shim set below keeps both toolchains building.
+- Toolchain note: host Swift is 6.3.3, OLDER than the 6.4 Linux CI
+  toolchain. Both accept `await` in `defer` (Swift 6.2+); only the
+  Xcode 16.3-era Swift 6.1 rejected it. The shim set below keeps both
+  toolchains building.
 - Deployment floor: package declares `.macOS(.v14)`. macOS 14 compatibility
   is NOT claimed (no 14.x host available); the floor stays
   declared-but-unproven.
@@ -509,8 +509,8 @@ Readiness log: `.needletail-dev/m4a-final/host-ready.log`.
 
 Tree sync (exact final tree): `git archive 32d2226` →
 `.needletail-dev/m4a-final/m4a-32d2226.tar`, SHA-256
-`22d5dcf27ce04432a73d3d0a270c0a54da9608febfedf20613210808958`
-identical on betalab and macbuild; extracted to `~/m4a`; spot hash
+`22d5dcf27ce04432a73d3d0a270c0a54da9608b359fa2fedf20613210808958d`
+identical on betalab and macbuild (from `transfer.log`); extracted to `~/m4a`; spot hash
 (`B0ActorIntegrationTests.swift` `96aa1b65…`) matches local `32d2226`
 byte-for-byte. No `.git` on host (archive tree); tree identity is the
 tarball hash. Transfer log: `transfer.log`.

@@ -204,6 +204,12 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             // A progress write for an invalidated generation is stale:
             // drop, never emit (cancellation/supersede suppression).
             if let p = progress, p.generation != generation { progress = nil }
+            // A visible progress line must be cleared before content:
+            // otherwise the content batch appends below it and commits
+            // the stale progress text to scrollback. A batch that only
+            // carries a progress clear (or a fresh progress value) needs
+            // no extra clear — the clear/newline write below handles it.
+            let clearBeforeContent = progressShown && (!controls.isEmpty || !droppable.isEmpty)
             pendingControl.removeAll()
             pendingDroppable.removeAll()
             pendingProgress = nil
@@ -211,6 +217,9 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             work.broadcast() // wake flush()
             work.unlock()
             // Encode + write off-lock; this thread is the only writer.
+            if clearBeforeContent {
+                writer("\r\u{1B}[K")
+            }
             for line in controls {
                 writer(ANSISpans.encode(line, caps: caps) + "\n")
             }

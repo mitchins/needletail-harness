@@ -225,19 +225,21 @@ public final class LineEditorSession: @unchecked Sendable {
         var term = termios()
         guard tcgetattr(fd, &term) == 0 else { return }
         // `stty sane` subset: cooked input, echo, signals, output
-        // post-processing; keep all other flags as-is.
-        term.c_lflag |= UInt32(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL)
-        term.c_oflag |= UInt32(OPOST | ONLCR)
-        term.c_iflag |= UInt32(ICRNL)
+        // post-processing; keep all other flags as-is. `tcflag_t` is
+        // the fields' own type on both targets (UInt32 on Glibc,
+        // UInt on Darwin) — a fixed `UInt32` does not compile on macOS.
+        term.c_lflag |= tcflag_t(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL)
+        term.c_oflag |= tcflag_t(OPOST | ONLCR)
+        term.c_iflag |= tcflag_t(ICRNL)
         _ = tcsetattr(fd, TCSANOW, &term)
 #elseif canImport(Darwin)
         let fd: Int32 = STDIN_FILENO
         guard isatty(fd) != 0 else { return }
         var term = termios()
         guard tcgetattr(fd, &term) == 0 else { return }
-        term.c_lflag |= UInt32(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL)
-        term.c_oflag |= UInt32(OPOST | ONLCR)
-        term.c_iflag |= UInt32(ICRNL)
+        term.c_lflag |= tcflag_t(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL)
+        term.c_oflag |= tcflag_t(OPOST | ONLCR)
+        term.c_iflag |= tcflag_t(ICRNL)
         _ = tcsetattr(fd, TCSANOW, &term)
 #endif
     }

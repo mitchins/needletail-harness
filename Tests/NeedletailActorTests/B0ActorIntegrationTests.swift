@@ -94,7 +94,11 @@ struct B0ActorIntegrationTests {
         _ check: (SessionState) -> Bool,
         _ label: String
     ) async throws where T: ModelTransport, E: ToolExecutor, S: SessionStore, A: ApprovalGateway {
-        for _ in 0..<20_000 {
+        // Wall-clock deadline, not a yield count: under a starved pool
+        // the test task can burn thousands of yields before the actor
+        // task is scheduled once (POLICY-04 CI flake class).
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
             if check(await actor.currentState()) { return }
             await Task.yield()
         }
@@ -103,7 +107,9 @@ struct B0ActorIntegrationTests {
     }
 
     private static func awaitExecutorEntry(_ exec: GatedExecutor, count: Int = 1) async throws {
-        for _ in 0..<20_000 {
+        // Wall-clock deadline (see awaitPhase above).
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
             if exec.pendingCount >= count || exec.calls.count >= count { return }
             await Task.yield()
         }

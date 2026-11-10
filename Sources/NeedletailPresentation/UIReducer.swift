@@ -164,6 +164,9 @@ private func deriveMention(_ state: UIState) -> (UIState, [UIEffect]) {
     }
     var current = next.suggestion!
     current.query = found.query
+    // A range-suffix-only correction clears a stale validation failure:
+    // no fetch is issued on this branch, so nothing else would clear it.
+    current.rangeError = nil
     next.suggestion = current
     return (next, [])
 }

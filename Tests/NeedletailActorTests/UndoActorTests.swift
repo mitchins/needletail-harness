@@ -506,6 +506,14 @@ struct UndoActorTests {
             if case .lineageFork(let f) = $0 { return f.boundary == boundary }
             return false
         }), "fork record committed through the actor")
+        // The file legs above hold for any fork implementation (the
+        // scripted executor never touches the filesystem); this leg is
+        // the violable one: a fork that staged inverse work would admit
+        // undo/ operations, and their intents would land in the log.
+        #expect(!log.contains(where: {
+            if case .operationIntent(let ref) = $0 { return ref.operationID.raw.hasPrefix("undo/") }
+            return false
+        }), "fork stages no inverse operations")
         #expect(try String(contentsOf: url.appendingPathComponent("a.txt"), encoding: .utf8) == "alpha-dirty\n",
             "dirty bytes untouched by the fork")
         #expect(try Data(contentsOf: url.appendingPathComponent("b.bin")) == Data([0, 1, 2, 255]),

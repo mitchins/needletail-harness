@@ -32,6 +32,19 @@ struct VTProjectionTests {
         #expect(!p.sawUnsupported, "no unsupported in the cursor corpus")
     }
 
+    @Test("empty CSI parameter fields stay positional")
+    func emptyParamsStayPositional() {
+        var p = VTProjection(rows: 24, cols: 80)
+        p.feed("\u{1B}[;5H")
+        #expect(p.cursorRow == 1 && p.cursorCol == 5, "omitted row defaults to 1, got \(p.cursorRow),\(p.cursorCol)")
+        #expect(!p.sawOutOfRange)
+        p.feed("\u{1B}[3;H")
+        #expect(p.cursorRow == 3 && p.cursorCol == 1, "omitted column defaults to 1, got \(p.cursorRow),\(p.cursorCol)")
+        p.feed("\u{1B}[;81H")
+        #expect(p.cursorRow == 1 && p.cursorCol == 81, "column clamps at cols+1, got \(p.cursorRow),\(p.cursorCol)")
+        #expect(p.sawOutOfRange, "out-of-range column latches on the column axis")
+    }
+
     @Test("erase, SGR, modes and paste markers move nothing and stay silent")
     func benignSequencesIgnored() {
         var p = VTProjection(rows: 24, cols: 80)

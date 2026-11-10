@@ -90,7 +90,14 @@ final class ChatPTYDriver {
                     cursor.append("\u{FFFD}")
                     pendingBytes.removeAll()
                 }
-                if cursor.take(through: marker) != nil { break }
+                // A marker landing in the final bytes before the child
+                // closes the PTY is a hit, not a timeout.
+                // NOTE: count < 0 is the routine select-timeout retry
+                // signal (nt_pty.c returns -1 when no data arrives
+                // within the poll window), not a hard error — it must
+                // keep polling until the deadline. All paths here are
+                // deadline-bounded; there is no unbounded spin.
+                if let hit = cursor.take(through: marker) { return hit }
                 break // child closed the PTY
             }
         }
@@ -103,6 +110,31 @@ final class ChatPTYDriver {
     /// 4-byte maximum is exceeded, in which case the lead byte is
     /// replaced once — a split multi-byte scalar never becomes FFFD).
     private var pendingBytes: [UInt8] = []
+
+    /// Read available output until `timeoutMS` elapses without new
+    /// data. Advances the transcript (so `transcriptSince` sees fresh
+    /// bytes) without matching any marker and without recording any
+    /// issue — the read side of freshness polling. EOF (count 0)
+    /// ends the drain; select-timeouts (count < 0) keep polling
+    /// until the deadline.
+    func drain(timeoutMS: Int = 200) {
+        let deadline = Date().addingTimeInterval(TimeInterval(timeoutMS) / 1000)
+        while Date() < deadline {
+            var chunk = [UInt8](repeating: 0, count: 4096)
+            let count = nt_pty_read(&pty, &chunk, 4096, 100)
+            if count > 0 {
+                pendingBytes.append(contentsOf: chunk.prefix(Int(count)))
+                cursor.append(decodePending())
+            } else if count == 0 {
+                cursor.append(decodePending())
+                if !pendingBytes.isEmpty {
+                    cursor.append("\u{FFFD}")
+                    pendingBytes.removeAll()
+                }
+                return // child closed the PTY
+            }
+        }
+    }
 
     private func decodePending() -> String {
         var out = ""
@@ -148,6 +180,17 @@ final class ChatPTYDriver {
     func send(_ text: String) { send(Array(text.utf8)) }
 
     func fullTranscript() -> String { cursor.fullText }
+
+    /// Monotonic transcript cursor for freshness polling:
+    /// `transcriptSince` returns only bytes appended after
+    /// `transcriptMark()`. Non-consuming (the expect cursor is
+    /// undisturbed), so polling for a marker never masks it.
+    func transcriptMark() -> Int { cursor.fullText.count }
+    func transcriptSince(_ mark: Int) -> String {
+        let full = cursor.fullText
+        guard mark < full.count else { return "" }
+        return String(full.dropFirst(mark))
+    }
 
     func signal(_ sig: Int32) { nt_pty_signal(&pty, sig) }
 

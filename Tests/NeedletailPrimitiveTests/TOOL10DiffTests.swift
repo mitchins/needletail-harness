@@ -22,6 +22,21 @@ struct TOOL10DiffTests {
 
     // MARK: - Fixtures
 
+    /// Regular-file executable check. `isExecutableFile` alone passes
+    /// for directories (search permission), and the ancestor walk below
+    /// can meet the checkout directory itself — a directory must never
+    /// resolve as the product binary (Process.run fails on it).
+    private static func isExecutableFile(_ url: URL) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+            && !isDir.boolValue
+            && FileManager.default.isExecutableFile(atPath: url.path)
+    }
+
+    private static func isExecutableFile(path: String) -> Bool {
+        isExecutableFile(URL(fileURLWithPath: path))
+    }
+
     private static func tempDir(prefix: String) throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -30,7 +45,7 @@ struct TOOL10DiffTests {
 
     private static func locateGit() -> String? {
         for candidate in ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"] {
-            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+            if Self.isExecutableFile(path: candidate) { return candidate }
         }
         return nil
     }
@@ -340,7 +355,7 @@ struct TOOL10DiffTests {
         // loudly as missingBinary, never as noGit (which means "no
         // system git", a different precondition).
         if let env = ProcessInfo.processInfo.environment["NEEDLETAIL_BIN"],
-           FileManager.default.isExecutableFile(atPath: env) {
+           Self.isExecutableFile(path: env) {
             return URL(fileURLWithPath: env)
         }
         var runner = URL(fileURLWithPath: CommandLine.arguments[0])
@@ -349,7 +364,7 @@ struct TOOL10DiffTests {
                 .appendingPathComponent(CommandLine.arguments[0])
         }
         let sibling = runner.deletingLastPathComponent().appendingPathComponent("needletail")
-        if FileManager.default.isExecutableFile(atPath: sibling.path) { return sibling }
+        if Self.isExecutableFile(sibling) { return sibling }
         // macOS `swift test` nests the runner inside the .xctest bundle, so
         // the product is NOT beside it: walk up to the products directory
         // (…/debug or …/release) and look there. Portable across platforms.
@@ -368,10 +383,10 @@ struct TOOL10DiffTests {
                 guard let d = dir else { break }
                 for config in ["debug", "release"] where d.lastPathComponent != config {
                     let cand = d.appendingPathComponent(config).appendingPathComponent("needletail")
-                    if FileManager.default.isExecutableFile(atPath: cand.path) { return cand }
+                    if Self.isExecutableFile(cand) { return cand }
                 }
                 let direct = d.appendingPathComponent("needletail")
-                if FileManager.default.isExecutableFile(atPath: direct.path) { return direct }
+                if Self.isExecutableFile(direct) { return direct }
                 if d.path == "/" { break }
                 dir = d.deletingLastPathComponent()
             }
@@ -392,10 +407,10 @@ struct TOOL10DiffTests {
             }
         }
         for cand in buildCands {
-            if FileManager.default.isExecutableFile(atPath: cand.path) { return cand }
+            if Self.isExecutableFile(cand) { return cand }
         }
         let built = URL(fileURLWithPath: "/data/coding/needletail/.build/debug/needletail")
-        if FileManager.default.isExecutableFile(atPath: built.path) { return built }
+        if Self.isExecutableFile(built) { return built }
         Issue.record("needletail binary missing; build the product before diff binary legs")
         throw TOOL10Error.missingBinary
     }

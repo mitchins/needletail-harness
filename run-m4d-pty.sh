@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # M4-D PTY acceptance runner (B6 run-b6final.sh precedent): builds the
 # release product, runs the physical PTY suites, and verifies every
 # required case executed its expected NONZERO test count. A zero-test
@@ -8,8 +8,8 @@ set -u
 cd "$(dirname "$0")"
 
 LOG=".needletail-dev/logs/m4d-pty-run.log"
-: > "$LOG" # fresh log per run (appending masks regressions)
 mkdir -p .needletail-dev/logs .needletail-dev/m4d-pty
+: > "$LOG" # fresh log per run (appending masks regressions)
 
 echo "== m4d-pty: release build =="
 swift build -c release --product needletail >>"$LOG" 2>&1 || {

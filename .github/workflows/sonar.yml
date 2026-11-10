@@ -90,9 +90,15 @@ jobs:
           }
 
       - name: Genuine instrumented coverage (Sonar generic XML)
+        # Lane-structured since the 59-minute serial stall: same test
+        # set as the old single serial run (parallel bulk + serialized
+        # actor/integration, timing, e2e, feasibility), each lane
+        # bounded with live streaming + diagnostics instead of silence.
+        timeout-minutes: 45
         run: ./dev coverage-sonar
 
       - name: SonarQube Cloud scan and quality gate
+        timeout-minutes: 15
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0, node24
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

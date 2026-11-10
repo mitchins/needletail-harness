@@ -51,11 +51,13 @@ struct ChatLoopTests {
                                       heldReason: nil, pendingApproval: nil,
                                       admittedCommandIDs: [], liveEpoch: EpochID("e"))
         let n = LockedValue(0)
+        let turnDone = LockedValue(false)
         let config = ChatLoop.Config(
             caps: ownerCaps(), sessionID: "sess",
             snapshotProvider: { empty },
             onEffects: { fx in await effects.append(fx) },
-            mintCommandID: { var id = 0; n.mutate { $0 += 1; id = $0 }; return CommandID("cmd-\(id)") })
+            mintCommandID: { var id = 0; n.mutate { $0 += 1; id = $0 }; return CommandID("cmd-\(id)") },
+            onTurnFinished: { turnDone.set(true) })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         // First submit marks busy optimistically (M4-D D2: closes the
         // submit-to-first-projection Ctrl+C window); a terminal
@@ -70,9 +72,13 @@ struct ChatLoopTests {
         // Drive the terminal transition directly: admitted then completed.
         loop.post(.projection(.admitted(commandID: CommandID("cmd-1"), revision: 1)))
         loop.post(.projection(.runUpdate(phase: "completed", detail: "done")))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // Readiness, not sleep: the terminal projection retires the
+        // turn (fires onTurnFinished) before the resubmit may proceed —
+        // posts are FIFO, but the resubmit's effect shape depends on
+        // the loop having retired to idle first.
+        #expect(await waitForFlag(turnDone, timeout: 5), "terminal projection never retired the turn")
         loop.post(.inputLine("same"))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(await waitForEffects(2, in: effects, timeout: 5), "resubmit never dispatched")
         loop.post(.inputLine(nil))
         await task.value
         let fx = await effects.all()
@@ -112,32 +118,42 @@ struct ChatLoopTests {
             mintCommandID: { CommandID("cmd-1") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let task = Task { await loop.run(scriptedInput: []) }
-        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
         // Type a mention query; the edge fetch is simulated by posting
         // completions (the reducer fills the suggestion popup).
         loop.post(.mirror(text: "@e", cursor: 2))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(await waitForEffects(1, in: effects, timeout: 5), "mirror never dispatched")
         loop.post(.completions(query: "e", revision: 1, candidates: [
             CandidateFile(path: "ok.swift"),
             CandidateFile(path: "ev\u{1B}.swift"),
         ]))
-        try await Task.sleep(nanoseconds: 200_000_000)
         // Gate open on the safe selected candidate (hostile entries never
-        // gate acceptance of the selected one).
-        guard let snap = loop.acceptSnapshot() else {
-            Issue.record("accept gate must open on a live safe suggestion"); return
+        // gate acceptance of the selected one) — the gate opening proves
+        // the completions were handled.
+        guard await waitForSnapshot(loop, timeout: 5),
+              let snap = loop.acceptSnapshot() else {
+            Issue.record("accept gate must open on a live safe suggestion")
+            loop.post(.inputLine(nil))
+            _ = await join(task: task, timeout: 5)
+            owner.close()
+            return
         }
         loop.post(.tabAccept(base: snap.base, display: snap.display, cursor: snap.cursor))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // tabAccept handled ⟺ gate closed (it was open above).
+        let closeDeadline = Date().addingTimeInterval(5)
+        while loop.acceptSnapshot() != nil, Date() < closeDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
         // Consumed: suggestion cleared, gate closed, token minted (the
         // attach composition test proves the token captures).
         #expect(loop.acceptSnapshot() == nil, "second Tab must be a no-op after accept")
         // Selection keys with no suggestion are safe no-ops.
         loop.post(.key(.up))
         loop.post(.key(.down))
-        try await Task.sleep(nanoseconds: 100_000_000)
+        // Barrier: nil shuts the loop (FIFO — keys handled first); the
+        // join proves processing, then the run ends cleanly.
         loop.post(.inputLine(nil))
-        await task.value
+        #expect(await join(task: task, timeout: 5), "loop did not exit")
         owner.close()
     }
 
@@ -159,14 +175,15 @@ struct ChatLoopTests {
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         #expect(loop.acceptSnapshot() == nil, "no suggestion ⇒ closed gate")
         let task = Task { await loop.run(scriptedInput: []) }
-        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
         loop.post(.key(.tab))
         loop.post(.key(.up))
         loop.post(.key(.down))
-        try await Task.sleep(nanoseconds: 200_000_000)
-        #expect(await effects.all().isEmpty, "no-op keys must emit no effects")
+        // Barrier: nil shuts the loop (FIFO — keys handled first); the
+        // join proves processing, then the negative assertion is sound.
         loop.post(.inputLine(nil))
-        await task.value
+        #expect(await join(task: task, timeout: 5), "loop did not exit")
+        #expect(await effects.all().isEmpty, "no-op keys must emit no effects")
         owner.close()
     }
 
@@ -191,7 +208,7 @@ struct ChatLoopTests {
         // invariant: the loop starts before any actor work, so the
         // inbox exists when the presenter posts).
         let runTask = Task { await loop.run(scriptedInput: []) }
-        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
         let gateway = ReplxxApprovalGateway { req, box in
             loop.prepareConfirm(box: box)
             loop.post(.approvalArmed(req))
@@ -200,15 +217,16 @@ struct ChatLoopTests {
                                   operation: "op", requiredGrant: "read")
         async let decision = gateway.decide(req)
         // Inbox FIFO: approvalArmed is handled (prompt rendered, draft
-        // snapshotted) before the answer below is processed.
-        try await Task.sleep(nanoseconds: 200_000_000)
-        // The actionable prompt rendered on the control lane.
-        #expect(written.joined().contains("approval required:"))
+        // snapshotted) before the answer below is processed. The prompt
+        // rendering proves the arm was handled — readiness, not sleep.
+        #expect(await waitFor(marker: "approval required:", in: written, timeout: 5),
+            "actionable prompt never rendered")
         loop.post(.inputLine("y"))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // FIFO: the decision line is consumed before the follow-up below;
+        // no sleep needed between ordered posts.
         // The follow-up line proves the mirror reset (not polluted by y).
         loop.post(.inputLine("second"))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(await waitForEffects(1, in: effects, timeout: 5), "follow-up never dispatched")
         loop.post(.inputLine(nil))
         await runTask.value
         let final = await decision
@@ -223,6 +241,42 @@ struct ChatLoopTests {
             return
         }
         #expect(fx[0] == [.submit(OperatorInput(text: "second", commandID: CommandID("cmd-1")))])
+        owner.close()
+    }
+
+    @Test("stale confirm arm submits the line normally, no hygiene warning")
+    func staleArmSubmitsNormally() async throws {
+        let written = LockedBox()
+        let effects = LockedEffects()
+        guard let editor = LineEditorSession() else { Issue.record("replxx_init failed headless"); return }
+        let owner = TerminalOutputOwner(
+            caps: ownerCaps(), writer: { written.append($0) })
+        let empty = QueueSyncSnapshot(entries: [], activeRequest: nil, queueHeld: false,
+                                      heldReason: nil, pendingApproval: nil,
+                                      admittedCommandIDs: [], liveEpoch: EpochID("e"))
+        let config = ChatLoop.Config(
+            caps: ownerCaps(), sessionID: "sess",
+            snapshotProvider: { empty },
+            onEffects: { fx in await effects.append(fx) },
+            mintCommandID: { CommandID("cmd-1") })
+        let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
+        let runTask = Task { await loop.run(scriptedInput: []) }
+        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        // Arm, then settle the box actor-side: cancellation wins the race
+        // against the operator's answer (the production stale-arm shape).
+        let box = ContinuationBox()
+        loop.prepareConfirm(box: box)
+        box.resumeDeny()
+        // The late decision line takes the stale path: a normal submit,
+        // never a confirm consumption, never a hygiene warning (the
+        // scripted path owns no live history to drop).
+        loop.post(.inputLine("y"))
+        #expect(await waitForEffects(1, in: effects, timeout: 5), "stale line never dispatched")
+        let fx = effects.all()
+        loop.post(.inputLine(nil))
+        #expect(await join(task: runTask, timeout: 5), "loop did not exit")
+        #expect(!written.joined().contains("confirm hygiene"), "no spurious hygiene warning on the scripted path")
+        #expect(fx == [[.submit(OperatorInput(text: "y", commandID: CommandID("cmd-1")))]], "stale line submits normally")
         owner.close()
     }
 
@@ -293,6 +347,38 @@ struct ChatLoopTests {
         return false
     }
 
+    /// Effect-batch readiness: posts are FIFO, so reaching `count`
+    /// batches proves every event posted before the last dispatch was
+    /// handled (a blind sleep proves nothing on a slow runner).
+    private func waitForEffects(_ count: Int, in effects: LockedEffects, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if effects.all().count >= count { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return effects.all().count >= count
+    }
+
+    /// Accept-gate readiness: polls the lock-published snapshot (the
+    /// input thread's own cross-thread read — safe to poll here).
+    private func waitForSnapshot(_ loop: ChatLoop, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if loop.acceptSnapshot() != nil { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return loop.acceptSnapshot() != nil
+    }
+
+    private func waitForFlag(_ flag: LockedValue<Bool>, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if flag.get() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return flag.get()
+    }
+
     private func join(task: Task<Void, Never>, timeout: TimeInterval) async -> Bool {
         final class Flag: @unchecked Sendable {
             let lock = NSLock()
@@ -350,7 +436,7 @@ struct ChatLoopTests {
             mintCommandID: { CommandID("cmd-1") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let runTask = Task { await loop.run(scriptedInput: []) }
-        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
         let gateway = ReplxxApprovalGateway { req, box in
             loop.prepareConfirm(box: box)
             loop.post(.approvalArmed(req))
@@ -358,16 +444,18 @@ struct ChatLoopTests {
         let req = ApprovalRequest(requestID: RequestID("r"), runID: RunID("r"), generation: Revision(1),
                                   operation: "op", requiredGrant: "read")
         async let decision = gateway.decide(req)
-        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(await waitFor(marker: "approval required:", in: written, timeout: 5),
+            "actionable prompt never rendered")
         // A pasted multi-line block arrives as one line (bracketed paste
         // collapses to the readLine result): not y/yes ⇒ deny, never
-        // auto-confirm, never submit.
+        // auto-confirm, never submit. `await decision` below suspends
+        // until the paste line is consumed — it IS the readiness wait.
         loop.post(.inputLine("pasted line one\nrm -rf /\nline three"))
         let final = await decision
         #expect(final == .deny("operator did not explicitly approve"), "armed paste must deny fail-closed, got \(final)")
         // Draft mirror restored; follow-up submits cleanly.
         loop.post(.inputLine("second"))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(await waitForEffects(1, in: effects, timeout: 5), "follow-up never dispatched")
         loop.post(.inputLine(nil))
         await runTask.value
         let fx = await effects.all()
@@ -398,15 +486,16 @@ struct ChatLoopTests {
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         // No nil terminator: the run stays alive for posted events.
         let task = Task { await loop.run(scriptedInput: ["hi"]) }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(await waitFor(marker: "hi", in: written, timeout: 5), "scripted submit never rendered")
         // Live request: progress registers, completion commits.
         loop.post(.tapProgress(RequestID("a"), 10))
         loop.post(.tapComplete(RequestID("a"), Revision(1), "# Done"))
         // Unknown request (never progressed, e.g. cancelled): drops.
         loop.post(.tapComplete(RequestID("zzz"), Revision(9), "# Ghost"))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // Barrier: nil shuts the loop (FIFO — taps handled first); the
+        // join proves processing, then the negative assertion is sound.
         loop.post(.inputLine(nil))
-        await task.value
+        #expect(await join(task: task, timeout: 5), "loop did not exit")
         let out = written.joined()
         #expect(out.contains("Done"))
         #expect(!out.contains("Ghost"))
@@ -430,15 +519,16 @@ struct ChatLoopTests {
             mintCommandID: { CommandID("cmd-1") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let task = Task { await loop.run(scriptedInput: ["hi"]) }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(await waitFor(marker: "hi", in: written, timeout: 5), "scripted submit never rendered")
         loop.post(.tapProgress(RequestID("a"), 10))
         loop.post(.tapComplete(RequestID("a"), Revision(3), "# Third"))
         // Late straggler for an older revision of the same request.
         loop.post(.tapProgress(RequestID("a"), 11))
         loop.post(.tapComplete(RequestID("a"), Revision(1), "# First"))
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // Barrier: nil shuts the loop (FIFO — taps handled first); the
+        // join proves processing, then the negative assertion is sound.
         loop.post(.inputLine(nil))
-        await task.value
+        #expect(await join(task: task, timeout: 5), "loop did not exit")
         let out = written.joined()
         #expect(out.contains("Third"))
         #expect(!out.contains("First"))

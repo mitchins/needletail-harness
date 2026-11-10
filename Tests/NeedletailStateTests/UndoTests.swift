@@ -858,26 +858,20 @@ struct UndoTests {
         ]
         #expect(durableIDHighWater(records) == 17, "max over seq/orderKey/entry/group/undo/fork; junk ignored")
     }
-    // MARK: - UX-UNDO-08 native: dirty-worktree rewind forks without touching files
+    // MARK: - UX-UNDO-08: rewind lineage fork records the fork
 
-    @Test("UX-UNDO-08 native: rewind lineage fork leaves every workspace byte intact")
-    func UX_UNDO_08_rewindLeavesWorktreeIntact() throws {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("undo-rewind-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        defer { try? FileManager.default.removeItem(at: url) }
-        try "alpha\n".write(to: url.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
-        try Data([0, 1, 2, 255]).write(to: url.appendingPathComponent("b.bin"))
-        // Dirty the worktree after the boundary, then fork past it.
-        try "alpha-dirty\n".write(to: url.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    @Test("UX-UNDO-08: rewind lineage fork records the fork boundary")
+    func UX_UNDO_08_rewindRecordsFork() throws {
+        // Pure reducer: no workspace, no filesystem. The byte-intact
+        // legs live in UndoActorTests (actor-driven); asserting file
+        // bytes here would hold for any reducer behavior, so this test
+        // pins only the fork record itself.
         var ids = StateFixtures.ids()
         var state = try StateFixtures.idle()
         state = state.replacing(lastSequence: 40)
         let boundary = LineageBoundary(epochID: state.epoch.epochID, throughSequence: 12)
         let t = transition(state, .lineageForkRequest(boundary: boundary, atMillis: 1000), &ids)
         #expect(t.records.contains(where: { if case .lineageFork = $0 { return true }; return false }), "fork recorded")
-        #expect(try String(contentsOf: url.appendingPathComponent("a.txt"), encoding: .utf8) == "alpha-dirty\n",
-            "dirty bytes preserved exactly — fork never mutates")
-        #expect(try Data(contentsOf: url.appendingPathComponent("b.bin")) == Data([0, 1, 2, 255]), "binary bytes intact")
     }
 }
 #endif

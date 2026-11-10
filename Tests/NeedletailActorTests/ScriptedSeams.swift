@@ -186,7 +186,12 @@ enum ActorFixtures {
     /// Bounded invocation barrier (fails loudly, never sleeps): yields until
     /// the gated transport has recorded `count` invocations.
     static func awaitInvocations(_ transport: GatedTransport, count: Int) async throws {
-        for _ in 0..<10_000 {
+        // Wall-clock deadline, not a yield count: under a starved pool
+        // the test task can burn thousands of yields before the actor
+        // task is scheduled once — a count bound then expires without
+        // giving the actor any wall time (POLICY-04 CI flake).
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
             if transport.invocations.count >= count { return }
             await Task.yield()
         }
@@ -202,7 +207,10 @@ enum ActorFixtures {
         _ label: String,
         sourceLocation: SourceLocation = #_sourceLocation
     ) async throws {
-        for _ in 0..<20_000 {
+        // Wall-clock deadline (see awaitInvocations): yield counts are
+        // scheduler-dependent and expire instantly under load.
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
             if check(await actor.currentState()) { return }
             await Task.yield()
         }
