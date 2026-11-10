@@ -57,14 +57,20 @@ swift_test() {
     # One test worker at a time: loopback suites share process/OS
     # resources, and multi-worker Swift Testing showed cross-suite
     # connection flakes on this Linux builder. Filter semantics stay exact.
+    swift_test_direct -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"
+}
+
+swift_test_direct() {
+    # Same runner for call sites that pass their own flags (the
+    # serialized timing/e2e lanes and the coverage-sonar lanes).
     # Line-buffered runner output when stdbuf exists (CI Ubuntu):
     # block-buffered file output hides the last-started test inside a
     # hang — heartbeats and timeout diagnostics must name it. macOS
     # has no stdbuf; the fallback is plain (buffered) execution.
     if command -v stdbuf >/dev/null 2>&1; then
-        stdbuf -o0 -e0 "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"
+        stdbuf -o0 -e0 "$NEEDLETAIL_SWIFT" test "$@"
     else
-        "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"
+        "$NEEDLETAIL_SWIFT" test "$@"
     fi
 }
 
@@ -355,7 +361,7 @@ test)
         _timing_xunit_actual="${_timing_xunit_base%.xml}-swift-testing.xml"
         mkdir -p "$root_dir/.needletail-dev/xunit"
         rm -f "$_timing_xunit_base" "$_timing_xunit_actual"
-        if stream_bounded timing "$(phase_secs timing)" "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter TransportCancellationTests --xunit-output "$_timing_xunit_base"; then
+        if stream_bounded timing "$(phase_secs timing)" swift_test_direct -j 4 --disable-automatic-resolution --no-parallel --filter TransportCancellationTests --xunit-output "$_timing_xunit_base"; then
             _timing_rc=0
         else
             _timing_rc=$?
@@ -391,7 +397,7 @@ test)
         _e2e_xunit_actual="${_e2e_xunit_base%.xml}-swift-testing.xml"
         mkdir -p "$root_dir/.needletail-dev/xunit"
         rm -f "$_e2e_xunit_base" "$_e2e_xunit_actual"
-        if stream_bounded e2e "$(phase_secs e2e)" "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests --xunit-output "$_e2e_xunit_base"; then
+        if stream_bounded e2e "$(phase_secs e2e)" swift_test_direct -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests --xunit-output "$_e2e_xunit_base"; then
             _e2e_rc=0
         else
             _e2e_rc=$?
@@ -916,31 +922,31 @@ coverage-sonar)
         fi
     }
     echo "== coverage-sonar: bulk (parallel) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-bulk "$(phase_secs coverage-sonar-bulk)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests" $BULK_SKIP; then
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-bulk "$(phase_secs coverage-sonar-bulk)" swift_test_direct --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests" $BULK_SKIP; then
         :
     else
         note_lane_rc $?
     fi
     echo "== coverage-sonar: actor + integration (serialized) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-serial "$(phase_secs coverage-sonar-serial)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter "NeedletailActorTests" --filter "NeedletailConfigIntegrationTests" --filter "NeedletailProviderIntegrationTests"; then
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-serial "$(phase_secs coverage-sonar-serial)" swift_test_direct --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter "NeedletailActorTests" --filter "NeedletailConfigIntegrationTests" --filter "NeedletailProviderIntegrationTests"; then
         :
     else
         note_lane_rc $?
     fi
     echo "== coverage-sonar: timing (serialized) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-timing "$(phase_secs coverage-sonar-timing)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter TransportCancellationTests; then
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-timing "$(phase_secs coverage-sonar-timing)" swift_test_direct --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter TransportCancellationTests; then
         :
     else
         note_lane_rc $?
     fi
     echo "== coverage-sonar: e2e (serialized) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-e2e "$(phase_secs coverage-sonar-e2e)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests; then
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-e2e "$(phase_secs coverage-sonar-e2e)" swift_test_direct --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests; then
         :
     else
         note_lane_rc $?
     fi
     echo "== coverage-sonar: feasibility (PTY terminal suite) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-feasibility "$(phase_secs coverage-sonar-feasibility)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter NeedletailTerminalTests; then
+    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-feasibility "$(phase_secs coverage-sonar-feasibility)" swift_test_direct --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter NeedletailTerminalTests; then
         :
     else
         note_lane_rc $?
