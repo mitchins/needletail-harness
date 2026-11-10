@@ -89,6 +89,16 @@ jobs:
             exit 1
           }
 
+      - name: Build the release product (PTY legs execute the release binary)
+        # The coverage-sonar feasibility lane runs the terminal PTY
+        # suite, whose legs spawn .build/release/needletail and
+        # fail-closed on a missing binary. Same artifact the offline
+        # gate qualifies in linux-ci.yml.
+        timeout-minutes: 30
+        run: |
+          swift build -c release --product needletail
+          test -x .build/release/needletail
+
       - name: Genuine instrumented coverage (Sonar generic XML)
         # Lane-structured since the 59-minute serial stall: same test
         # set as the old single serial run (parallel bulk + serialized
