@@ -107,6 +107,30 @@ struct ChatPTYTests {
         try? transcript.write(toFile: dir + "/\(name).log", atomically: true, encoding: .utf8)
     }
 
+    /// Bounded pipe read for the tmux helper below. Never blocks:
+    /// a daemonized tmux server can hold the client's stdout pipe
+    /// open across its daemon fork, so readDataToEndOfFile would wait
+    /// forever for an EOF that never comes (the CI feasibility stall
+    /// fingerprint). Returns what arrived within the grace; tmux
+    /// client output is small and prompt.
+    private static func readTmuxPipe(_ pipe: Pipe) -> String {
+        var out = Data()
+        let handle = pipe.fileHandleForReading
+        var quietRounds = 0
+        let deadline = Date().addingTimeInterval(10)
+        while quietRounds < 3, Date() < deadline {
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                quietRounds += 1
+                if quietRounds < 3 { Thread.sleep(forTimeInterval: 0.1) }
+            } else {
+                out.append(chunk)
+                quietRounds = 0
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
     /// Settle-then-exit without a blind sleep. The first Ctrl+C exits an
     /// idle-empty loop at once (the common case — the short probe
     /// returns promptly, faster than the old fixed 2 s sleep).
@@ -749,7 +773,9 @@ extension ChatPTYTests {
                 watchdog.start()
                 proc.waitUntilExit()
                 guard proc.terminationStatus == 0 else { throw TestSkip.tmuxFailed(args.joined(separator: " ")) }
-                return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                // Bounded read (never readDataToEndOfFile: a daemonized
+                // tmux server can hold this pipe open forever).
+                return Self.readTmuxPipe(pipe)
             }
             do {
                 _ = try tmux("new-session", "-d", "-s", tmuxName, "-x", "80", "-y", "24",
@@ -759,6 +785,11 @@ extension ChatPTYTests {
                 // failed #expect below must not leak the detached session
                 // (and its live chat child) past tearDown.
                 defer { _ = try? tmux("kill-session", "-t", tmuxName) }
+                // Leg deadline: with a sick tmux server every call can
+                // burn its 30 s watchdog (150+200 iterations would exceed
+                // any step budget silently). A deadline breach throws to
+                // the catch below — loud, never silent.
+                let legDeadline = Date().addingTimeInterval(600)
                 // Pass loopback env at session creation: tmux only applies
                 // set-environment to subsequently spawned processes, so the
                 // session's initial shell would otherwise miss the state
@@ -768,25 +799,31 @@ extension ChatPTYTests {
                 // Wait for the prompt via capture-pane polling.
                 var ready = false
                 var lastPane = ""
-                for _ in 0..<150 {
+                var probeCount = 0
+                while !ready, probeCount < 150, Date() < legDeadline {
+                    probeCount += 1
                     let pane = try tmux("capture-pane", "-t", tmuxName, "-p")
                     lastPane = pane
                     // capture-pane trims the prompt's trailing space.
                     if pane.contains("needletail>") { ready = true; break }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
+                if Date() >= legDeadline { throw TestSkip.tmuxFailed("leg deadline exceeded waiting for prompt") }
                 if !ready {
                     Self.preserve("pty-08-tmux-noprompt", transcript: lastPane)
                 }
                 #expect(ready, "REAL-TMUX prompt never appeared")
                 _ = try tmux("send-keys", "-t", tmuxName, "go", "Enter")
                 var done = false
-                for _ in 0..<200 {
+                var turnProbes = 0
+                while !done, turnProbes < 200, Date() < legDeadline {
+                    turnProbes += 1
                     let pane = try tmux("capture-pane", "-t", tmuxName, "-p")
                     lastPane = pane
                     if pane.contains("tmux turn ok") { done = true; break }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
+                if Date() >= legDeadline { throw TestSkip.tmuxFailed("leg deadline exceeded waiting for turn") }
                 if !done {
                     Self.preserve("pty-08-tmux-noturn", transcript: lastPane)
                 }
