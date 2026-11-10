@@ -125,6 +125,29 @@ stream_bounded() {
             if [ "$_sb_slept" -ge "$_sb_secs" ]; then
                 echo "TIMEOUT [$_sb_label]: exceeded ${_sb_secs}s — terminating owned processes."
                 touch "$_sb_log.timeout"
+                # Capture runner internals BEFORE killing (post-kill
+                # forensics only ever shows orphans): spinning (infinite
+                # loop) vs sleeping (blocked wait) decides the next
+                # investigation. Linux-only; skipped elsewhere.
+                {
+                    echo "---- pre-kill process tree ----"
+                    ps -ef 2>/dev/null | grep -a -e swift -e needletail -e tmux | grep -a -v grep | head -20
+                    for _p in $(ps -ef 2>/dev/null | grep -a "test-runner" | grep -a -v grep | awk '{print $2}' | head -3); do
+                        echo "---- runner pid $_p state ----"
+                        ps -o pid,ppid,stat,%cpu,etime,command -p "$_p" 2>/dev/null || true
+                        if [ -d "/proc/$_p/task" ]; then
+                            echo "threads: $(ls /proc/$_p/task 2>/dev/null | wc -l) fds: $(ls /proc/$_p/fd 2>/dev/null | wc -l)"
+                            echo "---- runner [$_p] wchan stacks ----"
+                            for _t in $(ls /proc/$_p/task 2>/dev/null); do
+                                _w=$(cat "/proc/$_p/task/$_t/wchan" 2>/dev/null || echo "?")
+                                _c=$(tr '\0' ' ' < "/proc/$_p/task/$_t/comm" 2>/dev/null || echo "?")
+                                echo "  tid $_t ($_c): wchan=$_w"
+                            done
+                        fi
+                    done
+                } > "$_sb_log.predump" 2>&1
+                # Snapshot the tree BEFORE any signal: KILL reparents
+                # survivors to init, hiding them from parent-pid walks.
                 # Snapshot the tree BEFORE signalling: a toolchain shim
                 # may defer TERM while waiting for its child, and KILL
                 # reparents survivors to init — pid-list kills land
@@ -179,24 +202,12 @@ stream_bounded() {
     wait 2>/dev/null || true
     if [ -f "$_sb_log.timeout" ]; then
         echo "FAIL [$_sb_label]: deadline kill after ${_sb_secs}s (exit $_sb_rc). Diagnostics:"
-        echo "---- process tree (evidence: $_sb_log) ----"
-        ps -ef 2>/dev/null | grep -a -e swift -e needletail -e tmux | grep -a -v grep | head -20 || true
-        # Runner internals: spinning (infinite loop) vs sleeping (blocked
-        # wait) decides the next investigation. Linux-only; skipped
-        # elsewhere.
-        for _p in $(ps -ef 2>/dev/null | grep -a "test-runner" | grep -a -v grep | awk '{print $2}' | head -3); do
-            echo "---- runner pid $_p state ----"
-            ps -o pid,ppid,stat,%cpu,etime,command -p "$_p" 2>/dev/null || true
-            if [ -d "/proc/$_p/task" ]; then
-                echo "threads: $(ls /proc/$_p/task 2>/dev/null | wc -l) fds: $(ls /proc/$_p/fd 2>/dev/null | wc -l)"
-                echo "---- runner [$_p] wchan stacks ----"
-                for _t in $(ls /proc/$_p/task 2>/dev/null); do
-                    _w=$(cat "/proc/$_p/task/$_t/wchan" 2>/dev/null || echo "?")
-                    _c=$(tr '\0' ' ' < "/proc/$_p/task/$_t/comm" 2>/dev/null || echo "?")
-                    echo "  tid $_t ($_c): wchan=$_w"
-                done
-            fi
-        done
+        if [ -f "$_sb_log.predump" ]; then
+            cat "$_sb_log.predump"
+        else
+            echo "---- process tree (evidence: $_sb_log) ----"
+            ps -ef 2>/dev/null | grep -a -e swift -e needletail -e tmux | grep -a -v grep | head -20 || true
+        fi
         echo "---- last 30 log lines (evidence: $_sb_log) ----"
         tail -30 "$_sb_log" || true
         return 124
