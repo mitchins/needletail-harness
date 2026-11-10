@@ -624,7 +624,11 @@ candidate; diffLeg Glibc-gated + hermetic git; PTYDriver EOF-hit
 fix (the `count < 0` break REJECTED: `nt_pty_read` returns −1 on
 routine select-timeout per `nt_pty.c:114-116` — breaking would fail
 every >250 ms output gap; all expect paths are deadline-bounded);
-tmux `kill-session` deferred + PATH-resolved + 30 s watchdog join;
+tmux `kill-session` deferred + PATH-resolved + 30 s watchdog join
++ bounded pipe read (a daemonized tmux server can hold the
+client stdout pipe open across its fork — `readDataToEndOfFile`
+would wait forever; CI orphan fingerprint) + 10 min leg deadline
+that throws to the loud catch path;
 coalescing assertion timing-independent; CSI empty params
 positional; ChatLoop/ChatLifecycle sleeps converted to readiness
 waits (markers, effect batches, gate snapshots, bounded joins);
