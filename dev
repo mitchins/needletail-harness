@@ -168,13 +168,10 @@ stream_bounded() {
                     kill -KILL "$_sb_v" 2>/dev/null || true
                 done
                 kill -KILL "$_sb_pid" 2>/dev/null || true
-                # Daemonized tmux legs escape the process tree: kill only
-                # our prefixed sessions (CI runners are ephemeral).
-                if command -v tmux >/dev/null 2>&1; then
-                    tmux ls 2>/dev/null | grep -o 'm4d-pty08-[^ :]*' | while read -r _s; do
-                        tmux kill-session -t "$_s" 2>/dev/null || true
-                    done
-                fi
+                # (No tmux cleanup here: `tmux ls` itself hangs on a
+                # wedged server and would stall the killer. In-test
+                # defers are the primary cleanup; step-level orphans
+                # die with the ephemeral CI runner.)
                 break
             fi
             sleep 10
@@ -221,9 +218,13 @@ stream_bounded() {
     return "$_sb_rc"
 }
 
-# Per-phase hard deadlines (seconds, generous: 3-6x the observed
-# local 4-core durations; the CI stall was 5.5 h of silence, so any
-# bound here converts that class into a diagnosed failure).
+# Per-phase hard deadlines (seconds). Every bound sits at least 5 min
+# BELOW its CI step timeout: on expiry the killer must finish its
+# diagnostics + owned-process cleanup before the step timeout SIGKILLs
+# the shell (a tied race loses the evidence and strands orphans).
+# Generous otherwise: 3-6x the observed local 4-core durations; the CI
+# stall was 5.5 h of silence, so any bound here converts that class
+# into a diagnosed failure.
 # NEEDLETAIL_PHASE_SECS_OVERRIDE (debugging only) replaces every
 # budget — validates the timeout/diagnostic path cheaply.
 phase_secs() {
@@ -232,19 +233,24 @@ phase_secs() {
         return
     fi
     case "$1" in
-        quick) echo 1500 ;;
+        quick) echo 1200 ;;
         native) echo 900 ;;
-        timing) echo 900 ;;
-        e2e) echo 2700 ;;
-        feasibility) echo 3600 ;;
-        coverage-evidence) echo 2700 ;;
-        coverage-ingest) echo 900 ;;
-        coverage-sonar-serial) echo 1800 ;;
-        coverage-sonar-timing) echo 900 ;;
-        coverage-sonar-e2e) echo 2700 ;;
-        coverage-sonar-feasibility) echo 3600 ;;
-        coverage-sonar-*) echo 1800 ;;
-        cases-*) echo 1800 ;;
+        timing) echo 600 ;;
+        e2e) echo 2100 ;;
+        feasibility) echo 3000 ;;
+        coverage-evidence) echo 2100 ;;
+        coverage-ingest) echo 600 ;;
+        coverage-sonar-bulk) echo 1500 ;;
+        coverage-sonar-serial) echo 1500 ;;
+        coverage-sonar-timing) echo 600 ;;
+        coverage-sonar-e2e) echo 2100 ;;
+        coverage-sonar-feasibility) echo 2400 ;;
+        coverage-sonar-*) echo 1500 ;;
+        cases-m1a) echo 900 ;;
+        cases-m1b) echo 900 ;;
+        cases-m1c) echo 1500 ;;
+        cases-m1d) echo 900 ;;
+        cases-*) echo 900 ;;
         *) echo 1200 ;;
     esac
 }
