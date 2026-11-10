@@ -77,9 +77,28 @@ struct ChatCompositionTests {
         return false
     }
 
+    /// Bounded run-task join: posts EOF, then polls for loop exit.
+    /// A loop that ignores EOF fails loudly here instead of hanging
+    /// the suite (the wedged run task leaks, but the test fails with
+    /// evidence instead of stalling CI silently — the offline-gate
+    /// feasibility hang fingerprint). The 30 s budget dwarfs any
+    /// healthy shutdown (ms); only a wedged loop can exhaust it.
+    private func joinRun(_ task: Task<Void, Never>, label: String, tail: String = "") async {
+        let flag = LockedFlag()
+        Task { await task.value; flag.set(true) }
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            if flag.get() { return }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if !flag.get() {
+            Issue.record("\(label): loop did not shut down on EOF within 30 s\(tail.isEmpty ? "" : "; tail: \(tail.suffix(300))")")
+        }
+    }
+
     private func finishRun(_ session: ChatCommand.ComposedSession, task: Task<Void, Never>) async {
         session.loop.post(.inputLine(nil))
-        await task.value
+        await joinRun(task, label: "finishRun")
     }
 
     /// The loop drops posts before its inbox exists; the first render
@@ -88,7 +107,7 @@ struct ChatCompositionTests {
         guard await waitUntil(env, "idle") else {
             Issue.record("loop never rendered initial frame; tail: \(env.written.joined().suffix(300))")
             session.loop.post(.inputLine(nil))
-            await task.value
+            await joinRun(task, label: "requireReady", tail: env.written.joined())
             return false
         }
         return true
@@ -461,7 +480,7 @@ struct ChatCompositionTests {
         // Tab-accept through the shared gate, then submit the accepted
         // buffer text (production Enter submits the mirrored buffer).
         guard let accepted = session.loop.acceptSnapshot() else {
-            Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await task.value; return
+            Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await joinRun(task, label: "acceptGate"); return
         }
         session.loop.post(.tabAccept(base: accepted.base, display: accepted.display, cursor: accepted.cursor))
         session.loop.post(.inputLine(accepted.display))
@@ -501,7 +520,7 @@ struct ChatCompositionTests {
         session.loop.post(.mirror(text: "@he", cursor: 3))
         #expect(await waitForAccept(session), "suggestion never filled for @he")
         guard let accepted = session.loop.acceptSnapshot() else {
-            Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await task.value; return
+            Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await joinRun(task, label: "acceptGate"); return
         }
         session.loop.post(.tabAccept(base: accepted.base, display: accepted.display, cursor: accepted.cursor))
         // Delete the file between accept and submit: the fd-pinned
@@ -550,7 +569,7 @@ extension ChatCompositionTests {
         let groups = reconcileChangeGroups(stored.map(\.record))
         #expect(!groups.isEmpty, "write must record a change group")
         guard let gid = groups.last?.groupID else {
-            session.loop.post(.inputLine(nil)); await task.value; return
+            session.loop.post(.inputLine(nil)); await joinRun(task, label: "shutdown"); return
         }
         // Run without preview refuses (read before mutate).
         session.loop.post(.inputLine("/undo run \(gid)"))
@@ -802,7 +821,7 @@ extension ChatCompositionTests {
         session.loop.post(.mirror(text: "@he", cursor: 3))
         #expect(await waitForAccept(session), "suggestion never filled for @he")
         guard let accepted = session.loop.acceptSnapshot() else {
-            Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await task.value; return
+            Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await joinRun(task, label: "acceptGate"); return
         }
         session.loop.post(.tabAccept(base: accepted.base, display: accepted.display, cursor: accepted.cursor))
         // Remove the file: the submit gate refuses pre-dispatch, so the
@@ -849,7 +868,7 @@ extension ChatCompositionTests {
         session.loop.post(.mirror(text: "@he", cursor: 3))
         #expect(await waitForAccept(session), "suggestion never filled for @he")
         guard let accepted = session.loop.acceptSnapshot() else {
-            Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await task.value; return
+            Issue.record("accept gate closed"); session.loop.post(.inputLine(nil)); await joinRun(task, label: "acceptGate"); return
         }
         session.loop.post(.tabAccept(base: accepted.base, display: accepted.display, cursor: accepted.cursor))
         session.loop.post(.mirror(text: "", cursor: 0))

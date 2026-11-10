@@ -644,7 +644,13 @@ run-m4d-pty mkdir order + `#!/usr/bin/env bash`.
   tree + log tail + owned-process cleanup (pid-snapshot tree kill —
   verified twice: rc 124, zero strays; daemonized tmux legs killed
   by session prefix). A stale timeout flag can never fail a later
-  run (deleted at phase start).
+  run (deleted at phase start). In-test unbounded joins eliminated:
+  ChatLoopTests/ChatLifecycleTests use bounded joins; ChatPTYTests
+  uses settleThenExit with positional freshness polling +
+  non-recording drain reads; ChatCompositionTests uses bounded
+  joinRun (the CI feasibility stall was an unbounded
+  `await task.value` in finishRun/requireReady — now a loud ≤50 s
+  failure naming the wedged test instead of a silent hang).
 - Redundancy removed: `test native` dropped from the aggregate
   (strict filter-subset of `quick`); `coverage` split so timing/e2e
   execute EXACTLY once per gate (`coverage-from-lanes` reuses the
