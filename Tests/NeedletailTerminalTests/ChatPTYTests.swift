@@ -880,7 +880,12 @@ extension ChatPTYTests {
             // Core replay the prior admission as a silent no-op).
             // The fourth provider request proves WHAT was recalled.
             driver.send([0x1B, 0x5B, 0x41]) // Up
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            // Readiness, not sleep: the recall must render before "?"
+            // is typed, or "?" submits on an empty line. The recalled
+            // "write the note" echo was consumed by the earlier
+            // approval-flow expects, so expect() waits for the fresh
+            // recall render.
+            driver.expect("write the note", timeoutMS: 20_000)
             driver.send("?")
             driver.send("\r")
             driver.expect("recall done", timeoutMS: 20_000)
