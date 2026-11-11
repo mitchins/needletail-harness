@@ -116,3 +116,16 @@ jobs:
           args: >
             -Dsonar.qualitygate.wait=true
             -Dsonar.qualitygate.timeout=300
+
+      - name: Upload coverage report (evidence, even on scanner failure)
+        # The scanner's rejection of a bad report is a bare "Error
+        # during parsing" — the actual rejected bytes must be captured
+        # to diagnose the schema violation. Uploads whenever the report
+        # exists, including after a failed scan.
+        if: always() && hashFiles('coverage-generic.xml') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (node24)
+        with:
+          name: coverage-generic-xml
+          path: coverage-generic.xml
+          if-no-files-found: error
+          retention-days: 14

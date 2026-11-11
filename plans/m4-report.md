@@ -36,7 +36,7 @@ transcript preservation on failure; Core/Runtime frozen
 two adversarial DeepSeek code-review rounds, all blockers closed
 with targeted regression tests.
 
-## 4. Results (Linux x86_64, exact-HEAD evidence)
+## 4. Results (Linux x86_64, exact-HEAD evidence) (M4-D CLOSEOUT STATE — SUPERSEDED by residual §§7–9: PTY 13, terminal 146, presentation 100 at §12 remediation; retained for history)
 
 - `run-m4d-pty.sh`: **11/11 green** (PTY-01…08 + EOF + D2.7
   hygiene oracle + TERM-04 refusal), release product, all cases

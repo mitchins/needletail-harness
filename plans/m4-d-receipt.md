@@ -50,6 +50,10 @@ amendments recorded in-plan).
     exactly this one documented file as different from pinned
     upstream `1f149bfe` (tool has no documented-patch exemption;
     exit 1 on the secondary check only — recorded, not a gate).
+    (SUPERSEDED by §12.2: the formal patch process replaced
+    `SHA256SUMS-vendored` with `SHA256SUMS-upstream` +
+    `patches/0001-*.patch` and two-direction verification — the
+    manifest-rewrite narrative above is historical.)
 - Dependency graph: unchanged from M4-C (`Package.resolved`
   untouched; swift-markdown 0.9.0 + swift-cmark 0.9.0). `Package.swift`
   gains test-only deps (`NeedletailCLI`, `NeedletailTestSupport` for
@@ -732,3 +736,112 @@ both sets of findings were actioned before push:
   local new-session hang with test-spawned tmux, mechanism
   unproven — default socket retained; CI hang occurs without it,
   so `-L` was not the CI fix).
+
+## 13. Operational-safety remediation (post-authorization, maintainer-directed)
+
+### 13.1 Operational controls
+
+- Project OpenCode policy installed (`opencode.json`, untracked,
+  excluded via `.git/info/exclude`): every shell command ASK, 30
+  deny rules covering unscoped process termination (`kill`,
+  `pkill`, `killall`), all tmux operations, and shutdown/reboot —
+  bare, path-invoked, compound (`&&`/`;`/`|`) and env-wrapped
+  forms. Built for the installed opencode 1.19.5 (`permission`
+  object form, resolved and verified via `opencode debug config`:
+  31 merged bash rules, reviewer agents keep their own stricter
+  overrides). Acknowledged residual: the policy guards agent shell
+  commands, NOT child processes — destructive-path tests (PTY/tmux,
+  SIGKILL matrices) run only in isolated CI runners, never on the
+  shared host.
+- `dev`: `pkill -f` removed (follower reaped by recorded pid;
+  pattern kills can hit unowned processes). Unverified descendant
+  signalling REMOVED — the deadline killer signals only its own
+  `$!` child; a pid snapshot is not an ownership guarantee. The
+  proposed /proc starttime-verification scheme was REJECTED by the
+  maintainer (incorrect parsing; check-then-kill insufficient).
+- Output follower has a bounded lifecycle: GNU `tail --pid` where
+  available (exits with the phase pid; awk EOF-exits); elsewhere NO
+  follower runs (BSD tail) — log, heartbeat and failure evidence
+  remain authoritative. awk `strftime` probed with an untimestamped
+  fallback (Apple awk lacks it). No idle `tail -f` anywhere.
+- Bounded timeout reporting, rc-124 failure status, read-only
+  pre-kill diagnostics (predump) and all log evidence preserved.
+
+### 13.2 Sonar report integrity
+
+- `show2sonar.py` now certifies its own output: deterministic
+  post-write validation over the sonar-generic-coverage.xsd
+  constraints (well-formedness, root/version, structural shape,
+  positive-integer line numbers, covered vocabulary, unique
+  relative non-empty paths, XML 1.0 character validity in
+  attributes) — the scanner's rejection is a bare "Error during
+  parsing" with no diagnostics.
+- `sonar.yml` uploads `coverage-generic.xml` as a pinned artifact
+  even when the scanner fails (`if: always()` + hashFiles guard),
+  so the actual rejected bytes are captured. The scanner rejection
+  is NOT claimed solved: the CI report (78 files, covered=12733,
+  uncovered=8078) failed scanner-side parsing while the local
+  artifact passes every statically-checkable constraint; the
+  precise violation awaits the captured bytes.
+
+### 13.3 CodeRabbit round-2 corrections (24 threads)
+
+Applied (each with its regression test): HTTPClient shutdown on
+every post-creation failure path in `compose` (AHC trap-on-deinit);
+queue reorder midpoint-exhaustion loud refusal
+(`queue-reorder-rank-exhausted`) with a halving-to-collapse
+regression test that also replays admission-time ranks + recorded
+updates; mention backward-scan stops at ANY Unicode whitespace;
+progress `progressShown` survives stale-pending drops (clear
+suppression + scrollback-commit regression test); rg test resolvers
+resolve symlinks (qualifiedRgFD refuses symlinked rg — verified
+NativeToolExecutor.swift:1043-1045); trap-class index guards
+(`try #require` before indexing) in ChatWidth ×6, MarkdownRenderer
+×4, ChatComposition multiline (+ unique completion marker);
+latch-disarm assertion counts a SECOND warning (was vacuous);
+transcript marks are scalar-based (grapheme-merge shifts
+Character-counted offsets); PTY-03 Tab accept is a bounded
+readiness poll (positional freshness), not a 500 ms sleep; Darwin
+SIGTERM/SIGHUP set SIG_IGN (kqueue EVFILT requires it) with Linux
+default disposition unchanged — PENDING NATIVE QUALIFICATION.
+Rejected/corrected with evidence: workflow-timeout finding cited a
+stale revision (bounds already below steps; real gap was the
+coverage step sum, raised 40→50 min); ChatWidth pair literal was
+already decomposed (verified by hexdump) — escape + scalar-count
+precondition applied as hardening; ChatPTYDriver `count < 0`
+break remains REJECTED (select-timeout retry signal).
+
+### 13.4 PTY-08 fresh-server bootstrap — findings and prepared diagnostic
+
+Verified: CI `new-session -d` never returns (loud 30 s bound fires;
+suite completes; gate fails closed; no tmux-class orphan in the
+last run). Local passes ride the operator's existing server
+(no spawn); the reverted `-L` experiment forced fresh-server spawn
+and reproduced the hang locally — so the hang is specific to
+FIRST-SERVER BOOTSTRAP under a Process-spawned, non-TTY-attached
+client, independent of host.
+
+Prepared diagnostic (NOT executed on the development host; requires
+an isolated CI job or container, maintainer-approved):
+1. Isolation: dedicated job/container; `env -u TMUX`;
+   `TMUX_TMPDIR=$(mktemp -d)`; private socket
+   `SOCKET=probe-$$`; never touches any default socket.
+2. Run: `timeout 20 tmux -L "$SOCKET" -f /dev/null -vv
+   new-session -d -s probe -x 80 -y 24`; record `$!` (the ONLY pid
+   this run owns) and its exit status.
+3. Capture: `$TMUX_TMPDIR/tmux-*.log` (server `-vv` output),
+   client stdout/stderr, `ps -o pid,ppid,stat,wchan,cmd` for the
+   recorded pid subtree while alive (read-only inspection).
+4. Ownership/bounds: `timeout(1)` bounds everything; cleanup kills
+   ONLY the recorded pid; no tmux cleanup commands; no pattern
+   kills.
+5. Evidence decides: server-side failure in the -vv log → tmux
+   bootstrap defect (file upstream / choose wrapper); client-side
+   hang with a healthy server log → client handshake defect
+   (PTYShim-wrapped spawn is the leading candidate fix).
+
+### 13.5 Verdict (unchanged)
+
+PARTIAL. macOS native matrix remains the single outstanding M4
+gate; PTY-08 fresh-server bootstrap and the Sonar scanner parsing
+are the smallest open issues, both with prepared next steps.
