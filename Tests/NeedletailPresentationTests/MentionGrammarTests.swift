@@ -33,6 +33,22 @@ struct MentionGrammarTests {
         }
     }
 
+    @Test("UX-MENTION-01 any Unicode whitespace ends the query, not just ASCII")
+    func UX_MENTION_01_unicodeWhitespaceStopsScan() {
+        // The backward scan uses the SAME predicate as the boundary
+        // test (Unicode whitespace): "@doc\rbar" or "@doc\u{00A0}bar"
+        // must not keep the earlier @ live with whitespace inside the
+        // returned query.
+        #expect(mentionQuery(text: "see @doc\rbar", cursor: 12) == nil,
+            "CR inside the token must end the live query")
+        #expect(mentionQuery(text: "see @doc\u{00A0}bar", cursor: 13) == nil,
+            "NBSP inside the token must end the live query")
+        #expect(mentionQuery(text: "see @doc bar", cursor: 12) == nil,
+            "ASCII space still stops the scan")
+        #expect(mentionQuery(text: "see @doc", cursor: 8)?.query == "doc",
+            "sanity: a clean query still derives")
+    }
+
     @Test("UX-MENTION-01 fetch key strips the range suffix")
     func UX_MENTION_01_fetchStripsRange() throws {
         var state = UIState()

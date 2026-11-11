@@ -230,8 +230,19 @@ public final class TerminalOutputOwner: @unchecked Sendable {
                 writer(progress.text.map { "\r" + displaySafe($0) + "\u{1B}[K" } ?? "\r\u{1B}[K")
             }
             work.lock()
-            // Track shown state for the clear-noop rule.
-            progressShown = progress?.text != nil
+            // Track shown state for the clear-noop rule. Only a batch
+            // that actually WROTE a progress record (or cleared before
+            // content) changes the visible state: a stale pending write
+            // dropped at the top of this batch (invalidate() between
+            // setProgress and the drain) wrote nothing, so the earlier
+            // visible line is still on screen and progressShown must
+            // stay true — otherwise the next clear no-ops and content
+            // commits the stale progress text to scrollback.
+            if let progress {
+                progressShown = progress.text != nil
+            } else if clearBeforeContent {
+                progressShown = false
+            }
             inFlight -= 1
             work.broadcast()
             work.unlock()

@@ -15,9 +15,15 @@ struct B2ReadSearchTests {
 
     /// Real-rg evidence needs a real rg: /usr/bin/rg on Linux builders,
     /// /usr/local/bin/rg where Homebrew-style installs land (macOS).
+    /// The executor's qualifiedRgFD refuses SYMLINKED rg (fixed
+    /// provisioned-binary posture), so resolve to the real file — a
+    /// symlinked candidate (…/Cellar/rg/x.y.z/bin/rg) would otherwise
+    /// deny every search leg.
     private static func locateRg() -> String? {
         for p in ["/usr/bin/rg", "/usr/local/bin/rg"] {
-            if FileManager.default.isExecutableFile(atPath: p) { return p }
+            if FileManager.default.isExecutableFile(atPath: p) {
+                return URL(fileURLWithPath: p).resolvingSymlinksInPath().path
+            }
         }
         return nil
     }

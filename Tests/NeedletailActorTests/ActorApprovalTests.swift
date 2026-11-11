@@ -149,6 +149,53 @@ struct ActorApprovalTests {
         releaseGate.finish()
     }
 
+    @Test("POLICY-04 observe: mutating proposals deny upfront, never authorise")
+    func POLICY_04_observeDeniesUpfront() async throws {
+        // Observe mode with VALID caps (read/search only — observe +
+        // mutating grants is refused at creation, pinned in
+        // ApprovalPolicyTests): a mutating batch is denied by effective
+        // capabilities as typed receipts — the run continues with a
+        // provider continuation, and NOTHING reaches authorising or the
+        // executor. (batchNeedsApproval(.observe) is false, so the
+        // caps layer is the only thing standing between a mutating
+        // proposal and dispatch — this leg proves it end to end.)
+        let approvals = ScriptedApprovals()
+        approvals.script = [.deny("must never be asked")]
+        let transport = GatedTransport()
+        let (gateStream, gateContinuation) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        transport.gate = gateStream
+        let (actor, _) = try ActorFixtures.makeActor(mode: .observe, permissive: false, transport: transport, approvals: approvals)
+        // Drive via the gated transport: respond with the mutating
+        // batch, then the denial continuation, then the final.
+        await actor.submitText(commandID: CommandID("o-1"), text: "run", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitInvocations(transport, count: 1)
+        let inv1 = transport.invocations[0]
+        gateContinuation.yield(.respond(ProviderResponse(
+            requestID: inv1.requestID, generation: inv1.generation,
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"h\",\"new_string\":\"w\"}"),
+                ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"/usr/bin/pytest\",\"argv\":[\"/usr/bin/pytest\",\"-q\"]}"),
+                ToolProposal(callID: "c3", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"b\",\"content\":\"x\"}"),
+            ], isFinal: false))))
+        try await ActorFixtures.awaitInvocations(transport, count: 2)
+        // The denial continuation is a provider request, never an
+        // approval ask and never an execution.
+        #expect(approvals.requests.isEmpty, "observe must not ask approval for mutating tools")
+        // Deliver the final response (the denial continuation).
+        let inv2 = transport.invocations[1]
+        gateContinuation.yield(.respond(ProviderResponse(
+            requestID: inv2.requestID, generation: inv2.generation,
+            outcome: .textDeltaComplete(text: "denials delivered", toolProposals: [], isFinal: true))))
+        gateContinuation.finish()
+        try await ActorFixtures.awaitPhase(actor, {
+            if case .completed = $0.phase { return true }
+            return false
+        }, "completed after typed denials")
+        let final = await actor.currentState()
+        #expect(final.pendingApproval == nil, "no approval request may linger")
+        gateContinuation.finish()
+    }
+
     @Test("HEAD-03 approval precedence: ask-gated schema-valid exec still asks")
     func HEAD_03_approvalPrecedenceAskGatedExec() async throws {
         // M2-C C0 (plan REV12 §3.2): HEAD-03's required OUTCOME is

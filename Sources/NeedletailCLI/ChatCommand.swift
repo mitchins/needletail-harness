@@ -508,8 +508,12 @@ struct ChatCommand: ParsableCommand {
             snapshotProvider: { snapshot },
             advertisedTools: effective.tools,
             nativeExecComposed: execComposed)
-        // 6. Terminal seams: owner, editor, tap box, loop.
+        // 6. Terminal seams: owner, editor, tap box, loop. EVERY throw
+        // from here until the actor's own do/catch must shut the client
+        // down first: AsyncHTTPClient traps when a client deinitializes
+        // un-shut-down (recorded in WireLoopbackTests).
         guard let lineEditor = LineEditorSession() else {
+            try? await httpClient.shutdown().get()
             eprint("chat error: cannot initialize the line editor")
             throw ExitCode(4)
         }
@@ -557,13 +561,18 @@ struct ChatCommand: ParsableCommand {
         // counter refuses at the transport backstop, never silently.
         let liveBudget: LiveRequestBudget?
         if let limit = LiveRequestBudget.limit(checkpoint: false, environment: ProcessInfo.processInfo.environment) {
-            let budgetDir = try RunCommand.resolveStateDirectory()
-            try FileManager.default.createDirectory(
-                atPath: budgetDir, withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700])
-            liveBudget = LiveRequestBudget(
-                fileURL: URL(fileURLWithPath: (budgetDir as NSString).appendingPathComponent("run-request-budget.json")),
-                limit: limit)
+            do {
+                let budgetDir = try RunCommand.resolveStateDirectory()
+                try FileManager.default.createDirectory(
+                    atPath: budgetDir, withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700])
+                liveBudget = LiveRequestBudget(
+                    fileURL: URL(fileURLWithPath: (budgetDir as NSString).appendingPathComponent("run-request-budget.json")),
+                    limit: limit)
+            } catch {
+                try? await httpClient.shutdown().get()
+                throw error
+            }
         } else {
             liveBudget = nil
         }
@@ -585,10 +594,12 @@ struct ChatCommand: ParsableCommand {
         if let tracePath = trace {
             guard FileManager.default.createFile(
                 atPath: tracePath, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                try? await httpClient.shutdown().get()
                 eprint("cannot create trace file \(tracePath)")
                 throw ExitCode(2)
             }
             guard let handle = FileHandle(forWritingAtPath: tracePath) else {
+                try? await httpClient.shutdown().get()
                 eprint("cannot open trace file \(tracePath)")
                 throw ExitCode(2)
             }
@@ -773,6 +784,17 @@ struct ChatCommand: ParsableCommand {
 #elseif canImport(Darwin)
         Darwin.signal(SIGINT, SIG_IGN)
         Darwin.signal(SIGPIPE, SIG_IGN)
+        // Darwin's kqueue EVFILT_SIGNAL (what GCD signal sources are
+        // built on) delivers only when the signal disposition is
+        // SIG_IGN; with the default disposition the process dies before
+        // the handler can restore termios. Linux GCD differs — it needs
+        // the DEFAULT disposition (a SIG_IGN signal is discarded by the
+        // kernel before the source fires; the PTY-08 dumb leg proved
+        // that exact failure) — hence the platform split.
+        // PENDING NATIVE QUALIFICATION: PTY-07's SIGTERM leg must pass
+        // on the final macOS matrix before this is considered proven.
+        Darwin.signal(SIGTERM, SIG_IGN)
+        Darwin.signal(SIGHUP, SIG_IGN)
 #endif
         let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
         sigintSource.setEventHandler {
@@ -788,10 +810,9 @@ struct ChatCommand: ParsableCommand {
         // a pure termios syscall (safe while the input thread is blocked
         // in readLine); owned work is cancelled best-effort. SIGKILL has
         // NO in-process cleanup (documented; recovery is external).
-        // NOTE: no signal(SIGTERM, SIG_IGN) here — GCD signal sources
-        // require the DEFAULT disposition (a SIG_IGN signal is discarded
-        // by the kernel before the source ever fires; the PTY-08 dumb
-        // leg proved that exact failure).
+        // Dispositions are set per-platform ABOVE: Linux keeps the
+        // default disposition (required by its GCD signal source);
+        // Darwin ignores SIGTERM/SIGHUP (required by kqueue EVFILT).
         let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
         termSource.setEventHandler {
             Task { @Sendable in await session.cancel() }

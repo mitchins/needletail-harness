@@ -283,9 +283,23 @@ extension ChatPTYTests {
             driver.send("@he")
             driver.expect("hello.txt", timeoutMS: 15_000)
             // Tab accepts exactly (token, not string parsing), Enter
-            // submits the accepted line.
+            // submits the accepted line. Readiness, not a fixed sleep:
+            // the accept must land before Enter (else the draft carries
+            // the raw query and the body oracle fails). Positional
+            // freshness: the popup's "hello.txt" is pre-mark, so only
+            // the ACCEPT repaint satisfies the wait.
             driver.send("\t")
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            let tmark = driver.transcriptMark()
+            var accepted = false
+            let acceptDeadline = Date().addingTimeInterval(10)
+            while !accepted, Date() < acceptDeadline {
+                driver.drain(timeoutMS: 200)
+                if driver.transcriptSince(tmark).contains("hello.txt") { accepted = true }
+            }
+            if !accepted {
+                Self.preserve("pty-03", transcript: driver.fullTranscript())
+                Issue.record("Tab accept never repainted the live line"); return
+            }
             server.releaseGate("p3")
             driver.expect("streaming output here", timeoutMS: 20_000)
             driver.send("\r")

@@ -143,6 +143,32 @@ struct TerminalOutputOwnerTests {
         #expect(writes[2].contains("hello"))
     }
 
+    @Test("a dropped stale pending write keeps the visible line clearable")
+    func staleDropKeepsLineClearable() {
+        let box = LockedBox()
+        let clock = ManualClock(start: Date(timeIntervalSince1970: 2_000_000))
+        let o = owner(now: { clock.now() }, written: box)
+        defer { o.close() }
+        let g = o.currentGeneration
+        o.setProgress("streaming… 10 bytes", generation: g)
+        o.flush() // line visible on screen
+        clock.advance(by: 0.2)
+        o.setProgress("streaming… 20 bytes", generation: g) // pending
+        o.invalidate() // the pending write is now stale…
+        o.flush() // …so the drain drops it: NOTHING written, line remains
+        #expect(box.values().count == 1, "a stale pending write must not emit")
+        // The shown-state tracker must still consider the line visible:
+        // the next clear passes and content is preceded by the clear.
+        o.setProgress(nil, generation: o.currentGeneration)
+        o.flush()
+        o.emit([RenderedLine(spans: [TextSpan(text: "hello", role: .normal)])], generation: o.currentGeneration)
+        o.flush()
+        let writes = box.values()
+        #expect(writes.count == 3, "expected clear + content after the visible line, got \(writes.count)")
+        #expect(writes[1] == "\r\u{1B}[K", "visible progress line must be cleared before content, got \(writes[1])")
+        #expect(writes[2].contains("hello"))
+    }
+
     @Test("progress path never carries live control bytes (C5.2 partial oracle)")
     func progressNoLiveControls() {
         let box = LockedBox()

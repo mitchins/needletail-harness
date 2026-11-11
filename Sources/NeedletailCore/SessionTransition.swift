@@ -1345,6 +1345,18 @@ private func reorderQueueEntry<I: IDSource>(_ state: SessionState, entryID: Stri
         let beforeRank = queue[target].rank
         let prevRank = target > 0 ? queue[target - 1].rank : beforeRank - 2.0
         newRank = (prevRank + beforeRank) / 2.0
+        // Midpoint exhaustion: repeated moves between the same two
+        // neighbours halve the gap until it collapses into a Double
+        // ULP. A tied or out-of-order rank would make replay
+        // (reconcileQueue sorts by (rank, orderKey)) silently revert
+        // the operator reorder — refuse loudly instead, never apply.
+        guard newRank > prevRank, newRank < beforeRank else {
+            let (s1, prefix) = sequenced(state, kind: "queue-reorder-rank-exhausted", digest: eventDigest("reorder", entryID, beforeID), ids: &ids)
+            return Transition(
+                state: s1,
+                effects: [.emitUI(.denied(cause: "reorder refused: rank precision exhausted between neighbours"))],
+                records: prefix)
+        }
         insertAt = target
     } else {
         newRank = (queue.map(\.rank).max() ?? 0.0) + 1.0

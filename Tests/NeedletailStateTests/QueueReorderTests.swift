@@ -99,6 +99,54 @@ struct QueueReorderTests {
         #expect(withdrawn.state.queue[0].state == .withdrawn)
     }
 
+    @Test("B2 reorder midpoint exhaustion refuses loudly and never reverts replay")
+    func B2_reorderRankExhaustionRefuses() throws {
+        var ids = StateFixtures.ids()
+        var state = try Self.busyState(ids: &ids)
+        state = transition(state, StateFixtures.input("a", id: "a-1", kind: .followUp), &ids).state
+        state = transition(state, StateFixtures.input("b", id: "b-1", kind: .followUp), &ids).state
+        state = transition(state, StateFixtures.input("c", id: "c-1", kind: .followUp), &ids).state
+        // The durable stream the journal holds: admissions at
+        // ADMISSION-TIME rank, then one queueUpdated per accepted move.
+        let admitted = state.queue
+        var records: [DurableRecord] = []
+        var refused = false
+        var moves = 0
+        for _ in 0..<500 {
+            let target = transition(state, .queueReorder(entryID: state.queue[2].entryID, beforeID: state.queue[1].entryID, atMillis: 2000), &ids)
+            // .denied is a static FACTORY on SessionEventProjection (not
+            // an enum case): equality/predicate matching only.
+            if target.effects.contains(where: {
+                if case .emitUI(let proj) = $0 {
+                    return proj.kind == "denied" && proj.detail.contains("rank precision exhausted")
+                }
+                return false
+            }) {
+                refused = true
+                break
+            }
+            #expect(target.effects.count == 1, "each accepted move emits exactly the reorder status")
+            if let last = target.records.last, case .queueUpdated(let moved) = last {
+                records.append(.queueUpdated(moved))
+            }
+            state = target.state
+            moves += 1
+        }
+        #expect(refused, "midpoint must eventually collapse and refuse loudly (moves: \(moves))")
+        #expect(moves > 10, "exhaustion must require real halving, not an immediate refusal")
+        // The refusal left the queue untouched and recorded no update:
+        // replay from admission-time ranks + the recorded updates must
+        // reproduce the live order exactly (a reorder never silently
+        // reverts — the contract this guard protects).
+        let recon = try reconcileQueue([
+            .queueAdmitted(admitted[0]),
+            .queueAdmitted(admitted[1]),
+            .queueAdmitted(admitted[2]),
+        ] + records)
+        #expect(recon.entries.map(\.commandID) == state.queue.map(\.commandID),
+            "replay must match the live order at exhaustion, got \(recon.entries.map(\.commandID)) vs \(state.queue.map(\.commandID))")
+    }
+
     @Test("B2 reorder survives reopen via rank-ordered replay")
     func B2_reorderSurvivesReopen() throws {
         var ids = StateFixtures.ids()

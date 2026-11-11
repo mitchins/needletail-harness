@@ -53,7 +53,11 @@ public func mentionQuery(text: String, cursor: Int) -> MentionQuery? {
             }
             return nil
         }
-        if s == "\n" || s == " " || s == "\t" { return nil }
+        // ANY Unicode whitespace ends the query — the same predicate
+        // the boundary test above uses. Scanning for only \n/space/tab
+        // let "@doc\rbar" or "@doc\u{00A0}bar" keep an earlier `@`
+        // live with whitespace inside the returned query.
+        if s.properties.isWhitespace { return nil }
         i -= 1
     }
     guard let found = at else { return nil }

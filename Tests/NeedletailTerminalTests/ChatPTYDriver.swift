@@ -185,11 +185,15 @@ final class ChatPTYDriver {
     /// `transcriptSince` returns only bytes appended after
     /// `transcriptMark()`. Non-consuming (the expect cursor is
     /// undisturbed), so polling for a marker never masks it.
-    func transcriptMark() -> Int { cursor.fullText.count }
+    /// Scalar-based (not Character count): appending can merge a new
+    /// scalar into the previous grapheme cluster ("\r" + "\n" → one
+    /// Character), which would shift a Character-counted mark and skip
+    /// the start of fresh output.
+    func transcriptMark() -> Int { cursor.fullText.unicodeScalars.count }
     func transcriptSince(_ mark: Int) -> String {
-        let full = cursor.fullText
-        guard mark < full.count else { return "" }
-        return String(full.dropFirst(mark))
+        let scalars = cursor.fullText.unicodeScalars
+        guard mark < scalars.count else { return "" }
+        return String(String.UnicodeScalarView(scalars.dropFirst(mark)))
     }
 
     func signal(_ sig: Int32) { nt_pty_signal(&pty, sig) }

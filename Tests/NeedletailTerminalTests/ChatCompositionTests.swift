@@ -888,7 +888,7 @@ extension ChatCompositionTests {
     func multilineSubmitPreservesNewlines() async throws {
         let env = try makeEnv(tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
         defer { tearDown(env) }
-        env.server.enqueue(ChatLoopback.textTurn("ok", splits: 1))
+        env.server.enqueue(ChatLoopback.textTurn("multiline-ok", splits: 1))
         let session = try await ChatCommand.compose(
             config: env.configPath, trace: nil, alias: nil, maxTurns: 10,
             allowExec: false, workspace: nil, readRoot: [],
@@ -897,8 +897,14 @@ extension ChatCompositionTests {
         let task = Task { await session.run(scriptedInput: []) }
         guard await requireReady(env, session, task: task) else { return }
         session.loop.post(.inputLine("line one\nline two"))
-        #expect(await waitUntil(env, "ok"))
+        // Unique marker: "ok" would match unrelated output ("types ok",
+        // receipt tails). A specific answer pins this turn's completion.
+        #expect(await waitUntil(env, "multiline-ok"))
         await finishRun(session, task: task)
+        // Guard BEFORE indexing: a missing request must fail the test
+        // cleanly — indexing an empty array traps (ud2/SIGILL) and
+        // kills the whole runner binary.
+        try #require(env.server.requests.count == 1, "expected exactly one provider request")
         let body = String(decoding: env.server.requests[0].body, as: UTF8.self)
         #expect(body.contains("line one\\nline two"), "newlines must survive submit byte-exact")
         try await requireStoreClean(session)

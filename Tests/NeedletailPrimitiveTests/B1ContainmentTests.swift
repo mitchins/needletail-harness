@@ -914,8 +914,11 @@ struct B1ContainmentTests {
         let store = InMemorySessionStore()
         let writer = WriterIdentity(session: SessionID("s-search"), writer: "w")
         // Real rg evidence needs a real rg: /usr/bin/rg on Linux builders,
-        // /usr/local/bin/rg for Homebrew-style installs (macOS).
-        let realRg = try #require(["/usr/bin/rg", "/usr/local/bin/rg"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
+        // /usr/local/bin/rg for Homebrew-style installs (macOS). The
+        // executor refuses SYMLINKED rg (qualifiedRgFD), so resolve.
+        let realRg = try #require(["/usr/bin/rg", "/usr/local/bin/rg"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+            .map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path },
                                   "rg required for B1 search evidence")
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-search"), writer: writer, rgPath: realRg)
         // Search with grantable path without approval should be denied

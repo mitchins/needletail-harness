@@ -8,10 +8,10 @@ struct MarkdownRendererTests {
     private var ctx: RenderContext { RenderContext(sessionID: "s", requestID: "r") }
 
     @Test("headings, emphasis, lists, task lists, code")
-    func blockStructure() {
+    func blockStructure() throws {
         let lines = renderMarkdownBlock("# Title\n\nHello **bold** and *em* with `code`.\n\n- a\n- [ ] task\n- [x] done\n\n1. first\n2. second\n", context: ctx)
         let headed = lines.filter { $0.spans.contains(where: { $0.role == .heading }) }
-        #expect(headed.count == 1)
+        try #require(headed.count == 1)
         #expect(headed[0].plainText == "Title")
         #expect(lines.flatMap(\.spans).contains(where: { $0.role == .strong && $0.text == "bold" }))
         #expect(lines.flatMap(\.spans).contains(where: { $0.role == .emphasis && $0.text == "em" }))
@@ -22,9 +22,9 @@ struct MarkdownRendererTests {
     }
 
     @Test("fenced code blocks keep fences and language")
-    func fencedCode() {
+    func fencedCode() throws {
         let lines = renderMarkdownBlock("```swift\nlet x = 1\n```", context: ctx)
-        #expect(lines.count == 3)
+        try #require(lines.count == 3)
         #expect(lines[0].plainText == "```swift")
         #expect(lines[1].spans.allSatisfy { $0.role == .codeBlock })
         #expect(lines[2].plainText == "```")
@@ -79,9 +79,9 @@ struct MarkdownRendererTests {
     }
 
     @Test("tables render head cells and body rows pipe-joined")
-    func tables() {
+    func tables() throws {
         let lines = renderMarkdownBlock("| a | b |\n|---|---|\n| 1 | 2 |\n", context: ctx)
-        #expect(lines.count == 2)
+        try #require(lines.count == 2)
         #expect(lines[0].plainText == "a | b")
         #expect(lines[1].plainText == "1 | 2")
     }
@@ -159,7 +159,7 @@ struct MarkdownRendererTests {
     }
 
     @Test("diff hunks classify by prefix; hostile bytes sanitized")
-    func diffRoles() {
+    func diffRoles() throws {
         let lines = DiffRenderer.renderHunks([
             "diff --git a/f b/f",
             "--- a/f",
@@ -169,6 +169,7 @@ struct MarkdownRendererTests {
             "-removed\u{202E}",
             " context",
         ])
+        try #require(lines.count == 7, "expected one line per input row, got \(lines.count)")
         #expect(lines[0].spans.first?.role == .diffHunk)
         #expect(lines[3].spans.first?.role == .diffHunk)
         #expect(lines[4].spans.first?.role == .diffAdd)

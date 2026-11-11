@@ -329,8 +329,19 @@ struct ChatLoopTests {
         // Any other input disarms the latch: typing clears it.
         loop.post(.inputLine("hello"))
         _ = await waitFor(marker: "hello", in: written, timeout: 5)
+        // The disarmed press must warn AGAIN (a SECOND "queued work
+        // pending") — a whole-buffer marker wait would pass vacuously
+        // on the first warning, proving nothing about the latch.
         loop.post(.key(.ctrlC))
-        #expect(await waitFor(marker: "queued work pending", in: written, timeout: 5), "latch must disarm on other input")
+        let rewarned: Bool = await {
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                if written.joined().components(separatedBy: "queued work pending").count - 1 >= 2 { return true }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            return false
+        }()
+        #expect(rewarned, "latch must disarm on other input (second warning expected)")
         // Second consecutive press exits.
         loop.post(.key(.ctrlC))
         let exited = await join(task: runTask, timeout: 5)

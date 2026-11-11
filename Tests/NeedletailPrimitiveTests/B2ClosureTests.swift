@@ -22,9 +22,13 @@ struct B2ClosureTests {
         return url
     }
 
+    /// See B2ReadSearchTests.locateRg: symlink candidates must resolve
+    /// — qualifiedRgFD refuses symlinked rg outright.
     private static func locateRg() -> String? {
         for p in ["/usr/bin/rg", "/usr/local/bin/rg"] {
-            if FileManager.default.isExecutableFile(atPath: p) { return p }
+            if FileManager.default.isExecutableFile(atPath: p) {
+                return URL(fileURLWithPath: p).resolvingSymlinksInPath().path
+            }
         }
         return nil
     }
