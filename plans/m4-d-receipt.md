@@ -778,11 +778,20 @@ both sets of findings were actioned before push:
   parsing" with no diagnostics.
 - `sonar.yml` uploads `coverage-generic.xml` as a pinned artifact
   even when the scanner fails (`if: always()` + hashFiles guard),
-  so the actual rejected bytes are captured. The scanner rejection
-  is NOT claimed solved: the CI report (78 files, covered=12733,
-  uncovered=8078) failed scanner-side parsing while the local
-  artifact passes every statically-checkable constraint; the
-  precise violation awaits the captured bytes.
+  so the actual rejected bytes are captured. RESULT: the captured
+  bytes diagnosed the violation precisely — llvm-cov EXPANSION
+  blocks (an inlined instance printed inside the enclosing file's
+  section, `|`-prefixed) were attributed by the dump parser to the
+  enclosing file, emitting 115 lineNumbers beyond
+  `UndoDiffViews.swift`'s 114 lines (the merged block was
+  LineEditorSession.swift 115–324, which also has its own correct
+  top-level section). Sonar validates coverage line numbers against
+  source length and rejects. Parser now skips `|`-led expansion
+  blocks (verified against a synthetic dump reproducing the CI
+  shape); the validator additionally rejects lineNumbers beyond a
+  source file's real length when the file is on disk (the OLD
+  artifact is rejected naming all 115 violations; the regenerated
+  report is clean).
 
 ### 13.3 CodeRabbit round-2 corrections (24 threads)
 

@@ -80,6 +80,17 @@ def main():
                 if line.startswith("/") and line.endswith(":") and " " not in line.strip():
                     cur = line[:-1]
                     continue
+                # llvm-cov EXPANSION blocks (inlined instances from other
+                # files): a "| /path:l:c:" header followed by "| 171| 37|
+                # source" content. Those line numbers belong to the
+                # EXPANDED file — which has its own top-level section in
+                # this same dump — so attributing them here emitted
+                # lineNumbers beyond the enclosing file's length, which
+                # the scanner rejects. Verified against the captured CI
+                # report: LineEditorSession lines 115-324 merged into
+                # UndoDiffViews (114 lines). Skip the whole block.
+                if line.lstrip().startswith("|"):
+                    continue
                 if cur is None:
                     continue
                 m = LINE_RE.match(line)
@@ -116,7 +127,7 @@ def main():
     except Exception as exc:
         sys.stderr.write(f"FAIL: cannot write {out_path}: {exc}\n")
         sys.exit(1)
-    validate_generic_coverage(out_path)
+    validate_generic_coverage(out_path, repo_root)
     print(f"SONAR COVERAGE OK: files={len(executable)} covered={total} uncovered={uncovered_total}")
     if not executable:
         sys.stderr.write("FAIL: zero production files with covered lines\n")
@@ -130,12 +141,14 @@ _XML10_CHAR = re.compile(
     "^[\\u0009\\u000A\\u000D\\u0020-\\uD7FF\\uE000-\\uFFFD\\U00010000-\\U0010FFFF]*$")
 
 
-def validate_generic_coverage(out_path):
+def validate_generic_coverage(out_path, repo_root):
     """Deterministic post-write gate over the sonar-generic-coverage.xsd
     constraints: well-formedness, root name and version, structural
     shape (coverage > file > lineToCover, nothing else), line-number
     domain (positive integer), covered vocabulary, unique relative
-    non-empty paths, and XML 1.0 character validity in every attribute.
+    non-empty paths, XML 1.0 character validity in every attribute, and
+    — when the source file exists on disk — line numbers within the
+    file's actual length (the CI scanner rejects out-of-range numbers).
 
     The scanner's rejection of a bad report is a bare "Error during
     parsing" with no diagnostics, so the generator certifies its own
@@ -173,6 +186,11 @@ def validate_generic_coverage(out_path):
         if path in seen_paths:
             problems.append(f"duplicate file path: {path}")
         seen_paths.add(path)
+        src_len = None
+        src = os.path.join(repo_root, path)
+        if os.path.isfile(src):
+            with open(src, encoding="utf-8", errors="replace") as fh:
+                src_len = sum(1 for _ in fh)
         for le in fe.findall("lineToCover"):
             nlines += 1
             raw = le.get("lineNumber")
@@ -180,6 +198,9 @@ def validate_generic_coverage(out_path):
                 n = int(raw)
                 if n < 1:
                     problems.append(f"{path}: lineNumber {n} is not a positive integer")
+                elif src_len is not None and n > src_len:
+                    problems.append(f"{path}: lineNumber {n} beyond EOF ({src_len} lines) — "
+                                    "expansion or mapping misattribution")
             except (TypeError, ValueError):
                 problems.append(f"{path}: lineNumber {raw!r} is not an integer")
             if le.get("covered") not in ("true", "false"):
