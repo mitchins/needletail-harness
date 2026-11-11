@@ -112,12 +112,12 @@ restore_all() {
 }
 trap restore_all EXIT
 for f in $FILES; do
-  [ -f "$f" ] || { echo "MISSING $f" | tee -a $LOG; continue }
+  [ -f "$f" ] || { echo "MISSING $f" | tee -a $LOG; continue; }
   cp "$f" "$f.pristine-b6final"
   shasum -a 256 "$f" | cut -d' ' -f1 > "$f.sha-b6final"
 done
 for f in $FILES; do
-  [ -f "$f" ] || { echo "MISSING $f" | tee -a $LOG; continue }
+  [ -f "$f" ] || { echo "MISSING $f" | tee -a $LOG; continue; }
   python3 - "$f" <<'PYEOF'
 import sys
 p = sys.argv[1]

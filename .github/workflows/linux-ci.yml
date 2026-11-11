@@ -130,7 +130,11 @@ jobs:
         run: ./dev test feasibility
 
       - name: Offline coverage (bulk evidence + merge + ingest, bounded + streaming)
-        timeout-minutes: 40
+        # Must exceed the SUM of the in-tree phase bounds
+        # (coverage-evidence 35 min + coverage-ingest 10 min) plus the
+        # merge, so the in-tree killer with its diagnostics always wins
+        # the race against the step timeout.
+        timeout-minutes: 50
         run: ./dev coverage-from-lanes
 
       - name: Offline cases m1a (bounded + streaming)

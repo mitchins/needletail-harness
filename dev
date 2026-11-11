@@ -99,17 +99,6 @@ require_test_result() {
 # `tmux ls` probe would itself hang on a wedged server). Returns the
 # command's exit code, or 124 on deadline kill (like timeout(1)).
 # POSIX sh only.
-# All descendant pids of $1 (recursive walk; used for timeout kills —
-# pids are snapshotted BEFORE any signal, so later reparenting cannot
-# hide a victim from the KILL pass).
-_sb_tree() {
-    _t_root="$1"
-    for _t_c in $(ps -o pid=,ppid= 2>/dev/null | awk -v p="$_t_root" '$2==p {print $1}'); do
-        echo "$_t_c"
-        _sb_tree "$_t_c"
-    done
-}
-
 stream_bounded() {
     _sb_label="$1"; _sb_secs="$2"; shift 2
     _sb_log="$root_dir/.needletail-dev/logs/dev-$_sb_label.log"
@@ -117,14 +106,34 @@ stream_bounded() {
     : > "$_sb_log"
     # A stale timeout flag can never fail a later run.
     rm -f "$_sb_log.timeout"
-    # Live stream with wall-clock prefixes (awk is POSIX-portable):
-    # CI forensics needs to know WHEN each line landed, not just its
-    # order — the 60-minute silent feasibility stall was ambiguous
-    # between "hung test" and "slow suite" without timestamps.
-    tail -n +1 -f "$_sb_log" 2>/dev/null | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' &
-    _sb_tail=$!
+    # Live stream with wall-clock prefixes: CI forensics needs to know
+    # WHEN each line landed, not just its order — the 60-minute silent
+    # feasibility stall was ambiguous between "hung test" and "slow
+    # suite" without timestamps. The follower has a BOUNDED lifecycle
+    # by construction:
+    #   - GNU tail supports --pid=<phase pid>: tail exits the moment
+    #     the command dies, awk sees EOF and exits. Nothing lingers.
+    #   - Elsewhere (BSD tail, e.g. macOS) NO follower runs: the log
+    #     file, the 5-min heartbeat and the failure evidence remain
+    #     authoritative. Never an idle `tail -f` with an unbounded
+    #     lifetime.
+    #   - Apple awk lacks strftime: probe once and fall back to an
+    #     untimestamped stream.
+    # The follower is launched AFTER the command with `tail -n +1`
+    # (reads the whole file from byte 0), so no output is missed.
+    if awk 'BEGIN { strftime("%H") }' >/dev/null 2>&1; then
+        _sb_ts='{ print strftime("%H:%M:%S"), $0; fflush() }'
+    else
+        _sb_ts='{ print; fflush() }'
+    fi
     "$@" > "$_sb_log" 2>&1 &
     _sb_pid=$!
+    if tail --help 2>/dev/null | grep -q -- '--pid'; then
+        tail -n +1 -f --pid="$_sb_pid" "$_sb_log" 2>/dev/null | awk "$_sb_ts" &
+        _sb_tail=$!
+    else
+        _sb_tail=""
+    fi
     (
         _sb_slept=0
         while kill -0 "$_sb_pid" 2>/dev/null; do
@@ -152,21 +161,16 @@ stream_bounded() {
                         fi
                     done
                 } > "$_sb_log.predump" 2>&1
-                # Snapshot the tree BEFORE any signal: KILL reparents
-                # survivors to init, hiding them from parent-pid walks.
-                # Snapshot the tree BEFORE signalling: a toolchain shim
-                # may defer TERM while waiting for its child, and KILL
-                # reparents survivors to init — pid-list kills land
-                # regardless of reparenting.
-                _sb_victims=$( _sb_tree "$_sb_pid" )
+                # Signal ONLY the recorded phase pid ($! — our own
+                # background child, the strongest ownership proof).
+                # Descendant signalling is deliberately NOT done: a
+                # pid snapshot is not an ownership guarantee (PIDs are
+                # reused; a snapshot cannot prove a process is still
+                # ours at signal time). Survivors are reaped by the
+                # ephemeral CI runner; host users' in-test defers are
+                # the primary cleanup.
                 kill -TERM "$_sb_pid" 2>/dev/null || true
-                for _sb_v in $_sb_victims; do
-                    kill -TERM "$_sb_v" 2>/dev/null || true
-                done
                 sleep 10
-                for _sb_v in $_sb_victims; do
-                    kill -KILL "$_sb_v" 2>/dev/null || true
-                done
                 kill -KILL "$_sb_pid" 2>/dev/null || true
                 # (No tmux cleanup here: `tmux ls` itself hangs on a
                 # wedged server and would stall the killer. In-test
@@ -197,12 +201,16 @@ stream_bounded() {
         _sb_rc=$?
     fi
     # Let the follower drain the final bytes before it is reaped, then
-    # reap the whole follower pipeline (awk is $!; its tail feeds it
-    # and would linger forever on the open log otherwise).
+    # reap the follower by pid: awk is the pipeline's $! (our own
+    # child); on the GNU path tail has already exited (its --pid died)
+    # and killing awk is a harmless no-op. No pattern matching — a
+    # pattern kill can hit processes we do not own.
     sleep 2
-    kill "$_sb_killer" "$_sb_watch" "$_sb_tail" 2>/dev/null || true
-    pkill -f "tail -n +1 -f $_sb_log" 2>/dev/null || true
-    wait 2>/dev/null || true
+    kill "$_sb_killer" "$_sb_watch" 2>/dev/null || true
+    if [ -n "$_sb_tail" ]; then
+        kill "$_sb_tail" 2>/dev/null || true
+        wait "$_sb_tail" 2>/dev/null || true
+    fi
     if [ -f "$_sb_log.timeout" ]; then
         echo "FAIL [$_sb_label]: deadline kill after ${_sb_secs}s (exit $_sb_rc). Diagnostics:"
         if [ -f "$_sb_log.predump" ]; then
@@ -961,7 +969,8 @@ coverage-sonar)
     # Signal/interruption deaths are NOT assertion failures: a runner
     # killed mid-run (128+N) leaves whole modules unmeasured, so the
     # merged report would understate coverage — refuse, do not certify.
-    [ "$_sonar_rc" -lt 128 ] || { echo "FAIL [coverage-sonar]: test runner died by signal/timeout (exit $_sonar_rc); refusing to certify coverage from an interrupted run."; exit 1; }
+    # 124 is the stream_bounded deadline-kill exit: equally interrupted.
+    [ "$_sonar_rc" -lt 124 ] || { echo "FAIL [coverage-sonar]: test runner died by signal or deadline kill (exit $_sonar_rc); refusing to certify coverage from an interrupted run."; exit 1; }
     # Stale-profile guard (FINAL-03 review): everything merged below must
     # have been produced by THIS run. The profraw trees were cleared at
     # lane start, so require at least one fresh profile and reject any

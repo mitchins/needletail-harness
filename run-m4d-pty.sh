@@ -5,7 +5,7 @@
 # pass is FAIL, not PASS. Transcripts persist under
 # .needletail-dev/m4d-pty/ on failure (the tests preserve them).
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 LOG=".needletail-dev/logs/m4d-pty-run.log"
 mkdir -p .needletail-dev/logs .needletail-dev/m4d-pty
@@ -20,8 +20,12 @@ BIN=".build/release/needletail"
 echo "release binary: $(du -h "$BIN" | cut -f1) ($(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN") bytes)"
 
 echo "== m4d-pty: ChatPTYTests (physical release-binary PTY) =="
-OUT=$(swift test --filter ChatPTYTests 2>&1)
+OUT=$(swift test --filter ChatPTYTests 2>&1); RC=$?
 echo "$OUT" >>"$LOG"
+if [ "$RC" -ne 0 ]; then
+    echo "FAIL: swift test exited $RC (see $LOG)"
+    exit 1
+fi
 SUMMARY=$(echo "$OUT" | grep -aE "Test run with [0-9]+ tests" | tail -1)
 echo "$SUMMARY"
 TOTAL=$(echo "$SUMMARY" | tr -d "\0" | sed -E 's/.*Test run with ([0-9]+) tests.*/\1/')
