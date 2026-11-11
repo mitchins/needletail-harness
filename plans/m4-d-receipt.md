@@ -779,19 +779,26 @@ both sets of findings were actioned before push:
 - `sonar.yml` uploads `coverage-generic.xml` as a pinned artifact
   even when the scanner fails (`if: always()` + hashFiles guard),
   so the actual rejected bytes are captured. RESULT: the captured
-  bytes diagnosed the violation precisely — llvm-cov EXPANSION
-  blocks (an inlined instance printed inside the enclosing file's
-  section, `|`-prefixed) were attributed by the dump parser to the
-  enclosing file, emitting 115 lineNumbers beyond
-  `UndoDiffViews.swift`'s 114 lines (the merged block was
-  LineEditorSession.swift 115–324, which also has its own correct
-  top-level section). Sonar validates coverage line numbers against
-  source length and rejects. Parser now skips `|`-led expansion
-  blocks (verified against a synthetic dump reproducing the CI
-  shape); the validator additionally rejects lineNumbers beyond a
-  source file's real length when the file is on disk (the OLD
-  artifact is rejected naming all 115 violations; the regenerated
-  report is clean).
+  bytes + the validator's beyond-EOF diagnostics root-caused the
+  violation precisely. ROOT CAUSE (verified): `llvm-cov show` on a
+  SINGLE-TU object (`NeedletailLineEditor.o`) emits NO per-file
+  path header — the dump begins directly with source lines. The
+  dump parser carried `cur` across dump files, so on CI (dev argv
+  order: …Presentation → LineEditor → CLI) every LineEditorSession
+  line landed on the previous dump's last section,
+  `UndoDiffViews.swift` (114 lines): 115 lineNumbers beyond EOF.
+  The scanner validates coverage line numbers against source length
+  and rejects. (Locally the same bug was SILENT: an ad-hoc
+  alphabetical dump order put a 324+-line Core file last, absorbing
+  the lines under the length cap.) Fixes: the parser resets `cur`
+  per dump file (LineEditor coverage is unaffected — the CLI-binary
+  dump contains the same file WITH a header and real counts, which
+  is where the artifact's own correct LineEditorSession entry came
+  from); the parser also skips `|`-led expansion/instantiation
+  records (defensive dedup); the validator rejects lineNumbers
+  beyond a source file's real length when on disk — which converted
+  this silent misattribution into the loud, precisely-diagnosed
+  failure that made the root cause findable.
 
 ### 13.3 CodeRabbit round-2 corrections (24 threads)
 

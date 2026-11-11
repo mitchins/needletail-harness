@@ -67,7 +67,6 @@ def main():
     out_path = sys.argv[2]
     covered = {}
     executable = {}
-    cur = None
     for dump_path in sys.argv[3:]:
         try:
             fh = open(dump_path, errors="replace")
@@ -75,20 +74,27 @@ def main():
             sys.stderr.write(f"FAIL: cannot read {dump_path}: {exc}\n")
             sys.exit(1)
         with fh:
+            # Each dump starts fresh: llvm-cov omits the per-file path
+            # header for single-TU objects (verified: the per-module
+            # LineEditor dump begins directly with source lines), and a
+            # `cur` carried over from the previous dump misattributed
+            # every following line — the CI report merged LineEditor
+            # Session 115-324 into UndoDiffViews (114 lines), which the
+            # scanner rejects. LineEditor coverage is unaffected: the
+            # CLI-binary dump contains the same file WITH a proper
+            # header.
+            cur = None
             for raw in fh:
                 line = raw.rstrip("\n")
                 if line.startswith("/") and line.endswith(":") and " " not in line.strip():
                     cur = line[:-1]
                     continue
-                # llvm-cov EXPANSION blocks (inlined instances from other
-                # files): a "| /path:l:c:" header followed by "| 171| 37|
-                # source" content. Those line numbers belong to the
-                # EXPANDED file — which has its own top-level section in
-                # this same dump — so attributing them here emitted
-                # lineNumbers beyond the enclosing file's length, which
-                # the scanner rejects. Verified against the captured CI
-                # report: LineEditorSession lines 115-324 merged into
-                # UndoDiffViews (114 lines). Skip the whole block.
+                # llvm-cov expansion/instantiation blocks: "| Unexecuted
+                # instantiation: <mangled>" records and "| <line>| <count>|
+                # source" content lines. Expansion content belongs to the
+                # expanded file, which carries its own top-level section —
+                # attributing it to the enclosing file would double-count.
+                # Skip every |-led line.
                 if line.lstrip().startswith("|"):
                     continue
                 if cur is None:
@@ -127,7 +133,7 @@ def main():
     except Exception as exc:
         sys.stderr.write(f"FAIL: cannot write {out_path}: {exc}\n")
         sys.exit(1)
-    validate_generic_coverage(out_path, repo_root)
+    validate_generic_coverage(out_path, repo_root, sys.argv[3:])
     print(f"SONAR COVERAGE OK: files={len(executable)} covered={total} uncovered={uncovered_total}")
     if not executable:
         sys.stderr.write("FAIL: zero production files with covered lines\n")
@@ -141,7 +147,7 @@ _XML10_CHAR = re.compile(
     "^[\\u0009\\u000A\\u000D\\u0020-\\uD7FF\\uE000-\\uFFFD\\U00010000-\\U0010FFFF]*$")
 
 
-def validate_generic_coverage(out_path, repo_root):
+def validate_generic_coverage(out_path, repo_root, dump_paths=()):
     """Deterministic post-write gate over the sonar-generic-coverage.xsd
     constraints: well-formedness, root name and version, structural
     shape (coverage > file > lineToCover, nothing else), line-number
@@ -221,6 +227,28 @@ def validate_generic_coverage(out_path, repo_root):
             sys.stderr.write(f"  - {p}\n")
         if len(problems) > 20:
             sys.stderr.write(f"  ... and {len(problems) - 20} more\n")
+        # Forensics: the scanner's rejection carries no diagnostics, and
+        # out-of-range numbers mean a dump section was misattributed.
+        # Print the raw dump lines following the offending file's header
+        # so the misrecognized form is visible in the CI log itself.
+        offenders = sorted({p.split(":")[0] for p in problems if "beyond EOF" in p})
+        for path in offenders[:2]:
+            abs_path = os.path.join(repo_root, path)
+            header_hint = os.path.basename(path) + ":"
+            for dump_path in dump_paths:
+                try:
+                    with open(dump_path, encoding="utf-8", errors="replace") as fh:
+                        lines = fh.readlines()
+                except OSError:
+                    continue
+                idx = next((i for i in range(len(lines) - 1, -1, -1)
+                            if header_hint in lines[i]), None)
+                if idx is None:
+                    continue
+                sys.stderr.write(f"---- raw dump following {path}'s header "
+                                 f"in {os.path.basename(dump_path)} (lines {idx + 1}-{min(idx + 40, len(lines))}) ----\n")
+                sys.stderr.writelines(lines[idx:idx + 40])
+                break
         sys.exit(1)
 
 
