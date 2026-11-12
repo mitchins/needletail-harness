@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 // PTY-08 fresh tmux-server bootstrap probe — mirrors
 // Tests/NeedletailTerminalTests/ChatPTYTests tmux() exactly:
@@ -38,6 +43,32 @@ while proc.isRunning, Date() < deadline {
 if proc.isRunning {
     let pid = proc.processIdentifier
     print("PROBE-B: HUNG past 30s (matches the PTY-08 CI signature)")
+    // Zombie analysis: isRunning can stay true for an exited-but-
+    // unreaped child. Read the REAL exit status via waitpid(WNOHANG)
+    // — Foundation's reaper has not taken it (state Z persisted).
+    var status: Int32 = 0
+    let wr = waitpid(pid, &status, WNOHANG)
+    if wr == pid {
+        if (status & 0x7F) == 0 {
+            print("PROBE-B: zombie already EXITED with code \((status >> 8) & 0xFF)")
+        } else {
+            print("PROBE-B: zombie died by signal \(status & 0x7F)")
+        }
+    } else if wr == -1, errno == ECHILD {
+        print("PROBE-B: waitpid ECHILD — child reaped elsewhere; exit status unknown")
+    } else {
+        print("PROBE-B: waitpid WNOHANG -> child still alive (wr=\(wr))")
+    }
+    // tmux -vv logs are written to the CURRENT DIRECTORY of the client
+    // (not TMUX_TMPDIR) — copy them next to the artifact evidence.
+    let cwd = FileManager.default.currentDirectoryPath
+    if let logs = try? FileManager.default.contentsOfDirectory(atPath: cwd) {
+        for log in logs where log.hasPrefix("tmux-") {
+            let dst = tmpDir + "/" + log
+            try? FileManager.default.copyItem(atPath: cwd + "/" + log, toPath: dst)
+            print("PROBE-B: copied \(log) into evidence dir")
+        }
+    }
     // Bounded wchan/fd diagnostic (pre-authorized): read-only /proc
     // inspection of our own hung child + any child it forked (the
     // would-be server), BEFORE termination.
