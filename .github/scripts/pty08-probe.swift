@@ -36,12 +36,63 @@ while proc.isRunning, Date() < deadline {
     Thread.sleep(forTimeInterval: 0.1)
 }
 if proc.isRunning {
+    let pid = proc.processIdentifier
     print("PROBE-B: HUNG past 30s (matches the PTY-08 CI signature)")
-    print("PROBE-B: child pid \(proc.processIdentifier) — TERM then SIGKILL (own child)")
+    // Bounded wchan/fd diagnostic (pre-authorized): read-only /proc
+    // inspection of our own hung child + any child it forked (the
+    // would-be server), BEFORE termination.
+    for target in [pid] + childPids(of: pid) {
+        print("---- pid \(target) ----")
+        dumpOne(path: "/proc/\(target)/cmdline", label: "cmdline", asArgs: true)
+        dumpOne(path: "/proc/\(target)/wchan", label: "wchan")
+        dumpOne(path: "/proc/\(target)/stat", label: "stat(state+ppid fields)")
+        dumpOne(path: "/proc/\(target)/syscall", label: "syscall")
+        if let fds = try? FileManager.default.contentsOfDirectory(atPath: "/proc/\(target)/fd") {
+            for fd in fds.sorted(by: { Int($0)! < Int($1)! }) {
+                let target_path = (try? FileManager.default.destinationOfSymbolicLink(atPath: "/proc/\(target)/fd/\(fd)")) ?? "?"
+                print("  fd \(fd) -> \(target_path)")
+            }
+        } else {
+            print("  fds: unreadable")
+        }
+    }
+    print("PROBE-B: child pid \(pid) — TERM then SIGKILL (own child)")
     proc.interrupt(); proc.terminate()
     Thread.sleep(forTimeInterval: 1)
     if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
     exit(1)
+}
+
+/// One-level child scan of /proc (read-only): pids whose PPID is `pid`.
+func childPids(of pid: pid_t) -> [pid_t] {
+    var out: [pid_t] = []
+    if let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") {
+        for e in entries where e.allSatisfy(\.isNumber) {
+            if let stat = try? String(contentsOfFile: "/proc/\(e)/stat", encoding: .utf8) {
+                // comm may contain spaces/parens: parse after the LAST ')'
+                if let close = stat.lastIndex(of: ")") {
+                    let fields = stat[stat.index(close, offsetBy: 2)...].split(separator: " ")
+                    if fields.count >= 2, let ppid = Int(fields[1]), ppid == pid {
+                        out.append(pid_t(e) ?? 0)
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+func dumpOne(path: String, label: String, asArgs: Bool = false) {
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty {
+        if asArgs {
+            let parts = data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+            print("  \(label): \(parts.joined(separator: " "))")
+        } else {
+            print("  \(label): \(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+    } else {
+        print("  \(label): <unreadable/empty>")
+    }
 }
 proc.waitUntilExit()
 print("PROBE-B: returned status \(proc.terminationStatus)")
