@@ -12,15 +12,22 @@ let socket = CommandLine.arguments[1]
 let tmpDir = CommandLine.arguments[2]
 let proc = Process()
 proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-proc.arguments = ["tmux", "-L", socket, "-f", "/dev/null",
+proc.arguments = ["tmux", "-L", socket, "-vv", "-f", "/dev/null",
                   "new-session", "-d", "-s", "probeB", "-x", "80", "-y", "24"]
 let outURL = URL(fileURLWithPath: tmpDir + "/client-stdout.log")
+let errURL = URL(fileURLWithPath: tmpDir + "/client-stderr.log")
 FileManager.default.createFile(atPath: outURL.path, contents: nil)
-guard let outHandle = FileHandle(forWritingAtPath: outURL.path) else {
-    print("PROBE-B: cannot open capture file"); exit(2)
+FileManager.default.createFile(atPath: errURL.path, contents: nil)
+guard let outHandle = FileHandle(forWritingAtPath: outURL.path),
+      let errHandle = FileHandle(forWritingAtPath: errURL.path) else {
+    print("PROBE-B: cannot open capture files"); exit(2)
 }
-defer { try? outHandle.close() }
+defer {
+    try? outHandle.close()
+    try? errHandle.close()
+}
 proc.standardOutput = outHandle
+proc.standardError = errHandle
 print("PROBE-B: spawning \(proc.arguments!.joined(separator: " "))")
 print("PROBE-B: child sees TERM=\(ProcessInfo.processInfo.environment["TERM"] ?? "<unset>")")
 try proc.run()

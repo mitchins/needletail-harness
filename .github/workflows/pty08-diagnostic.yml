@@ -83,16 +83,18 @@ jobs:
           mkdir -p "$TMUX_TMPDIR"
           unset TMUX || true
           echo "== inherited environment: TERM=${TERM:-<unset>}"
-          timeout 90 "$D/probe" "probeB-$$" "$TMUX_TMPDIR" > "$D/probeB1.log" 2>&1
-          echo "probeB1 (exact helper mirror) exit=$?"
+          timeout 90 "$D/probe" "probeB-$$" "$TMUX_TMPDIR" > "$D/probeB1.log" 2>&1 || true
+          echo "probeB1 (exact helper mirror) exit recorded (0 = ok, 1 = hung — must not abort B3)"
           cat "$D/probeB1.log"
           echo "== server -vv log from B1 (if any):"
-          cat "$TMUX_TMPDIR"/tmux-server-*.log 2>/dev/null || ls -la "$TMUX_TMPDIR"
-          # TERM differential: same spawn, explicit TERM=xterm.
-          rm -f "$TMUX_TMPDIR"/tmux-server-*.log 2>/dev/null || true
+          cat "$TMUX_TMPDIR"/tmux-server-*.log 2>/dev/null || ls -la "$TMUX_TMPDIR" "$TMUX_TMPDIR"/tmux-1001 2>/dev/null
+          echo "== client stderr from B1:"
+          cat "$TMUX_TMPDIR"/client-stderr.log 2>/dev/null
+          # TERM differential: same spawn, explicit TERM=xterm. B1 may
+          # "fail" (exit 1 = hung); this arm MUST still run.
           echo "== now with explicit TERM=xterm differential =="
-          timeout 90 env TERM=xterm "$D/probe" "probeB3-$$" "$TMUX_TMPDIR" > "$D/probeB3.log" 2>&1
-          echo "probeB3 (explicit TERM=xterm) exit=$?"
+          timeout 90 env TERM=xterm "$D/probe" "probeB3-$$" "$TMUX_TMPDIR" > "$D/probeB3.log" 2>&1 || true
+          echo "probeB3 (explicit TERM=xterm) exit recorded"
           cat "$D/probeB3.log"
           { echo "== B1 (helper mirror) =="; cat "$D/probeB1.log"
             echo "== B3 (TERM=xterm differential) =="; cat "$D/probeB3.log"; } > "$D/summary.txt" 2>&1
