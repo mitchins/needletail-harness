@@ -78,7 +78,7 @@ jobs:
         run: |
           set -u
           D="$RUNNER_TEMP/probeB"; mkdir -p "$D"
-          swiftc -o "$D/probe" .github/scripts/pty08-probe.swift 2>&1 | head -5
+          swiftc -o "$D/probe" .github/scripts/pty08-probe.swift
           export TMUX_TMPDIR="$D/tmp"
           mkdir -p "$TMUX_TMPDIR"
           unset TMUX || true
