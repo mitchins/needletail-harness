@@ -769,26 +769,16 @@ extension ChatPTYTests {
                     try? FileManager.default.removeItem(at: outURL)
                 }
                 proc.standardOutput = outHandle
-                // PTY-08 CI finding (diagnostic 43134786983): the CI
-                // test-runner process has fd 0 CLOSED — tmux inherited it
-                // and hung silently before server bootstrap; a /dev/null
-                // stdin handle opened INTO slot 0 made Foundation's spawn
-                // fail EBADF. Heal fd 0 first (valid stdin for this
-                // process and every spawned child), then set stdin
-                // explicitly. Verified by the CI feasibility lane.
-                #if canImport(Glibc)
-                if fcntl(0, F_GETFD) == -1, errno == EBADF {
-                    _ = open("/dev/null", O_RDONLY)
-                }
-                #elseif canImport(Darwin)
-                if fcntl(0, F_GETFD) == -1, errno == EBADF {
-                    _ = Darwin.open("/dev/null", O_RDONLY)
-                }
-                #endif
-                if let nullStdin = FileHandle(forReadingAtPath: "/dev/null") {
-                    proc.standardInput = nullStdin
-                    defer { try? nullStdin.close() }
-                }
+                // PTY-08 CI evidence (runs 43137685791/43141476745):
+                // with /dev/null stdin the spawn fails EBADF instantly;
+                // with stdin unset the spawn succeeds and tmux hangs
+                // silently before bootstrap. A self-closing pipe gives
+                // the child a guaranteed-valid stdin that reads EOF —
+                // discriminating the fd-inheritance vs handle-vs-env
+                // matrix. Verified by the CI feasibility lane.
+                let stdinPipe = Pipe()
+                proc.standardInput = stdinPipe
+                stdinPipe.fileHandleForWriting.closeFile()
                 var childEnv = ProcessInfo.processInfo.environment
                 childEnv["TERM"] = "xterm"
                 proc.environment = childEnv
