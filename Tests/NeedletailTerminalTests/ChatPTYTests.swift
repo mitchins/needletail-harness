@@ -769,43 +769,39 @@ extension ChatPTYTests {
                     try? FileManager.default.removeItem(at: outURL)
                 }
                 proc.standardOutput = outHandle
-                // PTY-08 CI evidence (runs 43137685791/43141476745):
-                // with /dev/null stdin the spawn fails EBADF instantly;
-                // with stdin unset the spawn succeeds and tmux hangs
-                // silently before bootstrap. A self-closing pipe gives
-                // the child a guaranteed-valid stdin that reads EOF —
-                // discriminating the fd-inheritance vs handle-vs-env
-                // matrix. Verified by the CI feasibility lane.
-                let stdinPipe = Pipe()
-                proc.standardInput = stdinPipe
-                stdinPipe.fileHandleForWriting.closeFile()
-                var childEnv = ProcessInfo.processInfo.environment
-                childEnv["TERM"] = "xterm"
-                proc.environment = childEnv
                 try proc.run()
-                // Bounded join, polled by the CALLER (never a spawned
-                // watchdog thread — thread creation must not be on the
-                // critical path of a hang bound). A wedged tmux server
-                // must fail this leg loudly, never hang the suite.
+                // PTY-08 ROOT CAUSE (CI diagnostic run 43151495879): the
+                // tmux client SUCCEEDS (exit 0 — verified via waitpid on
+                // the unreaped zombie, plus copied -vv logs showing the
+                // server started) — but Foundation-on-Linux never reaps
+                // a child whose stdout is a FileHandle: `isRunning` stays
+                // true forever and `waitUntilExit` never returns, so
+                // every Foundation-state poll reported a false hang.
+                // Bounded waitpid poll (Glibc), not Foundation state.
                 let tmuxDeadline = Date().addingTimeInterval(30)
-                while proc.isRunning, Date() < tmuxDeadline {
+                var rawStatus: Int32? = nil
+                var reapedElsewhere = false
+                while Date() < tmuxDeadline {
+                    var st: Int32 = 0
+                    let wr = waitpid(proc.processIdentifier, &st, WNOHANG)
+                    if wr == proc.processIdentifier { rawStatus = st; break }
+                    if wr == -1, errno == ECHILD { reapedElsewhere = true; break }
                     Thread.sleep(forTimeInterval: 0.1)
                 }
-                if proc.isRunning {
-                    // SIGTERM first (clean exit path); escalate to SIGKILL:
-                    // a client wedged in an uninterruptible server wait
-                    // must not survive as an orphan, and waitUntilExit
-                    // must have a dead child to reap.
-                    proc.interrupt()
-                    proc.terminate()
+                if rawStatus == nil, !reapedElsewhere {
+                    // Genuinely alive past 30 s: TERM then SIGKILL (own
+                    // child), then fail loudly.
+                    proc.interrupt(); proc.terminate()
                     Thread.sleep(forTimeInterval: 1)
-                    if proc.isRunning {
-                        kill(proc.processIdentifier, SIGKILL)
-                    }
+                    if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
                     throw TestSkip.tmuxFailed("tmux hung: \(args.joined(separator: " "))")
                 }
-                proc.waitUntilExit()
-                guard proc.terminationStatus == 0 else { throw TestSkip.tmuxFailed(args.joined(separator: " ")) }
+                if let st = rawStatus, (st & 0x7F) != 0 || (st >> 8) & 0xFF != 0 {
+                    throw TestSkip.tmuxFailed("tmux exited nonzero (raw \(st)): \(args.joined(separator: " "))")
+                }
+                // reapedElsewhere: Foundation reaped it — the exit code is
+                // unverifiable here, but session creation is verified by
+                // the capture-pane prompt probe below regardless.
                 return (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
             }
             // Cleanup on EVERY exit path, registered BEFORE the first
