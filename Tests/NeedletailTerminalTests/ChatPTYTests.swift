@@ -769,6 +769,20 @@ extension ChatPTYTests {
                     try? FileManager.default.removeItem(at: outURL)
                 }
                 proc.standardOutput = outHandle
+                // PTY-08 CI finding (diagnostic runs 43122886820 +
+                // 43134786983): under a bare Foundation-Process spawn the
+                // tmux client hung BEFORE server bootstrap (zero stdio
+                // bytes, no socket dir, no server log); shell spawn of the
+                // identical command worked. Explicit stdin (/dev/null) and
+                // TERM close the spawn-context inheritance gap. Verified
+                // by the CI feasibility lane — not on the shared host.
+                if let nullStdin = FileHandle(forReadingAtPath: "/dev/null") {
+                    proc.standardInput = nullStdin
+                    defer { try? nullStdin.close() }
+                }
+                var childEnv = ProcessInfo.processInfo.environment
+                childEnv["TERM"] = "xterm"
+                proc.environment = childEnv
                 try proc.run()
                 // Bounded join, polled by the CALLER (never a spawned
                 // watchdog thread — thread creation must not be on the
