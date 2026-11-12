@@ -769,13 +769,22 @@ extension ChatPTYTests {
                     try? FileManager.default.removeItem(at: outURL)
                 }
                 proc.standardOutput = outHandle
-                // PTY-08 CI finding (diagnostic runs 43122886820 +
-                // 43134786983): under a bare Foundation-Process spawn the
-                // tmux client hung BEFORE server bootstrap (zero stdio
-                // bytes, no socket dir, no server log); shell spawn of the
-                // identical command worked. Explicit stdin (/dev/null) and
-                // TERM close the spawn-context inheritance gap. Verified
-                // by the CI feasibility lane — not on the shared host.
+                // PTY-08 CI finding (diagnostic 43134786983): the CI
+                // test-runner process has fd 0 CLOSED — tmux inherited it
+                // and hung silently before server bootstrap; a /dev/null
+                // stdin handle opened INTO slot 0 made Foundation's spawn
+                // fail EBADF. Heal fd 0 first (valid stdin for this
+                // process and every spawned child), then set stdin
+                // explicitly. Verified by the CI feasibility lane.
+                #if canImport(Glibc)
+                if fcntl(0, F_GETFD) == -1, errno == EBADF {
+                    _ = open("/dev/null", O_RDONLY)
+                }
+                #elseif canImport(Darwin)
+                if fcntl(0, F_GETFD) == -1, errno == EBADF {
+                    _ = Darwin.open("/dev/null", O_RDONLY)
+                }
+                #endif
                 if let nullStdin = FileHandle(forReadingAtPath: "/dev/null") {
                     proc.standardInput = nullStdin
                     defer { try? nullStdin.close() }
