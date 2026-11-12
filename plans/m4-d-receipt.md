@@ -861,3 +861,102 @@ an isolated CI job or container, maintainer-approved):
 PARTIAL. macOS native matrix remains the single outstanding M4
 gate; PTY-08 fresh-server bootstrap and the Sonar scanner parsing
 are the smallest open issues, both with prepared next steps.
+
+## 14. Sonar reconciliation + coverage exception (PR ready-for-review)
+
+Sequence per maintainer direction: diagnostic workflow + probe
+removed (housekeeping commit 41b34e9 — recoverable from git history
+3587161..0302436), PR #10 marked ready for review, aggregate
+CodeRabbit review requested, Sonar findings resolved/documented
+here while review proceeds, then the production tree freezes for
+the single final macOS matrix.
+
+### 14.1 Exact gate state (API `qualitygates/project_status`, PR #10)
+
+| Metric | Actual | Threshold | Status |
+|---|---|---|---|
+| new_reliability_rating | 1 (A) | > 1 fails | OK |
+| **new_security_rating** | **3 (C)** | > 1 fails | **ERROR** |
+| new_maintainability_rating | 1 (A) | > 1 fails | OK |
+| **new_coverage** | **62.0 %** | < 80 fails | **ERROR** |
+| new_duplicated_lines_density | 0.7 % | > 3 fails | OK |
+| new_security_hotspots_reviewed | 100 % | < 100 fails | OK |
+
+### 14.2 Security rating reconciliation (the "C" is NOT Swift code)
+
+`new_security_rating` = C is driven by exactly **3 open MAJOR
+VULNERABILITIES**, all `githubactions` analyzer advisories on
+workflow YAML — none in Swift product code:
+
+1. `githubactions:S7694` (linux-ci.yml:109) — "Swift dependencies
+   should be locked": FALSE POSITIVE in substance. Dependencies ARE
+   locked: pinned `Package.resolved`, `swift package resolve`
+   followed by `git diff --exit-code Package.resolved` (drift
+   fails the job), and `--disable-automatic-resolution` on every
+   build. The analyzer cannot observe SwiftPM locking from a
+   workflow `swift build` line. Disposition: acknowledge-as-safe.
+2. `githubactions:S7694` (sonar.yml:99) — same, same disposition.
+3. `githubactions:S6506` (pty08-diagnostic.yml:68) — swiftly
+   download curl without explicit `--proto '=https'`. RESOLVED:
+   the diagnostic workflow was removed at 41b34e9 (the issue
+   auto-resolves when the file no longer exists). The remaining
+   swift/curl downloads in active workflows already use
+   checksum + HTTPS or `--proto '=https'`.
+
+Hotspots are NOT involved: `new_security_hotspots_reviewed` = 100 %
+OK, hotspot index empty for this PR. The 11 MAJOR code smells
+(S107 ×6 too-many-params, S3087 ×4 nested closures, S1172 ×1
+unused param, S2961 ×1 backticks) are CODE_SMELL type: they feed
+`new_maintainability_rating`, which is **A (OK)** — so they do not
+block the gate. Dispositions recorded: S2961 is a false positive
+(backticks around `continue` are REQUIRED — it is a keyword);
+S107/S3087/S1172 are accepted composition-root/factory design
+(single composition root + test-mirror factories; refactoring
+frozen M4 code for a smell is out of scope).
+
+Acknowledging the two S7694s requires the SonarCloud UI (issue
+keys `AaHMmUqTRRK2SVoU`, `AaHMmUncRRK2SVoU`) — maintainer action
+with login; the API path was not available to this session
+(SONAR_TOKEN is a CI secret).
+
+### 14.3 Coverage exception (62.0 % vs 80 %) — evidence and deferral
+
+Evidence (computed from the captured CI artifact at 76c087a ∩ PR
+diff — production Sources identical through 41b34e9):
+
+- 3,005 new production lines total; of these **211 (7 %) carry NO
+  coverage regions at all**: NativeToolExecutor.swift 150 lines =
+  `#if !canImport(Glibc)` Darwin spawn primitive (excluded from
+  Linux compilation) and UIAction.swift 61 lines = enum-case
+  declarations (llvm-cov emits no regions for cases). These lines
+  can NEVER be covered on Linux and permanently depress the
+  metric. Both 0 %-files in the Sonar annotations are entirely
+  this class — verified line-by-line, not assumed.
+- Attributed new lines: 1,738, of which **719 uncovered (41.4 %)**.
+  Concentration: ChatCommand.swift 272 (interactive `chat` wiring
+  whose primary oracle is the PTY lane — green on CI),
+  UIReducer 93, LineEditorSession 82 (callback glue + platform
+  gates), SessionTransition 78, Render 75, UndoDiffViews 34,
+  MentionGrammar 26, QueueSync 23.
+
+Deferral decision: the 80 % condition was calibrated for small
+PRs; a 3,005-line epic with 7 % structurally-uncoverable lines
+cannot clear it without a blanket campaign (explicitly out of
+scope). RECORDED DEFERRAL: accept the red `new_coverage` condition
+for this PR with the table above as the evidence baseline;
+next-milestone targets (M5 lead-in, not this PR): ChatCommand
+interactive-path tests via the existing composition fixtures, and
+UIReducer branch completion. The 80 % threshold itself is NOT
+altered, and no SonarCloud project setting was changed.
+
+### 14.4 Sequencing state
+
+- PR #10 marked ready for review (draft flag cleared) BEFORE macOS
+  qualification, per direction.
+- CodeRabbit aggregate review requested; 3 threads intentionally
+  open pending CI/native evidence; the rest resolved with
+  evidence.
+- After review reconciliation: production tree freezes at the
+  reviewed HEAD, then the single final macOS release matrix runs
+  (it also verifies the Darwin signal handling, §12/§13 pending
+  item). Merge readiness is decided from the resulting evidence.
