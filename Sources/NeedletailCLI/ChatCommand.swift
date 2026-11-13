@@ -530,6 +530,10 @@ struct ChatCommand: ParsableCommand {
         // pass an explicit writer for output capture (production: nil).
         let emit: @Sendable (String) -> Void = writer ?? { [lineEditor] text in lineEditor.emit(text) }
         let owner = TerminalOutputOwner(caps: caps, writer: emit)
+        // Every throw from here until the actor's own do/catch must
+        // also close the owner: it owns the writer thread — leaving it
+        // alive retains the thread and the line editor's emit path.
+        func shutdownOwner() { owner.close() }
         let actorRef = ActorRef()
         let isSandbox = sandboxGrant != nil
         // The loop is created before the actor (the sink/presenter/tap
@@ -570,6 +574,7 @@ struct ChatCommand: ParsableCommand {
                     fileURL: URL(fileURLWithPath: (budgetDir as NSString).appendingPathComponent("run-request-budget.json")),
                     limit: limit)
             } catch {
+                shutdownOwner()
                 try? await httpClient.shutdown().get()
                 throw error
             }
@@ -594,11 +599,13 @@ struct ChatCommand: ParsableCommand {
         if let tracePath = trace {
             guard FileManager.default.createFile(
                 atPath: tracePath, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                shutdownOwner()
                 try? await httpClient.shutdown().get()
                 eprint("cannot create trace file \(tracePath)")
                 throw ExitCode(2)
             }
             guard let handle = FileHandle(forWritingAtPath: tracePath) else {
+                shutdownOwner()
                 try? await httpClient.shutdown().get()
                 eprint("cannot open trace file \(tracePath)")
                 throw ExitCode(2)
@@ -631,6 +638,7 @@ struct ChatCommand: ParsableCommand {
                 execResolver: identityResolver,
                 undoValidator: undoValidator, inverseApplier: inverseApplier)
         } catch {
+            shutdownOwner()
             try? await httpClient.shutdown().get()
             throw error
         }

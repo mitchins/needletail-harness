@@ -789,11 +789,25 @@ extension ChatPTYTests {
                     Thread.sleep(forTimeInterval: 0.1)
                 }
                 if rawStatus == nil, !reapedElsewhere {
-                    // Genuinely alive past 30 s: TERM then SIGKILL (own
-                    // child), then fail loudly.
+                    // Genuinely alive past 30 s: TERM, then a bounded
+                    // waitpid escalation — reaps the child if TERM lands;
+                    // SIGKILL only if the poll CONFIRMS it is still alive
+                    // (Foundation's isRunning is unreliable here — the
+                    // unreaped-zombie defect is exactly what this helper
+                    // works around).
                     proc.interrupt(); proc.terminate()
-                    Thread.sleep(forTimeInterval: 1)
-                    if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+                    var killStatus: Int32 = 0
+                    let reapDeadline = Date().addingTimeInterval(5)
+                    var confirmed = true
+                    while Date() < reapDeadline {
+                        let wr = waitpid(proc.processIdentifier, &killStatus, WNOHANG)
+                        if wr == proc.processIdentifier || (wr == -1 && errno == ECHILD) {
+                            confirmed = false
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                    if confirmed { kill(proc.processIdentifier, SIGKILL) }
                     throw TestSkip.tmuxFailed("tmux hung: \(args.joined(separator: " "))")
                 }
                 if let st = rawStatus, (st & 0x7F) != 0 || (st >> 8) & 0xFF != 0 {

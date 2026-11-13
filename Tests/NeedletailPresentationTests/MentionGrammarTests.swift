@@ -41,7 +41,7 @@ struct MentionGrammarTests {
         // returned query.
         #expect(mentionQuery(text: "see @doc\rbar", cursor: 12) == nil,
             "CR inside the token must end the live query")
-        #expect(mentionQuery(text: "see @doc\u{00A0}bar", cursor: 13) == nil,
+        #expect(mentionQuery(text: "see @doc\u{00A0}bar", cursor: 12) == nil,
             "NBSP inside the token must end the live query")
         #expect(mentionQuery(text: "see @doc bar", cursor: 12) == nil,
             "ASCII space still stops the scan")

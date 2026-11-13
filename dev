@@ -23,21 +23,22 @@ Usage: ./dev <command>
 
 Build and offline tests (Linux first; no network, no provider calls):
   build                     Build the package
-  test quick               Pure core/ledger/config/state/render tests    (target <=3 s)
-  test native              M0-B native primitive probes (SSE, cancellation, subprocess)
-  test qualification       Intentional fail/skip/parameterized/pass fixtures (NOT a gate)
-  test case CASE-ID        Run the deterministic tests registered for one case
-  test integration         Disabled until M2 (reason recorded)
-  test feasibility        M0-C bounded Linux PTY feasibility scenario (replxx bridge)
-  test terminal            Disabled until M4 (reason recorded)
-  test pty                 Disabled until M4 (reason recorded)
-  test live --profile NAME Disabled until M3 (reason recorded)
-  test offline             Aggregate gate over all scheduled offline layers
-  coverage                 Reconcile catalogue IDs vs executed results
-  vendor-check             Verify vendored replxx sources match the pinned upstream commit
-  release-bundle           Build the release executable/bundle + linkage manifest
-  test packaging           Clean-host smoke (digest-pinned container, no network, no toolchain)
-  help                     Show this help
+  test quick                Pure core/ledger/config/state/render tests    (target <=3 s)
+  test native               M0-B native primitive probes (SSE, cancellation, subprocess)
+  test qualification        Intentional fail/skip/parameterized/pass fixtures (NOT a gate)
+  test case CASE-ID         Run the deterministic tests registered for one case
+  test integration          Disabled until M2 (reason recorded)
+  test feasibility          M0-C bounded Linux PTY feasibility scenario (replxx bridge)
+  test terminal             Disabled until M4 (reason recorded)
+  test pty                  Disabled until M4 (reason recorded)
+  test live --profile NAME  Disabled until M3 (reason recorded)
+  test offline              Aggregate gate over all scheduled offline layers
+  coverage                  Reconcile catalogue IDs vs executed results
+  latch-clear               Clear the phase-timeout latch (after cleanup)
+  vendor-check              Verify vendored replxx sources match the pinned upstream commit
+  release-bundle            Build the release executable/bundle + linkage manifest
+  test packaging            Clean-host smoke (digest-pinned container, no network, no toolchain)
+  help                      Show this help
 EOF
 }
 
@@ -103,6 +104,14 @@ stream_bounded() {
     _sb_label="$1"; _sb_secs="$2"; shift 2
     _sb_log="$root_dir/.needletail-dev/logs/dev-$_sb_label.log"
     mkdir -p "$root_dir/.needletail-dev/logs"
+    # Latch from a previous phase's survived-kill: refuse to start a
+    # new lane on top of an unreaped phase process. Cleared ONLY by
+    # `dev latch-clear` (explicit maintenance) — never automatically,
+    # so a leaked phase cannot silently poison later lanes.
+    if [ -f "$root_dir/.needletail-dev/logs/PHASE-TIMEOUT-LATCH" ]; then
+        echo "FAIL: .needletail-dev/logs/PHASE-TIMEOUT-LATCH exists — a previous phase process survived TERM+KILL. Inspect and clean up, then run: ./dev latch-clear"
+        exit 1
+    fi
     : > "$_sb_log"
     # A stale timeout flag can never fail a later run.
     rm -f "$_sb_log.timeout"
@@ -172,6 +181,21 @@ stream_bounded() {
                 kill -TERM "$_sb_pid" 2>/dev/null || true
                 sleep 10
                 kill -KILL "$_sb_pid" 2>/dev/null || true
+                # Verify the kill landed (bounded): if the phase pid
+                # somehow survived, refuse any subsequent lane and say
+                # so — a surviving phase process must never feed the
+                # next lane's results. This is NOT a process-tree walk
+                # and never signals anything but the recorded pid.
+                for _sb_check in 1 2 3 4 5; do
+                    if ! kill -0 "$_sb_pid" 2>/dev/null; then
+                        break
+                    fi
+                    sleep 1
+                done
+                if kill -0 "$_sb_pid" 2>/dev/null; then
+                    echo "LATCH [$_sb_label]: phase pid $_sb_pid survived TERM+KILL — refusing subsequent lanes this run."
+                    touch "$root_dir/.needletail-dev/logs/PHASE-TIMEOUT-LATCH"
+                fi
                 # (No tmux cleanup here: `tmux ls` itself hangs on a
                 # wedged server and would stall the killer. In-test
                 # defers are the primary cleanup; step-level orphans
@@ -657,6 +681,10 @@ test)
     fi
     echo "COVERAGE OK: executed results reconciled (evidence: $_xunit_merged)."
     ;;
+    latch-clear)
+        rm -f "$root_dir/.needletail-dev/logs/PHASE-TIMEOUT-LATCH"
+        echo "phase-timeout latch cleared"
+        ;;
 vendor-check)
     # Vendored integrity. OFFLINE FIRST:
     # - `SHA256SUMS-upstream` records the blob hashes of the pinned

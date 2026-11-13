@@ -123,6 +123,15 @@ struct QueueReorderTests {
                 return false
             }) {
                 refused = true
+                // Exhaustion must refuse LOUDLY and change nothing: the
+                // queue is untouched and no queueUpdated record lands
+                // (an update with a tied/out-of-order rank would let
+                // replay silently revert the operator reorder).
+                #expect(target.state.queue == state.queue, "refused exhaustion must not move entries")
+                #expect(!target.records.contains { record in
+                    if case .queueUpdated = record { return true }
+                    return false
+                }, "refused exhaustion must not record a queue update")
                 break
             }
             #expect(target.effects.count == 1, "each accepted move emits exactly the reorder status")
