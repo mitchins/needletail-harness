@@ -1,0 +1,54 @@
+# TEMPORARY (M4-OPS-10): adversarial process-lifecycle qualification in a
+# disposable hosted VM. workflow_dispatch only — never runs on push/PR.
+# Removed from the tree after its evidence run; the receipt references
+# the run ID. No secrets, no live traffic.
+name: pty-qualification
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: process-lifecycle qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
+        with:
+          persist-credentials: false
+
+      - name: Provision SQLite headers + tmux (PTY/case-group requirements)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev tmux
+
+      - name: Install the pinned Swift toolchain (swiftly)
+        run: |
+          command -v swift >/dev/null 2>&1 && swift --version || echo "no image-provided swift"
+          arch="$(uname -m)"
+          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/swiftly.tar.gz "https://download.swift.org/swiftly/linux/swiftly-${arch}.tar.gz"
+          echo "0b26b568811404374c7d7f07276b6aad4145db5d1893a45f307de6a94ca8d9c3  /tmp/swiftly.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/swiftly.tar.gz -C /tmp && rm -f /tmp/swiftly.tar.gz
+          /tmp/swiftly init --quiet-shell-followup
+          . "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/env.sh" 2>/dev/null || true
+          swiftly install 6.4 --assume-yes
+          swiftly use 6.4 --global-default
+          echo "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/bin" >> "$GITHUB_PATH"
+
+      - name: Process-lifecycle qualification (8 scenarios)
+        run: |
+          set -o pipefail
+          sh .github/scripts/pty-qualification.sh 2>&1 | tee qualification.log
+
+      - name: Upload qualification evidence (even on failure)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (node24)
+        with:
+          name: pty-qualification-log
+          path: qualification.log
+          if-no-files-found: error
+          retention-days: 14

@@ -90,24 +90,40 @@ require_test_result() {
     fi
 }
 # Bounded, streaming phase runner (CI logging + per-phase bounds): the
-# command's output goes to the phase log AND to stdout live (tail -f
-# with wall-clock prefixes, so a hang names its last-active suite),
-# a heartbeat names the last output every 5 min, and a hard deadline
-# kills the phase with pre-kill diagnostics (process tree + threads +
-# wchan + log tail) plus best-effort cleanup of owned children
-# (pid-snapshot tree kill). In-test defers are the primary cleanup;
-# this runner deliberately performs no tmux-specific cleanup (a
-# `tmux ls` probe would itself hang on a wedged server). Returns the
-# command's exit code, or 124 on deadline kill (like timeout(1)).
-# POSIX sh only.
+# command is executed EXACTLY as supplied — the runner never injects
+# `swift test` or any other prefix (Swift lanes compose their invocation
+# via swift_bounded; aggregate case-groups and binary lanes pass their
+# complete command here). Output goes to the phase log AND to stdout
+# live (tail -f with wall-clock prefixes, so a hang names its
+# last-active suite), a heartbeat names the last output every 5 min,
+# and a hard deadline kills the phase with pre-kill diagnostics
+# (process tree + threads + wchan + log tail). Returns the command's
+# exit code, or 124 on deadline kill (like timeout(1)). POSIX sh only.
+#
+# Process ownership: with setsid the phase runs in its OWN session and
+# process group. The group exists BECAUSE we created it for this phase,
+# so TERM/KILL to the negated pid reaches exactly this phase's tree —
+# structural ownership, no pid snapshots, no tree walks, nothing
+# outside the phase is inspected or signalled. Without setsid (e.g.
+# macOS) only the direct child is signalled, and a timeout engages the
+# latch CONSERVATIVELY: descendant survival cannot be verified without
+# process groups, so subsequent lanes refuse to start until an explicit
+# `./dev latch-clear`.
+#
+# The watchdog runs in the FOREGROUND of this function: escalation
+# (TERM, grace, KILL, reap, survivor verification) always completes
+# before this function returns or cleanup is reported — a background
+# watchdog could be cancelled mid-escalation at phase exit, leaving
+# survivors behind a completed-looking cleanup.
 stream_bounded() {
     _sb_label="$1"; _sb_secs="$2"; shift 2
     _sb_log="$root_dir/.needletail-dev/logs/dev-$_sb_label.log"
     mkdir -p "$root_dir/.needletail-dev/logs"
-    # Latch from a previous phase's survived-kill: refuse to start a
-    # new lane on top of an unreaped phase process. Cleared ONLY by
-    # `dev latch-clear` (explicit maintenance) — never automatically,
-    # so a leaked phase cannot silently poison later lanes.
+    # Latch from a previous phase's survived kill: refuse to start a
+    # new lane on top of surviving (possibly unreaped) processes.
+    # Cleared ONLY by `dev latch-clear` (explicit maintenance) — never
+    # automatically, so a leaked phase cannot silently poison later
+    # lanes.
     if [ -f "$root_dir/.needletail-dev/logs/PHASE-TIMEOUT-LATCH" ]; then
         echo "FAIL: .needletail-dev/logs/PHASE-TIMEOUT-LATCH exists — a previous phase process survived TERM+KILL. Inspect and clean up, then run: ./dev latch-clear"
         exit 1
@@ -116,10 +132,8 @@ stream_bounded() {
     # A stale timeout flag can never fail a later run.
     rm -f "$_sb_log.timeout"
     # Live stream with wall-clock prefixes: CI forensics needs to know
-    # WHEN each line landed, not just its order — the 60-minute silent
-    # feasibility stall was ambiguous between "hung test" and "slow
-    # suite" without timestamps. The follower has a BOUNDED lifecycle
-    # by construction:
+    # WHEN each line landed, not just its order. The follower has a
+    # BOUNDED lifecycle by construction:
     #   - GNU tail supports --pid=<phase pid>: tail exits the moment
     #     the command dies, awk sees EOF and exits. Nothing lingers.
     #   - Elsewhere (BSD tail, e.g. macOS) NO follower runs: the log
@@ -135,23 +149,18 @@ stream_bounded() {
     else
         _sb_ts='{ print; fflush() }'
     fi
-    # Compose the phase command: line-buffered runner output when
-    # stdbuf exists (CI Ubuntu); macOS falls back to plain execution.
-    if command -v stdbuf >/dev/null 2>&1; then
-        set -- stdbuf -o0 -e0 "$NEEDLETAIL_SWIFT" test "$@"
-    else
-        set -- "$NEEDLETAIL_SWIFT" test "$@"
-    fi
-    # setsid gives the phase its OWN session and process group (structural
-    # ownership: the group exists because we created it for this phase, and
-    # its members are exactly the phase's own descendants). The recorded
-    # pid is the group leader, so the deadline kill can signal the phase's
-    # whole tree WITHOUT pid snapshots or descendant walks. Fallback (no
-    # setsid, e.g. macOS): plain spawn + pid-only kill + latch.
-    if command -v setsid >/dev/null 2>&1; then
+    # Group operations (signal + existence checks on the negated pid)
+    # use /bin/kill: the shell builtin's parsing of negative targets is
+    # shell-specific (dash's `kill -0 -- -PGID` errors), while
+    # /bin/kill is unambiguous. Both tools must exist for the
+    # group-capable path; anything missing degrades to the conservative
+    # no-group path (pid-only kill + unconditional latch).
+    if command -v setsid >/dev/null 2>&1 && [ -x /bin/kill ]; then
         setsid "$@" > "$_sb_log" 2>&1 &
+        _sb_group=1
     else
         "$@" > "$_sb_log" 2>&1 &
+        _sb_group=0
     fi
     _sb_pid=$!
     if tail --help 2>/dev/null | grep -q -- '--pid'; then
@@ -160,96 +169,101 @@ stream_bounded() {
     else
         _sb_tail=""
     fi
-    (
-        _sb_slept=0
-        while kill -0 "$_sb_pid" 2>/dev/null; do
-            if [ "$_sb_slept" -ge "$_sb_secs" ]; then
-                echo "TIMEOUT [$_sb_label]: exceeded ${_sb_secs}s — terminating owned processes."
-                touch "$_sb_log.timeout"
-                # Capture runner internals BEFORE killing (post-kill
-                # forensics only ever shows orphans): spinning (infinite
-                # loop) vs sleeping (blocked wait) decides the next
-                # investigation. Linux-only; skipped elsewhere.
-                {
-                    echo "---- pre-kill process tree ----"
-                    ps -ef 2>/dev/null | grep -a -e swift -e needletail -e tmux | grep -a -v grep | head -20
-                    for _p in $(ps -ef 2>/dev/null | grep -a "test-runner" | grep -a -v grep | awk '{print $2}' | head -3); do
-                        echo "---- runner pid $_p state ----"
-                        ps -o pid,ppid,stat,%cpu,etime,command -p "$_p" 2>/dev/null || true
-                        if [ -d "/proc/$_p/task" ]; then
-                            echo "threads: $(ls /proc/$_p/task 2>/dev/null | wc -l) fds: $(ls /proc/$_p/fd 2>/dev/null | wc -l)"
-                            echo "---- runner [$_p] wchan stacks ----"
-                            for _t in $(ls /proc/$_p/task 2>/dev/null); do
-                                _w=$(cat "/proc/$_p/task/$_t/wchan" 2>/dev/null || echo "?")
-                                _c=$(tr '\0' ' ' < "/proc/$_p/task/$_t/comm" 2>/dev/null || echo "?")
-                                echo "  tid $_t ($_c): wchan=$_w"
-                            done
-                        fi
-                    done
-                } > "$_sb_log.predump" 2>&1
-                # Signal ONLY the recorded phase pid ($! — our own
-                # background child, the strongest ownership proof).
-                # Descendant signalling is deliberately NOT done: a
-                # pid snapshot is not an ownership guarantee (PIDs are
-                # reused; a snapshot cannot prove a process is still
-                # ours at signal time). Survivors are reaped by the
-                # ephemeral CI runner; host users' in-test defers are
-                # the primary cleanup.
-                kill -TERM "$_sb_pid" 2>/dev/null || true
-                if command -v setsid >/dev/null 2>&1; then
-                    # The phase group (created by setsid for THIS phase)
-                    # contains exactly the phase's own descendants.
-                    kill -TERM -- -"$_sb_pid" 2>/dev/null || true
-                fi
-                sleep 10
-                kill -KILL "$_sb_pid" 2>/dev/null || true
-                if command -v setsid >/dev/null 2>&1; then
-                    kill -KILL -- -"$_sb_pid" 2>/dev/null || true
-                fi
-                # Reap the phase so no zombie lingers.
-                wait "$_sb_pid" 2>/dev/null || true
-                # Verify the kill landed (bounded): if the phase pid
-                # somehow survived, refuse any subsequent lane and say
-                # so — a surviving phase process must never feed the
-                # next lane's results. This is NOT a process-tree walk
-                # and never signals anything but the recorded pid.
-                for _sb_check in 1 2 3 4 5; do
-                    if ! kill -0 "$_sb_pid" 2>/dev/null; then
-                        break
+    # FOREGROUND watchdog: bounded poll (5 s granularity — phase
+    # budgets are minutes, so deadline enforcement lands within 5 s),
+    # with the 5-min still-running heartbeat folded into the same
+    # loop. No background watchdog exists, so nothing can cancel an
+    # escalation in flight.
+    _sb_slept=0
+    _sb_hb=0
+    while kill -0 "$_sb_pid" 2>/dev/null; do
+        if [ "$_sb_slept" -ge "$_sb_secs" ]; then
+            echo "TIMEOUT [$_sb_label]: exceeded ${_sb_secs}s — terminating owned processes."
+            touch "$_sb_log.timeout"
+            # Capture runner internals BEFORE killing (post-kill
+            # forensics only ever shows orphans): spinning (infinite
+            # loop) vs sleeping (blocked wait) decides the next
+            # investigation. Linux-only; skipped elsewhere.
+            {
+                echo "---- pre-kill process tree ----"
+                ps -ef 2>/dev/null | grep -a -e swift -e needletail -e tmux | grep -a -v grep | head -20
+                for _p in $(ps -ef 2>/dev/null | grep -a "test-runner" | grep -a -v grep | awk '{print $2}' | head -3); do
+                    echo "---- runner pid $_p state ----"
+                    ps -o pid,ppid,stat,%cpu,etime,command -p "$_p" 2>/dev/null || true
+                    if [ -d "/proc/$_p/task" ]; then
+                        echo "threads: $(ls /proc/$_p/task 2>/dev/null | wc -l) fds: $(ls /proc/$_p/fd 2>/dev/null | wc -l)"
+                        echo "---- runner [$_p] wchan stacks ----"
+                        for _t in $(ls /proc/$_p/task 2>/dev/null); do
+                            _w=$(cat "/proc/$_p/task/$_t/wchan" 2>/dev/null || echo "?")
+                            _c=$(tr '\0' ' ' < "/proc/$_p/task/$_t/comm" 2>/dev/null || echo "?")
+                            echo "  tid $_t ($_c): wchan=$_w"
+                        done
                     fi
-                    sleep 1
                 done
-                if kill -0 "$_sb_pid" 2>/dev/null; then
-                    echo "LATCH [$_sb_label]: phase pid $_sb_pid survived TERM+KILL — refusing subsequent lanes this run."
-                    touch "$root_dir/.needletail-dev/logs/PHASE-TIMEOUT-LATCH"
-                fi
-                # (No tmux cleanup here: `tmux ls` itself hangs on a
-                # wedged server and would stall the killer. In-test
-                # defers are the primary cleanup; step-level orphans
-                # die with the ephemeral CI runner.)
-                break
+            } > "$_sb_log.predump" 2>&1
+            # Escalation, synchronously: TERM the direct child and the
+            # phase group (the group exists because WE setsid'd this
+            # phase), a 10 s grace, then SIGKILL both, then reap the
+            # child. Group membership is verified — not assumed —
+            # afterwards.
+            kill -TERM "$_sb_pid" 2>/dev/null || true
+            if [ "$_sb_group" = 1 ]; then
+                /bin/kill -TERM -- -"$_sb_pid" 2>/dev/null || true
             fi
             sleep 10
-            _sb_slept=$((_sb_slept + 10))
-        done
-    ) &
-    _sb_killer=$!
-    (
-        while kill -0 "$_sb_pid" 2>/dev/null; do
-            sleep 300
-            kill -0 "$_sb_pid" 2>/dev/null || break
+            kill -KILL "$_sb_pid" 2>/dev/null || true
+            if [ "$_sb_group" = 1 ]; then
+                /bin/kill -KILL -- -"$_sb_pid" 2>/dev/null || true
+            fi
+            wait "$_sb_pid" 2>/dev/null || true
+            # Survivor verification, ownership-scoped: the negated pid
+            # tests exactly OUR phase group (created by setsid for this
+            # phase) — a group exists while any of its members live, so
+            # this detects surviving descendants without snapshots.
+            # Without process-group support nothing can be verified:
+            # latch conservatively.
+            if [ "$_sb_group" = 1 ]; then
+                if /bin/kill -0 -- -"$_sb_pid" 2>/dev/null; then
+                    echo "LATCH [$_sb_label]: phase group -$_sb_pid still has members after TERM+KILL — refusing subsequent lanes this run."
+                    touch "$root_dir/.needletail-dev/logs/PHASE-TIMEOUT-LATCH"
+                fi
+            else
+                echo "LATCH [$_sb_label]: no process-group support on this platform — descendant survival is unverifiable after a deadline kill. Inspect for strays, then run: ./dev latch-clear"
+                touch "$root_dir/.needletail-dev/logs/PHASE-TIMEOUT-LATCH"
+            fi
+            echo "CLEANUP COMPLETE [$_sb_label]: escalation finished before this runner returns."
+            break
+        fi
+        sleep 5
+        _sb_slept=$((_sb_slept + 5))
+        _sb_hb=$((_sb_hb + 5))
+        if [ "$_sb_hb" -ge 300 ]; then
+            _sb_hb=0
             # Leading blank line: the follower may be mid-line, so the
             # header must not glue onto streamed test output.
             echo ""
             echo "STILL-RUNNING [$_sb_label]: last output:"
             tail -5 "$_sb_log" 2>/dev/null || true
-        done
-    ) &
-    _sb_watch=$!
-    if wait "$_sb_pid"; then
-        _sb_rc=0
+        fi
+    done
+    if [ -f "$_sb_log.timeout" ]; then
+        _sb_rc=124
     else
-        _sb_rc=$?
+        # Normal exit. Reap for the real status, then run the SAME
+        # ownership-scoped survivor check: a phase that exits 0 while
+        # leaving group members behind (a leaked worker) must not pass
+        # silently.
+        if wait "$_sb_pid"; then
+            _sb_rc=0
+        else
+            _sb_rc=$?
+        fi
+        if [ "$_sb_group" = 1 ]; then
+            if /bin/kill -0 -- -"$_sb_pid" 2>/dev/null; then
+                echo "LATCH [$_sb_label]: phase exited $_sb_rc but group -$_sb_pid still has members — a descendant survived the phase. Refusing subsequent lanes this run."
+                touch "$root_dir/.needletail-dev/logs/PHASE-TIMEOUT-LATCH"
+            fi
+        fi
     fi
     # Let the follower drain the final bytes before it is reaped, then
     # reap the follower by pid: awk is the pipeline's $! (our own
@@ -257,7 +271,6 @@ stream_bounded() {
     # and killing awk is a harmless no-op. No pattern matching — a
     # pattern kill can hit processes we do not own.
     sleep 2
-    kill "$_sb_killer" "$_sb_watch" 2>/dev/null || true
     if [ -n "$_sb_tail" ]; then
         kill "$_sb_tail" 2>/dev/null || true
         wait "$_sb_tail" 2>/dev/null || true
@@ -275,6 +288,21 @@ stream_bounded() {
         return 124
     fi
     return "$_sb_rc"
+}
+
+# Bounded Swift-test lane: composes the Swift-specific invocation
+# (line-buffered stdbuf prefix when available) and hands the COMPLETE
+# command to stream_bounded — which executes commands exactly as
+# supplied. All Swift test lanes route through this; aggregate
+# case-groups and binary lanes call stream_bounded directly with their
+# own complete command, so no lane ever gets an unexpected prefix.
+swift_bounded() {
+    _sbw_label="$1"; _sbw_secs="$2"; shift 2
+    if command -v stdbuf >/dev/null 2>&1; then
+        stream_bounded "$_sbw_label" "$_sbw_secs" stdbuf -o0 -e0 "$@"
+    else
+        stream_bounded "$_sbw_label" "$_sbw_secs" "$@"
+    fi
 }
 
 # Per-phase hard deadlines (seconds). Every bound sits at least 5 min
@@ -317,7 +345,7 @@ phase_secs() {
 run_swift_test() {
     _label="$1"; shift
     _log="$root_dir/.needletail-dev/logs/dev-$_label.log"
-    if stream_bounded "$_label" "$(phase_secs "$_label")" -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"; then
+    if swift_bounded "$_label" "$(phase_secs "$_label")" "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --parallel --num-workers 1 "$@"; then
         _rc=0
     else
         _rc=$?
@@ -426,7 +454,7 @@ test)
         _timing_xunit_actual="${_timing_xunit_base%.xml}-swift-testing.xml"
         mkdir -p "$root_dir/.needletail-dev/xunit"
         rm -f "$_timing_xunit_base" "$_timing_xunit_actual"
-        if stream_bounded timing "$(phase_secs timing)" -j 4 --disable-automatic-resolution --no-parallel --filter TransportCancellationTests --xunit-output "$_timing_xunit_base"; then
+        if swift_bounded timing "$(phase_secs timing)" "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter TransportCancellationTests --xunit-output "$_timing_xunit_base"; then
             _timing_rc=0
         else
             _timing_rc=$?
@@ -462,7 +490,7 @@ test)
         _e2e_xunit_actual="${_e2e_xunit_base%.xml}-swift-testing.xml"
         mkdir -p "$root_dir/.needletail-dev/xunit"
         rm -f "$_e2e_xunit_base" "$_e2e_xunit_actual"
-        if stream_bounded e2e "$(phase_secs e2e)" -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests --xunit-output "$_e2e_xunit_base"; then
+        if swift_bounded e2e "$(phase_secs e2e)" "$NEEDLETAIL_SWIFT" test -j 4 --disable-automatic-resolution --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests --xunit-output "$_e2e_xunit_base"; then
             _e2e_rc=0
         else
             _e2e_rc=$?
@@ -991,31 +1019,31 @@ coverage-sonar)
         fi
     }
     echo "== coverage-sonar: bulk (parallel) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-bulk "$(phase_secs coverage-sonar-bulk)" --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests" $BULK_SKIP; then
+    if NEEDLETAIL_BIN="$_wrap" swift_bounded coverage-sonar-bulk "$(phase_secs coverage-sonar-bulk)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter "$FILTER_BEHAVIOUR" --filter "$FILTER_PRIMITIVE" --filter "$FILTER_CONFIG_PURE" --filter "$FILTER_STATE_PURE" --filter "$FILTER_PRESENTATION_PURE" --filter "NeedletailProviderTests" $BULK_SKIP; then
         :
     else
         note_lane_rc $?
     fi
     echo "== coverage-sonar: actor + integration (serialized) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-serial "$(phase_secs coverage-sonar-serial)" --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter "NeedletailActorTests" --filter "NeedletailConfigIntegrationTests" --filter "NeedletailProviderIntegrationTests"; then
+    if NEEDLETAIL_BIN="$_wrap" swift_bounded coverage-sonar-serial "$(phase_secs coverage-sonar-serial)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter "NeedletailActorTests" --filter "NeedletailConfigIntegrationTests" --filter "NeedletailProviderIntegrationTests"; then
         :
     else
         note_lane_rc $?
     fi
     echo "== coverage-sonar: timing (serialized) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-timing "$(phase_secs coverage-sonar-timing)" --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter TransportCancellationTests; then
+    if NEEDLETAIL_BIN="$_wrap" swift_bounded coverage-sonar-timing "$(phase_secs coverage-sonar-timing)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter TransportCancellationTests; then
         :
     else
         note_lane_rc $?
     fi
     echo "== coverage-sonar: e2e (serialized) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-e2e "$(phase_secs coverage-sonar-e2e)" --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests; then
+    if NEEDLETAIL_BIN="$_wrap" swift_bounded coverage-sonar-e2e "$(phase_secs coverage-sonar-e2e)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --no-parallel --filter B5CEndToEndTests --filter TOOL10DiffTests --filter ProductionCLIWiringTests --filter ProductionExportCLIWiringTests --filter CrossRunGateCLITests --filter B1ContainmentTests --filter CrashMatrixTests --filter TOOL09OrderedBatchTests --filter SessionExportTests --filter C1ProcRunnerTests --filter C1QualificationTests --filter C2ExecDurableTests --filter C3ExecQualificationTests; then
         :
     else
         note_lane_rc $?
     fi
     echo "== coverage-sonar: feasibility (PTY terminal suite) =="
-    if NEEDLETAIL_BIN="$_wrap" stream_bounded coverage-sonar-feasibility "$(phase_secs coverage-sonar-feasibility)" --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter NeedletailTerminalTests; then
+    if NEEDLETAIL_BIN="$_wrap" swift_bounded coverage-sonar-feasibility "$(phase_secs coverage-sonar-feasibility)" "$NEEDLETAIL_SWIFT" test --enable-code-coverage --disable-automatic-resolution -j 4 --parallel --num-workers 1 --filter NeedletailTerminalTests; then
         :
     else
         note_lane_rc $?

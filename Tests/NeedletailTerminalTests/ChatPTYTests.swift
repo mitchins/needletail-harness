@@ -748,12 +748,22 @@ extension ChatPTYTests {
             guard let server = env.server else { Issue.record("no loopback"); return }
             server.enqueue(ChatLoopback.textTurn("tmux turn ok", splits: 1))
             let tmuxName = "m4d-pty08-\(UUID().uuidString.prefix(8))"
+            // Dedicated socket (ownership scope): the daemonized tmux
+            // server lives on a socket file unique to this run, so every
+            // operation below targets OUR server exclusively — the
+            // system default server (and any other user's sessions) is
+            // never touched, and a stale server from a killed run cannot
+            // collide with a later run. The server self-exits when its
+            // last session ends; the socket file is removed in teardown.
+            let tmuxSocket = FileManager.default.temporaryDirectory
+                .appendingPathComponent("m4d-pty08-sock-\(UUID().uuidString).sock")
+            defer { try? FileManager.default.removeItem(at: tmuxSocket) }
             func tmux(_ args: String...) throws -> String {
                 let proc = Process()
                 // Resolve via PATH (/usr/bin/env): a hard-coded
                 // /usr/bin/tmux misses Homebrew (/opt/homebrew, /usr/local).
                 proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                proc.arguments = ["tmux"] + args
+                proc.arguments = ["tmux", "-S", tmuxSocket.path] + args
                 // Capture to a FILE, never a pipe: a daemonized tmux
                 // server can inherit the client's stdout and hold a pipe
                 // open forever, so no pipe read (blocking or polling) is
@@ -818,14 +828,23 @@ extension ChatPTYTests {
                 // the capture-pane prompt probe below regardless.
                 return (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
             }
-            // Cleanup on EVERY exit path, registered BEFORE the first
-            // tmux call: a new-session failure must still attempt the
-            // kill (no-op if the session was never created).
-            defer { _ = try? tmux("kill-session", "-t", tmuxName) }
+            // Cleanup registered ONLY for a session THIS test created:
+            // the flag flips after new-session succeeds, so a creation
+            // failure (including a name collision with a pre-existing
+            // session) can never destroy that other session. Ownership
+            // is exact — the name is UUID-prefixed and the server is
+            // our dedicated socket.
+            var tmuxSessionCreated = false
+            defer {
+                if tmuxSessionCreated {
+                    _ = try? tmux("kill-session", "-t", tmuxName)
+                }
+            }
             do {
                 _ = try tmux("new-session", "-d", "-s", tmuxName, "-x", "80", "-y", "24",
                                "-e", "NEEDLETAIL_STATE_DIR=\(env.stateDir.path)",
                                "-e", "\(ChatLoopback.credentialEnv)=\(ChatLoopback.credentialValue)")
+                tmuxSessionCreated = true
                 // Leg deadline: with a sick tmux server every call can
                 // burn its 30 s watchdog (150+200 iterations would exceed
                 // any step budget silently). A deadline breach throws to

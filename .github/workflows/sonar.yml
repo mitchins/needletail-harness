@@ -23,11 +23,24 @@ jobs:
     # Dependabot PRs (which cannot access ordinary Actions secrets) are skipped.
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-24.04
-    # 120 min: must cover the SUM of the step budgets (release build
-    # 30 + coverage 45 + scan 15 = 90) plus checkout/toolchain/resolve,
-    # so the evidence upload (`if: always()`) always runs even when an
-    # earlier step burns its limit.
-    timeout-minutes: 120
+    # Timeout hierarchy (coherent by construction — each level exceeds the
+    # sum of everything beneath it):
+    #   per-lane dev budgets     sum 145 min (bulk 25 + serial 25 + timing 10
+    #                            + e2e 35 + feasibility 50), enforced inside
+    #                            the coverage step by stream_bounded;
+    #   coverage step    175 min (145 lane sum + predump/kill escalation
+    #                            overhead + llvm-cov merge/export + XML
+    #                            conversion);
+    #   release build     30 min, scan 15 min (sequential steps);
+    #   job              240 min (30 + 175 + 15 = 220 step sum + checkout/
+    #                            toolchain/resolve ~10 + upload margin), so
+    #                            the evidence upload (`if: always()`) always
+    #                            runs even when an earlier step burns its
+    #                            limit.
+    # Timeouts bind only on failure, so CI runtime is unchanged on green
+    # runs; a coverage interruption fails the step visibly and is never
+    # certified as complete coverage.
+    timeout-minutes: 240
     steps:
       - name: Checkout full history for new-code and blame analysis
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
@@ -108,7 +121,13 @@ jobs:
         # set as the old single serial run (parallel bulk + serialized
         # actor/integration, timing, e2e, feasibility), each lane
         # bounded with live streaming + diagnostics instead of silence.
-        timeout-minutes: 45
+        # 175 min: exceeds the 145-min SUM of the per-lane dev budgets
+        # (stream_bounded enforces each lane inside this step), leaving
+        # margin for deadline-kill escalations and the coverage merge/
+        # export/XML conversion that follow the lanes. A lane failure or
+        # interruption fails this step visibly — partial coverage is never
+        # certified as complete.
+        timeout-minutes: 175
         run: ./dev coverage-sonar
 
       - name: SonarQube Cloud scan and quality gate
