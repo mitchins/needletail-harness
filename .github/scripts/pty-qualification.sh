@@ -117,6 +117,11 @@ else
 fi
 
 check_bystander
+# Bounded teardown of the bystander (our own child): the check above has
+# already passed, and leaving it alive would hold the tee pipe open and
+# make the runner flag orphan processes at job end.
+kill "$BYSTANDER" 2>/dev/null || true
+wait "$BYSTANDER" 2>/dev/null || true
 echo "=============================================="
 echo "QUALIFICATION RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ] || exit 1
