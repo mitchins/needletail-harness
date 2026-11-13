@@ -1,10 +1,13 @@
 # TEMPORARY (M4-OPS-10): adversarial process-lifecycle qualification in a
-# disposable hosted VM. workflow_dispatch only — never runs on push/PR.
+# disposable hosted VM. push-to-m4-a trigger only (the file is not on the default branch,
+# so workflow_dispatch is unavailable) — never runs on PR events.
 # Removed from the tree after its evidence run; the receipt references
 # the run ID. No secrets, no live traffic.
 name: pty-qualification
 
 on:
+  push:
+    branches: [m4-a]
   workflow_dispatch: {}
 
 permissions:
