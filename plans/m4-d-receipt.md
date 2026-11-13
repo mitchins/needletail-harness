@@ -1014,3 +1014,20 @@ Blockers remaining (explicit, none silent):
 2. Sonar quality gate: `new_security_rating` C from 2 documented
    S7694 false-positive advisories (maintainer UI acknowledgment
    required) + `new_coverage` 61.9 % vs 80 (recorded deferral, §14.3).
+
+### 15.5 Core/Runtime freeze accounting (correction to this section)
+
+`git diff 3e9806f -- Sources/NeedletailCore Sources/NeedletailRuntime`
+at this HEAD is NOT empty: it contains exactly one hunk — the 12-line
+queue-reorder midpoint-exhaustion loud refusal
+(`queue-reorder-rank-exhausted`, SessionTransition.swift), applied in
+`41998d4` as a verified CodeRabbit round-2 finding with its regression
+test (replay-inclusive), documented in §13.3. This is the sole
+Core/Runtime delta of the entire epic post-freeze; it was part of the
+authorized round-2 remediation, but is restated here explicitly because
+the freeze accounting in earlier sections said "byte-identical", which
+was true at `06a9bae` and STALE after `41998d4`. The PR description
+was corrected accordingly. If the maintainer judges the round-2
+authorization not to cover a Core change, reverting this single hunk
+(plus its test) restores byte-identity without touching any OPS-10
+work.
