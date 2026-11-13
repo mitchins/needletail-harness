@@ -21,7 +21,10 @@ grep -q '^stream_bounded() {' /tmp/sb-extracted.sh || { echo "FATAL: stream_boun
 . /tmp/sb-extracted.sh
 
 # S8 setup: an unrelated bystander process that must survive EVERYTHING.
-sleep 300 &
+# 2 h lifetime — far beyond the script's duration (the job timeout kills
+# the VM tree long before expiry); the earlier 5-min value expired
+# NATURALLY mid-script in CI and produced a false "signalled" verdict.
+sleep 7200 &
 BYSTANDER=$!
 check_bystander() {
     if kill -0 "$BYSTANDER" 2>/dev/null; then
