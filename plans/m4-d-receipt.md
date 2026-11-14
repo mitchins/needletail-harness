@@ -1134,3 +1134,88 @@ legs are where the Darwin deltas live, exactly as the PENDING NATIVE
 QUALIFICATION markers anticipated. B and C cannot be dispositioned
 without the host; A needs the wrapper-stty discriminator. No
 production code changed in this session; `bc091fc` is test-infra only.
+
+### 15.8 macOS matrix — continued execution (host restarted; release-config sweep)
+
+Resumed after host restart. Redeployed exact HEAD; release + test
+builds PASS (550s / 364s). Diagnostics run natively on the Mac
+(bounded probes through script(1); no global cleanup, no pattern
+kills, nothing outside self-spawned processes touched):
+
+- **Finding A (echo probe) — DRIVER ARTIFACT, product correct.**
+  Native stty probe on the live slave: after clean exit the product
+  leaves `lflag=200005cb` (ECHO|ICANON|ISIG all set; sole delta
+  NOKERNINFO) and after SIGTERM exit `lflag=1cf` (ECHO|ICANON|ISIG
+  set, IEXTEN dropped — minor fidelity divergence worth a follow-up).
+  The suite's post-mortem `canonicalEchoRestored()` cannot observe a
+  torn-down pty on Darwin; every "termios restored" failure in the
+  suite is this artifact. Product restore verified directly.
+- **Finding B (SIGTERM) — REFUTED; the Darwin signal split is PROVEN
+  natively.** Manual probe: TERM while chat runs → exits 143
+  (conventional code) with termios restored; the in-suite PTY-07 leg
+  itself passed turn-commit → TERM → waitExit → code-143 (its only
+  issue is the class-A echo artifact at ChatPTYTests.swift:635). The
+  kqueue/EVFILT SIG_IGN design (§15.1 in-code note "PENDING NATIVE
+  QUALIFICATION") is now QUALIFIED on macOS 26.7.1.
+- **Finding C — CONFIRMED (2 genuine Darwin input defects, unfixed):**
+  (C1) idle Ctrl+C (0x03) does not exit (PTY-01 leg deterministic;
+  manual probe corroborates — two 0x03 presses did nothing, exit only
+  at master-close EOF). (C2) raw-mode Ctrl+D on an empty line does
+  not exit (PTY-07-EOF leg, 15.8s no exit). The replxx control-code
+  mapping is platform-independent C++ (verified in-tree); the
+  divergence sits deeper in the Darwin read/event path — NOT
+  root-caused in this closeout. These are terminal-safety defects
+  (raw mode must not survive an idle Ctrl+C/EOF exit path).
+- **Finding D — dispatch latency exceeds in-suite budgets.** PTY-02's
+  full transcript proves the complete flow WORKS (input renders,
+  bracketed paste literal + /cancel not executed, admission ranks,
+  gated stream completes, second dispatch+stream completes): the
+  failures are the 20s gate/expect budgets expiring before the first
+  provider request lands on macOS (first-dispatch latency 20-40s
+  in-suite; manual probes with identical config dispatch within
+  seconds). PTY-03 likewise failed only gate(280) + echo(321). Not
+  root-caused (URLSession/SystemConfiguration warm-up suspected);
+  budgets were calibrated on Linux.
+- PTY-04 anomaly (one observation): transcript 33 bytes — its typed
+  input never rendered; single observation, likely the same
+  stall/init window; needs its own repro when investigation resumes.
+- **Debug-config SIGBUS (signal 10)** in the Xcode 26.6
+  swiftpm-testing-helper on macOS 26.7 Intel — reproducible with
+  filtered swift-testing runs (State/Actor/PTY); NO crash report
+  captured (reporter appears disabled). **Release config is CLEAN**:
+  NeedletailStateTests 105/105 PASS in `-c release`. Toolchain
+  infrastructure issue, not product.
+- **Remaining suites (release config)**: Presentation 102/102 ✓
+  (debug), ConfigIntegration 21/21 ✓ (debug), State 105/105 ✓
+  (release). ActorTests 63/65: two loopback-script legs
+  (`.outOfScript` after 60s waits — plausibly finding-D latency
+  exhausting the scripted economy; unproven). PrimitiveTests: B2
+  search-evidence legs FAIL LOUDLY by design — `rg` is not installed
+  on this host (`rg required for B2 search evidence; silent skip is
+  not evidence`). ProviderIntegration/Provider/Config-pure/Behaviour/
+  QualificationProbes: not completed this session (probe session
+  ended before those lanes ran). TerminalTests release-config sweep:
+  not rerun (debug evidence above stands).
+- Environment gaps for FULL acceptance: `rg` (search evidence legs)
+  and `tmux` (PTY-08 real-tmux leg) are not installed on the host.
+
+### 15.9 macOS acceptance verdict (updated)
+
+Native evidence now EXISTS: build, bundle, doctor fail-closed, prompt/
+editing/paste/admission/streaming/rendering, TERM restore+143,
+SIGKILL boundary, durable export recovery, resize redraw, hostile-
+stream containment, credential fail-closed — all verified natively on
+macOS 26.7.1 x86_64. The Darwin signal-split pending item (§13) is
+QUALIFIED. Remaining BEFORE macOS acceptance can be declared:
+1. **C1/C2 (idle Ctrl+C exit; raw-mode Ctrl+D exit)** — genuine
+   product defects on Darwin; require a targeted fix + the two legs
+   going green. (Production change → separate authorization per the
+   freeze rules; NOT executed in this closeout.)
+2. **Finding D** first-dispatch latency vs 20s budgets — root-cause
+   or budget recalibration decision for the maintainer.
+3. Install `rg` + `tmux` on the host; rerun the search-evidence legs
+   + PTY-08 real-tmux leg.
+4. Complete the un-run lanes (ProviderIntegration, Provider-pure,
+   Config-pure, Behaviour, QualificationProbes; Actor's two legs).
+5. Xcode 26.6 debug-config SIGBUS — use `-c release` for macOS test
+   evidence until the toolchain issue is dispositioned.
