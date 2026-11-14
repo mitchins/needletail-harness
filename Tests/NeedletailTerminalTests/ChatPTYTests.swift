@@ -755,8 +755,12 @@ extension ChatPTYTests {
             // never touched, and a stale server from a killed run cannot
             // collide with a later run. The server self-exits when its
             // last session ends; the socket file is removed in teardown.
+            // Short filename: macOS Unix-socket addresses cap at 104
+            // bytes (sun_path) and temporaryDirectory can be deep under
+            // /var/folders; a full UUID would risk truncation there.
+            // 12 UUID chars (48 bits) per run is collision-negligible.
             let tmuxSocket = FileManager.default.temporaryDirectory
-                .appendingPathComponent("m4d-pty08-sock-\(UUID().uuidString).sock")
+                .appendingPathComponent("m4d08-\(UUID().uuidString.prefix(12)).sock")
             defer { try? FileManager.default.removeItem(at: tmuxSocket) }
             func tmux(_ args: String...) throws -> String {
                 let proc = Process()
