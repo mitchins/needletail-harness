@@ -1077,3 +1077,60 @@ work.
    The 6 duplication/refactoring suggestions: explicitly DEFERRED
    (reuse opportunities, not correctness findings; no PTY fixture
    extraction).
+
+### 15.7 Native macOS matrix — FIRST REAL EXECUTION (partial; host dropped mid-run)
+
+Access SUPERSEDES §11.7: `build@192.168.2.106` authenticates with the
+`mitch@betalab` identity (operator confirmed the provisioned keys,
+including `macbuild-dispatch`); host key pinned
+`SHA256:nz7Y2Oqriobes8hyWTVPeNzCNdNgD7YMVFewDp5gfoo` (ED25519, TOFU,
+operator-directed). Host: Builds-Mac-Pro.local, macOS 26.7.1 (25G241),
+**x86_64 Intel**, Apple Swift 6.3.3 (Xcode 26.6 toolchain; Linux gate
+pins 6.4 — a toolchain-version delta to note, tools-version 6.1
+satisfied). The earlier "reachable-but-inaccessible" record reflects
+host flakiness, not missing provisioned access: the host worked ~40
+minutes, then dropped off the network mid-matrix and stayed down
+(~55 min at recording).
+
+Executed (exact tree, `git archive` of the push HEAD):
+- Release build PASS (503.94 s); `needletail --version` 0.3.0 PASS.
+- `doctor` PASS with CORRECT fail-closed search provisioning
+  (`rg: NOT FOUND — disables the search tool (denied, never a
+  synthetic substitute)`) — the Darwin denial path verified natively.
+- Test build needed ONE test-infra fix (`bc091fc`):
+  `String(validating:as:)` is macOS 15+ and broke the macOS 14-floor
+  test target compilation; replaced with the equivalent strict
+  `String(bytes:encoding:)`. Linux CI unaffected (gated API missing on
+  Glibc).
+- `NeedletailTerminalTests`: 13 tests, 21 issues — TERM-04 PASS;
+  10 FAIL in three classes:
+  - **A (probe soundness, suspected driver artifact)**:
+    `canonicalEchoRestored()` failed post-mortem in D2.7/RESUBMIT/
+    PARITY/PTY-08-simulated rows. The probe writes to the pty master
+    AFTER the child exited; on Darwin the slave tears down at child
+    exit, so the kernel cannot echo regardless of the product's
+    restore. Preserved transcripts (pty-02/04/06-hex) show the product
+    rendering and working correctly natively. Discriminator pending:
+    wrapper-`stty` check on the live slave after product exit.
+  - **B (genuine product finding — the §15/§13 PENDING NATIVE
+    QUALIFICATION item)**: PTY-07 catchable SIGTERM leg FAILED
+    (no exit in 3.8 s). Darwin sets SIGTERM/SIGHUP to SIG_IGN so the
+    kqueue EVFILT source can deliver; the DispatchSource handler did
+    not produce the restore+exit on macOS 26.7.1.
+  - **C (genuine product finding)**: PTY-07 EOF (Ctrl+D on empty line)
+    leg FAILED (no exit in 15.8 s) — shim/EOF path on Darwin.
+  - PTY-08 real-tmux leg NOT executable: no tmux on the host (empty
+    preserved logs); the simulated rows' failures are class A.
+- One transient `swiftpm-testing-helper` SIGBUS during a filtered
+  run; not reproduced in the full-suite run. Noted, unassigned.
+- Suites NOT reached before the host dropped: presentation, state,
+  actor, config/provider integration, behaviour; macOS packaging
+  smoke (per §11.9 scope: build + suites + PTY evidence).
+
+Verdict: macOS matrix **INCOMPLETE — 3 findings recorded (A/B/C), no
+disposition yet**. The product builds and runs correctly natively
+(build/smoke/doctor/rendering transcripts); the terminal lifecycle
+legs are where the Darwin deltas live, exactly as the PENDING NATIVE
+QUALIFICATION markers anticipated. B and C cannot be dispositioned
+without the host; A needs the wrapper-stty discriminator. No
+production code changed in this session; `bc091fc` is test-infra only.
