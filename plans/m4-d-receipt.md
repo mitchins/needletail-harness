@@ -971,11 +971,11 @@ held: no merge, no release, no M5, Core/Runtime frozen.
 
 | # | Finding (reviewer) | File | Status | Evidence at final HEAD | Correction / regression |
 |---|---|---|---|---|---|
-| 1 | Timed-out Swift descendants survive the tracked pid, bypassing the latch (CodeRabbit Major) | `dev` stream_bounded | fixed | CI run 43514680706 S1/S2/S3/S4 | Phase spawned `setsid` (own session/group); escalation TERMs/KILLs the group via `/bin/kill`; survivor detection = `kill -0 -- -pgid` (ownership-scoped: the group exists because we created it) on BOTH timeout and normal exits; survivor → latch → subsequent lanes refuse. No pid snapshots, no tree walks, nothing outside the phase signalled. Harness caught a real bug en route: dash's builtin `kill -0 -- -PGID` misparses negative targets (rc=2 = false "group gone") → all group ops now use `/bin/kill`. |
-| 2 | stream_bounded prepends `swift test` to executable commands, breaking case-group lanes (CodeRabbit Major) | `dev` | fixed | CI run 43514680706 S5; local `./dev test case-group m1a` rc=0 | Runner executes commands EXACTLY as supplied; Swift composition moved to `swift_bounded` (stdbuf prefix only); case-group lanes pass `"$0" test case-group X` directly. |
+| 1 | Timed-out Swift descendants survive the tracked pid, bypassing the latch (CodeRabbit Major) | `dev` stream_bounded | fixed | CI run 43514680706 S1/S2/S4 + corrected S3 rerun 43557904847 | Phase spawned `setsid` (own session/group); escalation TERMs/KILLs the group via `/bin/kill`; survivor detection = `kill -0 -- -pgid` (ownership-scoped: the group exists because we created it) on BOTH timeout and normal exits; survivor → latch → subsequent lanes refuse. No pid snapshots, no tree walks, nothing outside the phase signalled. Harness caught a real bug en route: dash's builtin `kill -0 -- -PGID` misparses negative targets (rc=2 = false "group gone") → all group ops now use `/bin/kill`. |
+| 2 | stream_bounded prepends `swift test` to executable commands, breaking case-group lanes (CodeRabbit Major) | `dev` | fixed | aggregate wrapper evidence: dev:622-628 (`stream_bounded cases-mX ... "$0" test case-group mX`) executed in the full `./dev test offline` runs — local rc=0 with m1a–d stages logged, CI offline PASS (run 43532851226 at d6910ce); S5 itself verified only the INNER command's validity (it bypasses the wrapper by construction — `test case-group` is the aggregate-internal subcommand) | Runner executes commands EXACTLY as supplied; Swift composition moved to `swift_bounded` (stdbuf prefix only); case-group lanes pass `"$0" test case-group X` directly. |
 | 3 | Watchdog cancellable before group SIGKILL escalation completes (CodeRabbit Major) | `dev` | fixed | CI run 43514680706 S3 (group already dissolved at runner return) | Watchdog moved into the FOREGROUND of stream_bounded (bounded 5 s poll + folded heartbeat); no background watchdog exists to cancel; escalation completes before the runner returns "CLEANUP COMPLETE". |
 | 4 | Sonar timeout hierarchy incoherent: lanes sum 135–145 min inside a 45-min step, job 120 (CodeRabbit + Codatiel) | `.github/workflows/sonar.yml` | fixed | hierarchy documented in-workflow; lane budgets 145 total < step 175 < job 240 | Lane sum 145 (bulk 25 + serial 25 + timing 10 + e2e 35 + feasibility 50) < coverage step 175 (escalation + merge/export margin) < job 240 (30 build + 175 + 15 scan + setup margins). Timeouts bind on failure only — runtime unchanged on green; an interrupted lane fails the step visibly and is never certified complete. |
-| 5 | PTY-08 cleanup registered before session creation can kill a pre-existing same-name session (Codatiel) | `ChatPTYTests.swift` | fixed | code review; CI S7 scenario (dedicated-socket scoping + failed-creation safety) | `tmuxSessionCreated` flag gates teardown — registered only after `new-session` succeeds; a failed creation can no longer destroy anything. A dedicated Swift regression test was not added: the gate is a two-line structural change and restructuring the leg into a testable helper was judged churn; behavior is adversarially verified by CI S7. |
+| 5 | PTY-08 cleanup registered before session creation can kill a pre-existing same-name session (Codatiel) | `ChatPTYTests.swift` | fixed | gate structurally verified by inspection at HEAD (flag set ONLY on the line after `new-session` returns; every throw before it leaves the flag false; the defer is registered before any creation call); CI S7 verified the SURROUNDING behavior — dedicated-socket scoping and that a failed same-name creation leaves the existing session alive (shell mirror, it does NOT execute the Swift gate) | `tmuxSessionCreated` flag gates teardown — registered only after `new-session` succeeds; a failed creation can no longer destroy anything. Inspection found no correctness defect, so no targeted regression was added (per directive); the gate executes in every PTY-08 CI run (creation success path) — what is NOT independently exercised is the failed-creation branch of the Swift code itself. |
 | 6 | Detached tmux survival after forced test termination (Codatiel; corrected per CodeRabbit delta) | `ChatPTYTests.swift` + `dev` | verified, ownership-scoped; RESIDUAL LEAK RECORDED | daemon() in tmux server escapes any process group (structural); dedicated per-run socket added | Verified REAL: the tmux server daemonizes (setsid) and escapes the phase group, so a deadline kill cannot reap it. Mitigation: every tmux call uses a dedicated per-run socket (`-S`), so operations never touch the shared default server. HONEST RESIDUAL (corrected after initially overclaiming "self-exits"): on a FORCED kill the test's `defer` never runs, kill-session never happens, so the residue is a LIVE tmux server plus a running `chat` process on OUR socket — the socket limits ownership but reaps nothing. Bounded by: ephemeral CI VM teardown reaps it; locally a stale `m4d08-*.sock` + server persists until an explicit ownership-scoped `tmux -S <socket> kill-server` by the operator. Global cleanup / pattern kills remain forbidden. The server self-exits ONLY on the normal teardown path (kill-session succeeds). |
 | 7 | Darwin search path-binding/TOCTOU ×2 (Codatiel) | `NativeToolExecutor.swift` | accepted limitation — G1 accurately describes residual risk | in-code docs + M4-A receipt G1 | (a) rg exec binds by validated pathname on Darwin (`/dev/fd` exec is kernel-refused): open-time checks hold (absolute, lstat non-symlink, O_NOFOLLOW, dev/ino pinned, root-owned non-group/world-writable, sanitized PATH/env); residual = pathname replacement between qualification and exec by an attacker already holding write access to the rg install location. (b) search roots bind via `F_GETPATH` canonical path (no symlink smuggling); residual = rename/replacement between resolution and child-open; every emitted path still passes the per-path classifier. Both ARE M4-A G1 ("child-side binding degrades from fd to path on Darwin"); Linux guarantee (fd-pinned exec + held root FDs) unaffected; Darwin verification lands with the release matrix. NOT silently waived — recorded here and in the PR description as an accepted limitation inside the documented G1 scope; expanding the frozen runtime was not proposed. |
 | 8 | Observe-mode executor calls / duplicate launches / exit-124 false pass / queue-rank exhaustion / stale cleanup docs (previously reported) | various | verified corrected at HEAD | observe: recording-executor leg + denial receipts; duplicate launches: lane-structured aggregate; 124: CI S6 + local forced-timeout; queue exhaustion: refusal asserts; docs: §13 rewrite | No reimplementation needed; verification evidence cited. |
@@ -991,8 +991,17 @@ points in an ephemeral ubuntu-24.04 VM:
 (evidence artifact `pty-qualification-log`, retention 14 d; earlier
 runs 43507339266/43509781953 caught the S1 builtin-kill bug, the S8
 bystander natural-expiry, and the runner orphan-detection interaction —
-all harness defects, fixed before the green run). The harness files
-are REMOVED from the tree at this commit; the receipt + run URL are
+all harness defects, fixed before the green run). EVIDENCE CORRECTION
+(Codatiel agent-000, accepted): S3's independent check in that run used
+the shell builtin `kill -0 -- -PGID`, which misparses under dash (rc=2
+even for live groups), so its "group dissolved" verdict was NOT
+independent proof. Corrected rerun on a throwaway branch —
+**run 43557904847: success** — uses the production `/bin/kill` form and
+verifies the check itself in BOTH directions: positive control
+(detects a live group, pgid 2527) then dissolution (rc=124 +
+CLEANUP COMPLETE + group -2535 gone). S1/S2/S4/S6/S7/S8 were unaffected
+by that defect (their verdicts do not rest on the builtin form). The
+harness files are REMOVED from the tree; the receipt + run URLs are
 the permanent evidence.
 
 ### 15.3 Verification state at final HEAD
@@ -1031,3 +1040,40 @@ was corrected accordingly. If the maintainer judges the round-2
 authorization not to cover a Core change, reverting this single hunk
 (plus its test) restores byte-identity without touching any OPS-10
 work.
+
+### 15.6 Codatiel final-review dispositions (comment 6868778244; evidence-quality findings, no runtime defects)
+
+1. **S3 process-group check (agent-000) — CONFIRMED evidence defect; production unaffected.**
+   The base harness's independent check used the dash-builtin
+   `kill -0 -- -PGID` (misparse → rc=2 = false "group gone"), so S3's
+   original verdict was not independent proof. The PRODUCTION runner
+   was always correct (`/bin/kill` — the same defect was caught and
+   fixed in the product path during the harness's own green-run
+   cycle). Corrected rerun: throwaway branch, **CI run 43557904847 —
+   success**: positive control (check detects a live group) then
+   dissolution verified (rc=124, CLEANUP COMPLETE, group gone).
+   Remaining risk: none beyond the recorded §15.1 residuals.
+2. **S7 vs Swift teardown gate (agent-001) — CONFIRMED scope overclaim; no correctness defect.**
+   S7 verified socket isolation and that a failed same-name creation
+   leaves the existing session alive (shell mirror); it never executed
+   the Swift `tmuxSessionCreated` gate. Inspection at HEAD: flag flips
+   only after `new-session` returns; every throw before it leaves the
+   gate closed; defer registered before any creation call — no defect,
+   so no targeted regression added (per directive; no harness
+   refactor). Receipt wording corrected: the gate's failed-creation
+   branch is structurally verified, not independently executed.
+   Remaining risk: negligible (two-line structural gate; success path
+   exercised in every PTY-08 CI run).
+3. **S5 aggregate bypass (agent-002) — CONFIRMED scope overclaim; wrapper evidence rests elsewhere.**
+   S5 invoked the aggregate-INTERNAL subcommand directly
+   (`test case-group` runs "under the caller's stream_bounded"),
+   bypassing the wrapper — it verified the inner command's validity,
+   not wrapper composition. Genuine wrapper evidence: the aggregate
+   itself (dev:622-628) runs each case-group through
+   `stream_bounded ... "$0" test case-group mX`, and the FULL
+   `./dev test offline` passed locally (m1a–d stages logged) and in
+   CI (offline PASS at d6910ce, run 43532851226). Receipt wording
+   corrected. Remaining risk: none attributable to the wrapper.
+   The 6 duplication/refactoring suggestions: explicitly DEFERRED
+   (reuse opportunities, not correctness findings; no PTY fixture
+   extraction).
