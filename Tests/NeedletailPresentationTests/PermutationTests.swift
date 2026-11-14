@@ -32,7 +32,7 @@ struct PermutationTests {
 
     static func script(seed: UInt64, length: Int) -> [ScriptOp] {
         var rng = XorShift(state: seed == 0 ? 0x9E37 : seed)
-        let texts = ["a", "bb", " x ", "y"]
+        let texts = ["a", "bb", " x ", "y", "@m"]
         return (0..<length).map { _ in
             switch rng.next(bound: 6) {
             case 0: return .typeText(texts[rng.next(bound: texts.count)])
@@ -52,13 +52,15 @@ struct PermutationTests {
     }
 
     /// Replays one scripted trace, collecting invariant violations. All
-    /// five claimed invariants are asserted here (S3): (1) draft byte-exact;
+    /// claimed invariants are asserted here (S3): (1) draft byte-exact;
     /// (2) every queueOp emits exactly one explicit effect (never silent,
     /// never double — the actor decides, the UI always asks out loud);
     /// (3) stale revisions drop without mutation; (4) single owner: at most
     /// one submission-like effect per action; (5) non-session actions never
     /// touch the queue projection (no auto-dispatch while held — the
-    /// projection only moves on actor-originated session events).
+    /// projection only moves on actor-originated session events);
+    /// (6) plain typing emits NOTHING except mention-fetch requests
+    /// (B1: `@`-derivation may ask for completions, never submit/queue).
     static func replay(_ ops: [ScriptOp]) -> TraceResult {
         var state = UIState()
         state.suggestion = MentionSuggestionState(query: "q", revision: 2, candidates: [])
@@ -79,8 +81,9 @@ struct PermutationTests {
                 if state.composer.text != draft {
                     violations.append("draft corrupted: '\(state.composer.text)' vs '\(draft)'")
                 }
-                if !emitted.isEmpty {
-                    violations.append("plain typing must emit no effects")
+                for effect in emitted {
+                    if case .requestCompletions = effect { continue }
+                    violations.append("plain typing emitted a non-fetch effect")
                 }
             case .sessionAdmit(let revision):
                 let (next, emitted) = reduce(
@@ -93,17 +96,23 @@ struct PermutationTests {
                 effects += emitted.count
             case .completion(let rev):
                 let before = state.composer.text
-                let beforeCount = state.suggestion?.candidates.count ?? -1
+                let beforeSuggestion = state.suggestion
+                // Stale means: no live suggestion, or revision mismatch
+                // against the LIVE suggestion (not a fixed seed number —
+                // typing re-derives revisions, so rev 2 can be stale too).
+                let isStale = beforeSuggestion == nil || rev != beforeSuggestion!.revision
                 let (next, emitted) = reduce(state, .completion(CompletionResult(
                     queryRevision: rev, candidates: [CandidateFile(path: "late")])))
                 state = next
                 effects += emitted.count
-                if rev != 2 {
+                if isStale {
+                    // Stale completions change nothing: neither the draft
+                    // nor the live suggestion.
                     if state.composer.text != before {
                         violations.append("stale completion touched the draft")
                     }
-                    if (state.suggestion?.candidates.count ?? -2) != beforeCount {
-                        violations.append("stale completion overwrote candidates")
+                    if state.suggestion != beforeSuggestion {
+                        violations.append("stale completion mutated the suggestion")
                     }
                 }
             case .cancelNotice:
@@ -121,20 +130,42 @@ struct PermutationTests {
                 if emitted.count != 1 {
                     violations.append("queue intent must emit exactly one effect, got \(emitted.count)")
                 }
-                if state.queue != queueBefore {
-                    violations.append("queue intent mutated the projection instead of emitting")
+                // B2: submit intents project exactly one OPTIMISTIC row
+                // per command (visibly pending, Core confirms later);
+                // resubmits replace idempotently. Nothing else in the
+                // projection may move.
+                let matching = state.queue.filter { $0.isOptimistic && $0.commandID == CommandID("probe-q") }
+                let authoritativeBefore = queueBefore.filter { !$0.isOptimistic }
+                let authoritativeAfter = state.queue.filter { !$0.isOptimistic }
+                if matching.count != 1 {
+                    violations.append("queue intent must project exactly one optimistic row")
+                }
+                if authoritativeBefore != authoritativeAfter {
+                    violations.append("queue intent touched authoritative rows instead of only projecting")
                 }
             }
-            if state.queue != queueBefore, !isSessionOp(op) {
+            if state.queue != queueBefore, !isSessionOp(op), !isOptimisticOnlyDelta(before: queueBefore, after: state.queue) {
                 violations.append("non-session action touched the queue projection")
             }
         }
         return TraceResult(draft: draft, effects: effects, violations: violations)
     }
 
+    /// B2: the only legal queue delta from a non-session action is
+    /// appended optimistic rows (submit intents); anything else —
+    /// mutation, removal, authoritative edits — is a violation.
+    private static func isOptimisticOnlyDelta(before: [QueueSummary], after: [QueueSummary]) -> Bool {
+        guard after.count >= before.count else { return false }
+        guard Array(after.prefix(before.count)) == before else { return false }
+        return after.dropFirst(before.count).allSatisfy(\.isOptimistic)
+    }
     private static func isSessionOp(_ op: ScriptOp) -> Bool {
         switch op {
         case .sessionAdmit, .sessionDeny: return true
+        // cancelNotice forwards `.session(.denied)`, so its queue effects
+        // (optimistic rollback) are session-projection effects. Plain
+        // completions never touch the queue — no exemption for them.
+        case .cancelNotice: return true
         default: return false
         }
     }

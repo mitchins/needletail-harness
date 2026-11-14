@@ -393,14 +393,14 @@ struct B3EditWriteTests {
     /// gate (or the re-open) turns every conflict leg below green-to-red.
     private static func openDir(_ path: String) throws -> Int32 {
         var fd: Int32 = -1
-        path.withCString { cstr in fd = Glibc.open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        path.withCString { cstr in fd = open(cstr, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
         guard fd >= 0 else { throw StoreError.integrity("test setup: cannot open dir") }
         return fd
     }
 
     private static func openFile(_ path: String) throws -> Int32 {
         var fd: Int32 = -1
-        path.withCString { cstr in fd = Glibc.open(cstr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        path.withCString { cstr in fd = open(cstr, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
         guard fd >= 0 else { throw StoreError.integrity("test setup: cannot open file") }
         return fd
     }
@@ -441,7 +441,7 @@ struct B3EditWriteTests {
         let tmp = try exec.prepareCommitTmp(newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD)
         let swap = url.appendingPathComponent("swap")
         try Data("SWAPPED\n".utf8).write(to: swap)
-        #expect(swap.path.withCString({ a in file.path.withCString({ b in Glibc.rename(a, b) }) }) == 0, "test setup: atomic swap must work")
+        #expect(swap.path.withCString({ a in file.path.withCString({ b in rename(a, b) }) }) == 0, "test setup: atomic swap must work")
         let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: Data("MUTANT\n".utf8), fileMode: 0o644, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
         #expect(out.status == "conflict", "atomic replace must conflict, got \(out)")
         #expect(out.summary.contains("replaced"), "replacement distinguished from content change, got \(out.summary)")
@@ -490,14 +490,14 @@ struct B3EditWriteTests {
         defer { close(dirFD); close(fileFD); try? FileManager.default.removeItem(at: url) }
         let tmp = try exec.prepareCommitTmp(newData: Data("MUTANT\n".utf8), fileMode: 0o640, parentFD: dirFD)
         try FileManager.default.removeItem(at: file)
-        let fifoC = file.path.withCString { Glibc.mkfifo($0, mode_t(0o644)) }
+        let fifoC = file.path.withCString { mkfifo($0, mode_t(0o644)) }
         #expect(fifoC == 0, "test setup: mkfifo must work")
         let out = exec.finalizeCommit(callID: "c1", path: "f", fileFD: fileFD, current: Data("original\n".utf8), expectedHash: h, newData: Data("MUTANT\n".utf8), fileMode: 0o640, parentFD: dirFD, fileName: "f", tmpName: tmp, verb: "edited")
         #expect(out.status == "conflict", "fifo swap must conflict without hanging, got \(out)")
         #expect(try Self.preimageDigests(store: store, session: session).isEmpty, "no preimage on conflict")
         #expect(Self.tmpFiles(under: url).isEmpty, "tmp cleaned")
         var fstatBuf = stat()
-        #expect(file.path.withCString { Glibc.lstat($0, &fstatBuf) } == 0, "target must still exist")
+        #expect(file.path.withCString { lstat($0, &fstatBuf) } == 0, "target must still exist")
         #expect((fstatBuf.st_mode & S_IFMT) == S_IFIFO, "target must still be the fifo (no replace-on-conflict)")
     }
 
@@ -591,6 +591,7 @@ struct B3EditWriteTests {
 
     // MARK: - B3 approval byte-exactness (NFC vs NFD twins)
 
+#if canImport(Glibc) // APFS normalizes Unicode: NFC/NFD twin names collide (M4-A filesystem delta)
     @Test("approvalTwin byte-exact grants")
     func approvalTwin() async throws {
         // NFC ".env.\u{00E9}" and NFD ".env.e\u{0301}" are canonically equal
@@ -619,6 +620,8 @@ struct B3EditWriteTests {
         #expect(result2.calls[0].status == "denied", "unlisted NFD twin must stay denied, got \(result2.calls[0])")
         #expect(!FileManager.default.fileExists(atPath: url.appendingPathComponent(nfd).path), "twin file must not be created")
     }
+#endif
+
 
     // MARK: - TOOL-08 write
 

@@ -1,5 +1,7 @@
 /*
- * PTYShim implementation — Linux. Uses forkpty-family facilities through
+ * PTYShim implementation — Linux (macOS: same openpty-family API via
+ * util.h; M4-A build-portability only, no PTY behavior change).
+ * Uses forkpty-family facilities through
  * openpty + login_tty (forkpty itself glibc-internal), termios save/restore,
  * ioctl(TIOCSWINSZ), waitpid with deadlines, and bounded select() reads.
  * Teardown kills only the child it spawned (never a generic name).
@@ -16,10 +18,18 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <pthread.h>
 
 int nt_pty_spawn(nt_pty_t *pty, char *const argv[]) {
+    return nt_pty_spawn_env(pty, argv, NULL);
+}
+
+int nt_pty_spawn_env(nt_pty_t *pty, char *const argv[], char *const env[]) {
     if (pty == NULL || argv == NULL) {
         return -1;
     }
@@ -55,6 +65,22 @@ int nt_pty_spawn(nt_pty_t *pty, char *const argv[]) {
         dup2(slave, STDERR_FILENO);
         if (slave > STDERR_FILENO) {
             close(slave);
+        }
+        /* Apply caller-supplied environment overrides in the child
+         * (the parent's environment is never mutated, so concurrent
+         * suites cannot cross-contaminate spawned children): each
+         * entry is "KEY=VALUE" to set, or bare "KEY" to unset. */
+        if (env != NULL) {
+            for (char *const *entry = env; *entry != NULL; entry++) {
+                char *equals = strchr(*entry, '=');
+                if (equals != NULL) {
+                    *equals = '\0';
+                    setenv(*entry, equals + 1, 1);
+                    *equals = '=';
+                } else {
+                    unsetenv(*entry);
+                }
+            }
         }
         execvp(argv[0], argv);
         _exit(127);

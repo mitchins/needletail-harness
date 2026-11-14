@@ -72,7 +72,11 @@ struct M3AReplayLiveTests2 {
         let log = RequestLog()
         let distinctive = "SYNTHETIC-RETRIEVED-9F3C2-\(UUID().uuidString.prefix(4))"
         let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: ChatTransportPolicy.configuration(profile: profile))
-        defer { try? await client.shutdown().get() }
+        // No `await` in `defer` on Swift 6.1/Xcode 16.3 toolchains: the
+        // unstructured task retains `client` until the drain completes, so
+        // deinit still runs post-shutdown (no AHC trap). Nothing after the
+        // invoke touches the client, so the concurrent drain is harmless.
+        defer { Task { try? await client.shutdown().get() } }
         let messageProvider: @Sendable (ProviderInvocation) async throws -> [ChatMessage] = { _ in
             let msgs = try loadTranscript(from: store, session: session, limit: 1024)
             let data = try JSONEncoder().encode(msgs)
@@ -148,5 +152,7 @@ struct M3AReplayLiveTests2 {
         let (page, _) = try store.records(session: session, since: 0, limit: 100)
         #expect(page.contains(where: { if case .transcriptAppended = $0.record { return true }; return false }), "transcript appended to isolated GRDB store")
         if !secondText.isEmpty { print("M3-A7 second response contains distinctive: \(secondText.prefix(80))") }
+        // Awaited drain (normal path); the deferred task is the throw-path backstop.
+        try? await client.shutdown().get()
     }
 }

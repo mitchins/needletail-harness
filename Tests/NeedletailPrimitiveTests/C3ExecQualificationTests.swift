@@ -331,6 +331,7 @@ struct C3ExecQualificationTests {
     }
     // MARK: - Positive: read → edit → exec → continuation
 
+#if canImport(Glibc)
     @Test("C3 binary: read → edit → exec → continuation runs once with durable agreement")
     func binaryReadEditExecContinuation() throws {
         let server = try LoopbackSSEServer()
@@ -408,19 +409,30 @@ struct C3ExecQualificationTests {
             return nil
         }
         #expect(artifacts.count == 1, "exactly one exec-output artifact (stdout), got \(artifacts.count)")
+        let artifact = try #require(artifacts.first, "no exec-output artifact to read")
         let store = try GRDBSessionStore(path: Self.dbPath(in: stateDir))
         defer { try? store.close() }
-        let bytes = try store.readArtifact(artifacts[0])
+        let bytes = try store.readArtifact(artifact)
         #expect(bytes == Data("PROOF-OUTPUT\n".utf8), "artifact bytes are the exact child output")
         // No unresolved holds on the clean path.
         let report = try store.reconcile(session: SessionID(session))
         #expect(report.heldOperations.isEmpty, "clean run holds nothing: \(report)")
     }
+#endif // digest-approved exec is Linux-only (M4-A G1)
 
     private static func shaHex(_ s: String) -> String {
         SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    private final class LockedBox<T: Sendable>: @unchecked Sendable {
+        private var value: T
+        private let lock = NSLock()
+        init(_ value: T) { self.value = value }
+        func set(_ v: T) { lock.withLock { value = v } }
+        func get() -> T { lock.withLock { value } }
+    }
+
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: exec advertised only when granted and native-composed")
     func execAdvertisedOnlyWhenComposed() throws {
         // With --allow-exec: the first provider request carries an exec tool definition.
@@ -461,6 +473,8 @@ struct C3ExecQualificationTests {
         }
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: §10.4 banner present when native exec composes, absent otherwise")
     func execBannerPresentAndAbsent() throws {
         // Composed run: banner on stderr (stdout stays JSONL-pure).
@@ -496,6 +510,8 @@ struct C3ExecQualificationTests {
     }
     // MARK: - Negatives: refusals never execute
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: unadvertised exec denied (call fails, run continues, nothing spawned)")
     func execDeniedWithoutAllowExec() throws {
         let server = try LoopbackSSEServer()
@@ -544,6 +560,8 @@ struct C3ExecQualificationTests {
         #expect(deniedEnvelopes.contains(where: { ($0["kind"] as? String) == "run:tool-exec" }), "denial emits a tool-exec receipt")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: headless approval-required exits 3 with nothing spawned")
     func execHeadlessExit3() throws {
         let server = try LoopbackSSEServer()
@@ -578,6 +596,8 @@ struct C3ExecQualificationTests {
         }
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: malformed argv is invalid-arguments, never spawned")
     func execMalformedArgvRejected() throws {
         let server = try LoopbackSSEServer()
@@ -620,6 +640,8 @@ struct C3ExecQualificationTests {
         #expect(sawInvalid, "deterministic invalid-arguments receipt is durable")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: substitution changes the approved digest between runs")
     func execSubstitutionChangesDigest() throws {
         let directory = try Self.freshDirectory()
@@ -665,6 +687,8 @@ struct C3ExecQualificationTests {
         return ""
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: operator deny stops the run with exit 3, nothing spawned")
     func execDeniedByOperator() throws {
         let server = try LoopbackSSEServer()
@@ -687,6 +711,8 @@ struct C3ExecQualificationTests {
         #expect(!FileManager.default.fileExists(atPath: ws.appendingPathComponent("SENTINEL-DENY").path), "denied exec never spawns")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: cwd escape is invalid-arguments, never spawned")
     func execCwdEscapeRejected() throws {
         let server = try LoopbackSSEServer()
@@ -717,6 +743,8 @@ struct C3ExecQualificationTests {
     // MARK: - Negatives: child environment, launch, interruption, crash
     // MARK: - Negatives: child environment, launch, interruption, crash
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: child inherits no parent secrets and no harness credentials")
     func execCredentialContaminationAbsent() throws {
         let server = try LoopbackSSEServer()
@@ -765,6 +793,8 @@ struct C3ExecQualificationTests {
         }
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: credential overlay is refused with a receipt, never spawned")
     func execCredentialOverlayRefused() throws {
         let server = try LoopbackSSEServer()
@@ -791,6 +821,8 @@ struct C3ExecQualificationTests {
         #expect(bodies.contains(where: { $0.contains("credential overlay") }), "provider saw the credential refusal")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: launch failure is a deterministic receipt, never spawned")
     func execLaunchFailureDeterministic() throws {
         let server = try LoopbackSSEServer()
@@ -827,6 +859,8 @@ struct C3ExecQualificationTests {
         #expect(!sawArtifact, "no artifact without execution")
     }
 
+#endif
+#if canImport(Glibc)
     @Test("C3 binary: output-cap exhaustion truncates with exact discarded counts")
     func execOutputCapExhaustion() throws {
         let server = try LoopbackSSEServer()
@@ -869,7 +903,9 @@ struct C3ExecQualificationTests {
         #expect(sawTruncation, "exact discarded counts in the durable receipt")
         #expect(sawArtifact, "capped artifact committed")
     }
+#endif // digest-approved exec is Linux-only (M4-A G1)
 
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: terminal output cannot smuggle control bytes; JSONL stays parseable")
     func execTerminalControlSanitized() throws {
         let server = try LoopbackSSEServer()
@@ -904,6 +940,8 @@ struct C3ExecQualificationTests {
         }
     }
 
+#endif
+#if canImport(Glibc)
     @Test("C3 binary: SIGINT mid-exec yields ambiguous hold (exit 4), never success")
     func execInterruptHolds() throws {
         let server = try LoopbackSSEServer()
@@ -968,6 +1006,7 @@ struct C3ExecQualificationTests {
         }
         #expect(held, "interruption leaves an unresolved hold")
     }
+#endif // digest-approved exec is Linux-only (M4-A G1)
 
     /// Waits for a callID-bearing operation intent in any session of the
     /// given store (the commit that immediately precedes spawn).
@@ -990,6 +1029,7 @@ struct C3ExecQualificationTests {
         return false
     }
 
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("C3 binary: SIGINT while awaiting approval exits 130, nothing dispatched")
     func execInterruptWhileAuthorisingGives130() throws {
         let server = try LoopbackSSEServer()
@@ -1048,14 +1088,8 @@ struct C3ExecQualificationTests {
         #expect(!FileManager.default.fileExists(atPath: ws.appendingPathComponent("SENTINEL-INT").path), "nothing dispatched before interrupt")
     }
 
-    private final class LockedBox<T: Sendable>: @unchecked Sendable {
-        private var value: T
-        private let lock = NSLock()
-        init(_ value: T) { self.value = value }
-        func set(_ v: T) { lock.withLock { value = v } }
-        func get() -> T { lock.withLock { value } }
-    }
-
+#endif
+#if canImport(Glibc)
     @Test("C3 binary: divergent access — exec reads what native read denies (not OS-isolated)")
     func execDivergentAccess() throws {
         let server = try LoopbackSSEServer()
@@ -1096,7 +1130,9 @@ struct C3ExecQualificationTests {
         }
         #expect(sawReadDenial, "native read denial is durable")
     }
+#endif // digest-approved exec is Linux-only (M4-A G1)
 
+#if canImport(Glibc)
     @Test("C3 binary: crash mid-exec leaves a hold that blocks the next run")
     func execCrashReopenHolds() throws {
         let directory = try Self.freshDirectory()
@@ -1145,4 +1181,5 @@ struct C3ExecQualificationTests {
         #expect(result.exit == 3, "reopen trips the cross-run gate, got \(result.exit): \(result.stderr.prefix(300))")
         #expect(result.stderr.contains("blocked"), "gate explains the block: \(result.stderr.prefix(300))")
     }
+#endif // digest-approved exec is Linux-only (M4-A G1)
 }

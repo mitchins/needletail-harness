@@ -74,11 +74,9 @@ struct C1QualificationTests {
 
     /// Variant A: parent shell and same-group grandchild both ignore SIGINT.
     /// Ready handshake via file, then timeout-driven escalation must kill both.
+#if canImport(Glibc)
     @Test("PROC-02 A parent+grandchild ignore SIGINT — escalated TERM/KILL via timeout", .timeLimit(.minutes(2)))
     func proc02AParentGrandchildIgnoreINTTimeout() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only group probe")
-        #endif
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let ready = dir.appendingPathComponent("ready")
@@ -136,12 +134,11 @@ struct C1QualificationTests {
         // Counterfactual: if we had only sent SIGINT (no TERM/KILL), the test would hang / not time out properly.
         // Verified by elapsed <12 and timedOut true.
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
+#if canImport(Glibc)
     @Test("PROC-02 A cancellation variant — parent+grandchild ignore INT via Task cancel", .timeLimit(.minutes(2)))
     func proc02ACancel() async throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let ready = dir.appendingPathComponent("ready")
@@ -180,12 +177,11 @@ struct C1QualificationTests {
             Self.killGroup(pgid: pgid)
         }
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
+#if canImport(Glibc)
     @Test("PROC-02 B leader exits early, grandchild remains — probe must catch live descendant", .timeLimit(.minutes(2)))
     func proc02BLeaderEarlyExit() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let grandFile = dir.appendingPathComponent("grand.pid")
@@ -227,12 +223,11 @@ struct C1QualificationTests {
             Issue.record("could not read pgid/grand")
         }
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
+#if canImport(Glibc)
     @Test("PROC-02 C leader alive with closed stdio — still signalled", .timeLimit(.minutes(2)))
     func proc02CClosedStdioLeader() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let ready = dir.appendingPathComponent("ready")
@@ -263,12 +258,11 @@ struct C1QualificationTests {
             Self.killGroup(pgid: pgid)
         }
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
+#if canImport(Glibc)
     @Test("PROC-02 D grandchild closed stdio, leader exits — pipes EOF but group live", .timeLimit(.minutes(2)))
     func proc02DGrandchildClosedStdio() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let pgidFile = dir.appendingPathComponent("pgid")
@@ -303,6 +297,7 @@ struct C1QualificationTests {
             #expect(Self.isZombie(pid: grand) || Self.procState(pid: grand) == nil, "grand \(grand) must be reaped")
         }
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
     // MARK: - 2 Reaping and zombies
 
@@ -376,13 +371,11 @@ struct C1QualificationTests {
         #endif
     }
 
+#if canImport(Glibc)
     @Test("rg/git ordinary path — no zombie, no group probe false positive", .timeLimit(.minutes(1)))
     func ordinaryPath() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         func zombies() -> Set<Int32> {
-            var s = Set<Int32>(); let selfPid = Glibc.getpid()
+            var s = Set<Int32>(); let selfPid = getpid()
             guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return s }
             for name in entries {
                 guard let pid = Int32(name) else { continue }
@@ -404,14 +397,13 @@ struct C1QualificationTests {
         let after = zombies()
         #expect(after.subtracting(before).isEmpty, "ordinary path must not leak new zombies: \(after.subtracting(before))")
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
     // MARK: - 3 /proc and parser
 
+#if canImport(Glibc)
     @Test("Parser handles parenthesized comm with spaces and parens", .timeLimit(.minutes(1)))
     func parserParens() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         // Synthetic stat lines
         let cases: [(String, String, Int32)] = [
             ("123 (a (b) c) S 1 123 0 0 0", "S", 123),
@@ -426,18 +418,17 @@ struct C1QualificationTests {
             #expect(exp.pgid == expPgid, "pgid mismatch for \(stat)")
         }
         // Also test against real self stat
-        let selfPid = Glibc.getpid()
+        let selfPid = getpid()
         let real = try String(contentsOfFile: "/proc/\(selfPid)/stat", encoding: .utf8)
         let parsed = try #require(NativeToolExecutor.parseProcStatForTest(real), "real self stat parse failed: \(real.prefix(100))")
         // Self's pgid should match getpgrp? Not necessarily, but state should be R/S
          #expect(parsed.state == "R" || parsed.state == "S" || parsed.state == "R+" || parsed.state == "S+" || parsed.state.count == 1, "real self state \(parsed.state) plausible")
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
+#if canImport(Glibc)
     @Test("Parser versus actual process records", .timeLimit(.minutes(1)))
     func parserVersusReal() async throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         // Spawn a real process with tricky comm via exec -a
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -475,12 +466,11 @@ struct C1QualificationTests {
         usleep(300_000)
         Self.killGroup(pgid: pid)
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
+#if canImport(Glibc)
     @Test("Proc probe counterfactuals — unreadable/truncated/deadline cannot falsely claim termination", .timeLimit(.minutes(1)))
     func probeCounterfactuals() async throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         // Need a known live group to prove false-negative would be caught
         // Create a live group with a non-leader member so probe true
         let dir = try Self.tempDir()
@@ -532,14 +522,13 @@ struct C1QualificationTests {
         let empty = emptyProbe
         Self.killGroup(pgid: pgid)
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
     // MARK: - 4 Fault injection
 
+#if canImport(Glibc)
     @Test("ECHILD hook — waitid reports timedOut, never success, no hang", .timeLimit(.minutes(1)))
     func faultECHILD() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         NativeToolExecutor._testHook_waitidECHILD = true
         defer { NativeToolExecutor._testHook_waitidECHILD = false }
         let start = Date()
@@ -551,12 +540,11 @@ struct C1QualificationTests {
         // Also must set unsafeToSignal internally so no kill is attempted (cannot verify directly, but timedOut proves provably not success)
         // Counterfactual: if we incorrectly returned !timedOut, this test would fail — it fails under incorrect mechanism.
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
+#if canImport(Glibc)
     @Test("EPERM hook — failed group signals do not hang, report timedOut/cancel, remain safe", .timeLimit(.minutes(1)))
     func faultEPERM() async throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         // Run a timeout that will need to signal group, but hook makes kill(-pgid) EPERM
         // Hook is set to a pgid that will be the child's pgid — we need to know pgid in advance.
         // Instead, we set hook to a value that matches any pgid? Our hook matches exact pid/-pid.
@@ -607,6 +595,7 @@ struct C1QualificationTests {
         // Verify no indefinite cleanup wait: elapsed should be bounded ~8s (3+2+2+6) not indefinite
         // If mechanism hung waiting for kill to succeed, this test would time out.
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
     @Test("Kill failed but no fabricated success — ECHILD and EPERM are timedOut, not success", .timeLimit(.minutes(1)))
     func noFabricatedSuccess() throws {
@@ -619,12 +608,10 @@ struct C1QualificationTests {
 
     // MARK: - 5 ABI qualification
 
+#if canImport(Glibc)
     @Test("ABI siginfo_t offsets — x86_64 Linux, normal exit 42 and signalled TERM", .timeLimit(.minutes(1)))
     func abiOffsets() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux x86_64 only")
-        #endif
-        #if arch(x86_64) || arch(arm64)
+        #if canImport(Glibc) && (arch(x86_64) || arch(arm64))
         // Validate our raw offsets (8,16,24) against actual waitid for two cases
         func waitidCheck(expectedStatus: Int32, expectedCode: Int32, block: () throws -> pid_t) throws {
             let pid = try block()
@@ -654,7 +641,7 @@ struct C1QualificationTests {
             let pid = Glibc.fork()
             if pid == 0 {
                 // Child kills itself with SIGKILL
-                Glibc.kill(Glibc.getpid(), SIGKILL)
+                Glibc.kill(getpid(), SIGKILL)
                 Glibc._exit(127) // fallback
             }
             return pid
@@ -665,6 +652,7 @@ struct C1QualificationTests {
         throw RequireSkip("only x86_64/arm64 Linux has known offsets 8/16/24")
         #endif
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
     @Test("ABI platform assumption explicit — runBounded uses waitid WNOWAIT only on Glibc", .timeLimit(.minutes(1)))
     func platformAssumption() throws {
@@ -677,11 +665,9 @@ struct C1QualificationTests {
         #endif
     }
 
+#if canImport(Glibc)
     @Test("PROC-02 group KILL — parent+grandchild trap INT+TERM, only KILL terminates", .timeLimit(.minutes(2)))
     func proc02GroupKill() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let ready = dir.appendingPathComponent("ready_kill")
@@ -714,6 +700,7 @@ struct C1QualificationTests {
         #expect(!Self.isZombie(pid: grand) || Self.procState(pid: grand) == nil, "grand reaped")
         Self.killGroup(pgid: pgid)
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
     @Test("PROC-03 25 cycles — repeated timeout/cancel leaves no zombie/FD leak", .timeLimit(.minutes(3)))
     func proc03TwentyFive() async throws {
@@ -749,11 +736,9 @@ struct C1QualificationTests {
         #endif
     }
 
+#if canImport(Glibc)
     @Test("PROC-04 setsid descendant escapes group — exposed limitation, pid-cleanup only", .timeLimit(.minutes(2)))
     func proc04SetsidEscape() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         let dir = try Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let pgidFile = dir.appendingPathComponent("pgid4")
@@ -792,16 +777,15 @@ struct C1QualificationTests {
         #expect(Self.procState(pid: escaped) == nil || Self.isZombie(pid: escaped), "escaped must be reaped after pid kill")
         Self.killGroup(pgid: pgid)
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 
+#if canImport(Glibc)
     @Test("Benign clean path — no descendant, success not timedOut, probe false", .timeLimit(.minutes(1)))
     func benignCleanPath() throws {
-        #if !canImport(Glibc)
-        throw RequireSkip("Linux-only")
-        #endif
         // Count zombies before to avoid failing on pre-existing leaks from prior tests in same process
         func zombiePids() -> Set<Int32> {
             var s = Set<Int32>()
-            let selfPid = Glibc.getpid()
+            let selfPid = getpid()
             guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return s }
             for name in entries {
                 guard let pid = Int32(name) else { continue }
@@ -838,6 +822,7 @@ struct C1QualificationTests {
         }
         #expect(zombiePids().subtracting(beforeZombies).isEmpty, "10 rapid clean runs must not leak zombies")
     }
+#endif // Linux-only (Linux process-lifecycle qualification)
 }
 
 private struct TestError: Error, CustomStringConvertible {
@@ -846,7 +831,13 @@ private struct TestError: Error, CustomStringConvertible {
     var description: String { msg }
 }
 
-private struct RequireSkip: Error {
+// Shared within the PrimitiveTests target: thrown to skip a test whose
+// platform precondition is absent at RUNTIME, with an explicit reason
+// instead of a silent pass. (Linux-only lifecycle tests now use
+// compile-time `#if canImport(Glibc)` gates instead, including the
+// x86_64/arm64 offset guard; RequireSkip remains for runtime-detected
+// preconditions.)
+struct RequireSkip: Error {
     let msg: String
     init(_ m: String) { msg = m }
 }

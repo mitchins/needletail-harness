@@ -14,6 +14,23 @@ public enum StyleRole: String, Sendable, Equatable, Codable {
     case candidate
     case candidateSelected
     case errorNotice
+    // M4-C additive terminal roles (pure vocabulary only — `Render`
+    // semantic output is unchanged; the NeedletailTerminal adapter maps
+    // these to ANSI spans or plain text).
+    case heading
+    case strong
+    case emphasis
+    case code
+    case codeBlock
+    case listMarker
+    case taskCheckbox
+    case filePath
+    case quote
+    case diffAdd
+    case diffDel
+    case diffHunk
+    case toolReceipt
+    case warning
 }
 
 public struct StyledRun: Sendable, Equatable {
@@ -91,6 +108,17 @@ public struct TerminalCapabilities: Sendable, Equatable {
 /// Wraps pre-wrapped logical lines to the width (never splits inside a
 /// grapheme cluster — Swift String indices). Content roles never change
 /// with width or capabilities (DX-01); only layout does.
+///
+/// B5 bounds: the queue is the largest unbounded input (inspection
+/// arrays arrive edge-bounded by catalogue caps; candidates cap at
+/// maxCandidates). The absolute frame cap below backstops everything.
+/// Queue rows past the cap collapse into one visible marker —
+/// truncation is never silent. The OLDEST rows are kept and the newest
+/// dropped (operator context over backlog); the marker reports the
+/// hidden count so the direction is explicit.
+public let maxQueueRows = 64
+/// Absolute post-wrap safety bound (grapheme clusters, not bytes).
+public let maxFrameLines = 512
 public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilities) -> RenderFrame {
     let safeWidth = max(20, width)
     var lines: [SemanticLine] = []
@@ -103,11 +131,28 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
         lines.append(SemanticLine(id: "status-held", runs: [StyledRun(text: "held: \(terminalSafe(reason))", role: .status)]))
     case .failed(let cause):
         lines.append(SemanticLine(id: "status-failed", runs: [StyledRun(text: terminalSafe(cause), role: .errorNotice)]))
+    case .completedBudgetBoundary(let detail):
+        lines.append(SemanticLine(id: "status-budget-boundary", runs: [StyledRun(text: "completed (budget boundary): \(terminalSafe(detail))", role: .status)]))
     }
-    for entry in state.queue {
+    let queueRows = state.queue.prefix(maxQueueRows)
+    for entry in queueRows {
+        var text = "\(entry.kind) \(entry.state)\(entry.pending ? " (pending)" : "")"
+        if entry.staleTarget {
+            text += " [stale target]"
+        }
+        if entry.hasAttachments {
+            text += " [attachments]"
+        }
         lines.append(SemanticLine(
-            id: "queue-\(entry.entryID)",
-            runs: [StyledRun(text: "\(entry.kind) \(entry.state)\(entry.pending ? " (pending)" : "")", role: .normal)]))
+            id: "queue-\(terminalSafe(entry.entryID))",
+            runs: [StyledRun(text: terminalSafe(text), role: .normal)]))
+    }
+    if state.queue.count > maxQueueRows {
+        lines.append(SemanticLine(
+            id: "queue-truncated",
+            runs: [StyledRun(
+                text: "+\(state.queue.count - maxQueueRows) more queued (list bounded at \(maxQueueRows))",
+                role: .normal)]))
     }
     if let agent = state.activeAgent {
         lines.append(SemanticLine(
@@ -116,16 +161,168 @@ public func render(_ state: UIState, width: Int, capabilities: TerminalCapabilit
                 text: "\(terminalSafe(agent.modelAlias)) · \(terminalSafe(agent.locality)) · \(terminalSafe(agent.phase))",
                 role: .status)]))
     }
+    if let approval = state.pendingApproval {
+        var text = "\(approval.sandbox ? "sandbox" : "human") approval: \(terminalSafe(approval.operation)) [\(terminalSafe(approval.requiredGrant))]"
+        if !approval.protectedPaths.isEmpty {
+            text += " scope: \(approval.protectedPaths.map(terminalSafe).joined(separator: ","))"
+        }
+        lines.append(SemanticLine(
+            id: "approval-request",
+            runs: [StyledRun(text: text, role: .candidateSelected)]))
+        for (index, identity) in approval.execIdentities.enumerated() {
+            lines.append(SemanticLine(
+                id: "approval-exec-\(index)",
+                runs: [StyledRun(
+                    text: "exec: \(terminalSafe(identity.resolvedPath))#\(terminalSafe(identity.contentDigest))",
+                    role: .normal)]))
+        }
+    }
     if let suggestion = state.suggestion {
+        let selected = suggestion.selectedIndex ?? 0
         for (index, candidate) in suggestion.candidates.enumerated() {
             lines.append(SemanticLine(
                 id: "candidate-\(index)",
                 runs: [StyledRun(
                     text: terminalSafe(candidate.path),
-                    role: index == 0 ? .candidateSelected : .candidate)]))
+                    role: index == selected ? .candidateSelected : .candidate)]))
+        }
+        if let error = suggestion.rangeError {
+            lines.append(SemanticLine(
+                id: "mention-range-error",
+                runs: [StyledRun(text: terminalSafe(error), role: .errorNotice)]))
         }
     }
-    let wrapped = lines.flatMap { wrapLine($0, width: safeWidth) }
+    if let inspection = state.inspection {
+        switch inspection {
+        case .sessions(let rows):
+            for row in rows {
+                lines.append(SemanticLine(
+                    id: "session-\(terminalSafe(row.row.sessionID.raw))",
+                    runs: [StyledRun(
+                        text: "\(terminalSafe(row.row.sessionID.raw)) \(row.liveness.rawValue) \(terminalSafe(row.row.modelAlias))",
+                        role: .normal)]))
+            }
+        case .agents(let rows):
+            for (index, agent) in rows.enumerated() {
+                lines.append(SemanticLine(
+                    id: "agent-\(index)",
+                    runs: [StyledRun(
+                        text: "\(terminalSafe(agent.alias)) · \(terminalSafe(agent.phase))",
+                        role: .status)]))
+                if let child = agent.childActivity {
+                    lines.append(SemanticLine(
+                        id: "agent-\(index)-child",
+                        runs: [StyledRun(text: "child: \(terminalSafe(child))", role: .normal)]))
+                }
+            }
+        case .models(let routes):
+            for route in routes {
+                lines.append(SemanticLine(
+                    id: "model-\(terminalSafe(route.alias))",
+                    runs: [StyledRun(
+                        text: "\(terminalSafe(route.alias)) [\(route.kind.rawValue)] \(terminalSafe(route.locality))",
+                        role: .normal)]))
+            }
+        case .context(let usage):
+            let tokens = usage.inputTokens.map(String.init) ?? "estimated"
+            let cache: String
+            if usage.cacheUnknown {
+                cache = "cache unknown"
+            } else if let hits = usage.cacheHits {
+                cache = "cache \(hits) hits"
+            } else {
+                cache = "cache unknown"
+            }
+            lines.append(SemanticLine(
+                id: "context-usage",
+                runs: [StyledRun(
+                    text: "tokens \(tokens)\(usage.estimated ? " (estimated)" : "") · \(cache) · receipts \(usage.receipts) · unverified \(usage.unverifiedClaims)",
+                    role: .normal)]))
+        case .epochs(let rows):
+            for row in rows {
+                let checkpoint: String
+                switch row.checkpoint {
+                case .none: checkpoint = "no checkpoint"
+                case .success(let cost): checkpoint = "checkpoint ok (\(cost)ms)"
+                case .failed(let reason): checkpoint = "failed: \(reason)"
+                }
+                var text = "\(row.epochID) <- \(row.parentID ?? "-") · \(checkpoint)"
+                if let prefill = row.prefill {
+                    text += " · prefill \(prefill)"
+                }
+                lines.append(SemanticLine(
+                    id: "epoch-\(terminalSafe(row.epochID))",
+                    runs: [StyledRun(text: terminalSafe(text), role: .normal)]))
+            }
+        case .compact(let preview):
+            lines.append(SemanticLine(
+                id: "compact-estimate",
+                runs: [StyledRun(
+                    text: "compact dry-run: ~\(preview.estimatedTokens) tokens, \(preview.wouldReplaceEpoch ? "would replace epoch" : "no epoch change"), 0 provider calls (\(terminalSafe(preview.note)))",
+                    role: .normal)]))
+        case .queue(let ids):
+            for id in ids {
+                lines.append(SemanticLine(
+                    id: "inspect-queue-\(terminalSafe(id))",
+                    runs: [StyledRun(text: terminalSafe(id), role: .normal)]))
+            }
+        case .diff(let files):
+            for file in files {
+                // Paths are untrusted (dirty-tree filenames can carry
+                // control/format scalars): sanitize the text AND derive
+                // the id from the sanitized form.
+                let safePath = terminalSafe(file.path)
+                lines.append(SemanticLine(
+                    id: "diff-\(safePath)",
+                    runs: [StyledRun(
+                        text: "\(safePath) [\(file.provenance.rawValue)]",
+                        role: .normal)]))
+                for (index, hunk) in file.hunks.enumerated() {
+                    lines.append(SemanticLine(
+                        id: "diff-\(safePath)#\(index)",
+                        runs: [StyledRun(text: terminalSafe(hunk), role: .normal)]))
+                }
+            }
+        case .undoPreview(let preview):
+            lines.append(SemanticLine(
+                id: "undo-preview-\(terminalSafe(preview.groupID))",
+                runs: [StyledRun(
+                    text: "undo \(terminalSafe(preview.groupID)): \(preview.canRun ? "ready" : "blocked") — \(terminalSafe(preview.notice))",
+                    role: preview.canRun ? .status : .errorNotice)]))
+            for file in preview.files {
+                var text = "\(file.path): \(file.eligible ? "eligible" : "ineligible")"
+                if let conflict = file.conflict {
+                    text += " (\(conflict))"
+                }
+                let safePath = terminalSafe(file.path)
+                lines.append(SemanticLine(
+                    id: "undo-file-\(safePath)",
+                    runs: [StyledRun(text: terminalSafe(text), role: file.eligible ? .normal : .errorNotice)]))
+            }
+        case .undoOutcome(let outcome):
+            lines.append(SemanticLine(
+                id: "undo-outcome-\(terminalSafe(outcome.groupID))",
+                runs: [StyledRun(
+                    text: "undo \(terminalSafe(outcome.groupID)): \(outcome.applied.count) applied, \(outcome.refused.count) refused, \(outcome.failed.count) failed — \(terminalSafe(outcome.notice))",
+                    role: outcome.failed.isEmpty ? .status : .errorNotice)]))
+        case .rewind(let view):
+            lines.append(SemanticLine(
+                id: "rewind-\(terminalSafe(view.boundaryEpoch))",
+                runs: [StyledRun(
+                    text: "rewind to \(terminalSafe(view.boundaryEpoch))#\(view.throughSequence)\(view.divergent ? " DIVERGENT" : ""): \(terminalSafe(view.warning))",
+                    role: view.divergent ? .errorNotice : .status)]))
+        }
+    }
+    var wrapped = lines.flatMap { wrapLine($0, width: safeWidth) }
+    // Absolute safety bound on content lines. In dumb mode the inline
+    // composer is appended after the cap, so reserve its slot: the
+    // bound covers the total frame either way.
+    let contentCap = capabilities.cursorAddressing ? maxFrameLines : maxFrameLines - 1
+    if wrapped.count > contentCap {
+        wrapped = Array(wrapped.prefix(contentCap - 1)) + [SemanticLine(
+            id: "frame-truncated",
+            runs: [StyledRun(text: "+lines truncated (frame bounded at \(maxFrameLines))", role: .normal)])]
+    }
     // Dumb/non-addressable terminals get an inline composer (no overlay);
     // content is identical either way (DX-01 capability fallback).
     if capabilities.cursorAddressing {

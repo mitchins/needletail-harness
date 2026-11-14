@@ -6,6 +6,9 @@ import NeedletailTestSupport
 /// M2-D D0: durable queue admission/hold/reconcile, dispatch linkage,
 /// head barrier, retarget/reconcile — reducer level (fast, deterministic).
 /// Actor + store fault-injection legs live in QueueCrashMatrixTests.
+/// Darwin-debug: suite gated (B2 G14-class — the debug runner SIGBUSes
+/// on these deep transition chains; Linux-debug + Darwin `-O` green).
+#if canImport(Glibc)
 struct QueueDurabilityTests {
 
     private static func streamingWithQueue(
@@ -33,7 +36,7 @@ struct QueueDurabilityTests {
         QueueEntry(
             entryID: base.entryID, commandID: base.commandID, kind: base.kind,
             state: state, revision: base.revision, text: base.text,
-            targetEpochID: base.targetEpochID, orderKey: base.orderKey, sealed: base.sealed)
+            targetEpochID: base.targetEpochID, orderKey: base.orderKey, rank: base.rank, sealed: base.sealed)
     }
 
     @Test("D0 link commits atomically with history, intent and transcript")
@@ -125,7 +128,7 @@ struct QueueDurabilityTests {
         queue[0] = QueueEntry(
             entryID: queue[0].entryID, commandID: queue[0].commandID, kind: queue[0].kind,
             state: .held, revision: queue[0].revision, text: queue[0].text,
-            targetEpochID: EpochID("epoch-stale"), orderKey: queue[0].orderKey, sealed: queue[0].sealed)
+            targetEpochID: EpochID("epoch-stale"), orderKey: queue[0].orderKey, rank: queue[0].rank, sealed: queue[0].sealed)
         let state = streaming.replacing(queue: queue)
         let completed = transition(state, Self.finalResponse(run), &ids)
         #expect(completed.state.queueHeld, "stale head must hold the queue")
@@ -156,9 +159,9 @@ struct QueueDurabilityTests {
         var ids = StateFixtures.ids()
         var state = try StateFixtures.idle()
         state = state.replacing(queueHeld: true, heldReason: .cancelled(sinceMillis: 1))
-        let e1 = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .held, revision: 1, text: "a", targetEpochID: state.epoch.epochID, orderKey: 1, sealed: false)
-        let e2 = QueueEntry(entryID: "q-2", commandID: CommandID("c-2"), kind: .followUp, state: .held, revision: 1, text: "b", targetEpochID: EpochID("epoch-old"), orderKey: 2, sealed: false)
-        let e3 = QueueEntry(entryID: "q-3", commandID: CommandID("c-3"), kind: .followUp, state: .heldUnknown, revision: 1, text: "c", targetEpochID: state.epoch.epochID, orderKey: 3, sealed: false)
+        let e1 = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .held, revision: 1, text: "a", targetEpochID: state.epoch.epochID, orderKey: 1, rank: Double(1), sealed: false)
+        let e2 = QueueEntry(entryID: "q-2", commandID: CommandID("c-2"), kind: .followUp, state: .held, revision: 1, text: "b", targetEpochID: EpochID("epoch-old"), orderKey: 2, rank: Double(2), sealed: false)
+        let e3 = QueueEntry(entryID: "q-3", commandID: CommandID("c-3"), kind: .followUp, state: .heldUnknown, revision: 1, text: "c", targetEpochID: state.epoch.epochID, orderKey: 3, rank: Double(3), sealed: false)
         state = state.replacing(queue: [e1, e2, e3])
         let resumed = transition(state, .queueResume(atMillis: 2000), &ids)
         #expect(resumed.state.queue[0].state == .queued, "current-epoch held entry released")
@@ -175,7 +178,7 @@ struct QueueDurabilityTests {
     func retargetValidatesAndRecords() throws {
         var ids = StateFixtures.ids()
         var state = try StateFixtures.idle()
-        let stale = QueueEntry(entryID: "q-9", commandID: CommandID("c-9"), kind: .followUp, state: .held, revision: 1, text: "x", targetEpochID: EpochID("epoch-old"), orderKey: 9, sealed: false)
+        let stale = QueueEntry(entryID: "q-9", commandID: CommandID("c-9"), kind: .followUp, state: .held, revision: 1, text: "x", targetEpochID: EpochID("epoch-old"), orderKey: 9, rank: Double(9), sealed: false)
         state = state.replacing(queue: [stale], queueHeld: true, heldReason: .staleAttachment)
         let retargeted = transition(state, .queueRetarget(entryID: "q-9", atMillis: 1001), &ids)
         #expect(retargeted.state.queue.first?.targetEpochID == state.epoch.epochID, "target moves to the current epoch")
@@ -201,7 +204,7 @@ struct QueueDurabilityTests {
     func reconcileRequeuesHeldUnknown() throws {
         var ids = StateFixtures.ids()
         var state = try StateFixtures.idle()
-        let u = QueueEntry(entryID: "q-u", commandID: CommandID("c-u"), kind: .followUp, state: .heldUnknown, revision: 1, text: "u", targetEpochID: state.epoch.epochID, orderKey: 7, sealed: false)
+        let u = QueueEntry(entryID: "q-u", commandID: CommandID("c-u"), kind: .followUp, state: .heldUnknown, revision: 1, text: "u", targetEpochID: state.epoch.epochID, orderKey: 7, rank: Double(7), sealed: false)
         state = state.replacing(queue: [u], queueHeld: true, heldReason: .error("reopen: unknown"))
         let reconciled = transition(state, .queueReconcile(entryID: "q-u", atMillis: 1001), &ids)
         #expect(reconciled.state.queue.first?.state == .queued, "explicit reconcile releases to queued")
@@ -232,8 +235,8 @@ struct QueueDurabilityTests {
 
     @Test("D0 replay: never-sent entries reconstruct without holds")
     func replayNeverSent() throws {
-        let e1 = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let e2 = QueueEntry(entryID: "q-2", commandID: CommandID("c-2"), kind: .steer, state: .queued, revision: 1, text: "b", targetEpochID: EpochID("e-1"), orderKey: 12, sealed: false)
+        let e1 = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let e2 = QueueEntry(entryID: "q-2", commandID: CommandID("c-2"), kind: .steer, state: .queued, revision: 1, text: "b", targetEpochID: EpochID("e-1"), orderKey: 12, rank: Double(12), sealed: false)
         let recon = try reconcileQueue([.queueAdmitted(e1), .queueAdmitted(e2)])
         #expect(recon.entries.count == 2)
         #expect(recon.entries.allSatisfy { $0.state == .queued })
@@ -246,10 +249,10 @@ struct QueueDurabilityTests {
 
     @Test("D0 replay: link without completion holds unknown and blocks dispatch")
     func replayLinkWithoutCompletionHolds() throws {
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
-        let updated = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let updated = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let recon = try reconcileQueue([
             .queueAdmitted(entry),
             .queueUpdated(updated),
@@ -263,9 +266,9 @@ struct QueueDurabilityTests {
 
     @Test("D0 replay: link with run completion stands as history")
     func replayLinkWithCompletionStands() throws {
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
-        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let recon = try reconcileQueue([
             .queueAdmitted(entry),
             .queueDispatched(link),
@@ -279,10 +282,10 @@ struct QueueDurabilityTests {
 
     @Test("D0 replay: explicit reconcile supersedes the unknown link")
     func replayReconcileSupersedesLink() throws {
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let requeued = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let requeued = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
         // Dispatch, crash, reopen (unknown), reconcile to queued, crash:
         // the recorded reconcile decision stands — no re-held unknown.
@@ -298,7 +301,7 @@ struct QueueDurabilityTests {
         #expect(recon.unknownLinks.isEmpty, "superseded link is not unknown")
         // A redispatch after reconcile starts a fresh unknown window.
         let link2 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-10"), requestID: RequestID("req-10"), effectID: EffectID("eff-10"), epochID: EpochID("e-1"))
-        let history2 = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let history2 = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let recon2 = try reconcileQueue([
             .queueAdmitted(entry),
             .queueUpdated(dispatched),
@@ -315,8 +318,8 @@ struct QueueDurabilityTests {
 
     @Test("D3 replay: second link without intervening reconcile fails closed, never re-resolves the first")
     func replayDuplicateLinkWithoutReconcileFailsClosed() throws {
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let link1 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
         let link2 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-10"), requestID: RequestID("req-10"), effectID: EffectID("eff-10"), epochID: EpochID("e-1"))
         // No production transition can dispatch a heldUnknown head without
@@ -335,8 +338,8 @@ struct QueueDurabilityTests {
 
     @Test("D3 replay: second link after a completed run fails closed (completed entries never redispatch)")
     func replayLinkAfterCompletionFailsClosed() throws {
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let link1 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
         let link2 = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-10"), requestID: RequestID("req-10"), effectID: EffectID("eff-10"), epochID: EpochID("e-1"))
         #expect(throws: StoreError.self) {
@@ -352,8 +355,8 @@ struct QueueDurabilityTests {
 
     @Test("D0 replay: legacy history without link keeps recorded state")
     func replayLegacyHistoryStands() throws {
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         let recon = try reconcileQueue([.queueAdmitted(entry), .queueUpdated(history)])
         #expect(recon.entries.first?.state == .admittedToHistory, "pre-linkage history is preserved, never auto-resent")
         #expect(!recon.queueHeld)
@@ -363,7 +366,7 @@ struct QueueDurabilityTests {
     func replayAckRetentionBoundary() throws {
         var records: [DurableRecord] = []
         for i in 1...Int(maxAdmittedCommands + 1) {
-            let e = QueueEntry(entryID: "q-\(i)", commandID: CommandID("c-\(i)"), kind: .followUp, state: .queued, revision: 1, text: "t", targetEpochID: EpochID("e-1"), orderKey: UInt64(i), sealed: false)
+            let e = QueueEntry(entryID: "q-\(i)", commandID: CommandID("c-\(i)"), kind: .followUp, state: .queued, revision: 1, text: "t", targetEpochID: EpochID("e-1"), orderKey: UInt64(i), rank: Double(i), sealed: false)
             records.append(.queueAdmitted(e))
         }
         let recon = try reconcileQueue(records)
@@ -374,11 +377,11 @@ struct QueueDurabilityTests {
 
     @Test("D0 replay: corrupt queue records fail closed")
     func replayCorruptRecordsThrow() throws {
-        let e = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let e = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         #expect(throws: StoreError.self, "duplicate admission is corruption") {
             try reconcileQueue([.queueAdmitted(e), .queueAdmitted(e)])
         }
-        let other = QueueEntry(entryID: "q-9", commandID: CommandID("c-9"), kind: .followUp, state: .queued, revision: 2, text: "b", targetEpochID: EpochID("e-1"), orderKey: 12, sealed: false)
+        let other = QueueEntry(entryID: "q-9", commandID: CommandID("c-9"), kind: .followUp, state: .queued, revision: 2, text: "b", targetEpochID: EpochID("e-1"), orderKey: 12, rank: Double(12), sealed: false)
         #expect(throws: StoreError.self, "update for unknown entry is corruption") {
             try reconcileQueue([.queueUpdated(other)])
         }
@@ -398,9 +401,9 @@ struct QueueDurabilityTests {
         try store.claimWriterOwnership(session: base.sessionID, writer: "q-writer")
         let identity = WriterIdentity(session: base.sessionID, writer: "q-writer")
         let held = OperationRef(operationID: OperationID("eff-1/c1"), callID: "c1", state: .unknown, mutating: true)
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "u", targetEpochID: base.epoch.epochID, orderKey: 5, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "u", targetEpochID: base.epoch.epochID, orderKey: 5, rank: Double(5), sealed: false)
         let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: base.epoch.epochID)
-        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "u", targetEpochID: base.epoch.epochID, orderKey: 5, sealed: false)
+        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "u", targetEpochID: base.epoch.epochID, orderKey: 5, rank: Double(5), sealed: false)
         try store.appendBatch([
             .cancelledPendingMarker(held, outcome: "cancelled: pending c1"),
             .queueAdmitted(entry),
@@ -434,7 +437,7 @@ struct QueueDurabilityTests {
             effectiveCaps: caps, route: .allowed(endpoint: "http://127.0.0.1:11434/chat/completions", alias: "local-coder"))
         var ids = StateFixtures.ids()
         var state = SessionState(sessionID: SessionID("s-9"), epoch: epoch, trustMode: .workspace, phase: .idle)
-        state = state.replacing(queue: [QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "old", targetEpochID: EpochID("epoch-1"), orderKey: 1, sealed: false)])
+        state = state.replacing(queue: [QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "old", targetEpochID: EpochID("epoch-1"), orderKey: 1, rank: Double(1), sealed: false)])
         let switched = transition(state, .switchModel(alias: "second", atMillis: 1001), &ids)
         #expect(switched.state.queue.first?.state == .held, "stale entries hold on switch")
         #expect(switched.state.queueHeld, "switch with stale entries holds the queue")
@@ -451,8 +454,8 @@ struct QueueDurabilityTests {
     @Test("D0 failed dispatch holds the queue; resume after failure releases")
     func failedLinkHoldsQueue() throws {
         let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
-        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 11, rank: Double(11), sealed: false)
         // Link + failed run (no completion): determinate failure, not unknown.
         let recon = try reconcileQueue([
             .queueAdmitted(entry),
@@ -521,7 +524,7 @@ struct QueueDurabilityTests {
         var ids = StateFixtures.ids()
         var state = try StateFixtures.idle()
         state = state.replacing(
-            queue: [QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "x", targetEpochID: state.epoch.epochID, orderKey: 1, sealed: false)],
+            queue: [QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "x", targetEpochID: state.epoch.epochID, orderKey: 1, rank: Double(1), sealed: false)],
             queueHeld: true,
             heldReason: .error("cancelled"),
             unresolvedOperations: [OperationRef(operationID: OperationID("eff-1/c1"), callID: "c1", state: .unknown, mutating: true)])
@@ -546,3 +549,4 @@ struct QueueDurabilityTests {
         #expect(texts.contains("keep"), "surviving entry proceeds")
     }
 }
+#endif

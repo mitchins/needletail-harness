@@ -370,8 +370,9 @@ struct UndoActorTests {
         // commit atomically; a second sweep is a pure no-op.
         let transport = ScriptedTransport()
         transport.script = [ActorFixtures.finalResponse(requestID: RequestID("scripted"), generation: Revision(0))]
+        let tmpDir = FilePath(FileManager.default.temporaryDirectory.path)
         let actor = try Self.makeActor(
-            dir: FilePath("/tmp"), store: store, state: rebuilt,
+            dir: tmpDir, store: store, state: rebuilt,
             transport: transport,
             executor: NativeToolExecutor(
                 resolver: try WorkspaceResolver(workspace: nil, readRoots: []),
@@ -446,8 +447,9 @@ struct UndoActorTests {
             unresolvedOperations: [OperationRef(
                 operationID: OperationID("eff-0/c0"), callID: "c0",
                 state: .unknown, mutating: true)])
+        let tmpDir2 = FilePath(FileManager.default.temporaryDirectory.path)
         let actor = try Self.makeActor(
-            dir: FilePath("/tmp"), store: store, state: held,
+            dir: tmpDir2, store: store, state: held,
             transport: ScriptedTransport(),
             executor: NativeToolExecutor(
                 resolver: try WorkspaceResolver(workspace: nil, readRoots: []),
@@ -466,5 +468,55 @@ struct UndoActorTests {
             if case .transcriptAppended(.workspaceChangeNotice(let n)) = $0 { return n.undoCommandID == "undo-9" }
             return false
         }), "refused finalize publishes no notice")
+    }
+
+    @Test("UX-UNDO-08 native: dirty-worktree rewind forks without touching files")
+    func UX_UNDO_08_dirtyWorktreeForkLeavesFilesIntact() async throws {
+        let (url, _) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try Data([0, 1, 2, 255]).write(to: url.appendingPathComponent("b.bin"))
+        let store = InMemorySessionStore()
+        let session = SessionID("s-undo-fork")
+        let writer = WriterIdentity(session: session, writer: "w-undo")
+        try store.claimWriterOwnership(session: session, writer: writer.writer)
+        let idle = try ActorFixtures.idleState(mode: .trustedExec, permissive: true)
+        let idleSession = SessionState(
+            sessionID: session, epoch: idle.epoch, trustMode: idle.trustMode, phase: .idle)
+        let approvals = ScriptedApprovals()
+        let transport = ScriptedTransport()
+        let actor = try SessionActor(
+            state: idleSession, ids: DeterministicIDSource(prefix: "fork"),
+            clock: VirtualClock(now: 1_000_000),
+            transport: transport, executor: ScriptedExecutor(), store: store,
+            approvals: approvals, writer: writer.writer)
+        // Dirty the worktree, then fork: the record lands, no byte moves.
+        // (throughSequence 0: the history is empty at this fresh state;
+        // boundary rules are pinned in the pure D2 tests.)
+        try "alpha-dirty\n".write(to: url.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        let boundary = LineageBoundary(epochID: idle.epoch.epochID, throughSequence: 0)
+        await actor.requestLineageFork(boundary: boundary)
+        try await ActorFixtures.awaitPhase(actor, { _ in
+            (try? Self.records(store))?.contains(where: {
+                if case .lineageFork(let f) = $0 { return f.boundary == boundary }
+                return false
+            }) == true
+        }, "fork record committed")
+        let log = try Self.records(store)
+        #expect(log.contains(where: {
+            if case .lineageFork(let f) = $0 { return f.boundary == boundary }
+            return false
+        }), "fork record committed through the actor")
+        // The file legs above hold for any fork implementation (the
+        // scripted executor never touches the filesystem); this leg is
+        // the violable one: a fork that staged inverse work would admit
+        // undo/ operations, and their intents would land in the log.
+        #expect(!log.contains(where: {
+            if case .operationIntent(let ref) = $0 { return ref.operationID.raw.hasPrefix("undo/") }
+            return false
+        }), "fork stages no inverse operations")
+        #expect(try String(contentsOf: url.appendingPathComponent("a.txt"), encoding: .utf8) == "alpha-dirty\n",
+            "dirty bytes untouched by the fork")
+        #expect(try Data(contentsOf: url.appendingPathComponent("b.bin")) == Data([0, 1, 2, 255]),
+            "binary bytes untouched by the fork")
     }
 }

@@ -23,7 +23,24 @@ jobs:
     # Dependabot PRs (which cannot access ordinary Actions secrets) are skipped.
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Timeout hierarchy (coherent by construction — each level exceeds the
+    # sum of everything beneath it):
+    #   per-lane dev budgets     sum 145 min (bulk 25 + serial 25 + timing 10
+    #                            + e2e 35 + feasibility 50), enforced inside
+    #                            the coverage step by stream_bounded;
+    #   coverage step    175 min (145 lane sum + predump/kill escalation
+    #                            overhead + llvm-cov merge/export + XML
+    #                            conversion);
+    #   release build     30 min, scan 15 min (sequential steps);
+    #   job              240 min (30 + 175 + 15 = 220 step sum + checkout/
+    #                            toolchain/resolve ~10 + upload margin), so
+    #                            the evidence upload (`if: always()`) always
+    #                            runs even when an earlier step burns its
+    #                            limit.
+    # Timeouts bind only on failure, so CI runtime is unchanged on green
+    # runs; a coverage interruption fails the step visibly and is never
+    # certified as complete coverage.
+    timeout-minutes: 240
     steps:
       - name: Checkout full history for new-code and blame analysis
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
@@ -89,10 +106,32 @@ jobs:
             exit 1
           }
 
+      - name: Build the release product (PTY legs execute the release binary)
+        # The coverage-sonar feasibility lane runs the terminal PTY
+        # suite, whose legs spawn .build/release/needletail and
+        # fail-closed on a missing binary. Same artifact the offline
+        # gate qualifies in linux-ci.yml.
+        timeout-minutes: 30
+        run: |
+          swift build -c release --product needletail
+          test -x .build/release/needletail
+
       - name: Genuine instrumented coverage (Sonar generic XML)
+        # Lane-structured since the 59-minute serial stall: same test
+        # set as the old single serial run (parallel bulk + serialized
+        # actor/integration, timing, e2e, feasibility), each lane
+        # bounded with live streaming + diagnostics instead of silence.
+        # 175 min: exceeds the 145-min SUM of the per-lane dev budgets
+        # (stream_bounded enforces each lane inside this step), leaving
+        # margin for deadline-kill escalations and the coverage merge/
+        # export/XML conversion that follow the lanes. A lane failure or
+        # interruption fails this step visibly — partial coverage is never
+        # certified as complete.
+        timeout-minutes: 175
         run: ./dev coverage-sonar
 
       - name: SonarQube Cloud scan and quality gate
+        timeout-minutes: 15
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0, node24
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -100,3 +139,16 @@ jobs:
           args: >
             -Dsonar.qualitygate.wait=true
             -Dsonar.qualitygate.timeout=300
+
+      - name: Upload coverage report (evidence, even on scanner failure)
+        # The scanner's rejection of a bad report is a bare "Error
+        # during parsing" — the actual rejected bytes must be captured
+        # to diagnose the schema violation. Uploads whenever the report
+        # exists, including after a failed scan.
+        if: always() && hashFiles('coverage-generic.xml') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (node24)
+        with:
+          name: coverage-generic-xml
+          path: coverage-generic.xml
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,112 @@
+import Foundation
+import NeedletailCore
+
+/// B1 mention grammar (UX-MENTION-01/02/08). Pure, scalar-indexed,
+/// no I/O. A mention opens at an `@` that starts the text or follows
+/// whitespace/`(` — never inside a word (emails), never after a
+/// backslash (escaped `\@` stays literal).
+public struct MentionQuery: Sendable, Equatable {
+    /// Scalar index of the `@`.
+    public var at: Int
+    /// Full query text (may include a `#L` range suffix for accept).
+    public var query: String
+    /// Fetch key: query up to the first `#` (range suffixes never reach
+    /// the candidate source — UX-MENTION-08 flow would otherwise starve).
+    public var pathQuery: String
+    public init(at: Int, query: String) {
+        self.at = at
+        self.query = query
+        if let hash = query.firstIndex(of: "#") {
+            self.pathQuery = String(query[..<hash])
+        } else {
+            self.pathQuery = query
+        }
+    }
+}
+
+/// Derives the live mention query before `cursor` (a Unicode-scalar
+/// offset into `text`), or nil when the cursor is not inside a
+/// trigger span. The query runs from after `@` to the cursor and
+/// must contain no whitespace; `@` alone is an empty query (list).
+public func mentionQuery(text: String, cursor: Int) -> MentionQuery? {
+    let scalars = Array(text.unicodeScalars)
+    guard cursor >= 0, cursor <= scalars.count else { return nil }
+    var at: Int? = nil
+    var i = cursor - 1
+    while i >= 0 {
+        let s = scalars[i]
+        if s == "@" {
+            let prevIsBoundary: Bool = {
+                if i == 0 { return true }
+                let p = scalars[i - 1]
+                if p == "\\" { return false }
+                // Spec §2.2: beginning or after whitespace/allowed
+                // punctuation. Unicode whitespace plus an explicit ASCII
+                // punctuation set; word characters, slashes, dots and
+                // `@` itself stay literal (emails, paths, code).
+                if p.properties.isWhitespace { return true }
+                return "([{\"'`,;:".unicodeScalars.contains(p)
+            }()
+            if prevIsBoundary {
+                at = i
+                break
+            }
+            return nil
+        }
+        // ANY Unicode whitespace ends the query — the same predicate
+        // the boundary test above uses. Scanning for only \n/space/tab
+        // let "@doc\rbar" or "@doc\u{00A0}bar" keep an earlier `@`
+        // live with whitespace inside the returned query.
+        if s.properties.isWhitespace { return nil }
+        i -= 1
+    }
+    guard let found = at else { return nil }
+    let query = String(String.UnicodeScalarView(scalars[(found + 1)..<cursor]))
+    return MentionQuery(at: found, query: query)
+}
+
+/// Fetch key for a raw query string: text up to the first `#`.
+public func mentionPathQuery(_ query: String) -> String {
+    if let hash = query.firstIndex(of: "#") {
+        return String(query[..<hash])
+    }
+    return query
+}
+/// reversed, zero, or absurd (>1M) ranges return nil (UX-MENTION-08).
+/// Parses a `#L10` / `#L10-L30` range suffix. Lines are 1-based;
+/// reversed, zero, or absurd (>1M) ranges return nil (UX-MENTION-08).
+public func parseMentionRange(_ suffix: String) -> ClosedRange<Int>? {
+    guard suffix.hasPrefix("#L") else { return nil }
+    let body = String(suffix.dropFirst(2))
+    let segments = body.split(separator: "-", omittingEmptySubsequences: false).map(String.init)
+    guard segments.count == 1 || segments.count == 2 else { return nil }
+    func line(_ s: String) -> Int? {
+        let t = s.hasPrefix("L") ? String(s.dropFirst()) : s
+        guard let v = Int(t), v >= 1, v <= 1_000_000 else { return nil }
+        return v
+    }
+    guard let start = line(segments[0]) else { return nil }
+    if segments.count == 1 { return start...start }
+    guard let end = line(segments[1]), end >= start else { return nil }
+    return start...end
+}
+
+public let maxPreviewLines = 8
+public let maxPreviewBytes = 4 * 1_024
+
+/// Sanitizes preview lines for display: `terminalSafe` each line,
+/// cap at 8 lines / 4 KiB total. Returns the kept lines and whether
+/// anything was dropped (UX-MENTION-06). No provider request.
+public func sanitizePreview(_ lines: [String]) -> (kept: [String], truncated: Bool) {
+    var kept: [String] = []
+    var bytes = 0
+    for line in lines {
+        let safe = terminalSafe(line)
+        if kept.count >= maxPreviewLines || bytes + safe.utf8.count > maxPreviewBytes {
+            return (kept, true)
+        }
+        kept.append(safe)
+        bytes += safe.utf8.count
+    }
+    return (kept, false)
+}

@@ -4,12 +4,15 @@ import NeedletailPresentation
 import NeedletailCore
 
 /// Tiny scripted candidate source (tests only): deterministic, bounded,
-/// no filesystem. Product wiring is M2-D/M4.
+/// no filesystem. Product wiring is M4-B/B6. `excluded` simulates the
+/// Runtime confinement contract (callers must filter secrets/out-of-root
+/// BEFORE the seam): excluded entries never surface even on match.
 struct ScriptedCandidates: FileCandidateSource, Sendable {
     var catalog: [String]
+    var excluded: [String] = []
     func candidates(query: String, revision: UInt64) -> [CandidateFile] {
         _ = revision
-        return catalog.filter { $0.contains(query) }.prefix(maxCandidates).map {
+        return catalog.filter({ $0.contains(query) && !excluded.contains($0) }).prefix(maxCandidates).map {
             CandidateFile(path: $0, previewLines: ["-- preview --"])
         }
     }

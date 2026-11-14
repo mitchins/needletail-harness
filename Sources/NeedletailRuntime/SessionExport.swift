@@ -307,6 +307,7 @@ public enum SessionExport {
                                   "revision": entry.revision,
                                   "targetEpochID": entry.targetEpochID.raw,
                                   "orderKey": entry.orderKey,
+                                  "rank": entry.rank,
                                   "sealed": entry.sealed,
                                   "attachments": entry.attachments.map { attachmentRow($0, includeContent: includeContent) }]
         if includeContent {

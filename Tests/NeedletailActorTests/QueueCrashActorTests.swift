@@ -7,6 +7,9 @@ import NeedletailTestSupport
 /// actual committed record groups and real provider dispatch. Crashes are
 /// actor drops (in-memory state gone, store survives); rebuilds replay the
 /// durable stream. No sleeps: gates, barriers and scripts only.
+/// Darwin-debug: suite gated (B6 G14-class — the debug runner SIGBUSes
+/// on these deep actor chains; Linux-debug + Darwin `-O` green).
+#if canImport(Glibc)
 struct QueueCrashActorTests {
 
     /// Failing store: throws on any appendBatch containing a dispatch
@@ -173,8 +176,8 @@ struct QueueCrashActorTests {
         let idle = try ActorFixtures.idleState()
         // Seed: queued entry, dispatched with linkage, no completion.
         let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: idle.epoch.epochID)
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "follow", targetEpochID: idle.epoch.epochID, orderKey: 5, sealed: false)
-        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "follow", targetEpochID: idle.epoch.epochID, orderKey: 5, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "follow", targetEpochID: idle.epoch.epochID, orderKey: 5, rank: Double(5), sealed: false)
+        let dispatched = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .dispatched, revision: 1, text: "follow", targetEpochID: idle.epoch.epochID, orderKey: 5, rank: Double(5), sealed: false)
         let identity = WriterIdentity(session: idle.sessionID, writer: "q-writer")
         try store.claimWriterOwnership(session: idle.sessionID, writer: "q-writer")
         try store.appendBatch([.queueAdmitted(entry), .queueUpdated(dispatched), .queueDispatched(link)], as: identity)
@@ -384,3 +387,4 @@ struct QueueCrashActorTests {
         continuation.finish()
     }
 }
+#endif

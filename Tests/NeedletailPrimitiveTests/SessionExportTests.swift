@@ -84,7 +84,7 @@ struct SessionExportTests {
             Self.toolResult("ghost/r1", call: "gr", mutating: false, state: .done, outcome: "read it"),
             .queueAdmitted(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .followUp,
                                       state: .queued, revision: 3, text: "fix QUEUED-111",
-                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false,
+                                      targetEpochID: EpochID("epoch-1"), orderKey: 42, rank: 42.0, sealed: false,
                                       attachments: [AttachmentSnapshot(
                                         path: "notes/plan.txt", grantedRoot: "workspace",
                                         device: 11, inode: 22, size: 19,
@@ -98,7 +98,7 @@ struct SessionExportTests {
                                       attachmentConsentEpoch: EpochID("epoch-1"))),
             .queueUpdated(QueueEntry(entryID: "q-1", commandID: CommandID("cmd-1"), kind: .followUp,
                                      state: .dispatched, revision: 4, text: "fix QUEUED-111 now",
-                                     targetEpochID: EpochID("epoch-1"), orderKey: 42, sealed: false)),
+                                     targetEpochID: EpochID("epoch-1"), orderKey: 42, rank: 42.0, sealed: false)),
             .queueDispatched(QueueDispatchLink(
                 entryID: "q-1", commandID: CommandID("cmd-1"),
                 runID: RunID("r-1"), requestID: RequestID("req-1"),
@@ -172,7 +172,7 @@ struct SessionExportTests {
             "eventSeq", "eventKind", "digest",
             "operationID", "callID", "state", "mutating", "outcome",
             "action", "entryID", "commandID", "queueKind", "state", "revision",
-            "targetEpochID", "orderKey", "sealed", "redacted", "text",
+            "targetEpochID", "orderKey", "rank", "sealed", "redacted", "text",
             "attachments", "path", "grantedRoot", "device", "inode", "size",
             "contentHash", "totalLines", "intent", "captureEpochID", "alias",
             "locality", "admissionSealed", "lineStart", "lineEnd", "content",

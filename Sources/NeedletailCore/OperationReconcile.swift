@@ -309,8 +309,10 @@ extension SessionState {
 /// (queue, acks, hold); the cross-run gate scans it for unknown
 /// deliveries without rebuilding live state.
 public struct QueueReconstruction: Sendable, Equatable {
-    /// Entries in first-admission order (replay preserves the live array
-    /// order: append on admit, replace in place on update).
+    /// Entries in rank order (B2: reorder display order; ties broken by
+    /// orderKey, so pre-B2 rows with fallback rank == orderKey keep
+    /// admission order). Replay preserves operator reorders across
+    /// reopen — a reorder never silently reverts.
     public let entries: [QueueEntry]
     /// Ack index rebuilt from admissions (ack sequence = the admission
     /// orderKey, which IS the admission sequence by construction in
@@ -483,7 +485,8 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
         entries[i] = QueueEntry(
             entryID: entry.entryID, commandID: entry.commandID, kind: entry.kind,
             state: .heldUnknown, revision: entry.revision, text: entry.text,
-            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, sealed: entry.sealed,
+            targetEpochID: entry.targetEpochID, orderKey: entry.orderKey, rank: entry.rank,
+            sealed: entry.sealed,
             attachments: entry.attachments, attachmentConsentEpoch: entry.attachmentConsentEpoch)
         unknownLinks.append(link)
         queueHeld = true
@@ -521,5 +524,12 @@ public func reconcileQueue(_ records: [DurableRecord]) throws -> QueueReconstruc
             acks.removeValue(forKey: ack.commandID)
         }
     }
-    return QueueReconstruction(entries: entries, acks: acks, queueHeld: queueHeld, unknownLinks: unknownLinks, failedLinks: failedLinks)
+    // Rank order (B2): the live array order already reflects reorders,
+    // but reopen rebuilds from the log — sort by (rank, orderKey) so an
+    // operator reorder survives. orderKey is unique per admission, so the
+    // key is total and pre-B2 rows (rank == orderKey) keep admission order.
+    let ordered = entries.sorted {
+        ($0.rank, $0.orderKey) < ($1.rank, $1.orderKey)
+    }
+    return QueueReconstruction(entries: ordered, acks: acks, queueHeld: queueHeld, unknownLinks: unknownLinks, failedLinks: failedLinks)
 }

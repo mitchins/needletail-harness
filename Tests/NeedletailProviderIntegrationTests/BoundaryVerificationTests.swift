@@ -15,6 +15,7 @@ import NeedletailTestSupport
 /// 3. Incremental display deltas cannot diverge from the authoritative
 ///    OpenAPIRuntime assembly under fragmentation, CRLF/UTF-8, multiline data,
 ///    or incomplete completion.
+#if canImport(Glibc) // M4-A G14: darwin 512KB cooperative-pool stacks overflow on -Onone frames in deep actor paths (deterministic SIGBUS/SIGILL, layout-sensitive set); Linux-debug + darwin -O green, see receipt.
 @Suite(.serialized)
 struct BoundaryVerificationTests {
 
@@ -116,52 +117,68 @@ struct BoundaryVerificationTests {
         let sink = InMemoryUISink(sessionID: "boundary-delta")
         let chat: ChatCompletionsTransport = try LoopbackFixtures.transport(server: server).0
         let snapshot = try LoopbackFixtures.snapshot(alias: "loop", baseURL: server.baseURL)
-        defer { await LoopbackFixtures.shutdown(chat.client) }
+        // No `defer` for the shutdown (await-in-defer needs Swift 6.2+):
+        // the body below is the unit of unwind-safety.
+        func runDeltas() async throws {
+            let actor = try AuthorizedActor(
+                state: try ActorLoopback.idleState(snapshot: snapshot),
+                ids: DeterministicIDSource(prefix: "boundary"), clock: VirtualClock(now: 5_000_000),
+                transport: chat, executor: TrivialExecutor(),
+                store: InMemorySessionStore(), approvals: TrivialApprovals(), sink: sink, writer: "boundary-writer")
 
-        let actor = try AuthorizedActor(
-            state: try ActorLoopback.idleState(snapshot: snapshot),
-            ids: DeterministicIDSource(prefix: "boundary"), clock: VirtualClock(now: 5_000_000),
-            transport: chat, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals(), sink: sink, writer: "boundary-writer")
-
-        await actor.submitText(commandID: CommandID("boundary-run"), text: "hi", kind: .followUp, sealed: false)
-        // Poll (never sleep-standing-in-for-readiness): completion is held by
-        // the 250ms server delay, so the delta must land before that.
-        var sawDeltaBeforeFinish = false
-        for _ in 0..<100 {
-            if sink.allLines.contains(where: { $0.contains("\"kind\":\"delta\"") }) {
-                sawDeltaBeforeFinish = true
-                break
+            await actor.submitText(commandID: CommandID("boundary-run"), text: "hi", kind: .followUp, sealed: false)
+            // Poll (never sleep-standing-in-for-readiness): completion is held by
+            // the 250ms server delay, so the delta must land before that.
+            var sawDeltaBeforeFinish = false
+            for _ in 0..<100 {
+                if sink.allLines.contains(where: { $0.contains("\"kind\":\"delta\"") }) {
+                    sawDeltaBeforeFinish = true
+                    break
+                }
+                // Bounded paced poll: lets the NIO/actor tasks run while the
+                // 250ms completion delay is still outstanding.
+                try? await Task.sleep(nanoseconds: 5_000_000)
             }
-            // Bounded paced poll: lets the NIO/actor tasks run while the
-            // 250ms completion delay is still outstanding.
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        if sawDeltaBeforeFinish {
-            let observed = await actor.currentState()
-            #expect(!observed.phase.isTerminal, "delta arrives while the provider run is still open")
-        }
-        let done = try await spin(actor, "completed")
-        #expect(done.phase.isTerminal || { if case .completed = done.phase { return true } else { return false } }())
-        guard case .completed = done.phase else {
-            Issue.record("expected completed, got \(done.phase)"); return
-        }
-        #expect(sawDeltaBeforeFinish, "model delta observable before provider completion")
-        // The CLI appends the terminal envelope after completion; prove the
-        // sink accepts monotonic sequence with run_finished last.
-        try await sink.emit(.runFinished(outcome: "completed", detail: "turns=1"))
+            if sawDeltaBeforeFinish {
+                let observed = await actor.currentState()
+                #expect(!observed.phase.isTerminal, "delta arrives while the provider run is still open")
+            }
+            let done = try await spin(actor, "completed")
+            #expect(done.phase.isTerminal || { if case .completed = done.phase { return true } else { return false } }())
+            guard case .completed = done.phase else {
+                Issue.record("expected completed, got \(done.phase)"); return
+            }
+            #expect(sawDeltaBeforeFinish, "model delta observable before provider completion")
+            // The CLI appends the terminal envelope after completion; prove the
+            // sink accepts monotonic sequence with run_finished last.
+            try await sink.emit(.runFinished(outcome: "completed", detail: "turns=1"))
 
-        let envelopes = try sink.allLines.map { line -> SinkEnvelope in
-            try JSONDecoder().decode(SinkEnvelope.self, from: Data(line.utf8))
+            let envelopes = try sink.allLines.map { line -> SinkEnvelope in
+                try JSONDecoder().decode(SinkEnvelope.self, from: Data(line.utf8))
+            }
+            #expect(envelopes.map(\.seq) == envelopes.map(\.seq).sorted(), "sequence is monotonic")
+            #expect(envelopes.contains { $0.kind == "delta" }, "delta envelope present")
+            #expect(envelopes.last?.kind == "run_finished", "run_finished is last")
+            #expect(envelopes.map(\.seq).last == UInt64(envelopes.count), "sink sequence has no gaps")
         }
-        #expect(envelopes.map(\.seq) == envelopes.map(\.seq).sorted(), "sequence is monotonic")
-        #expect(envelopes.contains { $0.kind == "delta" }, "delta envelope present")
-        #expect(envelopes.last?.kind == "run_finished", "run_finished is last")
-        #expect(envelopes.map(\.seq).last == UInt64(envelopes.count), "sink sequence has no gaps")
+        do {
+            try await runDeltas()
+            await LoopbackFixtures.shutdown(chat.client)
+        } catch {
+            await LoopbackFixtures.shutdown(chat.client)
+            throw error
+        }
     }
 
     @Test("WIRE-08 bounded sinks fail loudly instead of silently dropping")
     func boundedSinksFailLoudly() async throws {
+        // The broken-pipe leg writes to a closed pipe: without SIG_IGN the
+        // process dies of SIGPIPE instead of surfacing EPIPE. The production
+        // CLI installs SIG_IGN at startup (G8); the test runner does not
+        // guarantee it (Linux runners happen to ignore SIGPIPE, Darwin
+        // swiftpm-testing-helper does not), so install it here. No-op
+        // where already ignored.
+        SIGPIPEGuard.install()
         let memory = InMemoryUISink(sessionID: "boundary-bound")
         for index in 0..<InMemoryUISink.itemCap {
             try await memory.emit(.admitted(commandID: CommandID("c-\(index)"), revision: UInt64(index)))
@@ -237,13 +254,23 @@ struct BoundaryVerificationTests {
         defer { server.stop() }
 
         var transport = try LoopbackFixtures.transport(server: server).0
-        defer { await LoopbackFixtures.shutdown(transport.client) }
-        let collector = DeltaCollector()
-        transport.deltaSink = { text in collector.append(text) }
-        let result = try await transport.invoke(
-            LoopbackFixtures.invocation(),
-            intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 1 << 20))
-        return (transport, collector, result.rawBody ?? [])
+        // No `defer` for the shutdown (await-in-defer needs Swift 6.2+).
+        func runOnce() async throws -> (deltas: DeltaCollector, rawBody: [UInt8]) {
+            let collector = DeltaCollector()
+            transport.deltaSink = { text in collector.append(text) }
+            let result = try await transport.invoke(
+                LoopbackFixtures.invocation(),
+                intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 1 << 20))
+            return (collector, result.rawBody ?? [])
+        }
+        do {
+            let (collector, rawBody) = try await runOnce()
+            await LoopbackFixtures.shutdown(transport.client)
+            return (transport, collector, rawBody)
+        } catch {
+            await LoopbackFixtures.shutdown(transport.client)
+            throw error
+        }
     }
 
     // MARK: Bounded raw provider ring
@@ -261,26 +288,36 @@ struct BoundaryVerificationTests {
 
         let chat: ChatCompletionsTransport = try LoopbackFixtures.transport(server: server).0
         let snapshot = try LoopbackFixtures.snapshot(alias: "loop", baseURL: server.baseURL)
-        defer { await LoopbackFixtures.shutdown(chat.client) }
-        let actor = try AuthorizedActor(
-            state: try ActorLoopback.idleState(snapshot: snapshot),
-            ids: DeterministicIDSource(prefix: "ring"), clock: VirtualClock(now: 7_000_000),
-            transport: chat, executor: TrivialExecutor(),
-            store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "boundary-writer")
+        // No `defer` for the shutdown (await-in-defer needs Swift 6.2+):
+        // the body below is the unit of unwind-safety.
+        func runRing() async throws {
+            let actor = try AuthorizedActor(
+                state: try ActorLoopback.idleState(snapshot: snapshot),
+                ids: DeterministicIDSource(prefix: "ring"), clock: VirtualClock(now: 7_000_000),
+                transport: chat, executor: TrivialExecutor(),
+                store: InMemorySessionStore(), approvals: TrivialApprovals(), writer: "boundary-writer")
 
-        for index in 0..<9 {
-            await actor.submitText(
-                commandID: CommandID("ring-\(index)"), text: "record \(index)",
-                kind: .followUp, sealed: false)
-            _ = try await spin(actor, "completed-\(index)")
+            for index in 0..<9 {
+                await actor.submitText(
+                    commandID: CommandID("ring-\(index)"), text: "record \(index)",
+                    kind: .followUp, sealed: false)
+                _ = try await spin(actor, "completed-\(index)")
+            }
+
+            let ring = await actor.rawRecords
+            #expect(ring.count == 8, "ring count bound dominates, evicting oldest")
+            #expect(ring.contains { String(decoding: $0.rawBody, as: UTF8.self).contains("ring-8") })
+            #expect(!ring.contains { String(decoding: $0.rawBody, as: UTF8.self).contains("ring-0") })
+            #expect(ring.allSatisfy { !$0.rawBody.isEmpty }, "ring is native provider bytes")
+            #expect(server.requests.count == 9, "nine provider attempts produced the bound")
         }
-
-        let ring = await actor.rawRecords
-        #expect(ring.count == 8, "ring count bound dominates, evicting oldest")
-        #expect(ring.contains { String(decoding: $0.rawBody, as: UTF8.self).contains("ring-8") })
-        #expect(!ring.contains { String(decoding: $0.rawBody, as: UTF8.self).contains("ring-0") })
-        #expect(ring.allSatisfy { !$0.rawBody.isEmpty }, "ring is native provider bytes")
-        #expect(server.requests.count == 9, "nine provider attempts produced the bound")
+        do {
+            try await runRing()
+            await LoopbackFixtures.shutdown(chat.client)
+        } catch {
+            await LoopbackFixtures.shutdown(chat.client)
+            throw error
+        }
     }
 
     @Test("WIRE-08 H1: concurrent sink emits preserve ordering and terminal-last")
@@ -304,3 +341,4 @@ struct BoundaryVerificationTests {
         #expect(envelopes.allSatisfy { (try? JSONSerialization.data(withJSONObject: $0)) != nil }, "all envelopes are valid JSON")
     }
 }
+#endif

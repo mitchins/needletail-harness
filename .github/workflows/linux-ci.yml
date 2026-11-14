@@ -95,15 +95,70 @@ jobs:
           }
 
       - name: Build
+        timeout-minutes: 30
         run: ./dev build
 
-      - name: Full offline gate (quick/native/PTY/case-bound integrations)
-        run: ./dev test offline
+      - name: Build the release product (M4 PTY legs execute the release binary)
+        timeout-minutes: 30
+        run: |
+          # The NeedletailTerminalTests PTY legs (PTY-01…08, hygiene,
+          # resubmit, parity) spawn `.build/release/needletail` and
+          # fail-closed on a missing binary (no silent skips, BDD-04).
+          # Same command as run-m4d-pty.sh so CI tests the identical
+          # artifact the local gate qualifies.
+          swift build -c release --product needletail
+          test -x .build/release/needletail
+
+      - name: Offline gate quick (pure suites, bounded + streaming)
+        timeout-minutes: 25
+        run: ./dev test quick
+
+      - name: Offline gate timing (serialized NET-04, bounded + streaming)
+        timeout-minutes: 15
+        run: ./dev test timing
+
+      - name: Offline gate e2e (serialized OS-heavy suites, bounded + streaming)
+        timeout-minutes: 40
+        run: ./dev test e2e
+
+      - name: Offline gate feasibility (PTY terminal suite, bounded + streaming)
+        # The 6 h silent stall lived here: output is now streamed live
+        # (per-test lines + 5 min heartbeats), the phase is hard-bounded
+        # with diagnostics + owned-process cleanup on expiry, and the
+        # unbounded tmux waits that wedged the runner are bounded in-tree.
+        timeout-minutes: 60
+        run: ./dev test feasibility
+
+      - name: Offline coverage (bulk evidence + merge + ingest, bounded + streaming)
+        # Must exceed the SUM of the in-tree phase bounds
+        # (coverage-evidence 35 min + coverage-ingest 10 min) plus the
+        # merge, so the in-tree killer with its diagnostics always wins
+        # the race against the step timeout.
+        timeout-minutes: 50
+        run: ./dev coverage-from-lanes
+
+      - name: Offline cases m1a (bounded + streaming)
+        timeout-minutes: 20
+        run: ./dev test case-group m1a
+
+      - name: Offline cases m1b (bounded + streaming)
+        timeout-minutes: 20
+        run: ./dev test case-group m1b
+
+      - name: Offline cases m1c (bounded + streaming)
+        timeout-minutes: 30
+        run: ./dev test case-group m1c
+
+      - name: Offline cases m1d (bounded + streaming)
+        timeout-minutes: 20
+        run: ./dev test case-group m1d
 
       - name: Vendor integrity
+        timeout-minutes: 15
         run: ./dev vendor-check
 
       - name: False-pass guards
+        timeout-minutes: 15
         run: |
           # A bogus case ID or a zero-match filter must be red.
           if ./dev test case BOGUS-99; then
@@ -116,6 +171,7 @@ jobs:
           fi
 
       - name: Entry point works via a relative path from another directory
+        timeout-minutes: 15
         run: |
           # Regression test for the relative-root_dir defect: invoked as
           # `sh <relpath>/dev` from outside the repo, every log/bundle path
@@ -125,6 +181,7 @@ jobs:
           sh "$(basename "$GITHUB_WORKSPACE")/dev" test case BDD-01
 
       - name: Runner qualification (expected failure)
+        timeout-minutes: 15
         run: ./dev test qualification
 
   packaging:

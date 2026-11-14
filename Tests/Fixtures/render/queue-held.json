@@ -1,0 +1,9 @@
+{
+  "width": 80,
+  "lines": [
+    {"id": "status-held", "runs": [{"text": "held: queue held: cancelled", "role": "status"}]},
+    {"id": "queue-q-1", "runs": [{"text": "followUp queued", "role": "normal"}]},
+    {"id": "queue-q-2", "runs": [{"text": "steer held [stale target]", "role": "normal"}]},
+    {"id": "approval-request", "runs": [{"text": "sandbox approval: exec [exec]", "role": "candidateSelected"}]}
+  ]
+}

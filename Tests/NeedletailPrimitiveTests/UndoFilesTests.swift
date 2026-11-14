@@ -425,4 +425,58 @@ struct UndoFilesTests {
         }
         #expect((try Data(contentsOf: url.appendingPathComponent("e.txt"))).isEmpty, "restored to zero bytes")
     }
+
+    // MARK: - UX-UNDO-06 real: shell-produced bytes are not ledger-undoable
+
+    @Test("UX-UNDO-06 real: exec-touched file has no member; undo leaves it byte-identical")
+    func UX_UNDO_06_execTouchedFileExcluded() async throws {
+        let (url, fp) = try Self.tempRoot()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (dir, store, session, writer) = try Self.tempStore()
+        defer { try? FileManager.default.removeItem(at: dir); try? store.close() }
+        try "v0\n".write(to: url.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
+        try "g0\n".write(to: url.appendingPathComponent("g.txt"), atomically: true, encoding: .utf8)
+        let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: session, writer: writer)
+        // Native edit on f.txt (ledger-recorded with preimage).
+        let batch = Self.editBatch(path: "f.txt", expectedHash: Self.sha("v0\n"), old: "v0", new: "v1")
+        let outcome = try #require(try await exec.execute(batch: batch, reservation: Self.reservation(batch)).calls.first)
+        #expect(outcome.status == "success")
+        // A shell/exec-equivalent write lands outside the ledger: bytes
+        // change with NO durable record (identical to what an exec tool
+        // produces from the undo layer's perspective — C0/C2 own exec
+        // execution fidelity; undo sees only recorded vs unrecorded bytes).
+        try "g0-shelled\n".write(to: url.appendingPathComponent("g.txt"), atomically: true, encoding: .utf8)
+        // The batch carried an exec proposal alongside the edit.
+        // Even a *successful* exec outcome for g.txt (as if the exec
+        // had written it and reported success) must never become a
+        // member: exec effects are not natively undoable, only
+        // native-tool preimages are.
+        let execOutcome = ToolCallOutcome(
+            callID: "c2", status: "success", summary: "ok", data: "",
+            artifactID: nil, secondaryArtifactIDs: [], truncated: false, warnings: [],
+            error: nil, path: "g.txt", mode: "100644",
+            beforeHash: Self.sha("g0\n"), afterHash: Self.sha("g0-shelled\n"),
+            started: true, mutating: true,
+            deviceBefore: 7, inodeBefore: 9, deviceAfter: 7, inodeAfter: 9,
+            created: false, grantedRoot: fp.string)
+        let mixed = ToolBatch(batch.proposals + [ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d",
+            arguments: "{\"command\":\"touch g.txt\"}")])
+        let group = try #require(buildChangeGroup(
+            groupID: "chg-1", runID: RunID("r1"), effectID: EffectID("eff-1"),
+            proposals: mixed.proposals, outcomes: ["c1": outcome, "c2": execOutcome], doneCallIDs: ["c1", "c2"]))
+        #expect(group.members.count == 1 && group.members[0].path == "f.txt",
+            "even a successful exec outcome gains no member: \(group.members.map(\.path))")
+        #expect(group.hadExecProposals, "mixed batch marks exec participation for the notice")
+        // Undo restores the recorded file and leaves the exec-touched one byte-identical.
+        let inverses = undoInverses(undoCommandID: "undo-1", group: group)
+        #expect(inverses.count == 1, "exactly one inverse (no phantom for g.txt)")
+        let applier = FilesystemUndoApplier(resolver: resolver, store: store, session: session, writer: writer)
+        let applied = await applier.apply(inverses[0])
+        guard case .applied = applied else {
+            Issue.record("recorded inverse must apply, got \(applied)"); return
+        }
+        #expect(try String(contentsOf: url.appendingPathComponent("f.txt"), encoding: .utf8) == "v0\n", "ledger file restored")
+        #expect(try String(contentsOf: url.appendingPathComponent("g.txt"), encoding: .utf8) == "g0-shelled\n", "exec-touched bytes untouched")
+    }
 }

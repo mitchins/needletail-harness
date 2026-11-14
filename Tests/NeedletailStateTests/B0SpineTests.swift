@@ -4,6 +4,7 @@ import NeedletailCore
 /// B0 spine: per-call truthfulness and cancellation supersession.
 /// Covers the 10 required per-call scenarios + supersession attacks per B0 mission.
 /// Uses the real reducer and actor with scripted deterministic executors (no file I/O).
+#if canImport(Glibc) // M4-A G14: darwin 512KB cooperative-pool stacks overflow on -Onone frames in deep actor paths (deterministic SIGBUS/SIGILL, layout-sensitive set); Linux-debug + darwin -O green, see receipt.
 struct B0SpineTests {
 
     // MARK: - Helpers
@@ -350,10 +351,22 @@ struct B0SpineTests {
             ToolCallOutcome(callID: "c2", status: "success", summary: "ok2", data: "ok2", started: true),
         ])
         let completed = transition(state, .effectCompleted(effectID: effectID, runID: run.runID, generation: run.revision, expectedRevision: run.revision, mutating: true, outcome: .perCall(dupResult), atMillis: 1015), &ids)
-        let recs = completed.records.compactMap { if case .operationResult(let r, _) = $0 { return r } else { return nil } }.filter { $0.state == .unknown }
+        // Explicit loops (not compactMap closures): older Swift toolchains
+        // cannot infer these closure parameters; the loop form is identical.
+        var recs: [OperationRef] = []
+        for record in completed.records {
+            if case .operationResult(let r, _) = record, r.state == .unknown {
+                recs.append(r)
+            }
+        }
         #expect(recs.map { $0.callID ?? "" }.sorted() == ["c1", "c2"], "both duplicates should be unknown")
-        // Check byte-deterministic: records for c1 and c2 should be in proposal order (c1 before c2)
-        let ordered = completed.records.compactMap { if case .operationResult(let r, _) = $0, r.state == .unknown { return r.callID } else { return nil } }
+        // Check byte-deterministic: records for c1 and c2 should be in proposal order (c1 before c2).
+        var ordered: [String] = []
+        for record in completed.records {
+            if case .operationResult(let r, _) = record, r.state == .unknown, let callID = r.callID {
+                ordered.append(callID)
+            }
+        }
         #expect(ordered == ["c1", "c2"], "duplicate records must be in proposal order")
     }
 
@@ -433,3 +446,4 @@ struct B0SpineTests {
         #expect(completed.records.contains(where: { if case .operationResult(let r, _) = $0 { return r.callID == "c2" && r.state == .done } else { return false } }), "c2 after no-match should be done, not halt")
     }
 }
+#endif

@@ -48,10 +48,11 @@ struct ImportGateTests {
         for _ in 0..<3 { testFile.deleteLastPathComponent() }
         let cli = testFile.appendingPathComponent("Sources/NeedletailCLI").path
         for file in try FileManager.default.contentsOfDirectory(atPath: cli).filter({ $0.hasSuffix(".swift") }) {
-            // M1-D RunCommand is the headless loop and legitimately links the
-            // transport; the offline bootstrap paths (Doctor, ConfigValidate)
-            // must stay offline.
-            if file == "RunCommand.swift" { continue }
+            // M1-D RunCommand is the headless loop and M4-C ChatCommand the
+            // interactive loop; both legitimately link the transport. The
+            // offline bootstrap paths (Doctor, ConfigValidate) must stay
+            // offline.
+            if file == "RunCommand.swift" || file == "ChatCommand.swift" { continue }
             let text = try String(contentsOfFile: cli + "/" + file, encoding: .utf8)
             #expect(!text.contains("import AsyncHTTPClient"),
                     "NeedletailCLI/\(file): offline bootstrap paths must not link the HTTP client")

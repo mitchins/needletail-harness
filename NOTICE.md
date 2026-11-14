@@ -28,7 +28,9 @@ and re-verified before release (M0-D/M6).
   commit `1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2`, licence in
   `Sources/CReplxx/replxx/LICENSE.md`). Only the bridge files are
   Needletail's: `shim.h`, `include/module.modulemap`, `README.provenance`,
-  and `SHA256SUMS-vendored`. C++ runtime: the bundle links the system
+  `SHA256SUMS-upstream` (pristine upstream hashes) plus registered
+  local patches in `Sources/CReplxx/patches/` (each verified both
+  directions by `./dev vendor-check`: tree == upstream + patches). C++ runtime: the bundle links the system
   `libstdc++` (declared in the linkage manifest).
 
 - **replxx** (candidate commit `1f149bfe20bf6e49c1afd4154eaf0032c8c2fda2`) is
