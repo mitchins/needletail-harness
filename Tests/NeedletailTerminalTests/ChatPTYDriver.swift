@@ -154,7 +154,10 @@ final class ChatPTYDriver {
             }
             let end = pendingBytes.index(i, offsetBy: width, limitedBy: pendingBytes.endIndex)
             guard let end, pendingBytes.distance(from: i, to: end) == width,
-                  let text = String(validating: Array(pendingBytes[i..<end]), as: UTF8.self) else {
+                  // Strict UTF-8 decode via the long-available
+                  // bytes:encoding: form — String(validating:as:) is
+                  // macOS 15+ and broke the macOS 14-floor test build.
+                  let text = String(bytes: Array(pendingBytes[i..<end]), encoding: .utf8) else {
                 // Incomplete (wait for more) or invalid (consume one).
                 if let end, pendingBytes.distance(from: i, to: end) == width {
                     out += "\u{FFFD}"
