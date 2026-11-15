@@ -42,9 +42,12 @@ public final class LineEditorSession: @unchecked Sendable {
     /// (replxx.h:372). Blocks the calling thread; call from a dedicated
     /// blocking thread.
     public func readLine(prompt: String) -> String? {
+        let trace = getenv("NEEDLETAIL_INPUT_TRACE") != nil
+        if trace { itraceLog("readLine enter") }
         let result: UnsafePointer<CChar>? = prompt.withCString { promptC in
             replxx_input(handle, promptC)
         }
+        if trace { itraceLog("readLine returned \(result.map { String(cString: $0) } ?? "nil")") }
         guard let result else { return nil }
         return String(cString: result)
     }
@@ -95,7 +98,9 @@ public final class LineEditorSession: @unchecked Sendable {
             replxx_bind_key(handle, code, { code, userData in
                 guard let userData else { return REPLXX_ACTION_RESULT_CONTINUE }
                 let session = Unmanaged<LineEditorSession>.fromOpaque(userData).takeUnretainedValue()
+                if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("keyHandler fired code=0x\(String(code, radix: 16))") }
                 let result = session.keyHandlers[code]?().rawValue ?? REPLXX_ACTION_RESULT_CONTINUE
+                if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("keyHandler result=\(result)") }
                 session.syncMirror()
                 return result
             }, userData)
@@ -320,6 +325,23 @@ public final class LineEditorSession: @unchecked Sendable {
             candidate.withCString { candidateC in
                 replxx_add_completion(completions, candidateC)
             }
+        }
+    }
+}
+
+
+/// M4-MAC-02 temporary input-path diagnostics (env NEEDLETAIL_INPUT_TRACE=1;
+/// removed after root-cause). POSIX write(2): no shared mutable Swift state.
+private func itraceLog(_ message: String) {
+    let line = "[itrace] " + message + "\n"
+    line.withCString { ptr in
+        var remaining = strlen(ptr)
+        var offset = 0
+        while remaining > 0 {
+            let n = write(2, ptr + offset, remaining)
+            if n <= 0 { break }
+            offset += n
+            remaining -= n
         }
     }
 }

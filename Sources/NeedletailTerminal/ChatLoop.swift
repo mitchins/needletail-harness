@@ -354,12 +354,14 @@ public final class ChatLoop: @unchecked Sendable {
             // pending (M4-D D2.5) or warns-then-exits on the second press
             // with queued work (`.abort` bails `readLine`, which returns
             // nil — the input thread posts EOF and the run shuts down).
+            let trace = getenv("NEEDLETAIL_INPUT_TRACE") != nil
             let action = self.lock.withLock {
                 ComposerBridge.ctrlCAction(
                     busy: self.statusBusy, armed: self.confirmArmed,
                     draftNonEmpty: self.draftNonEmpty, queuePending: self.queuePending,
                     exitArmed: self.ctrlCExitArmed)
             }
+            if trace { itraceLog("ctrlC action=\(action)") }
             switch action {
             case .cancelRun:
                 self.post(.cancelKey)
@@ -399,6 +401,31 @@ public final class ChatLoop: @unchecked Sendable {
             return .continue
         }
         lineEditor.enableBracketedPaste()
+        if getenv("NEEDLETAIL_INPUT_TRACE") != nil {
+            var t = termios()
+            if tcgetattr(0, &t) == 0 {
+                let l = t.c_lflag
+                itraceLog("termios post-bind: ISIG=\((l & UInt32(ISIG)) != 0) ICANON=\((l & UInt32(ICANON)) != 0) ECHO=\((l & UInt32(ECHO)) != 0) IEXTEN=\((l & UInt32(IEXTEN)) != 0) raw-lflag=0x\(String(l, radix: 16))")
+            } else {
+                itraceLog("termios tcgetattr(0) failed errno=\(errno)")
+            }
+        }
+    }
+
+    /// M4-MAC-02 temporary input-path diagnostics (env NEEDLETAIL_INPUT_TRACE=1;
+    /// removed after root-cause). POSIX write(2): no shared mutable Swift state.
+    private func itraceLog(_ message: String) {
+        let line = "[itrace] " + message + "\n"
+        line.withCString { ptr in
+            var remaining = strlen(ptr)
+            var offset = 0
+            while remaining > 0 {
+                let n = write(2, ptr + offset, remaining)
+                if n <= 0 { break }
+                offset += n
+                remaining -= n
+            }
+        }
     }
 
     private func spawnInputThread() {
