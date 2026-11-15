@@ -333,7 +333,7 @@ public final class LineEditorSession: @unchecked Sendable {
 /// M4-MAC-02 temporary input-path diagnostics (env NEEDLETAIL_INPUT_TRACE=1;
 /// removed after root-cause). POSIX write(2): no shared mutable Swift state.
 private func itraceLog(_ message: String) {
-    let line = "[itrace] " + message + "\n"
+    let line = "[pid\(getpid())] [itrace] " + message + "\n"
     line.withCString { ptr in
         var remaining = strlen(ptr)
         var offset = 0
@@ -342,6 +342,11 @@ private func itraceLog(_ message: String) {
             if n <= 0 { break }
             offset += n
             remaining -= n
+        }
+        let fd = open("/tmp/nb-itrace.log", O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        if fd >= 0 {
+            _ = write(fd, ptr, strlen(ptr))
+            close(fd)
         }
     }
 }
