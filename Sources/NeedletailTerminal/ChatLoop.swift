@@ -354,14 +354,12 @@ public final class ChatLoop: @unchecked Sendable {
             // pending (M4-D D2.5) or warns-then-exits on the second press
             // with queued work (`.abort` bails `readLine`, which returns
             // nil — the input thread posts EOF and the run shuts down).
-            let trace = getenv("NEEDLETAIL_INPUT_TRACE") != nil
             let action = self.lock.withLock {
                 ComposerBridge.ctrlCAction(
                     busy: self.statusBusy, armed: self.confirmArmed,
                     draftNonEmpty: self.draftNonEmpty, queuePending: self.queuePending,
                     exitArmed: self.ctrlCExitArmed)
             }
-            if trace { itraceLog("ctrlC action=\(action)") }
             switch action {
             case .cancelRun:
                 self.post(.cancelKey)
@@ -379,9 +377,30 @@ public final class ChatLoop: @unchecked Sendable {
                 // and the main task sets `shutdown` in
                 // `handleSubmitLine` (main-owned — never written here,
                 // so the input thread cannot race the main-task read).
+                // QUIESCE FIRST (M4-MAC-02): replxx's unwind ends in
+                // tcsetattr(TCSADRAIN), which on Darwin blocks forever
+                // while composer writes keep refilling the tty output
+                // queue. With emissions stopped the drain settles and
+                // the exit completes.
+                self.owner.quiesce()
                 self.lock.withLock { self.ctrlCExitArmed = false }
                 return .abort
             }
+        }
+        // M4-MAC-02: bind Ctrl+D ourselves. replxx's default send_eof
+        // returns BAIL through the same unwind whose tcsetattr(TCSADRAIN)
+        // deadlocks against live composer output on Darwin (the C2
+        // empty-line EOF hang). Handling it here mirrors the Ctrl+C
+        // path: quiesce emissions, then abort. Non-empty buffer keeps
+        // replxx's delete-forward semantics.
+        lineEditor.bindKey(code: LineEditorSession.ctrlDKeyCode) { [weak self] in // Ctrl+D
+            guard let self else { return .continue }
+            if self.lock.withLock({ self.draftNonEmpty }) {
+                self.lineEditor.deleteForwardCharacter()
+                return .continue
+            }
+            self.owner.quiesce()
+            return .abort
         }
         lineEditor.bindKey(code: LineEditorSession.ctrlJKeyCode) { [weak self] in // Ctrl+J
             // Newline goes into the LIVE buffer (set_state); the mirror
@@ -401,36 +420,6 @@ public final class ChatLoop: @unchecked Sendable {
             return .continue
         }
         lineEditor.enableBracketedPaste()
-        if getenv("NEEDLETAIL_INPUT_TRACE") != nil {
-            var t = termios()
-            if tcgetattr(0, &t) == 0 {
-                let l = t.c_lflag
-                itraceLog("termios post-bind: ISIG=\((l & tcflag_t(ISIG)) != 0) ICANON=\((l & tcflag_t(ICANON)) != 0) ECHO=\((l & tcflag_t(ECHO)) != 0) IEXTEN=\((l & tcflag_t(IEXTEN)) != 0) raw-lflag=0x\(String(l, radix: 16))")
-            } else {
-                itraceLog("termios tcgetattr(0) failed errno=\(errno)")
-            }
-        }
-    }
-
-    /// M4-MAC-02 temporary input-path diagnostics (env NEEDLETAIL_INPUT_TRACE=1;
-    /// removed after root-cause). POSIX write(2): no shared mutable Swift state.
-    private func itraceLog(_ message: String) {
-        let line = "[pid\(getpid())] [itrace] " + message + "\n"
-        line.withCString { ptr in
-            var remaining = strlen(ptr)
-            var offset = 0
-            while remaining > 0 {
-                let n = write(2, ptr + offset, remaining)
-                if n <= 0 { break }
-                offset += n
-                remaining -= n
-            }
-            let fd = open("/tmp/nb-itrace.log", O_WRONLY | O_CREAT | O_APPEND, 0o644)
-            if fd >= 0 {
-                _ = write(fd, ptr, strlen(ptr))
-                close(fd)
-            }
-        }
     }
 
     private func spawnInputThread() {

@@ -42,12 +42,9 @@ public final class LineEditorSession: @unchecked Sendable {
     /// (replxx.h:372). Blocks the calling thread; call from a dedicated
     /// blocking thread.
     public func readLine(prompt: String) -> String? {
-        let trace = getenv("NEEDLETAIL_INPUT_TRACE") != nil
-        if trace { itraceLog("readLine enter") }
         let result: UnsafePointer<CChar>? = prompt.withCString { promptC in
             replxx_input(handle, promptC)
         }
-        if trace { itraceLog("readLine returned \(result.map { String(cString: $0) } ?? "nil")") }
         guard let result else { return nil }
         return String(cString: result)
     }
@@ -98,12 +95,8 @@ public final class LineEditorSession: @unchecked Sendable {
             replxx_bind_key(handle, code, { code, userData in
                 guard let userData else { return REPLXX_ACTION_RESULT_CONTINUE }
                 let session = Unmanaged<LineEditorSession>.fromOpaque(userData).takeUnretainedValue()
-                if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("keyHandler fired code=0x\(String(code, radix: 16))") }
                 let result = session.keyHandlers[code]?().rawValue ?? REPLXX_ACTION_RESULT_CONTINUE
-                if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("keyHandler result=\(result)") }
-                if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("syncMirror begin") }
                 session.syncMirror()
-                if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("syncMirror end") }
                 return result
             }, userData)
         } else {
@@ -116,9 +109,7 @@ public final class LineEditorSession: @unchecked Sendable {
     /// sync after handler-driven `set_state` edits).
     private func syncMirror() {
         var state = ReplxxState(text: nil, cursorPosition: 0)
-        if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("syncMirror: before get_state") }
         replxx_get_state(handle, &state)
-        if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("syncMirror: after get_state") }
         let text = state.text.map { String(cString: $0) } ?? ""
         modifyHandler?(text, Int(state.cursorPosition))
     }
@@ -178,12 +169,32 @@ public final class LineEditorSession: @unchecked Sendable {
     /// replxx defaults (default abort) while only the scripted paths
     /// were tested).
     public static var ctrlCKeyCode: Int32 { Int32(REPLXX_KEY_BASE_CONTROL) | 67 } // control('C')
+    public static var ctrlDKeyCode: Int32 { Int32(REPLXX_KEY_BASE_CONTROL) | 68 } // control('D')
     public static var ctrlJKeyCode: Int32 { Int32(REPLXX_KEY_BASE_CONTROL) | 74 } // control('J')
     public static var escKeyCode: Int32 { Int32(REPLXX_KEY_ESCAPE) } // lone ESC (if unmapped)
     public static var escControlKeyCode: Int32 { Int32(REPLXX_KEY_BASE_CONTROL) | 91 } // control('[')
     public static var tabKeyCode: Int32 { Int32(REPLXX_KEY_TAB) }
     public static var upKeyCode: Int32 { Int32(REPLXX_KEY_UP) }
     public static var downKeyCode: Int32 { Int32(REPLXX_KEY_DOWN) }
+
+    /// Deletes the character under the cursor (M4-MAC-02: our Ctrl+D
+    /// binding must reproduce replxx's default send_eof non-empty
+    /// semantics — delete forward — because binding the key replaces
+    /// the default action entirely).
+    public func deleteForwardCharacter() {
+        var state = ReplxxState(text: nil, cursorPosition: 0)
+        replxx_get_state(handle, &state)
+        let text = state.text.map { String(cString: $0) } ?? ""
+        let cursor = Int(state.cursorPosition)
+        let scalars = Array(text.unicodeScalars)
+        guard cursor < scalars.count else { return }
+        var updated = String(String.UnicodeScalarView(scalars[..<cursor]))
+        updated += String(String.UnicodeScalarView(scalars[(cursor + 1)...]))
+        updated.withCString { cstr in
+            var next = ReplxxState(text: cstr, cursorPosition: Int32(cursor))
+            replxx_set_state(handle, &next)
+        }
+    }
 
     /// Inserts a newline at the live cursor (M4-C Ctrl+J multiline).
     /// replxx positions are UTF-32 code points = Swift scalar offsets.
@@ -228,30 +239,44 @@ public final class LineEditorSession: @unchecked Sendable {
     /// blocked in `readLine` (replxx teardown would race). Only acts
     /// when stdin is a TTY.
     public func restoreSaneTermios() {
-#if canImport(Glibc)
+#if canImport(Glibc) || canImport(Darwin)
         let fd: Int32 = STDIN_FILENO
         guard isatty(fd) != 0 else { return }
         var term = termios()
         guard tcgetattr(fd, &term) == 0 else { return }
-        // `stty sane` subset: cooked input, echo, signals, output
-        // post-processing; keep all other flags as-is. `tcflag_t` is
-        // the fields' own type on both targets (UInt32 on Glibc,
-        // UInt on Darwin) — a fixed `UInt32` does not compile on macOS.
-        term.c_lflag |= tcflag_t(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL)
-        term.c_oflag |= tcflag_t(OPOST | ONLCR)
-        term.c_iflag |= tcflag_t(ICRNL)
-        _ = tcsetattr(fd, TCSANOW, &term)
-#elseif canImport(Darwin)
-        let fd: Int32 = STDIN_FILENO
-        guard isatty(fd) != 0 else { return }
-        var term = termios()
-        guard tcgetattr(fd, &term) == 0 else { return }
-        term.c_lflag |= tcflag_t(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL)
-        term.c_oflag |= tcflag_t(OPOST | ONLCR)
-        term.c_iflag |= tcflag_t(ICRNL)
+        // M4-MAC-02: prefer the TERMINAL'S OWN pre-raw state, captured
+        // at init (before replxx ever entered raw mode). This restores
+        // IEXTEN exactly (the raw-mode entry clears it; a synthetic
+        // sane subset silently dropped it — the post-SIGTERM lflag
+        // delta the macOS matrix surfaced) plus every other original
+        // local flag, instead of an approximation. The OR-ed sane
+        // subset remains as the fallback when no capture exists.
+        if let saved = Self.originalTermios {
+            term.c_lflag = saved.lflag
+            term.c_oflag = saved.oflag
+            term.c_iflag = saved.iflag
+        } else {
+            // `stty sane` subset fallback: cooked input, echo, signals,
+            // output post-processing. `tcflag_t` is the fields' own type
+            // on both targets (UInt32 on Glibc, UInt on Darwin).
+            term.c_lflag |= tcflag_t(ECHO | ICANON | ISIG | ECHOE | ECHOK | ECHOCTL | IEXTEN)
+            term.c_oflag |= tcflag_t(OPOST | ONLCR)
+            term.c_iflag |= tcflag_t(ICRNL)
+        }
         _ = tcsetattr(fd, TCSANOW, &term)
 #endif
     }
+
+    /// The stdin termios captured at session init, before raw mode.
+    /// `nil` when stdin is not a TTY or the capture failed. Immutable
+    /// after init (let) — concurrency-safe shared state.
+    private static let originalTermios: (lflag: tcflag_t, oflag: tcflag_t, iflag: tcflag_t)? = {
+        let fd: Int32 = STDIN_FILENO
+        guard isatty(fd) != 0 else { return nil }
+        var t = termios()
+        guard tcgetattr(fd, &t) == 0 else { return nil }
+        return (lflag: t.c_lflag, oflag: t.c_oflag, iflag: t.c_iflag)
+    }()
 
     /// History snapshot, oldest-first (M4-D D2.7 hygiene probe). Thin
     /// forwarding of the C scan API; empty when replxx holds nothing.
@@ -334,23 +359,3 @@ public final class LineEditorSession: @unchecked Sendable {
 }
 
 
-/// M4-MAC-02 temporary input-path diagnostics (env NEEDLETAIL_INPUT_TRACE=1;
-/// removed after root-cause). POSIX write(2): no shared mutable Swift state.
-private func itraceLog(_ message: String) {
-    let line = "[pid\(getpid())] [itrace] " + message + "\n"
-    line.withCString { ptr in
-        var remaining = strlen(ptr)
-        var offset = 0
-        while remaining > 0 {
-            let n = write(2, ptr + offset, remaining)
-            if n <= 0 { break }
-            offset += n
-            remaining -= n
-        }
-        let fd = open("/tmp/nb-itrace.log", O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        if fd >= 0 {
-            _ = write(fd, ptr, strlen(ptr))
-            close(fd)
-        }
-    }
-}

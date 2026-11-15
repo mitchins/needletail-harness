@@ -54,6 +54,24 @@ public final class TerminalOutputOwner: @unchecked Sendable {
     private var generation: UInt64 = 0
     private var inFlight = 0
     private var stopped = false
+    /// M4-MAC-02: set before a BAIL unwind so the composer's remaining
+    /// renders never race replxx's terminal restore (Darwin tcsetattr
+    /// TCSADRAIN blocks forever while writes keep refilling the tty
+    /// output queue — the root cause of the C1/C2 exit hangs).
+    private var quiesced = false
+
+    /// Stops ALL further emissions (queued and future). The writer
+    /// thread keeps running until stop() so teardown semantics are
+    /// unchanged; nothing is written after this returns.
+    public func quiesce() {
+        work.lock()
+        quiesced = true
+        pendingDroppable.removeAll()
+        pendingControl.removeAll()
+        pendingProgress = nil
+        work.broadcast()
+        work.unlock()
+    }
     private var finished = false
     private var writerThread: Thread?
 
@@ -130,6 +148,9 @@ public final class TerminalOutputOwner: @unchecked Sendable {
     public func emit(_ lines: [RenderedLine], generation: UInt64, lane: Lane = .droppable) -> EmitResult {
         work.lock()
         defer { work.unlock() }
+        if quiesced {
+            return EmitResult(written: 0, truncated: 0, droppedStale: true, controlOverflow: false)
+        }
         guard generation == self.generation else {
             return EmitResult(written: 0, truncated: 0, droppedStale: true, controlOverflow: false)
         }
