@@ -101,7 +101,9 @@ public final class LineEditorSession: @unchecked Sendable {
                 if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("keyHandler fired code=0x\(String(code, radix: 16))") }
                 let result = session.keyHandlers[code]?().rawValue ?? REPLXX_ACTION_RESULT_CONTINUE
                 if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("keyHandler result=\(result)") }
+                if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("syncMirror begin") }
                 session.syncMirror()
+                if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("syncMirror end") }
                 return result
             }, userData)
         } else {
@@ -114,7 +116,9 @@ public final class LineEditorSession: @unchecked Sendable {
     /// sync after handler-driven `set_state` edits).
     private func syncMirror() {
         var state = ReplxxState(text: nil, cursorPosition: 0)
+        if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("syncMirror: before get_state") }
         replxx_get_state(handle, &state)
+        if getenv("NEEDLETAIL_INPUT_TRACE") != nil { itraceLog("syncMirror: after get_state") }
         let text = state.text.map { String(cString: $0) } ?? ""
         modifyHandler?(text, Int(state.cursorPosition))
     }
