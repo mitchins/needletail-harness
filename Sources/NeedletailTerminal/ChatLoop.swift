@@ -405,7 +405,7 @@ public final class ChatLoop: @unchecked Sendable {
             var t = termios()
             if tcgetattr(0, &t) == 0 {
                 let l = t.c_lflag
-                itraceLog("termios post-bind: ISIG=\((l & UInt32(ISIG)) != 0) ICANON=\((l & UInt32(ICANON)) != 0) ECHO=\((l & UInt32(ECHO)) != 0) IEXTEN=\((l & UInt32(IEXTEN)) != 0) raw-lflag=0x\(String(l, radix: 16))")
+                itraceLog("termios post-bind: ISIG=\((l & tcflag_t(ISIG)) != 0) ICANON=\((l & tcflag_t(ICANON)) != 0) ECHO=\((l & tcflag_t(ECHO)) != 0) IEXTEN=\((l & tcflag_t(IEXTEN)) != 0) raw-lflag=0x\(String(l, radix: 16))")
             } else {
                 itraceLog("termios tcgetattr(0) failed errno=\(errno)")
             }
