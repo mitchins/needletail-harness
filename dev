@@ -786,8 +786,13 @@ vendor-check)
             continue
         fi
         # (R) reverse direction: tree minus patch must be upstream bytes.
+        # Scoped repo: the temp dir sits INSIDE the real repo, so bare
+        # `git apply` would resolve a/ b/ paths against the repo root
+        # and could rewrite real tree files. init makes the temp dir
+        # its own repository so the apply is contained.
         mkdir -p "$tmpd/pristine/$(dirname "$rel")"
         cp "$root_dir/$rel" "$tmpd/pristine/$rel"
+        git -C "$tmpd/pristine" init -q 2>/dev/null || true
         if ! git -C "$tmpd/pristine" apply --reverse --check "$patch" 2>"$tmpd/reverse-check.err"; then
             echo "FAIL: $patch does not reverse-apply to the tree file:"
             cat "$tmpd/reverse-check.err"
@@ -804,6 +809,7 @@ vendor-check)
         # (F) forward direction: patch applied to pristine must rebuild the tree file.
         mkdir -p "$tmpd/roundtrip/$(dirname "$rel")"
         cp "$tmpd/pristine/$rel" "$tmpd/roundtrip/$rel"
+        git -C "$tmpd/roundtrip" init -q 2>/dev/null || true
         git -C "$tmpd/roundtrip" apply --check "$patch" 2>"$tmpd/forward-check.err" || {
             echo "FAIL: $patch does not forward-apply to pristine $base:"
             cat "$tmpd/forward-check.err"
@@ -873,6 +879,11 @@ vendor-check)
                         rm -rf "$tmpd/clone"
                         mkdir -p "$tmpd/clone"
                         cp "$f" "$tmpd/clone/$base"
+                        # Scoped repo: inside the real repo a bare git
+                        # apply silently no-ops (paths resolve against
+                        # the repo root, where the stripped basename
+                        # does not exist) — contain it like (R)/(F).
+                        git -C "$tmpd/clone" init -q 2>/dev/null || true
                         git -C "$tmpd/clone" apply --reverse -p4 "$patch" 2>/dev/null || {
                             echo "FAIL: registered patch does not reverse-apply to $base (clone check)"
                             status=1

@@ -270,7 +270,18 @@ int Terminal::reset_raw_mode( void ) {
 	return ( 0 );
 #else
 	/* put terminal in raw mode after flushing */
+#if defined(__APPLE__)
+	/* needletail local patch (0002): TCSADRAIN on a Darwin pty waits
+	 * for the output queue to go fully idle; with a concurrent
+	 * renderer streaming frames the drain never settles and every
+	 * raw-mode transition (per-keystroke IOModeGuard, read-loop
+	 * unwind) can block indefinitely. TCSANOW applies the flags
+	 * immediately; output already queued was processed under the
+	 * flags in effect when it was written. */
+	return ( tcsetattr( 0, TCSANOW, &_rawModeTermios ) );
+#else
 	return ( tcsetattr( 0, TCSADRAIN, &_rawModeTermios ) );
+#endif
 #endif
 }
 
@@ -285,9 +296,17 @@ void Terminal::disable_raw_mode(void) {
 	_consoleIn = INVALID_HANDLE_VALUE;
 #else
 	_terminal_ = nullptr;
+#if defined(__APPLE__)
+	/* needletail local patch (0002): see reset_raw_mode — TCSADRAIN
+	 * livelocks against a concurrent renderer on a Darwin pty. */
+	if ( tcsetattr( 0, TCSANOW, &_origTermios ) == -1 ) {
+		return;
+	}
+#else
 	if ( tcsetattr( 0, TCSADRAIN, &_origTermios ) == -1 ) {
 		return;
 	}
+#endif
 #endif
 	_rawMode = false;
 	return;
