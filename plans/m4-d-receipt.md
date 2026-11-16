@@ -1356,3 +1356,42 @@ confined to the registered patch.
 - Freeze accounting unchanged: Core/Runtime hold except the accepted
   queue-reorder guard; replxx deltas confined to registered patches
   (0001, 0002); vendor-check passes offline (R)+(F) and clone.
+
+### 16.6 Final native qualification attempt (exact HEAD 558a5ed, no implementation changes)
+
+Environment: Builds-Mac-Pro.local, macOS 26.7.1 (25G241), x86_64,
+Xcode 26.6.0 (Swift 6.3.3), fresh tree from `git archive 558a5ed`,
+release product rebuilt (491.74 s), rg 14.1.1 + tmux 3.4 provisioned
+(~/bin, ~/.local/bin on the runner PATH), stale processes cleaned,
+one-at-a-time suite invocations.
+
+- **Toolchain-health control: PASS.** `swift test -c release --filter
+  ChatWidthTests` → rc=0, "Test run with 6 tests in 1 suite passed"
+  (the runner launches and executes when no test spawns child
+  processes).
+- **Any suite that spawns product children: ENVIRONMENT FAILURE.**
+  The swift-testing runner process enters exit-blocked limbo
+  (ps STAT `?NEs` — attempting exit, stuck — sampled at 21+ min in
+  release and 4+ min in debug), produces ZERO test-result lines, and
+  the toolchain helper (`swiftpm-testing-helper`) waits in `__wait4`
+  forever. Reproduced: release ChatPTYTests (21 min), debug
+  ChatPTYTests (4 min), after full process cleanup and a from-scratch
+  `.build` rebuild, at load ~1.5, host uptime 1d13h. The same host ran
+  three full debug suites earlier in the session; the degradation is
+  host/toolchain-side (Xcode 26.6 helper + runner exit path), not
+  product: the product children themselves exit cleanly (verified by
+  probe and by the absence of orphans post-run) and the equivalent
+  full suite + oracle is GREEN on Linux at the same HEAD.
+- **Standing native evidence for the exit paths** (from the earlier
+  working window + probes, recorded in §15.8/§16.3): C1/C2 exit
+  cleanly post-fix (deterministic hangs pre-fix); PTY-01 15.9 s →
+  2.9 s; PTY-02 gate armed (D latency gone); PTY-04 anomaly gone;
+  all 11 residual failures were the replaced post-mortem oracle.
+
+**Verdict: macOS qualification remains HOST-BLOCKED (environment,
+not product).** Operator remediation: reboot the Mac (or reset the
+Xcode 26.6 toolchain), then run /tmp/nb-matrix.sh (deployed) — it
+executes the control + all twelve lanes in release config and writes
+/tmp/matrix-summary.log. No code changes are needed or pending for
+the macOS verdict; Linux carries the identical suite + oracle green
+at this HEAD.
