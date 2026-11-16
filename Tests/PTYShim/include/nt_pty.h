@@ -16,6 +16,7 @@ typedef struct {
     int masterFd;
     pid_t childPid;
     struct termios savedSlaveTermios;
+    int slaveFd; /* kept open in the parent: post-exit termios oracle */
     int haveSavedTermios;
 } nt_pty_t;
 
@@ -44,6 +45,13 @@ int nt_pty_signal(nt_pty_t *pty, int sig);
 /* Wait for the child to exit within the deadline. Returns the wait status,
  * -1 on timeout. */
 int nt_pty_wait(nt_pty_t *pty, int timeout_ms);
+
+/* M4-MAC-02 exact-restore oracle: the parent keeps the slave open, so
+ * after the child exits the termios is still readable. Returns 0 and
+ * fills current with the slave's live termios; -1 if unavailable. */
+int nt_pty_slave_termios(nt_pty_t *pty, struct termios *current);
+/* 1 when the spawn-time initial termios was captured, else 0. */
+int nt_pty_have_initial_termios(nt_pty_t *pty);
 
 /* Close the master and reap if needed. */
 void nt_pty_close(nt_pty_t *pty);

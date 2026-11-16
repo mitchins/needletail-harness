@@ -213,19 +213,28 @@ final class ChatPTYDriver {
     }
 
     /// Functional mode-restoration check after child exit.
-    func canonicalEchoRestored() -> Bool {
-        send("echo-probe\r")
-        var collected = ""
-        let deadline = Date().addingTimeInterval(2)
-        while Date() < deadline {
-            var chunk = [UInt8](repeating: 0, count: 256)
-            let count = nt_pty_read(&pty, &chunk, 256, 200)
-            if count > 0 {
-                collected += String(decoding: chunk.prefix(Int(count)), as: UTF8.self)
-                if collected.contains("echo-probe") { return true }
-            }
-        }
-        return false
+    /// M4-MAC-02 exact-restore oracle: compares the slave's LIVE
+    /// termios after child exit against the spawn-time initial state
+    /// (the parent holds the slave open, so the state is observable).
+    /// This replaces the post-mortem echo-probe, which could never
+    /// observe a torn-down pty on Darwin and mis-measured every
+    /// restore as failed. Exact comparison also catches partial
+    /// restores (e.g. a dropped IEXTEN), per the release-acceptance
+    /// requirement.
+    func termiosRestoredExactly() -> Bool {
+        guard nt_pty_have_initial_termios(&pty) == 1 else { return false }
+        var initial = termios()
+        var current = termios()
+        // Initial capture lives in the shim; fetch it by re-reading the
+        // saved copy through a dedicated accessor is unnecessary: the
+        // comparison target is the SAVED spawn-time state, exposed via
+        // the same accessor pattern below.
+        guard nt_pty_slave_termios(&pty, &current) == 0 else { return false }
+        initial = pty.savedSlaveTermios
+        return initial.c_lflag == current.c_lflag
+            && initial.c_iflag == current.c_iflag
+            && initial.c_oflag == current.c_oflag
+            && initial.c_cflag == current.c_cflag
     }
 
     func stop() {

@@ -86,8 +86,11 @@ int nt_pty_spawn_env(nt_pty_t *pty, char *const argv[], char *const env[]) {
         _exit(127);
     }
 
-    /* Parent. */
-    close(slave);
+    /* Parent. The slave fd stays open (stored, never used for I/O):
+     * it anchors the post-exit termios oracle — a pty whose only slave
+     * handle closed tears down, and the restore state would be
+     * unobservable (the M4-MAC-02 oracle defect). */
+    pty->slaveFd = slave;
     pty->masterFd = master;
     pty->childPid = pid;
     return 0;
@@ -150,6 +153,17 @@ int nt_pty_resize(nt_pty_t *pty, int rows, int cols) {
     return ioctl(pty->masterFd, TIOCSWINSZ, &size);
 }
 
+int nt_pty_slave_termios(nt_pty_t *pty, struct termios *current) {
+    if (pty == NULL || current == NULL || pty->slaveFd < 0) {
+        return -1;
+    }
+    return tcgetattr(pty->slaveFd, current);
+}
+
+int nt_pty_have_initial_termios(nt_pty_t *pty) {
+    return (pty != NULL && pty->haveSavedTermios) ? 1 : 0;
+}
+
 int nt_pty_signal(nt_pty_t *pty, int sig) {
     if (pty == NULL || pty->childPid <= 0) {
         return -1;
@@ -203,6 +217,7 @@ void nt_pty_close(nt_pty_t *pty) {
     }
     if (pty->masterFd >= 0) {
         close(pty->masterFd);
+	if (pty->slaveFd >= 0) { close(pty->slaveFd); pty->slaveFd = -1; }
         pty->masterFd = -1;
     }
 }

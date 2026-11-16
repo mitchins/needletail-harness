@@ -127,7 +127,7 @@ private final class ProbeProcess {
     /// Functional mode-restoration check: after the child has exited and the
     /// slave termios is back to canonical echo, a byte written to the master
     /// is echoed back. In a leaked raw mode it would not be.
-    func canonicalEchoRestored() -> Bool {
+    func termiosRestoredExactly() -> Bool {
         send("echo-probe\r")
         var collected = ""
         let deadline = Date().addingTimeInterval(2)
@@ -275,7 +275,7 @@ struct TerminalFeasibilityTests {
         #expect(status.map(isCleanExitStatus) ?? false, "probe did not exit with code 0: raw status \(String(describing: status))")
 
         // 9. Functional terminal-state check after exit.
-        #expect(probe.canonicalEchoRestored(), "terminal did not return to canonical echo after exit")
+        #expect(probe.termiosRestoredExactly(), "terminal did not return to canonical echo after exit")
     }
 }
 

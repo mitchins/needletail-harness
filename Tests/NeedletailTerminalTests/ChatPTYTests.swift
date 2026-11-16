@@ -167,7 +167,7 @@ struct ChatPTYTests {
                 Self.preserve("pty-01", transcript: driver.fullTranscript())
             }
             #expect(chatPTYCleanExit(status), "PTY-01 exit must be code 0, raw status \(status)")
-            #expect(driver.canonicalEchoRestored(), "PTY-01 terminal must return to canonical echo after exit")
+            #expect(driver.termiosRestoredExactly(), "PTY-01 terminal must return to canonical echo after exit")
         }
     }
 }
@@ -242,11 +242,11 @@ extension ChatPTYTests {
                 Self.preserve("pty-02", transcript: driver.fullTranscript())
                 Issue.record("PTY-02 release chat did not exit"); return
             }
-            if !chatPTYCleanExit(status) || driver.canonicalEchoRestored() == false {
+            if !chatPTYCleanExit(status) || driver.termiosRestoredExactly() == false {
                 Self.preserve("pty-02", transcript: driver.fullTranscript())
             }
             #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            #expect(driver.termiosRestoredExactly(), "terminal restored")
             if let v = Self.allowlistViolation(driver.fullTranscript(), "PTY-02") {
                 Self.preserve("pty-02", transcript: driver.fullTranscript())
                 Issue.record(Comment(rawValue: v))
@@ -318,7 +318,7 @@ extension ChatPTYTests {
                 Issue.record("PTY-03 release chat did not exit"); return
             }
             #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            #expect(driver.termiosRestoredExactly(), "terminal restored")
             let transcript = driver.fullTranscript()
             if let v = Self.allowlistViolation(transcript, "PTY-03") {
                 Self.preserve("pty-03", transcript: transcript)
@@ -428,7 +428,7 @@ extension ChatPTYTests {
                 Issue.record("PTY-04 release chat did not exit"); return
             }
             #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            #expect(driver.termiosRestoredExactly(), "terminal restored")
             if let v = Self.allowlistViolation(driver.fullTranscript(), "PTY-04") {
                 Self.preserve("pty-04", transcript: driver.fullTranscript())
                 Issue.record(Comment(rawValue: v))
@@ -475,7 +475,7 @@ extension ChatPTYTests {
                 ChatPTYTests.preserve("pty-05", transcript: transcript)
             }
             #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            #expect(driver.termiosRestoredExactly(), "terminal restored")
             // Cursor discipline: project the abort-to-exit region; the
             // projection must never see an unknown sequence, and no
             // absolute cursor address may target outside the 80-column
@@ -530,7 +530,7 @@ extension ChatPTYTests {
                 Issue.record("PTY-06 release chat did not exit"); return
             }
             #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            #expect(driver.termiosRestoredExactly(), "terminal restored")
             let transcript = driver.fullTranscript()
             // (a) Untrusted bytes never appear unsanitized: no raw ESC
             // outside the harness allowlist.
@@ -632,7 +632,7 @@ extension ChatPTYTests {
                     Self.preserve("pty-07-term", transcript: driver.fullTranscript())
                 }
                 #expect(code == 143, "SIGTERM must restore + exit 143, raw \(status)")
-                #expect(driver.canonicalEchoRestored(), "termios restored after SIGTERM")
+                #expect(driver.termiosRestoredExactly(), "termios restored after SIGTERM")
                 // Recover the session ID from the trace for the export leg.
                 guard let trace = try? String(contentsOf: traceURL, encoding: .utf8),
                       let line = trace.split(separator: "\n").first,
@@ -735,7 +735,7 @@ extension ChatPTYTests {
                 }
                 let code = (status >> 8) & 0xFF
                 #expect(code == 143 || chatPTYCleanExit(status), "PTY-08 [\(name)] clean or SIGTERM exit, raw \(status)")
-                #expect(driver.canonicalEchoRestored(), "PTY-08 [\(name)] terminal restored")
+                #expect(driver.termiosRestoredExactly(), "PTY-08 [\(name)] terminal restored")
                 // D1.1/D7-review-B5: every real-traffic leg proves the
                 // dummy-bearer composition (a wrong-but-present bearer
                 // would be served and pass without this).
@@ -932,7 +932,7 @@ extension ChatPTYTests {
                 Self.preserve("pty-07-eof", transcript: driver.fullTranscript())
             }
             #expect(chatPTYCleanExit(status), "EOF exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored after EOF")
+            #expect(driver.termiosRestoredExactly(), "terminal restored after EOF")
         }
     }
 
@@ -1004,7 +1004,7 @@ extension ChatPTYTests {
                 Issue.record("PTY hygiene release chat did not exit"); return
             }
             #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            #expect(driver.termiosRestoredExactly(), "terminal restored")
             let transcript = driver.fullTranscript()
             if let v = Self.allowlistViolation(transcript, "PTY-hygiene") {
                 Self.preserve("pty-hygiene", transcript: transcript)
@@ -1108,7 +1108,7 @@ extension ChatPTYTests {
                 Issue.record("PTY resubmit release chat did not exit"); return
             }
             #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            #expect(driver.termiosRestoredExactly(), "terminal restored")
             let transcript = driver.fullTranscript()
             if let v = Self.allowlistViolation(transcript, "PTY-resubmit") {
                 Self.preserve("pty-resubmit", transcript: transcript)
@@ -1167,7 +1167,7 @@ extension ChatPTYTests {
                 Issue.record("PTY parity release chat did not exit"); return
             }
             #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
-            #expect(driver.canonicalEchoRestored(), "terminal restored")
+            #expect(driver.termiosRestoredExactly(), "terminal restored")
             let final = driver.fullTranscript()
             if let v = Self.allowlistViolation(final, "PTY-parity") {
                 Self.preserve("pty-parity", transcript: final)
