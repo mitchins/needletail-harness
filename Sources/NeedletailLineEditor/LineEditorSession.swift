@@ -251,10 +251,18 @@ public final class LineEditorSession: @unchecked Sendable {
         // delta the macOS matrix surfaced) plus every other original
         // local flag, instead of an approximation. The OR-ed sane
         // subset remains as the fallback when no capture exists.
-        if let saved = Self.originalTermios {
-            term.c_lflag = saved.lflag
-            term.c_oflag = saved.oflag
-            term.c_iflag = saved.iflag
+        if Self.haveOriginalTermios {
+            let saved = Self.originalTermios
+            // The exact-restore oracle (M4-MAC-02) caught the Linux
+            // SIGTERM path leaving replxx's raw c_cc (VMIN=1/VTIME=0)
+            // in place: restore the captured control characters and
+            // flags wholesale so the terminal returns to its true
+            // pre-raw configuration, not a near miss.
+            term.c_lflag = saved.c_lflag
+            term.c_oflag = saved.c_oflag
+            term.c_iflag = saved.c_iflag
+            term.c_cflag = saved.c_cflag
+            term.c_cc = saved.c_cc
         } else {
             // `stty sane` subset fallback: cooked input, echo, signals,
             // output post-processing. `tcflag_t` is the fields' own type
@@ -270,12 +278,15 @@ public final class LineEditorSession: @unchecked Sendable {
     /// The stdin termios captured at session init, before raw mode.
     /// `nil` when stdin is not a TTY or the capture failed. Immutable
     /// after init (let) — concurrency-safe shared state.
-    private static let originalTermios: (lflag: tcflag_t, oflag: tcflag_t, iflag: tcflag_t)? = {
+    private static let originalTermios: termios = {
         let fd: Int32 = STDIN_FILENO
-        guard isatty(fd) != 0 else { return nil }
         var t = termios()
-        guard tcgetattr(fd, &t) == 0 else { return nil }
-        return (lflag: t.c_lflag, oflag: t.c_oflag, iflag: t.c_iflag)
+        guard isatty(fd) != 0, tcgetattr(fd, &t) == 0 else { return t }
+        return t
+    }()
+    private static let haveOriginalTermios: Bool = {
+        let fd: Int32 = STDIN_FILENO
+        return isatty(fd) != 0
     }()
 
     /// History snapshot, oldest-first (M4-D D2.7 hygiene probe). Thin
