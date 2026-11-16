@@ -26,6 +26,7 @@ public final class LineEditorSession: @unchecked Sendable {
     private var keyHandlers: [Int32: @Sendable () -> KeyResult] = [:]
 
     public init?() {
+        Self.captureOriginalTermios()
         guard let handle = replxx_init() else { return nil }
         self.handle = handle
         // Without this, SIGWINCH never reaches replxx: resizes change the
@@ -288,6 +289,17 @@ public final class LineEditorSession: @unchecked Sendable {
         let fd: Int32 = STDIN_FILENO
         return isatty(fd) != 0
     }()
+
+    /// Captures the pre-raw stdin state. MUST run before the first
+    /// readLine: `originalTermios` is a lazily-initialized static, and
+    /// a first touch inside restoreSaneTermios would capture the RAW
+    /// state (the exact-restore oracle caught exactly that on the
+    /// Linux SIGTERM path — post-exit c_cc still held replxx's
+    /// VMIN=1/VTIME=0).
+    static func captureOriginalTermios() {
+        _ = originalTermios
+        _ = haveOriginalTermios
+    }
 
     /// History snapshot, oldest-first (M4-D D2.7 hygiene probe). Thin
     /// forwarding of the C scan API; empty when replxx holds nothing.
