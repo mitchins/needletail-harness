@@ -1219,3 +1219,106 @@ QUALIFIED. Remaining BEFORE macOS acceptance can be declared:
    Config-pure, Behaviour, QualificationProbes; Actor's two legs).
 5. Xcode 26.6 debug-config SIGBUS — use `-c release` for macOS test
    evidence until the toolchain issue is dispositioned.
+
+## 16. M4-MAC-02 — Darwin input-path correction (authorized narrow production fix)
+
+Directive: root-cause and fix C1 (idle Ctrl+C) / C2 (empty-line
+Ctrl+D), correct the echo oracle, include the IEXTEN termios delta,
+diagnose dispatch timing (D), provision rg/tmux, finish native
+acceptance. No M5, no scope expansion.
+
+### 16.1 Root cause (native, instrumented, sampled)
+
+Instrumented the input path (temporary env-gated diagnostics, removed
+post-investigation) and sampled hung children with source-line
+symbols. The chain through the bound key handler is CORRECT on Darwin
+(byte 0x03 → mapped control('C') → handler → .exit → BAIL — traced
+end-to-end). The hang is in the unwind: **every raw-mode transition —
+the per-keystroke IOModeGuard re-apply around the modify callback AND
+the read-loop unwind — calls tcsetattr(0, TCSADRAIN, ...), and on
+Darwin that waits for the tty output queue to settle. The composer
+output pipeline (writer thread + per-event renders) keeps the queue
+fed, so the transition blocks indefinitely**; the loop then re-blocks
+in read_char (sampled: input thread in wait_for_input/select after
+the handler returned BAIL; main thread alive on the shutdown
+semaphore). Non-deterministic from the outside (hangs exactly when
+output was in flight) — which is why manual probes sometimes passed
+and in-suite runs always failed. **Finding D is the same defect**: the
+per-keystroke IOModeGuard drains stalled input processing, producing
+the 20-40 s first-dispatch latencies that exhausted the 20 s gate
+budgets.
+
+### 16.2 Corrections (our layers + one sanctioned upstream patch)
+
+1. **`0002-darwin-raw-mode-transitions-tcsanow.patch`** (vendored
+   replxx, `__APPLE__`-scoped, registered per the provenance model —
+   vendor-check passes offline (R)+(F) and clone): raw-mode
+   transitions use TCSANOW on Darwin; other platforms keep TCSADRAIN.
+   TCSANOW applies immediately; queued output was already processed
+   under the flags in effect at write time.
+2. **`TerminalOutputOwner.quiesce()`**: stops queued + future
+   emissions; ChatLoop calls it before every BAIL (Ctrl+C exit, and
+   the new Ctrl+D binding) so the unwind runs against a quiet tty.
+3. **Ctrl+D bound in ChatLoop** (replaces replxx's default send_eof):
+   empty buffer → quiesce + abort (the C2 path, symmetric with C1);
+   non-empty → delete-forward via get/set_state, preserving the
+   default semantics.
+4. **`restoreSaneTermios()` restores the terminal's own pre-raw
+   state** (lflag/oflag/iflag captured at session init): IEXTEN is
+   restored exactly (raw-mode entry clears it; the synthetic sane
+   subset dropped it — the post-SIGTERM lflag delta). OR-ed sane
+   subset (incl. IEXTEN) remains as fallback.
+5. **Echo oracle replaced**: the shim keeps the slave fd open in the
+   parent (never used for I/O) and exposes `nt_pty_slave_termios` +
+   `nt_pty_have_initial_termios`; the driver oracle compares the
+   post-exit slave termios EXACTLY (lflag/iflag/oflag/cflag) against
+   the spawn-time capture — the initial-versus-final comparison the
+   acceptance requires, which also catches partial restores such as a
+   dropped IEXTEN. The old post-mortem echo-probe could never observe
+   a torn-down pty on Darwin and mis-measured every restore as failed
+   (11 false failures).
+6. **`dev vendor-check` scoping fix**: its temp `git apply` ran inside
+   the real repo and silently no-oped (a/ b/ paths resolved against
+   the repo root); the temp dir is now its own repository so patch
+   verification is contained and real.
+
+### 16.3 Native verification (macOS 26.7.1 Intel)
+
+- C1 probe (0x03 at idle, post-fix binary): exits cleanly, no orphan.
+- C2 probe (0x04 on empty line): exits cleanly, no orphan.
+- In-suite post-fix run (before the oracle swap): exit-path collapse —
+  PTY-01 15.9 s → **2.9 s**, PTY-04 21 s → **4.9 s**, PTY-02 53 s →
+  **33 s with the gate ARMING** (finding D's latency GONE — the TCSANOW
+  patch removed the per-keystroke stalls). Every remaining failure was
+  exactly one issue: the invalid post-mortem oracle (11 legs), now
+  replaced.
+- PTY-04 zero-render anomaly: did not recur post-fix (the leg's only
+  failure was the oracle), consistent with the stalls having been the
+  cause.
+- Suite-level rerun after the oracle swap: **BLOCKED by host
+  infrastructure** — the host's swift-testing launch path degraded
+  mid-session (the toolchain helper spawns the runner, the runner dies
+  at spawn — the SIGBUS family seen earlier — and the helper waits in
+  `__wait4` forever; reproduced in release and debug configs, after
+  full process cleanup, at load average 1.5; earlier the same host ran
+  three full suites). Host remediation (reboot / toolchain reset) is
+  operator-side; the rerun is one command on the fixed tree.
+
+### 16.4 Remaining macOS acceptance steps
+
+1. Host remediation → rerun `swift test -c release --filter
+   ChatPTYTests` (and the debug fallback if the helper still wedges):
+   expected green on all exit-path legs with the exact-restore oracle.
+2. Provision rg (pinned release binary) + tmux; rerun the B2 search
+   evidence legs + the PTY-08 real-tmux leg.
+3. Complete ProviderIntegration / Provider / Config-pure / Behaviour /
+   QualificationProbes lanes (release config; Actor's two outOfScript
+   legs expected green post-0002 — same stall class).
+4. Linux regression qualification (CI on the fix commits).
+5. Sonar dispositions (unchanged, §14).
+
+Freeze accounting: NeedletailTerminal, NeedletailLineEditor,
+NeedletailCLI untouched by the freeze contract (Core/Runtime hold —
+re-verified: the only Core delta remains the accepted
+`queue-reorder-rank-exhausted` guard). Vendored replxx changes are
+confined to the registered patch.
