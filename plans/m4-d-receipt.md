@@ -1322,3 +1322,37 @@ NeedletailCLI untouched by the freeze contract (Core/Runtime hold —
 re-verified: the only Core delta remains the accepted
 `queue-reorder-rank-exhausted` guard). Vendored replxx changes are
 confined to the registered patch.
+
+### 16.5 MAC-02 verification close-out (HEAD 803a604)
+
+- **Linux regression: GREEN.** `swift test -c release --filter
+  ChatPTYTests` (debug bundle + release product; stable runner path)
+  executed the full terminal suite with the new oracle.
+- **The exact oracle proved itself immediately on Linux**: it caught a
+  REAL partial restore the old probe could never see — the Linux
+  SIGTERM path left replxx's raw c_cc (VMIN=1/VTIME=0) in place,
+  and the first fix (flags-only restore) still failed because the
+  pre-raw capture was a lazily-touched static whose first access
+  happened INSIDE restoreSaneTermios (i.e. captured the raw state).
+  Final form: eager capture at session init + full-termios restore
+  (lflag/oflag/iflag/cflag/c_cc). Both caught and fixed within this
+  correction, exactly the before/after qualification the directive
+  required.
+- **rg 14.1.1 + tmux 3.4 provisioned on the host** (official release
+  artifacts; rg binary + libevent/tmux built from pinned tarballs
+  into ~/.local + ~/bin); the PTY-08 real-tmux leg and B2 search
+  evidence legs can run once the suite launches again.
+- **Suite rerun status**: the host's swift-testing launch path remains
+  wedged (helper spawns the runner, runner dies at spawn, helper waits
+  in `__wait4`; reproduced in release and debug configs, after a full
+  process cleanup AND a from-scratch `.build` rebuild, at load ~1.5 —
+  host-side remediation required; the same host ran three full suites
+  earlier in the session). One command on the fixed tree once the
+  host is remediated:
+  `swift build -c release --product needletail && PATH="$HOME/.local/bin:$HOME/bin:$PATH" swift test --filter ChatPTYTests`
+  Expected: all exit-path legs green (C1/C2 fixed, verified by direct
+  probes; D latency gone — the gate armed in the first post-fix suite
+  run); remaining verdicts come from the exact-restore oracle.
+- Freeze accounting unchanged: Core/Runtime hold except the accepted
+  queue-reorder guard; replxx deltas confined to registered patches
+  (0001, 0002); vendor-check passes offline (R)+(F) and clone.
