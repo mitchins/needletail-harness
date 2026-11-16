@@ -1390,8 +1390,8 @@ one-at-a-time suite invocations.
 
 **Verdict: macOS qualification remains HOST-BLOCKED (environment,
 not product).** Operator remediation: reboot the Mac (or reset the
-Xcode 26.6 toolchain), then run /tmp/nb-matrix.sh (deployed) — it
-executes the control + all twelve lanes in release config and writes
+Xcode 26.6 toolchain), then run ~/nb-matrix.sh (persisted in the
+operator home; a copy also at /tmp/nb-matrix.sh) — it executes the control + all twelve lanes in release config and writes
 /tmp/matrix-summary.log. No code changes are needed or pending for
 the macOS verdict; Linux carries the identical suite + oracle green
 at this HEAD.
