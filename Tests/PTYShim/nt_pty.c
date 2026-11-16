@@ -164,6 +164,20 @@ int nt_pty_have_initial_termios(nt_pty_t *pty) {
     return (pty != NULL && pty->haveSavedTermios) ? 1 : 0;
 }
 
+/* M4-MAC-02: exact restoration verdict — full struct comparison (a
+ * Swift-side field list missed c_cc, the exact class of partial
+ * restore — raw VMIN/VTIME — that motivated this oracle). */
+int nt_pty_termios_restored_exactly(nt_pty_t *pty) {
+    if (pty == NULL || !pty->haveSavedTermios || pty->slaveFd < 0) {
+        return -1;
+    }
+    struct termios current;
+    if (tcgetattr(pty->slaveFd, &current) != 0) {
+        return -1;
+    }
+    return memcmp(&current, &pty->savedSlaveTermios, sizeof(struct termios)) == 0 ? 1 : 0;
+}
+
 int nt_pty_signal(nt_pty_t *pty, int sig) {
     if (pty == NULL || pty->childPid <= 0) {
         return -1;

@@ -178,6 +178,20 @@ public final class LineEditorSession: @unchecked Sendable {
     public static var upKeyCode: Int32 { Int32(REPLXX_KEY_UP) }
     public static var downKeyCode: Int32 { Int32(REPLXX_KEY_DOWN) }
 
+    /// Live buffer emptiness, read on the INPUT THREAD only (safe:
+    /// get_state is lock-free and this is the thread replxx_input runs
+    /// on). The mirror (`draftNonEmpty`) lags — it reflects the last
+    /// syncMirror, and confirmation flows suppress mirror updates —
+    /// so exit decisions must consult the live buffer (M4-MAC-02
+    /// review: a stale-empty mirror could abort readLine with an
+    /// unsent draft).
+    public func currentBufferIsEmpty() -> Bool {
+        var state = ReplxxState(text: nil, cursorPosition: 0)
+        replxx_get_state(handle, &state)
+        guard let t = state.text else { return true }
+        return String(cString: t).isEmpty
+    }
+
     /// Deletes the character under the cursor (M4-MAC-02: our Ctrl+D
     /// binding must reproduce replxx's default send_eof non-empty
     /// semantics — delete forward — because binding the key replaces

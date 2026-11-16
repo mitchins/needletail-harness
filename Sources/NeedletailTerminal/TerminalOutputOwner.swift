@@ -70,6 +70,15 @@ public final class TerminalOutputOwner: @unchecked Sendable {
         pendingControl.removeAll()
         pendingProgress = nil
         work.broadcast()
+        // Wait out the batch the writer may have already captured and
+        // be writing off-lock: quiesce is called before terminal
+        // restoration, and a batch in flight would still hit the tty
+        // during the unwind. The writer broadcasts after each batch
+        // (writes to the pty complete promptly — the test driver
+        // reads continuously), so this wait is bounded in practice.
+        while inFlight > 0 {
+            work.wait()
+        }
         work.unlock()
     }
     private var finished = false
@@ -188,6 +197,7 @@ public final class TerminalOutputOwner: @unchecked Sendable {
     public func setProgress(_ text: String?, generation: UInt64) {
         work.lock()
         defer { work.unlock() }
+        if quiesced { return }
         guard generation == self.generation, caps.cursorAddressing, caps.color else { return }
         if text != nil {
             let current = now()

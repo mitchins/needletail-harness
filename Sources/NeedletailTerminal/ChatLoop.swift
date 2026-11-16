@@ -395,7 +395,11 @@ public final class ChatLoop: @unchecked Sendable {
         // replxx's delete-forward semantics.
         lineEditor.bindKey(code: LineEditorSession.ctrlDKeyCode) { [weak self] in // Ctrl+D
             guard let self else { return .continue }
-            if self.lock.withLock({ self.draftNonEmpty }) {
+            // Live-buffer check (input thread): the mirror can lag the
+            // current replxx buffer (main-loop deferral; confirmation
+            // flows suppress mirrors) — a stale-empty mirror would
+            // abort and drop an unsent draft.
+            if !self.lineEditor.currentBufferIsEmpty() {
                 self.lineEditor.deleteForwardCharacter()
                 return .continue
             }

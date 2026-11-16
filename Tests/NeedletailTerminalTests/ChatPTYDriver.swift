@@ -222,19 +222,10 @@ final class ChatPTYDriver {
     /// restores (e.g. a dropped IEXTEN), per the release-acceptance
     /// requirement.
     func termiosRestoredExactly() -> Bool {
-        guard nt_pty_have_initial_termios(&pty) == 1 else { return false }
-        var initial = termios()
-        var current = termios()
-        // Initial capture lives in the shim; fetch it by re-reading the
-        // saved copy through a dedicated accessor is unnecessary: the
-        // comparison target is the SAVED spawn-time state, exposed via
-        // the same accessor pattern below.
-        guard nt_pty_slave_termios(&pty, &current) == 0 else { return false }
-        initial = pty.savedSlaveTermios
-        return initial.c_lflag == current.c_lflag
-            && initial.c_iflag == current.c_iflag
-            && initial.c_oflag == current.c_oflag
-            && initial.c_cflag == current.c_cflag
+        // Full-struct comparison in the shim (c_cc included — a field
+        // list missed exactly the raw VMIN/VTIME class of partial
+        // restore this oracle exists to catch).
+        return nt_pty_termios_restored_exactly(&pty) == 1
     }
 
     func stop() {
