@@ -1395,3 +1395,63 @@ operator home; a copy also at /tmp/nb-matrix.sh) — it executes the control + a
 /tmp/matrix-summary.log. No code changes are needed or pending for
 the macOS verdict; Linux carries the identical suite + oracle green
 at this HEAD.
+
+### 16.7 Post-reboot qualification (final)
+
+Operator rebooted the host. Control lane **PASS** (ChatWidthTests
+6/6, rc=0) on the fresh boot. The twelve-lane matrix then ran; the
+runner-exit wedge RECURRED and is now fully characterized:
+
+- **Every child-spawning suite runs its tests to completion (results
+  stream to the per-lane log) and then wedges: the runner enters
+  exit-blocked limbo (STAT ?NEs, unsampleable even by sudo sample and
+  invisible to lsof) and `swiftpm-testing-helper` waits in `__wait4`
+  forever.** The wedge survives a full OS reboot, a from-scratch
+  `.build`, release and debug configs, and `--disable-xctest`. The
+  no-child-spawning control passes every time.
+- Matrix results (harvested from the per-lane logs; rc missing where
+  the runner wedged at exit): ChatWidth 6/6 ✓; **ConfigTests 77/77 ✓;
+  PresentationTests 102/102 ✓; StateTests 105/105 ✓;
+  ProviderTests 34/34 ✓; ConfigIntegrationTests 21/21 ✓;
+  BehaviourTests 28/28 ✓; QualificationProbes 5/5 ✓** (all release);
+  ActorTests 63/65 (two loopback legs outOfScript at 60 s); ChatPTYTests
+  PTY-01 **did not exit after idle-empty Ctrl+C in-suite** (recorded
+  twice — the in-suite exit remains NONDETERMINISTIC across runs even
+  with 0002 + quiesce: the same leg exited in 2.9 s in an earlier
+  post-fix suite run and in every manual probe); ProviderIntegration
+  lane died with the helper wedge; PrimitiveTests killed mid-run by
+  process cleanup — its visible failures were the rg-missing B2 legs.
+- **rg cannot be provisioned for the search-evidence legs on this
+  host**: the product's sanitized search PATH is pinned to
+  /usr/bin:/bin by design (fail-closed) and macOS SIP makes both
+  read-only. The B2 legs' loud failure is the CORRECT product
+  behavior; the legs are environment-blocked pending an operator
+  decision on rg placement (SIP/configuration change — outside this
+  correction).
+
+### 16.8 Final verdict (M4-MAC-02)
+
+FIXED AND NATIVELY VERIFIED: C1/C2 manual-probe exits (deterministic
+pre-fix hangs → clean exits), D dispatch latency (0002 removed the
+per-keystroke drains — the PTY-02 gate armed and latencies collapsed
+in the post-fix suite run), the oracle replacement, the IEXTEN-precise
+restoration, Linux green at HEAD (offline gate + terminal suite + the
+exact oracle).
+
+UNRESOLVED (each precisely scoped, none partially fixed):
+1. **In-suite exit nondeterminism**: PTY-01's idle Ctrl+C exit hangs
+   in some in-suite runs and succeeds in others (and in every manual
+   probe). All fixes so far addressed the identified deadlock; a
+   residual race remains — sample next occurrence (the process tree
+   was cleared before a sample could be captured this run).
+2. **Xcode 26.6 helper/runner exit-limbo** (infrastructure): blocks
+   suite-level result reporting on this host. Operator remediation
+   (reboot did NOT clear it; toolchain reset or runner bypass is
+   required).
+3. rg placement decision (SIP) for the search-evidence legs.
+4. Actor's two outOfScript legs (60 s budgets) — retest after 1.
+
+MERGE verdict: **HOLD** — macOS native acceptance cannot be declared
+with the in-suite exit nondeterminism unresolved and the suite-level
+reporting blocked; Linux remains green at HEAD (offline gate +
+terminal suite + oracle).
