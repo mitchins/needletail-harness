@@ -257,6 +257,7 @@ int Terminal::enable_raw_mode( void ) {
 }
 
 int Terminal::reset_raw_mode( void ) {
+	int _rv = 0;
 	if ( ! _rawMode ) {
 		return ( -1 );
 	}
@@ -278,14 +279,23 @@ int Terminal::reset_raw_mode( void ) {
 	 * unwind) can block indefinitely. TCSANOW applies the flags
 	 * immediately; output already queued was processed under the
 	 * flags in effect when it was written. */
-	return ( tcsetattr( 0, TCSANOW, &_rawModeTermios ) );
+	/* needletail local patch (0003): a signal delivery can EINTR the
+	 * transition; silently failing leaves the terminal raw forever. */
+	do {
+		_rv = tcsetattr( 0, TCSANOW, &_rawModeTermios );
+	} while ( _rv == -1 && errno == EINTR );
+	return ( _rv );
 #else
-	return ( tcsetattr( 0, TCSADRAIN, &_rawModeTermios ) );
+	do {
+		_rv = tcsetattr( 0, TCSADRAIN, &_rawModeTermios );
+	} while ( _rv == -1 && errno == EINTR );
+	return ( _rv );
 #endif
 #endif
 }
 
 void Terminal::disable_raw_mode(void) {
+	int _rv = 0;
 	if ( ! _rawMode ) {
 		return;
 	}
@@ -297,13 +307,21 @@ void Terminal::disable_raw_mode(void) {
 #else
 	_terminal_ = nullptr;
 #if defined(__APPLE__)
-	/* needletail local patch (0002): see reset_raw_mode — TCSADRAIN
-	 * livelocks against a concurrent renderer on a Darwin pty. */
-	if ( tcsetattr( 0, TCSANOW, &_origTermios ) == -1 ) {
+	/* needletail local patch (0002)+(0003): TCSANOW on Darwin (0002);
+	 * EINTR retry — a swallowed tcsetattr failure leaves the terminal
+	 * RAW forever (observed: in-suite exit nondeterminism; the unwind
+	 * completed but the restore was EINTR'd). */
+	do {
+		_rv = tcsetattr( 0, TCSANOW, &_origTermios );
+	} while ( _rv == -1 && errno == EINTR );
+	if ( _rv == -1 ) {
 		return;
 	}
 #else
-	if ( tcsetattr( 0, TCSADRAIN, &_origTermios ) == -1 ) {
+	do {
+		_rv = tcsetattr( 0, TCSADRAIN, &_origTermios );
+	} while ( _rv == -1 && errno == EINTR );
+	if ( _rv == -1 ) {
 		return;
 	}
 #endif

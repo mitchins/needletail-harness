@@ -70,14 +70,22 @@ public final class TerminalOutputOwner: @unchecked Sendable {
         pendingControl.removeAll()
         pendingProgress = nil
         work.broadcast()
-        // Wait out the batch the writer may have already captured and
-        // be writing off-lock: quiesce is called before terminal
-        // restoration, and a batch in flight would still hit the tty
-        // during the unwind. The writer broadcasts after each batch
-        // (writes to the pty complete promptly — the test driver
-        // reads continuously), so this wait is bounded in practice.
-        while inFlight > 0 {
-            work.wait()
+        // Wait — BOUNDED — for the batch the writer may have already
+        // captured: a batch in flight would otherwise still hit the tty
+        // during the unwind. The wait CANNOT be unbounded: the writer's
+        // writes go through replxx's notification pipe, which the
+        // CALLING thread (input) drains — a full pipe plus an
+        // unbounded wait is exactly the circular wait this method must
+        // not create (observed: the terminal left raw at a forced
+        // exit, because the unwind never ran). 500 ms bounds the
+        // straggler batch; anything still writing is abandoned and the
+        // BAIL unwind (instant TCSANOW restore) proceeds.
+        var waitedMs = 0
+        while inFlight > 0 && waitedMs < 500 {
+            work.unlock()
+            usleep(10_000)
+            waitedMs += 10
+            work.lock()
         }
         work.unlock()
     }

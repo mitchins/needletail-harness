@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -200,7 +201,29 @@ int nt_pty_termios_restored_exactly(nt_pty_t *pty) {
     if (tcgetattr(pty->slaveFd, &current) != 0) {
         return -1;
     }
-    return termios_equal_meaningful(&current, &pty->savedSlaveTermios);
+    int verdict = termios_equal_meaningful(&current, &pty->savedSlaveTermios);
+    if (verdict != 1) {
+        int fd = open("/tmp/nb-td.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf), "saved: l=%lx i=%lx o=%lx c=%lx cc[VT]=%x cc[VM]=%x\n",
+                (unsigned long)pty->savedSlaveTermios.c_lflag,
+                (unsigned long)pty->savedSlaveTermios.c_iflag, (unsigned long)pty->savedSlaveTermios.c_oflag,
+                (unsigned long)pty->savedSlaveTermios.c_cflag,
+                (unsigned)pty->savedSlaveTermios.c_cc[VTIME], (unsigned)pty->savedSlaveTermios.c_cc[VMIN]);
+            ssize_t w1 = write(fd, buf, (size_t)n);
+            (void)w1;
+            n = snprintf(buf, sizeof(buf), "curr : l=%lx i=%lx o=%lx c=%lx cc[VT]=%x cc[VM]=%x\n",
+                (unsigned long)current.c_lflag,
+                (unsigned long)current.c_iflag, (unsigned long)current.c_oflag,
+                (unsigned long)current.c_cflag,
+                (unsigned)current.c_cc[VTIME], (unsigned)current.c_cc[VMIN]);
+            ssize_t w2 = write(fd, buf, (size_t)n);
+            (void)w2;
+            close(fd);
+        }
+    }
+    return verdict;
 }
 
 int nt_pty_signal(nt_pty_t *pty, int sig) {

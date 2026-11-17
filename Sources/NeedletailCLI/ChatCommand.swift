@@ -85,6 +85,7 @@ struct ChatCommand: ParsableCommand {
             let value = DispatchSemaphore(value: 0)
             func signal() { value.signal() }
             func wait() { value.wait() }
+            func wait(until deadline: DispatchTime) -> DispatchTimeoutResult { value.wait(timeout: deadline) }
         }
         let box = Box()
         let semBox = SemBox()
@@ -107,7 +108,25 @@ struct ChatCommand: ParsableCommand {
             }
             semBox.signal()
         }
-        semBox.wait()
+        // Bounded graceful shutdown (M4-MAC-03): Ctrl+C-cancelled
+        // in-flight runs can leave the post-loop teardown (transport /
+        // actor cleanup) blocked on some platforms — reproduced
+        // deterministically on Linux after cancelling an actively
+        // streaming request. By this point the terminal is already
+        // restored (replxx's readLine unwind precedes teardown) and the
+        // durable store fsyncs its own writes, so a timed-out graceful
+        // wait exits forcefully with the recorded conventional code
+        // instead of hanging the terminal. _exit (no stdio flush) per
+        // the PTY-08 stream-lock note.
+        let graceful = semBox.wait(until: .now() + 5)
+        if graceful == .timedOut {
+            let forced = box.lock.withLock { box.exitCode }
+#if canImport(Glibc)
+            Glibc._exit(Int32(forced))
+#elseif canImport(Darwin)
+            Darwin._exit(Int32(forced))
+#endif
+        }
         let (code, err) = box.lock.withLock { (box.exitCode, box.error) }
         if let error = err {
             eprint("chat failed: \(terminalSafe(String(describing: error)))")
