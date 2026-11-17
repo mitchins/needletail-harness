@@ -432,6 +432,17 @@ public final class ChatLoop: @unchecked Sendable {
         let thread = Thread {
             while true {
                 let line = editor.readLine(prompt: "needletail> ")
+                // M4-MAC-03: after the unwind completes (readLine
+                // returned), enforce the captured pre-raw state as the
+                // LAST terminal transition. On cancel-then-exit paths
+                // the slave termios was observed to end at replxx's
+                // RAW configuration despite the unwind's own restore —
+                // a late IOModeGuard re-apply supersedes it. Our exact
+                // restore (captured full termios, TCSANOW) is safe here:
+                // this is the input thread, after readLine returned.
+                if line == nil {
+                    editor.restoreSaneTermios()
+                }
                 // Commit every accepted non-empty line to history
                 // on the input thread (M4-D D7 review B2): replxx
                 // itself only stages a scratch entry per read — the
