@@ -222,9 +222,9 @@ final class ChatPTYDriver {
     /// restores (e.g. a dropped IEXTEN), per the release-acceptance
     /// requirement.
     func termiosRestoredExactly() -> Bool {
-        // Full-struct comparison in the shim (c_cc included — a field
-        // list missed exactly the raw VMIN/VTIME class of partial
-        // restore this oracle exists to catch).
+        // Meaningful-settings comparison in the shim (M4-MAC-03): all
+        // flags, every control character (VMIN/VTIME included) and
+        // speeds — no struct padding involvement.
         return nt_pty_termios_restored_exactly(&pty) == 1
     }
 

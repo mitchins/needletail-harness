@@ -266,8 +266,7 @@ public final class LineEditorSession: @unchecked Sendable {
         // delta the macOS matrix surfaced) plus every other original
         // local flag, instead of an approximation. The OR-ed sane
         // subset remains as the fallback when no capture exists.
-        if Self.haveOriginalTermios {
-            let saved = Self.originalTermios
+        if let saved = Self.originalTermios {
             // The exact-restore oracle (M4-MAC-02) caught the Linux
             // SIGTERM path leaving replxx's raw c_cc (VMIN=1/VTIME=0)
             // in place: restore the captured control characters and
@@ -291,28 +290,28 @@ public final class LineEditorSession: @unchecked Sendable {
     }
 
     /// The stdin termios captured at session init, before raw mode.
-    /// `nil` when stdin is not a TTY or the capture failed. Immutable
-    /// after init (let) — concurrency-safe shared state.
-    private static let originalTermios: termios = {
-        let fd: Int32 = STDIN_FILENO
-        var t = termios()
-        guard isatty(fd) != 0, tcgetattr(fd, &t) == 0 else { return t }
-        return t
-    }()
-    private static let haveOriginalTermios: Bool = {
-        let fd: Int32 = STDIN_FILENO
-        return isatty(fd) != 0
-    }()
+    /// `nil` = no valid capture (not a TTY, or tcgetattr failed) — the
+    /// restore path then uses the sane fallback. One optional value:
+    /// a failed capture can never masquerade as a zero-initialized
+    /// snapshot (M4-MAC-03 finding A). Immutable after init.
+    private static let originalTermios: termios? = captureTermiosFrom(fd: STDIN_FILENO)
 
     /// Captures the pre-raw stdin state. MUST run before the first
-    /// readLine: `originalTermios` is a lazily-initialized static, and
-    /// a first touch inside restoreSaneTermios would capture the RAW
-    /// state (the exact-restore oracle caught exactly that on the
-    /// Linux SIGTERM path — post-exit c_cc still held replxx's
-    /// VMIN=1/VTIME=0).
+    /// readLine (`originalTermios` is a lazily-initialized static; a
+    /// first touch inside restoreSaneTermios would capture the RAW
+    /// state — the exact-restore oracle caught exactly that on the
+    /// Linux SIGTERM path).
     static func captureOriginalTermios() {
         _ = originalTermios
-        _ = haveOriginalTermios
+    }
+
+    /// fd-parameterized so tests can exercise the failure path (a
+    /// non-TTY descriptor yields nil).
+    static func captureTermiosFrom(fd: Int32) -> termios? {
+        guard isatty(fd) != 0 else { return nil }
+        var t = termios()
+        guard tcgetattr(fd, &t) == 0 else { return nil }
+        return t
     }
 
     /// History snapshot, oldest-first (M4-D D2.7 hygiene probe). Thin

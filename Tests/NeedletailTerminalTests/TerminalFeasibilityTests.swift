@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import PTYShim
+@testable import NeedletailLineEditor
 
 /// M0-C feasibility scenario — ONE bounded Linux PTY exercise (TESTING §7).
 /// It proves the vendored line editor can: stay live while synthetic
@@ -325,4 +326,104 @@ struct ExitStatusDecodingTests {
         #expect(!isCleanExitStatus(256), "exit code 1 (0x100) must not pass")
         #expect(!isCleanExitStatus(0x7F00), "stopped state must not pass")
     }
+
+// M4-MAC-03 finding C: the exact-restoration comparator must catch
+// partial restores — control-character flips (VMIN/VTIME) and local-
+// flag flips (IEXTEN) — independent of struct padding. VMIN/VTIME
+// indices come from the platform constants, not literals.
+@Test("MAC-03 oracle: comparator catches VMIN/VTIME and IEXTEN regressions")
+func mac03TermiosComparatorProof() {
+    var base = termios()
+    var same = base
+    #expect(nt_pty_termios_equal(&base, &same) == 1, "identical states must compare equal")
+
+    // IEXTEN regression (local flag).
+    var iextenOff = base
+    iextenOff.c_lflag &= ~tcflag_t(IEXTEN)
+    #expect(nt_pty_termios_equal(&base, &iextenOff) == 0, "dropped IEXTEN must be caught")
+
+    // VMIN regression (control character).
+    var vminChanged = base
+    withUnsafeMutableBytes(of: &vminChanged.c_cc) { raw in
+        let old = raw[Int(VMIN)]
+        raw[Int(VMIN)] = old == 5 ? 2 : 5
+    }
+    #expect(nt_pty_termios_equal(&base, &vminChanged) == 0, "changed VMIN must be caught")
+
+    // VTIME regression (control character).
+    var vtimeChanged = base
+    withUnsafeMutableBytes(of: &vtimeChanged.c_cc) { raw in
+        let old = raw[Int(VTIME)]
+        raw[Int(VTIME)] = old == 5 ? 2 : 5
+    }
+    #expect(nt_pty_termios_equal(&base, &vtimeChanged) == 0, "changed VTIME must be caught")
+
+    // Speeds (carried in c_cflag on both targets): a c_cflag flip must
+    // be caught (and is covered by the flag comparison above — assert
+    // the field itself differs so the verdict is meaningful).
+    var cflagChanged = base
+    cflagChanged.c_cflag |= tcflag_t(CS8)
+    if base.c_cflag != cflagChanged.c_cflag {
+        #expect(nt_pty_termios_equal(&base, &cflagChanged) == 0, "changed c_cflag must be caught")
+    }
+}
+
+    // M4-MAC-03 finding A: a failed termios capture yields nil (never a
+    // zero-initialized "valid" snapshot). A pipe is not a TTY — the
+    // capture must refuse it; a real pty slave must capture.
+    @Test("MAC-03 capture: non-TTY refused, real pty captured")
+    func mac03CaptureRefusesNonTTY() {
+        var fds: [Int32] = [-1, -1]
+        let rc = pipe(&fds)
+        #expect(rc == 0)
+        defer { close(fds[0]); close(fds[1]) }
+        #expect(LineEditorSession.captureTermiosFrom(fd: fds[0]) == nil,
+                "a pipe capture must fail closed (nil), not produce a zero snapshot")
+        // A real pty slave: valid capture (non-nil). Spawn a trivial
+        // child through the shim so the suite owns a genuine pty.
+        var pty = nt_pty_t()
+        let truePath = "/usr/bin/true"
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(truePath), nil]
+        let spawnRC = nt_pty_spawn(&pty, &argv)
+        argv.forEach { $0?.deallocate() }
+        #expect(spawnRC == 0)
+        if spawnRC == 0 {
+            defer { nt_pty_close(&pty) }
+            let sfd = nt_pty_slave_fd(&pty)
+            #expect(sfd >= 0)
+            if sfd >= 0 {
+                let captured = LineEditorSession.captureTermiosFrom(fd: sfd)
+                #expect(captured != nil, "a real pty slave must capture")
+                if let c = captured {
+                    #expect((c.c_lflag & tcflag_t(ICANON)) != 0, "a fresh pty starts canonical")
+                }
+            }
+        }
+    }
+
+    // M4-MAC-03 finding B regression: Ctrl+C during concurrent streamed
+    // output with the writer actively batching (notification-pipe
+    // backpressure window) must still exit cleanly — the quiesce-then-
+    // BAIL ordering removed the writer/input circular wait.
+    @Test("MAC-03 Ctrl+C exits under concurrent output backpressure")
+    func mac03CtrlCUnderBackpressure() async throws {
+        let env = try ChatPTYTests.makeEnv(withServer: true, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+        defer { ChatPTYTests.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+        guard let server = env.server else { Issue.record("no loopback"); return }
+        server.enqueue(ChatLoopback.textTurn("backpressure stream", splits: 40))
+        let driver = ChatPTYDriver(
+            executable: ChatPTYTests.releaseBinary(),
+            args: ["chat", "--config", env.configPath],
+            extraEnv: ChatPTYTests.childEnv(env))
+        defer { driver.stop() }
+        guard driver.start() else { Issue.record("pty spawn failed"); return }
+        driver.expect("needletail> ", timeoutMS: 30_000)
+        driver.send("stream it\r")
+        driver.expect("backpressure stream", timeoutMS: 20_000)
+        driver.send([3])
+        let status = driver.waitExit(timeoutMS: 15_000)
+        #expect(status != nil, "Ctrl+C during active streamed output must exit")
+        #expect(driver.termiosRestoredExactly(), "terminal must restore exactly under backpressure")
+    }
+
 }

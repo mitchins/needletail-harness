@@ -164,9 +164,34 @@ int nt_pty_have_initial_termios(nt_pty_t *pty) {
     return (pty != NULL && pty->haveSavedTermios) ? 1 : 0;
 }
 
-/* M4-MAC-02: exact restoration verdict — full struct comparison (a
- * Swift-side field list missed c_cc, the exact class of partial
- * restore — raw VMIN/VTIME — that motivated this oracle). */
+int nt_pty_slave_fd(nt_pty_t *pty) {
+    return (pty != NULL) ? pty->slaveFd : -1;
+}
+
+/* M4-MAC-03 finding C: compare MEANINGFUL terminal settings only —
+ * all four flag fields, every control character, and both speeds.
+ * No memcmp: struct padding is unspecified and could make the verdict
+ * depend on bytes that are not terminal state at all. */
+static int termios_equal_meaningful(const struct termios *a, const struct termios *b) {
+    if (a->c_iflag != b->c_iflag) return 0;
+    if (a->c_oflag != b->c_oflag) return 0;
+    if (a->c_cflag != b->c_cflag) return 0;
+    if (a->c_lflag != b->c_lflag) return 0;
+    for (int i = 0; i < NCCS; i++) {
+        if (a->c_cc[i] != b->c_cc[i]) return 0;
+    }
+    if (cfgetispeed(a) != cfgetispeed(b)) return 0;
+    if (cfgetospeed(a) != cfgetospeed(b)) return 0;
+    return 1;
+}
+
+/* 1 = equal, 0 = differ (M4-MAC-03 regression-provable: flips of
+ * VMIN/VTIME (c_cc) or IEXTEN (c_lflag) change the verdict). */
+int nt_pty_termios_equal(struct termios *a, struct termios *b) {
+    return termios_equal_meaningful(a, b);
+}
+
+/* M4-MAC-02: exact restoration verdict — full meaningful comparison. */
 int nt_pty_termios_restored_exactly(nt_pty_t *pty) {
     if (pty == NULL || !pty->haveSavedTermios || pty->slaveFd < 0) {
         return -1;
@@ -175,7 +200,7 @@ int nt_pty_termios_restored_exactly(nt_pty_t *pty) {
     if (tcgetattr(pty->slaveFd, &current) != 0) {
         return -1;
     }
-    return memcmp(&current, &pty->savedSlaveTermios, sizeof(struct termios)) == 0 ? 1 : 0;
+    return termios_equal_meaningful(&current, &pty->savedSlaveTermios);
 }
 
 int nt_pty_signal(nt_pty_t *pty, int sig) {

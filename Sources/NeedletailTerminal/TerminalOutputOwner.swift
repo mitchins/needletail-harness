@@ -246,6 +246,15 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             pendingProgress = nil
             inFlight += 1
             work.broadcast() // wake flush()
+            // M4-MAC-03 finding B: a captured batch must NEVER be
+            // written once quiesced. Writing during the BAIL unwind
+            // deadlocks — the writer can block on replxx's notification
+            // pipe, which only the input thread drains, while the input
+            // thread is inside quiesce() waiting for this batch — a
+            // circular wait (the intermittent PTY-01 hang). Drop
+            // instead of writing; quiesce's inFlight wait then always
+            // terminates.
+            if !quiesced {
             work.unlock()
             // Encode + write off-lock; this thread is the only writer.
             if clearBeforeContent {
@@ -277,6 +286,12 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             inFlight -= 1
             work.broadcast()
             work.unlock()
+            } else {
+                work.lock()
+                inFlight -= 1
+                work.broadcast()
+                work.unlock()
+            }
         }
     }
 

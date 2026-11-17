@@ -52,6 +52,11 @@ int nt_pty_wait(nt_pty_t *pty, int timeout_ms);
 int nt_pty_slave_termios(nt_pty_t *pty, struct termios *current);
 /* 1 when the spawn-time initial termios was captured, else 0. */
 int nt_pty_have_initial_termios(nt_pty_t *pty);
+/* The retained slave descriptor (post-exit termios oracle anchor). */
+int nt_pty_slave_fd(nt_pty_t *pty);
+/* M4-MAC-03: meaningful-settings equality (flags, all NCCS control
+ * chars, speeds) — no struct padding involvement. 1 = equal. */
+int nt_pty_termios_equal(struct termios *a, struct termios *b);
 /* 1 when the live slave termios equals the spawn-time capture exactly
  * (full struct memcmp, c_cc included); 0 when it differs; -1 if
  * unavailable. */
