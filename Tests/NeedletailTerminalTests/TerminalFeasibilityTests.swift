@@ -337,10 +337,16 @@ func mac03TermiosComparatorProof() {
     var same = base
     #expect(nt_pty_termios_equal(&base, &same) == 1, "identical states must compare equal")
 
-    // IEXTEN regression (local flag).
+    // IEXTEN regression (local flag). The zero-initialized base has no
+    // flag bits set, so the test RAISES IEXTEN first — a flip from a
+    // flagless base would be a no-op.
+    var iextenOn = base
+    iextenOn.c_lflag |= tcflag_t(IEXTEN)
     var iextenOff = base
+    iextenOff.c_lflag |= tcflag_t(IEXTEN)
     iextenOff.c_lflag &= ~tcflag_t(IEXTEN)
-    #expect(nt_pty_termios_equal(&base, &iextenOff) == 0, "dropped IEXTEN must be caught")
+    #expect(nt_pty_termios_equal(&base, &iextenOn) == 0, "raised IEXTEN must be caught")
+    #expect(nt_pty_termios_equal(&base, &iextenOff) == 1, "flagless states must compare equal")
 
     // VMIN regression (control character).
     var vminChanged = base
