@@ -29,6 +29,23 @@ import NIOCore
 /// Headless `run` is untouched (same binary, separate command).
 /// M4-D owns PTY acceptance, lifecycle/cleanup and release smoke.
 struct ChatCommand: ParsableCommand {
+    /// M4-MAC-03: the composed session's line editor, registered for the
+    /// bounded-shutdown terminal restore (the forced exit must be the
+    /// LAST terminal transition — a resumed replxx write from the output
+    /// thread re-applies raw mode via its IOModeGuard). Lock-guarded,
+    /// @unchecked Sendable, set once per chat invocation.
+    private final class ShutdownEditorBox: @unchecked Sendable {
+        private var editor: LineEditorSession?
+        private let lock = NSLock()
+        func set(_ e: LineEditorSession?) {
+            lock.withLock { editor = e }
+        }
+        func restore() {
+            lock.withLock { editor }?.restoreSaneTermios()
+        }
+    }
+    private static let shutdownEditor = ShutdownEditorBox()
+
     static let configuration = CommandConfiguration(
         commandName: "chat",
         abstract: "Run an interactive terminal session (M4-C adapter).")
@@ -120,11 +137,19 @@ struct ChatCommand: ParsableCommand {
         // the PTY-08 stream-lock note.
         let graceful = semBox.wait(until: .now() + 5)
         if graceful == .timedOut {
-            let forced = box.lock.withLock { box.exitCode }
+            let forcedCode = box.lock.withLock { box.exitCode }
+            Self.shutdownEditor.restore()
+            // Terminal restore is the LAST word before the forced exit:
+            // the output thread's blocked replxx write resumes the
+            // moment the input thread (the notification-pipe reader)
+            // terminates — and a resumed replxx write re-applies raw
+            // mode via its IOModeGuard — so the unwind's earlier restore
+            // can be superseded. Apply the exact captured state here,
+            // after that race window has closed.
 #if canImport(Glibc)
-            Glibc._exit(Int32(forced))
+            Glibc._exit(forcedCode)
 #elseif canImport(Darwin)
-            Darwin._exit(Int32(forced))
+            Darwin._exit(forcedCode)
 #endif
         }
         let (code, err) = box.lock.withLock { (box.exitCode, box.error) }
@@ -803,6 +828,7 @@ struct ChatCommand: ParsableCommand {
             sandboxGrant: sandboxGrant,
             acknowledgedDetermination: acknowledgedDetermination,
             writer: nil)
+        Self.shutdownEditor.set(session.lineEditor)
         // SIGINT → actor cancel (same as `run`); the input thread owns
         // Ctrl+C as a key (raw mode), this is the signal fallback.
 #if canImport(Glibc)
