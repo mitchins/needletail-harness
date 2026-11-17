@@ -426,9 +426,16 @@ func mac03TermiosComparatorProof() {
         driver.expect("needletail> ", timeoutMS: 30_000)
         driver.send("stream it\r")
         driver.expect("backpressure stream", timeoutMS: 20_000)
+        // Ctrl+C at busy CANCELS the run (D2 semantics); the settle-then-
+        // exit sequence then exits at idle. The regression target is the
+        // writer/input interaction during active streamed output — the
+        // cancel exercises exactly that window.
         driver.send([3])
+        if driver.waitExit(timeoutMS: 3_000) == nil {
+            driver.send([3])
+        }
         let status = driver.waitExit(timeoutMS: 15_000)
-        #expect(status != nil, "Ctrl+C during active streamed output must exit")
+        #expect(status != nil, "Ctrl+C settle-then-exit must exit under streamed output")
         #expect(driver.termiosRestoredExactly(), "terminal must restore exactly under backpressure")
     }
 
