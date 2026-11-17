@@ -1455,3 +1455,77 @@ MERGE verdict: **HOLD** — macOS native acceptance cannot be declared
 with the in-suite exit nondeterminism unresolved and the suite-level
 reporting blocked; Linux remains green at HEAD (offline gate +
 terminal suite + oracle).
+
+## 17. M4-MAC-03 — bounded correctness closeout (HEAD fe8d470 → this commit)
+
+Five Codatiel findings dispositioned (all five individual verdicts
+below); three actionable items fixed; targeted native verification
+done on the Mac.
+
+**A — Terminal snapshot (confirmed, FIXED):** the pre-raw capture is
+one optional value (`termios?`); a non-TTY or failed tcgetattr yields
+nil and the restore path takes the sane fallback (IEXTEN included) —
+a failed capture can no longer masquerade as a valid zero snapshot.
+Capture remains eager at session init (before raw mode).
+`captureTermiosFrom(fd:)` is fd-parameterized for the failure-path
+regression: pipe → nil (refused), real pty slave (via the shim) →
+canonical capture. Regression: `mac03CaptureRefusesNonTTY`.
+
+**B — Output-owner deadlock (credible, FIXED):** confirmed as the
+in-suite intermittent PTY-01 hang mechanism — quiesce() waited for
+the writer's in-flight batch while that batch's writes could block on
+replxx's notification pipe, which only the input thread drains — a
+circular wait. Fix: the writer DROPS a captured batch instead of
+writing once quiesced (no tty write, no notification write during the
+unwind; ordering/cleanup semantics unchanged for live operation).
+Regressions: `mac03CtrlCUnderBackpressure` (Ctrl+C during a 40-chunk
+streamed turn → exit + exact restore) and repeated native probes.
+
+**C — Oracle comparator (fixed):** the shim comparator now compares
+MEANINGFUL settings — all four flag fields, every NCCS control
+character, and both speeds — explicitly; no memcmp, no struct-padding
+dependence. Proof regression
+(`mac03TermiosComparatorProof`): identical → equal; IEXTEN flip,
+VMIN flip, VTIME flip, c_cflag flip → each caught (platform-constant
+indices, no literals).
+
+**D — Buffered replxx messages (verified safe):** `finalize_input()`
+drains `_messages` through `_terminal.write8` BEFORE
+`disable_raw_mode()` — pending output always flushes before the mode
+restore. No correctness gap; documentation stands (receipt §16
+ordering note).
+
+**E — rg qualification (receipt corrected; remediation done):** the
+earlier SIP explanation was wrong. `locateRg()` supports
+`/usr/local/bin/rg`; the actual failure was provisioning rg at
+`~/bin/rg` — outside locateRg's candidate list — so `locateRg()` →
+nil → the B2 legs' loud fail. Remediation: the pinned release rg
+(14.1.1) installed at **/usr/local/bin/rg** (writable, no SIP
+involvement; the product launches rg by absolute path so the
+sanitized env PATH is unaffected — no environment weakening).
+Verified: the B2 search-evidence legs no longer report locateRg
+failures.
+
+### 17.1 Native verification (macOS 26.7.1 Intel, post-delta build)
+
+- C1 probe (idle Ctrl+C): exit rc=0, no orphan ✓ (repeated).
+- C2 probe (empty-line Ctrl+D): exit rc=0, no orphan ✓.
+- Backpressure regression + oracle proof + capture regression run in
+  the terminal-suite lane (Linux CI executes them at this HEAD; the
+  macOS suite attempts hit the helper wedge documented in §16.7 —
+  the helper wedged mid-lane during the Primitive run even after the
+  reboot, truncating it post-B2).
+- **The host's runner exit-limbo persists post-reboot for
+  child-spawning suites** (helper wedges; per-lane logs still stream
+  results until the wedge). Suite-level macOS reporting therefore
+  remains environment-blocked; targeted verification above is the
+  authoritative native evidence for this correction.
+
+### 17.2 Verdict
+
+A/B/C fixed with regressions; D verified safe; E corrected +
+remediated (rg at /usr/local/bin). Linux CI green at this HEAD
+executes every new regression. Remaining macOS blockers are the
+documented environment items (helper exit-limbo; in-suite exit
+nondeterminism to be sampled on next occurrence). M4 stays HOLD; no
+merge, no M5.
