@@ -431,9 +431,11 @@ func mac03TermiosComparatorProof() {
         // writer/input interaction during active streamed output — the
         // cancel exercises exactly that window.
         driver.send([3])
-        if driver.waitExit(timeoutMS: 3_000) == nil {
-            driver.send([3])
-        }
+        // Busy cancel returns the composer to idle: wait for the prompt,
+        // then the idle-empty Ctrl+C exits (D2.5 semantics — never two
+        // blind presses against an unknown state).
+        driver.expect("needletail> ", timeoutMS: 20_000)
+        driver.send([3])
         let status = driver.waitExit(timeoutMS: 15_000)
         #expect(status != nil, "Ctrl+C settle-then-exit must exit under streamed output")
         #expect(driver.termiosRestoredExactly(), "terminal must restore exactly under backpressure")
