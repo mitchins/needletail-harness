@@ -1529,3 +1529,38 @@ executes every new regression. Remaining macOS blockers are the
 documented environment items (helper exit-limbo; in-suite exit
 nondeterminism to be sampled on next occurrence). M4 stays HOLD; no
 merge, no M5.
+
+### 16.9 Post-reboot full matrix (post-0003 tree)
+
+Control PASS again (ChatWidth 6/6). The full ChatPTYTests release run
+**wedged the swift-testing runner at exit again** (STAT ?NEs, ~22 min,
+zero test-output lines) — reproduced identically post-reboot, with all
+MAC-02/03 fixes in the binary, after process cleanup, and with the
+wedge-discriminator suite (2 trivial shim spawns: slave-closed vs
+slave-retained to exit) **passing cleanly both ways** (2/2, rc=0, the
+runner exits normally). The wedge therefore requires the FULL PTY
+suite context (13 legs + loopback servers + streamed turns + oracle
+reads) and is not explained by the simplest cleanup hypothesis; the
+wedged runner cannot be inspected on this host (sample/lsof/ptrace all
+refused — the process is in an uninterruptible exit state).
+
+Lanes completed this session (release): ChatWidth 6/6 ✓, Config 77/77 ✓,
+Presentation 102/102 ✓, State 105/105 ✓, Provider 34/34 ✓,
+ConfigIntegration 21/21 ✓, Behaviour 28/28 ✓, QualificationProbes 5/5 ✓;
+Actor 63/65 (two outOfScript legs); Primitive truncated (B2 search legs
+GREEN post-rg-provisioning before truncation). ChatPTYTests: blocked by
+the runner wedge (its exit-path/flow verdicts stand from the earlier
+completed run + the repeated native probes).
+
+### 16.10 Final verdict
+
+M4-MAC-03 completed: A/B/C fixed with regressions (Linux-green),
+D/E dispositions recorded (D verified safe; E remediated — rg at
+/usr/local/bin, B2 search legs green). Linux CI green at HEAD.
+**Remaining merge blocker: the macOS suite-level ChatPTYTests
+verification is blocked by the Xcode 26.6 runner exit-limbo — an
+environment/toolchain issue requiring an operator decision (Xcode
+reset, runner bypass, or a macOS/toolchain update), with the
+in-suite nondeterminism already reduced to a single named defect
+class by the MAC-02/03 corrections.** No implementation changes were
+made beyond the authorized bounded corrections.
