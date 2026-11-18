@@ -803,9 +803,6 @@ struct ChatCommand: ParsableCommand {
             owner: owner)
         holder.loop = loop
         chatSink.post = { event in holder.loop?.post(event) }
-        // M4-MAC-04 (P1): the output owner drops writes whenever the
-        // input thread is not draining replxx's notification pipe.
-        loop.registerInputGate(on: owner)
         return ComposedSession(
             actor: actor, loop: loop, owner: owner,
             lineEditor: lineEditor, transport: budgetedTransport, tapBox: tapBox,
@@ -822,23 +819,6 @@ struct ChatCommand: ParsableCommand {
             acknowledgedDetermination: acknowledgedDetermination,
             writer: nil)
         Self.shutdownEditor.set(session.lineEditor)
-        // M4-MAC-04 (P0): the teardown watchdog lives INSIDE executeStatic,
-        // armed just before session.run() and cancelled the moment the
-        // interactive loop returns — it bounds ONLY the post-run cleanup
-        // (transport/actor teardown after a Ctrl+C-cancelled in-flight run
-        // can block; the interactive session itself is never bounded).
-        // The terminal restore is the LAST word before the forced exit: a
-        // resumed replxx write re-applies raw mode via its IOModeGuard.
-        let teardownWatchdog = Task {
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            Self.shutdownEditor.restore()
-#if canImport(Glibc)
-            Glibc._exit(0)
-#elseif canImport(Darwin)
-            Darwin._exit(0)
-#endif
-        }
-        defer { teardownWatchdog.cancel() }
         // SIGINT → actor cancel (same as `run`); the input thread owns
         // Ctrl+C as a key (raw mode), this is the signal fallback.
 #if canImport(Glibc)
@@ -906,6 +886,12 @@ struct ChatCommand: ParsableCommand {
         hupSource.resume()
         defer { hupSource.cancel() }
         await session.run()
+        // M4-MAC-04: the post-run teardown is bounded by the INPUT
+        // THREAD's watchdog (ChatLoop.spawnInputThread) — armed the
+        // moment the operator's session ends, so the interactive session
+        // itself is never bounded and run()'s cleanup cannot hang the
+        // terminal. The shutdown editor stays registered for the signal
+        // paths (SIGTERM/SIGHUP force-exits conventionally already).
     }
 
     /// Edge translation: UIEffects → actor/store calls + loop feedback.
