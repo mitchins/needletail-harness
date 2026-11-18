@@ -38,3 +38,12 @@ Provenance model (tree == upstream + registered patches):
 
 Swift boundary: `shim.h` exposes only the C API (`extern "C"` in
 replxx/replxx.h). C++ interoperability does not cross into Swift.
+
+### Registered patch 0002
+
+`patches/0002-darwin-terminal-transitions.patch` → `replxx/terminal.cxx`:
+Darwin raw-mode transitions use TCSANOW (TCSADRAIN livelocks against a
+concurrent renderer on a pty — the M4-MAC-02/03 exit hangs) and retry
+tcsetattr on EINTR (a swallowed signal-interrupted restore left the
+terminal raw forever — the in-suite exit nondeterminism). Verified
+both directions by `./dev vendor-check`.

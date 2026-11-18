@@ -1,0 +1,72 @@
+diff --git a/Sources/CReplxx/replxx/terminal.cxx b/Sources/CReplxx/replxx/terminal.cxx
+index d737edf..961072b 100644
+--- a/Sources/CReplxx/replxx/terminal.cxx
++++ b/Sources/CReplxx/replxx/terminal.cxx
+@@ -257,6 +257,7 @@ int Terminal::enable_raw_mode( void ) {
+ }
+ 
+ int Terminal::reset_raw_mode( void ) {
++	int _rv = 0;
+ 	if ( ! _rawMode ) {
+ 		return ( -1 );
+ 	}
+@@ -270,11 +271,31 @@ int Terminal::reset_raw_mode( void ) {
+ 	return ( 0 );
+ #else
+ 	/* put terminal in raw mode after flushing */
+-	return ( tcsetattr( 0, TCSADRAIN, &_rawModeTermios ) );
++#if defined(__APPLE__)
++	/* needletail local patch (0002): TCSADRAIN on a Darwin pty waits
++	 * for the output queue to go fully idle; with a concurrent
++	 * renderer streaming frames the drain never settles and every
++	 * raw-mode transition (per-keystroke IOModeGuard, read-loop
++	 * unwind) can block indefinitely. TCSANOW applies the flags
++	 * immediately; output already queued was processed under the
++	 * flags in effect when it was written. */
++	/* needletail local patch (0003): a signal delivery can EINTR the
++	 * transition; silently failing leaves the terminal raw forever. */
++	do {
++		_rv = tcsetattr( 0, TCSANOW, &_rawModeTermios );
++	} while ( _rv == -1 && errno == EINTR );
++	return ( _rv );
++#else
++	do {
++		_rv = tcsetattr( 0, TCSADRAIN, &_rawModeTermios );
++	} while ( _rv == -1 && errno == EINTR );
++	return ( _rv );
++#endif
+ #endif
+ }
+ 
+ void Terminal::disable_raw_mode(void) {
++	int _rv = 0;
+ 	if ( ! _rawMode ) {
+ 		return;
+ 	}
+@@ -285,9 +306,25 @@ void Terminal::disable_raw_mode(void) {
+ 	_consoleIn = INVALID_HANDLE_VALUE;
+ #else
+ 	_terminal_ = nullptr;
+-	if ( tcsetattr( 0, TCSADRAIN, &_origTermios ) == -1 ) {
++#if defined(__APPLE__)
++	/* needletail local patch (0002)+(0003): TCSANOW on Darwin (0002);
++	 * EINTR retry — a swallowed tcsetattr failure leaves the terminal
++	 * RAW forever (observed: in-suite exit nondeterminism; the unwind
++	 * completed but the restore was EINTR'd). */
++	do {
++		_rv = tcsetattr( 0, TCSANOW, &_origTermios );
++	} while ( _rv == -1 && errno == EINTR );
++	if ( _rv == -1 ) {
+ 		return;
+ 	}
++#else
++	do {
++		_rv = tcsetattr( 0, TCSADRAIN, &_origTermios );
++	} while ( _rv == -1 && errno == EINTR );
++	if ( _rv == -1 ) {
++		return;
++	}
++#endif
+ #endif
+ 	_rawMode = false;
+ 	return;
