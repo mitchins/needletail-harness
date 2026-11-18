@@ -432,12 +432,11 @@ func mac03TermiosComparatorProof() {
         // cancel exercises exactly that window.
         driver.send([3])
         // Busy cancel returns the composer to idle: wait for the prompt,
-        // then the idle-empty Ctrl+C exits (D2.5 semantics — never two
-        // blind presses against an unknown state).
+        // then the settle-then-exit sequence (the cancelled run leaves a
+        // held queue entry, so the exit may need the warned second press
+        // — never blind presses against an unknown state).
         driver.expect("needletail> ", timeoutMS: 20_000)
-        driver.send([3])
-        let status = driver.waitExit(timeoutMS: 15_000)
-        #expect(status != nil, "Ctrl+C settle-then-exit must exit under streamed output")
+        let status = await ChatPTYTests.settleThenExit(driver)
         // TRACKED DEFECT (receipt §17.3): after cancel + the bounded
         // shutdown's forced exit, the slave termios can remain raw —
         // the exact-restore assertion stays open until the post-cancel
