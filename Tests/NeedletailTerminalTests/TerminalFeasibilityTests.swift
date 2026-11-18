@@ -444,4 +444,59 @@ func mac03TermiosComparatorProof() {
         // restore ordering is fixed. Do not assert it here yet.
     }
 
+    // M4-MAC-04 (P0): an idle session and a mid-stream session must
+    // SURVIVE well past the previous 5-second launch-started deadline —
+    // the deadline now bounds only the post-run teardown. Proves the
+    // fix with real elapsed time, repeated for the idle case.
+    @Test("MAC-04 P0: idle session survives 16+ seconds (repeated)")
+    func mac04IdleSurvival() async throws {
+        for round in 1...3 {
+            let env = try ChatPTYTests.makeEnv(withServer: false, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+            defer { ChatPTYTests.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+            let driver = ChatPTYDriver(
+                executable: ChatPTYTests.releaseBinary(),
+                args: ["chat", "--config", env.configPath],
+                extraEnv: ChatPTYTests.childEnv(env))
+            defer { driver.stop() }
+            guard driver.start() else { Issue.record("pty spawn failed"); return }
+            driver.expect("needletail> ", timeoutMS: 30_000)
+            // 16 s of idle: with the old launch-started deadline the
+            // process was force-exited at ~5 s — this wait returning
+            // nil proves the session SURVIVED the entire window.
+            #expect(driver.waitExit(timeoutMS: 16_000) == nil,
+                    "round \(round): an idle interactive session must not be terminated by any watchdog")
+            driver.send([3])
+            let status = driver.waitExit(timeoutMS: 15_000)
+            #expect(status != nil, "round \(round): idle Ctrl+C must exit after the survival window")
+            #expect(chatPTYCleanExit(status ?? 0), "round \(round): idle Ctrl+C exits 0")
+            #expect(driver.termiosRestoredExactly(), "round \(round): exact restoration after survival")
+        }
+    }
+
+    @Test("MAC-04 P0: mid-stream session survives 16+ seconds, then settles")
+    func mac04StreamingSurvival() async throws {
+        let env = try ChatPTYTests.makeEnv(withServer: true, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+        defer { ChatPTYTests.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+        guard let server = env.server else { Issue.record("no loopback"); return }
+        server.enqueue(ChatLoopback.textTurn("survival stream", splits: 60))
+        let driver = ChatPTYDriver(
+            executable: ChatPTYTests.releaseBinary(),
+            args: ["chat", "--config", env.configPath],
+            extraEnv: ChatPTYTests.childEnv(env))
+        defer { driver.stop() }
+        guard driver.start() else { Issue.record("pty spawn failed"); return }
+        driver.expect("needletail> ", timeoutMS: 30_000)
+        driver.send("go\r")
+        driver.expect("survival stream", timeoutMS: 20_000)
+        #expect(driver.waitExit(timeoutMS: 16_000) == nil,
+                "a mid-stream interactive session must not be terminated by any watchdog")
+        // Settle-then-exit after the survival window.
+        driver.send([3])
+        driver.expect("needletail> ", timeoutMS: 20_000)
+        driver.send([3])
+        let status = driver.waitExit(timeoutMS: 15_000)
+        #expect(status != nil, "settle-then-exit must exit after the survival window")
+        #expect(driver.termiosRestoredExactly(), "exact restoration after streamed-output survival")
+    }
+
 }

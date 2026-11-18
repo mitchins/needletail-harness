@@ -135,23 +135,13 @@ struct ChatCommand: ParsableCommand {
         // wait exits forcefully with the recorded conventional code
         // instead of hanging the terminal. _exit (no stdio flush) per
         // the PTY-08 stream-lock note.
-        let graceful = semBox.wait(until: .now() + 5)
-        if graceful == .timedOut {
-            let forcedCode = box.lock.withLock { box.exitCode }
-            Self.shutdownEditor.restore()
-            // Terminal restore is the LAST word before the forced exit:
-            // the output thread's blocked replxx write resumes the
-            // moment the input thread (the notification-pipe reader)
-            // terminates — and a resumed replxx write re-applies raw
-            // mode via its IOModeGuard — so the unwind's earlier restore
-            // can be superseded. Apply the exact captured state here,
-            // after that race window has closed.
-#if canImport(Glibc)
-            Glibc._exit(forcedCode)
-#elseif canImport(Darwin)
-            Darwin._exit(forcedCode)
-#endif
-        }
+        // M4-MAC-04 (P0): unbounded — the interactive session runs as
+        // long as the operator chooses. The ONLY bounded window is the
+        // post-run teardown, handled by the watchdog armed inside
+        // executeStatic (the previous outer 5 s wait started at session
+        // LAUNCH and force-exited healthy interactive sessions —
+        // Codatiel, confirmed).
+        semBox.wait()
         let (code, err) = box.lock.withLock { (box.exitCode, box.error) }
         if let error = err {
             eprint("chat failed: \(terminalSafe(String(describing: error)))")
@@ -813,6 +803,9 @@ struct ChatCommand: ParsableCommand {
             owner: owner)
         holder.loop = loop
         chatSink.post = { event in holder.loop?.post(event) }
+        // M4-MAC-04 (P1): the output owner drops writes whenever the
+        // input thread is not draining replxx's notification pipe.
+        loop.registerInputGate(on: owner)
         return ComposedSession(
             actor: actor, loop: loop, owner: owner,
             lineEditor: lineEditor, transport: budgetedTransport, tapBox: tapBox,
@@ -829,6 +822,23 @@ struct ChatCommand: ParsableCommand {
             acknowledgedDetermination: acknowledgedDetermination,
             writer: nil)
         Self.shutdownEditor.set(session.lineEditor)
+        // M4-MAC-04 (P0): the teardown watchdog lives INSIDE executeStatic,
+        // armed just before session.run() and cancelled the moment the
+        // interactive loop returns — it bounds ONLY the post-run cleanup
+        // (transport/actor teardown after a Ctrl+C-cancelled in-flight run
+        // can block; the interactive session itself is never bounded).
+        // The terminal restore is the LAST word before the forced exit: a
+        // resumed replxx write re-applies raw mode via its IOModeGuard.
+        let teardownWatchdog = Task {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            Self.shutdownEditor.restore()
+#if canImport(Glibc)
+            Glibc._exit(0)
+#elseif canImport(Darwin)
+            Darwin._exit(0)
+#endif
+        }
+        defer { teardownWatchdog.cancel() }
         // SIGINT → actor cancel (same as `run`); the input thread owns
         // Ctrl+C as a key (raw mode), this is the signal fallback.
 #if canImport(Glibc)

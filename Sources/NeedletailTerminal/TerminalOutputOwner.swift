@@ -59,6 +59,20 @@ public final class TerminalOutputOwner: @unchecked Sendable {
     /// TCSADRAIN blocks forever while writes keep refilling the tty
     /// output queue — the root cause of the C1/C2 exit hangs).
     private var quiesced = false
+    /// M4-MAC-04 (P1): consulted per batch — when it returns false the
+    /// input thread is NOT inside readLine (not draining replxx's
+    /// notification pipe) and replxx writes are unsafe (they can block
+    /// forever and re-apply raw mode after restoration). Batches are
+    /// dropped instead of written.
+    private var inputGate: (() -> Bool)?
+
+    /// Installs the drain-state gate (from the loop that owns the input
+    /// thread). Thread-safe; consulted under `work` per batch.
+    public func setInputGate(_ gate: @escaping () -> Bool) {
+        work.lock()
+        inputGate = gate
+        work.unlock()
+    }
 
     /// Stops ALL further emissions (queued and future). The writer
     /// thread keeps running until stop() so teardown semantics are
@@ -248,10 +262,21 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             // the stale progress text to scrollback. A batch that only
             // carries a progress clear (or a fresh progress value) needs
             // no extra clear — the clear/newline write below handles it.
+            let gate = inputGate
             let clearBeforeContent = progressShown && (!controls.isEmpty || !droppable.isEmpty)
             pendingControl.removeAll()
             pendingDroppable.removeAll()
             pendingProgress = nil
+            if let g = gate, !g() {
+                // The input thread is not draining replxx: a replxx write
+                // now can block forever and re-apply raw mode after
+                // restoration. Drop the batch.
+                pendingControl.removeAll()
+                pendingDroppable.removeAll()
+                pendingProgress = nil
+                work.unlock()
+                continue
+            }
             inFlight += 1
             work.broadcast() // wake flush()
             // M4-MAC-03 finding B: a captured batch must NEVER be

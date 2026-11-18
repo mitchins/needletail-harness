@@ -426,12 +426,33 @@ public final class ChatLoop: @unchecked Sendable {
         lineEditor.enableBracketedPaste()
     }
 
+    /// M4-MAC-04 (P1): true while the input thread is inside readLine
+    /// (draining replxx's notification pipe). The output owner's writer
+    /// consults this before touching replxx: a replxx_write issued while
+    /// the reader is away can block forever and re-apply raw mode after
+    /// restoration (the residual exit hang).
+    private let inputGateLock = NSLock()
+    private var inputDraining = false
+    public func setInputDraining(_ value: Bool) {
+        inputGateLock.withLock { inputDraining = value }
+    }
+    public func inputIsDraining() -> Bool {
+        inputGateLock.withLock { inputDraining }
+    }
+
+    /// M4-MAC-04 (P1): wires the output owner to the input drain state.
+    public func registerInputGate(on owner: TerminalOutputOwner) {
+        owner.setInputGate { [weak self] in self?.inputIsDraining() ?? false }
+    }
+
     private func spawnInputThread() {
         let editor = lineEditor
         let loop = self
         let thread = Thread {
             while true {
+                loop.setInputDraining(true)
                 let line = editor.readLine(prompt: "needletail> ")
+                loop.setInputDraining(false)
                 // M4-MAC-03: after the unwind completes (readLine
                 // returned), enforce the captured pre-raw state as the
                 // LAST terminal transition. On cancel-then-exit paths

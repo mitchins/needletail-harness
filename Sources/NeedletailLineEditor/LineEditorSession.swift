@@ -26,12 +26,22 @@ public final class LineEditorSession: @unchecked Sendable {
     private var keyHandlers: [Int32: @Sendable () -> KeyResult] = [:]
 
     public init?() {
-        Self.captureOriginalTermios()
+        originalTermios = Self.captureTermiosFrom(fd: STDIN_FILENO)
         guard let handle = replxx_init() else { return nil }
         self.handle = handle
         // Without this, SIGWINCH never reaches replxx: resizes change the
         // kernel winsize but the editor never repaints (M0-C evidence).
         _ = replxx_install_window_change_handler(handle)
+    }
+
+    /// fd-parameterized so tests can exercise the failure path (a
+    /// non-TTY descriptor yields nil). Per-INSTANCE capture (M4-MAC-04,
+    /// P1): a process-wide static held the first session's capture.
+    static func captureTermiosFrom(fd: Int32) -> termios? {
+        guard isatty(fd) != 0 else { return nil }
+        var t = termios()
+        guard tcgetattr(fd, &t) == 0 else { return nil }
+        return t
     }
 
     deinit {
@@ -266,7 +276,7 @@ public final class LineEditorSession: @unchecked Sendable {
         // delta the macOS matrix surfaced) plus every other original
         // local flag, instead of an approximation. The OR-ed sane
         // subset remains as the fallback when no capture exists.
-        if let saved = Self.originalTermios {
+        if let saved = originalTermios {
             // The exact-restore oracle (M4-MAC-02) caught the Linux
             // SIGTERM path leaving replxx's raw c_cc (VMIN=1/VTIME=0)
             // in place: restore the captured control characters and
@@ -289,30 +299,15 @@ public final class LineEditorSession: @unchecked Sendable {
 #endif
     }
 
-    /// The stdin termios captured at session init, before raw mode.
-    /// `nil` = no valid capture (not a TTY, or tcgetattr failed) — the
-    /// restore path then uses the sane fallback. One optional value:
-    /// a failed capture can never masquerade as a zero-initialized
-    /// snapshot (M4-MAC-03 finding A). Immutable after init.
-    private static let originalTermios: termios? = captureTermiosFrom(fd: STDIN_FILENO)
-
-    /// Captures the pre-raw stdin state. MUST run before the first
-    /// readLine (`originalTermios` is a lazily-initialized static; a
-    /// first touch inside restoreSaneTermios would capture the RAW
-    /// state — the exact-restore oracle caught exactly that on the
-    /// Linux SIGTERM path).
-    static func captureOriginalTermios() {
-        _ = originalTermios
-    }
-
-    /// fd-parameterized so tests can exercise the failure path (a
-    /// non-TTY descriptor yields nil).
-    static func captureTermiosFrom(fd: Int32) -> termios? {
-        guard isatty(fd) != 0 else { return nil }
-        var t = termios()
-        guard tcgetattr(fd, &t) == 0 else { return nil }
-        return t
-    }
+    /// The stdin termios captured at THIS session's init, before raw
+    /// mode. Per-INSTANCE (M4-MAC-04, P1): a process-wide static held
+    /// the first session's capture — a later session (an embedding
+    /// process whose TTY/flags changed between sessions) would restore
+    /// the first session's flags, not its own. `nil` = no valid capture
+    /// (not a TTY, or tcgetattr failed) — the restore path then uses
+    /// the sane fallback; a failed capture can never masquerade as a
+    /// zero-initialized snapshot (M4-MAC-03 finding A).
+    private let originalTermios: termios?
 
     /// History snapshot, oldest-first (M4-D D2.7 hygiene probe). Thin
     /// forwarding of the C scan API; empty when replxx holds nothing.
