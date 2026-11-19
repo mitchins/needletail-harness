@@ -1564,3 +1564,67 @@ reset, runner bypass, or a macOS/toolchain update), with the
 in-suite nondeterminism already reduced to a single named defect
 class by the MAC-02/03 corrections.** No implementation changes were
 made beyond the authorized bounded corrections.
+
+## 18. M4-MAC-04 — immediate correctness correction (HEAD 0b85927/995d271 lineage)
+
+Three current-head defects dispositioned and fixed; targeted native +
+Linux verification complete.
+
+**P0 (Codatiel 6961747626 finding 1, CONFIRMED — my defect):** the 5 s
+bounded wait started at session LAUNCH and force-exited healthy
+interactive sessions ~5 s in. FIXED: the teardown watchdog moved
+INSIDE executeStatic — armed after session.run() returns, cancelled
+at return — bounding ONLY the post-run cleanup; the outer wait is
+unbounded again. REGRESSIONS: `mac04IdleSurvival` (3 rounds × 16 s
+idle survival → Ctrl+C → exit 0 → exact restore — 48.6 s total,
+green ×3 locally) and `mac04StreamingSurvival` (60-chunk stream,
+16 s mid-stream survival → settle-then-exit → exact restore — green).
+
+**P1-B (Codatiel 6963052000 window, partially addressed then
+reverted):** the input-drain writer gate (drop batches when the input
+thread is not draining replxx) eliminated the blocked-write entry —
+but dropped legitimate renders in edge windows (D1's initial frame,
+CI-proven) and did not fix the raw-at-exit. REVERTED. The remaining
+protection: drop-on-quiesce + the bounded shutdown + the input
+thread's last-word exact restore (the restore runs after the unwind
+completes — before the teardown hang window).
+
+**P1-C (Codatiel d4089bfbd133 finding 1, CONFIRMED):** the pre-raw
+capture is per-SESSION (instance property captured at init) — a
+process-wide static held the first session's capture. Regression:
+`mac03CaptureRefusesNonTTY` continues to cover the nil path.
+
+**0003 extension (EINTR retry registered):** terminal.cxx raw-mode
+transitions retry tcsetattr on EINTR (a swallowed signal-interrupted
+restore left the terminal raw forever — the in-suite exit
+nondeterminism mechanism). Folded into the unified
+`0002-darwin-terminal-transitions.patch` (one patch per file);
+vendor-check passes offline (R)+(F) and clone; provenance registry
+updated. The bounded shutdown applies the exact captured termios as
+the LAST terminal transition before a forced exit.
+
+**Native verification (final build, macOS 26.7.1 Intel):**
+- C1 idle Ctrl+C ×5: clean exits, zero orphans.
+- C2 empty-line Ctrl+D ×2: clean exits, zero orphans.
+- PTY-02-style dispatch probe: admission → dispatch → server receipt
+  (requests=1) → streaming render ✓.
+- Feasibility suite (Linux, final): 9/9 incl. the comparator proof,
+  the capture regression, the backpressure settle-then-exit, both P0
+  survival legs. Linux offline gate: GREEN at 995d271 (the terminal
+  suite + exact oracle included).
+
+**Full macOS matrix: still blocked by the toolchain runner.** The
+swift-testing runner wedges at launch/exit (STAT ?NEs, zero test
+lines, unsampleable) for the ChatPTYTests filter — reproduced
+identically after the OS reboot, on release and debug configs, with
+a from-scratch `.build`, and with all product fixes in the binary.
+**The directive-required discrimination is recorded**: a minimal
+independent child-spawning swift-testing suite (the shim spawn,
+slave-closed AND slave-retained variants) PASSES cleanly both ways
+(2/2, rc=0, the runner exits normally) — the toolchain runner
+handles minimal child-spawning; the wedge requires the FULL PTY
+suite context. The runner is uninspectable on this host (sample,
+lsof and ptrace all refused; the process sits in an uninterruptible
+exit state), so the exact blocking frame cannot be captured without
+host-level remediation (Xcode/toolchain reset or update — operator
+decision).
