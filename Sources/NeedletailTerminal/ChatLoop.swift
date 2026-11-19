@@ -118,6 +118,11 @@ public final class ChatLoop: @unchecked Sendable {
     private var emitted: [(id: String, text: String)] = []
     private var shutdown = false
     private var confirmArmed = false
+    /// M4-MAC-04B: set by finish() when run()'s post-loop cleanup has
+    /// completed. The input thread's teardown watchdog consults it at
+    /// fire time and disarms silently if teardown made it — force-exit
+    /// only bounds genuinely hung teardowns.
+    private var teardownComplete = false
 
     private let lock = NSLock()
     private var inboxContinuation: AsyncStream<Event>.Continuation?
@@ -284,6 +289,11 @@ public final class ChatLoop: @unchecked Sendable {
             inboxContinuation = nil
         }
         owner.close()
+        // M4-MAC-04B: teardown completed. The input thread's watchdog —
+        // armed at the genuine EOF — checks this before firing: a
+        // teardown that finished within its 5 s bound leaves the
+        // watchdog disarmed (no late _exit, no exit-code perturbation).
+        lock.withLock { teardownComplete = true }
     }
 
     // MARK: - Wiring
@@ -403,6 +413,13 @@ public final class ChatLoop: @unchecked Sendable {
                 self.lineEditor.deleteForwardCharacter()
                 return .continue
             }
+            // M4-MAC-04B: EOF while an approval is armed settles the
+            // approval (deny) and the session CONTINUES. It is not a
+            // session shutdown: no quiesce (that would drop all output
+            // of the continuing session), no teardown watchdog (the
+            // input thread reads confirmArmed before arming).
+            let armed = self.lock.withLock { self.confirmArmed }
+            if armed { return .abort }
             self.owner.quiesce()
             return .abort
         }
@@ -440,8 +457,27 @@ public final class ChatLoop: @unchecked Sendable {
                 // a late IOModeGuard re-apply supersedes it. Our exact
                 // restore (captured full termios, TCSANOW) is safe here:
                 // this is the input thread, after readLine returned.
+                // M4-MAC-04B: the restore is bracketed by the output
+                // owner's silence+barrier — no writer batch can start
+                // or complete during the termios transition — but ONLY
+                // on a genuine shutdown. An EOF while an approval is
+                // armed settles the approval and the session CONTINUES:
+                // silencing the owner there would drop every later
+                // render of the continuing session.
+                let armed = loop.lock.withLock { loop.confirmArmed }
                 if line == nil {
-                    editor.restoreSaneTermios()
+                    if armed {
+                        editor.restoreSaneTermios()
+                    } else {
+                        loop.restoreTerminalExclusively(editor)
+                    }
+                }
+                // M4-MAC-04B: a nil line while an approval is armed is
+                // NOT a session shutdown — it settles the approval
+                // (deny) and the session continues; arming the watchdog
+                // here would force-exit the continuing session five
+                // seconds later (the operator-reported defect).
+                if line == nil, !armed {
                     // M4-MAC-04: the session is over for the operator —
                     // bound the remaining teardown UNCONDITIONALLY, right
                     // here, before the shutdown is even posted. run()'s
@@ -449,12 +485,16 @@ public final class ChatLoop: @unchecked Sendable {
                     // Ctrl+C-cancelled in-flight run) can block on some
                     // platforms; 5 s after this point the terminal is
                     // re-restored (idempotent) and the process force-exits
-                    // with the conventional code. Plain Foundation Thread +
-                    // usleep: no concurrency-runtime subtleties can delay
-                    // or swallow this bound.
+                    // with the conventional code — UNLESS teardown
+                    // completed first, in which case the watchdog
+                    // disarms silently (no exit-code perturbation of a
+                    // normal exit). Plain Foundation Thread + usleep: no
+                    // concurrency-runtime subtleties can delay or
+                    // swallow this bound.
                     let watchdog = Thread {
                         usleep(5_000_000)
-                        editor.restoreSaneTermios()
+                        if loop.lock.withLock({ loop.teardownComplete }) { return }
+                        loop.restoreTerminalExclusively(editor)
 #if canImport(Glibc)
                         Glibc._exit(0)
 #elseif canImport(Darwin)
@@ -473,9 +513,19 @@ public final class ChatLoop: @unchecked Sendable {
                 // check). Decision lines are removed right after by
                 // settleConfirm's hygiene drop.
                 if let line, !line.isEmpty { editor.addHistoryEntry(line) }
-                let armed = loop.lock.withLock { loop.confirmArmed }
                 if armed {
                     loop.settleConfirm(line: line, fromMain: false)
+                    // M4-MAC-04B: an EOF-deny abandons the pending
+                    // request outright. Core keeps a denied batch's run
+                    // in flight (the denial is a tool result, not a
+                    // turn outcome), which would leave busy set and
+                    // queue every later submission forever. The
+                    // operator's EOF means "abandon": cancel the run
+                    // (D2 busy-cancel semantics) so the queue releases
+                    // and the session continues. A typed y/N deny is
+                    // NOT cancelled — the model continues informed of
+                    // the denial.
+                    if line == nil { loop.post(.cancelKey) }
                 } else {
                     loop.post(.inputLine(line))
                     if line == nil { break }
@@ -485,6 +535,20 @@ public final class ChatLoop: @unchecked Sendable {
         thread.name = "needletail-input"
         thread.qualityOfService = .userInteractive
         thread.start()
+    }
+
+    /// M4-MAC-04B: the exclusive terminal-restore sequence. Silence the
+    /// output owner (no new captures), take the restore barrier (every
+    /// accepted write has completed), restore the captured termios as
+    /// the LAST terminal transition, release the barrier. The proof
+    /// obligation "the writer cannot emit after terminal restoration"
+    /// holds by construction: a batch either wrote before the barrier
+    /// or is dropped (silenced gate re-check) and can never start.
+    private func restoreTerminalExclusively(_ editor: LineEditorSession) {
+        owner.silence()
+        owner.beginRestoreBarrier()
+        editor.restoreSaneTermios()
+        owner.endRestoreBarrier()
     }
 
     /// Settles an armed confirm: resumes the shared box, restores the

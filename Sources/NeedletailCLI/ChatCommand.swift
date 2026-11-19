@@ -34,14 +34,23 @@ struct ChatCommand: ParsableCommand {
     /// LAST terminal transition — a resumed replxx write from the output
     /// thread re-applies raw mode via its IOModeGuard). Lock-guarded,
     /// @unchecked Sendable, set once per chat invocation.
+    /// M4-MAC-04B: the output owner is registered too; the restore runs
+    /// behind the owner's silence+barrier so no writer batch can start
+    /// or complete during the termios transition.
     private final class ShutdownEditorBox: @unchecked Sendable {
         private var editor: LineEditorSession?
+        private var owner: TerminalOutputOwner?
         private let lock = NSLock()
-        func set(_ e: LineEditorSession?) {
-            lock.withLock { editor = e }
+        func set(_ e: LineEditorSession?, owner o: TerminalOutputOwner? = nil) {
+            lock.withLock { editor = e; owner = o }
         }
         func restore() {
-            lock.withLock { editor }?.restoreSaneTermios()
+            let (e, o) = lock.withLock { (editor, owner) }
+            guard let e else { return }
+            o?.silence()
+            o?.beginRestoreBarrier()
+            e.restoreSaneTermios()
+            o?.endRestoreBarrier()
         }
     }
     private static let shutdownEditor = ShutdownEditorBox()
@@ -818,7 +827,7 @@ struct ChatCommand: ParsableCommand {
             sandboxGrant: sandboxGrant,
             acknowledgedDetermination: acknowledgedDetermination,
             writer: nil)
-        Self.shutdownEditor.set(session.lineEditor)
+        Self.shutdownEditor.set(session.lineEditor, owner: session.owner)
         // SIGINT → actor cancel (same as `run`); the input thread owns
         // Ctrl+C as a key (raw mode), this is the signal fallback.
 #if canImport(Glibc)

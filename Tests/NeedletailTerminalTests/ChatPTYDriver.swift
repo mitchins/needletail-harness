@@ -207,10 +207,16 @@ final class ChatPTYDriver {
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutMS) / 1000)
         while Date() < deadline {
             let status = nt_pty_wait(&pty, 250)
-            if status >= 0 { return status }
+            if status >= 0 { reaped = true; return status }
         }
         return nil
     }
+
+    /// M4-MAC-04B: true once waitExit has actually reaped the child.
+    /// A reaped child cannot survive; the no-orphan assertions use
+    /// this instead of a second (always-nil) waitExit poll.
+    private(set) var reaped = false
+    func childReaped() -> Bool { reaped }
 
     /// Functional mode-restoration check after child exit.
     /// M4-MAC-02 exact-restore oracle: compares the slave's LIVE

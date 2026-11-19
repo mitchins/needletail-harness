@@ -59,10 +59,30 @@ public final class TerminalOutputOwner: @unchecked Sendable {
     /// TCSADRAIN blocks forever while writes keep refilling the tty
     /// output queue — the root cause of the C1/C2 exit hangs).
     private var quiesced = false
+    /// M4-MAC-04B: set by silence() before the terminal-restore barrier.
+    /// After it, the writer loop never captures a batch again — queued
+    /// work is dropped and no future emission is accepted — so no write
+    /// can start after the restore sequence begins.
+    private var silenced = false
+    /// M4-MAC-04B: serializes the writer's write section against the
+    /// terminal-restore barrier. The writer holds it for the duration
+    /// of its batch writes; beginRestoreBarrier() acquires it, which
+    /// returns only when every accepted write has completed and no
+    /// further write can start (silence() precedes it). This is the
+    /// proof obligation for "the writer cannot emit after terminal
+    /// restoration": writes either completed before the barrier or
+    /// were dropped at the capture re-check.
+    private let writeLock = NSLock()
 
     /// Stops ALL further emissions (queued and future). The writer
     /// thread keeps running until stop() so teardown semantics are
     /// unchanged; nothing is written after this returns.
+    ///
+    /// BOUNDED by design: it returns once the in-flight straggler window
+    /// has expired (500 ms). A writer still writing at that point is
+    /// handled by the M4-MAC-04B teardown sequence — silence() then
+    /// beginRestoreBarrier() — which guarantees the terminal restore
+    /// never overlaps a write; quiesce itself never blocks unboundedly.
     public func quiesce() {
         work.lock()
         quiesced = true
@@ -89,6 +109,35 @@ public final class TerminalOutputOwner: @unchecked Sendable {
         }
         work.unlock()
     }
+
+    /// M4-MAC-04B: permanently stops the writer from capturing or
+    /// writing. Pending work is dropped. Unlike quiesce() this is not
+    /// reversible by design — it precedes the terminal-restore barrier.
+    /// Idempotent; safe from any thread.
+    public func silence() {
+        work.lock()
+        silenced = true
+        pendingDroppable.removeAll()
+        pendingControl.removeAll()
+        pendingProgress = nil
+        work.broadcast()
+        work.unlock()
+    }
+
+    /// M4-MAC-04B: blocks until the writer is between writes (or done),
+    /// then holds that guarantee. Call silence() first — otherwise new
+    /// captures could still start. Returns after acquiring the write
+    /// gate; pair with endRestoreBarrier(). The gate wait is bounded in
+    /// production by the ChatLoop teardown watchdog.
+    public func beginRestoreBarrier() {
+        writeLock.lock()
+    }
+
+    /// Releases the restore barrier acquired by beginRestoreBarrier().
+    public func endRestoreBarrier() {
+        writeLock.unlock()
+    }
+
     private var finished = false
     private var writerThread: Thread?
 
@@ -262,7 +311,19 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             // circular wait (the intermittent PTY-01 hang). Drop
             // instead of writing; quiesce's inFlight wait then always
             // terminates.
-            if !quiesced {
+            // M4-MAC-04B: the check runs at the WRITE GATE too — a batch
+            // captured before quiesce()/silence() is re-evaluated after
+            // acquiring writeLock, so a batch can never slip in between
+            // the capture and the write.
+            writeLock.lock()
+            if quiesced || silenced {
+                // Drop the captured batch: never write it.
+                inFlight -= 1
+                work.broadcast()
+                work.unlock()
+                writeLock.unlock()
+                continue
+            }
             work.unlock()
             // Encode + write off-lock; this thread is the only writer.
             if clearBeforeContent {
@@ -277,15 +338,11 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             if let progress {
                 writer(progress.text.map { "\r" + displaySafe($0) + "\u{1B}[K" } ?? "\r\u{1B}[K")
             }
+            writeLock.unlock()
             work.lock()
-            // Track shown state for the clear-noop rule. Only a batch
-            // that actually WROTE a progress record (or cleared before
-            // content) changes the visible state: a stale pending write
-            // dropped at the top of this batch (invalidate() between
-            // setProgress and the drain) wrote nothing, so the earlier
-            // visible line is still on screen and progressShown must
-            // stay true — otherwise the next clear no-ops and content
-            // commits the stale progress text to scrollback.
+            // Track shown state for the clear-noop rule (written path
+            // only — a gate-dropped batch wrote nothing and must not
+            // change the visible progress state).
             if let progress {
                 progressShown = progress.text != nil
             } else if clearBeforeContent {
@@ -294,12 +351,6 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             inFlight -= 1
             work.broadcast()
             work.unlock()
-            } else {
-                work.lock()
-                inFlight -= 1
-                work.broadcast()
-                work.unlock()
-            }
         }
     }
 

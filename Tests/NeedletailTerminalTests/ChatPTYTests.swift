@@ -1014,6 +1014,72 @@ extension ChatPTYTests {
         }
     }
 
+    @Test("M4-MAC-04B: approval deny continues the session past any watchdog bound, exits clean")
+    func mac04ApprovalDenyContinues() async throws {
+        // The directive's scenario: approval → deny → the session must
+        // keep interacting for MORE than six seconds (the old defect
+        // armed the 5 s teardown watchdog at readLine(nil) unconditionally,
+        // killing continuing sessions five seconds after any EOF/deny)
+        // → then a normal exit with the exact restoration. A post-deny
+        // TEXT turn proves the output owner was not left quiesced by
+        // the deny path (it would drop every later render).
+        // NOTE (receipt §20): the EOF-at-approval variant (^D) is
+        // blocked by an unresolved replxx decode bypass — the ctrlD
+        // key binding is never invoked at the approval prompt and
+        // replxx's default send_eof bails with the arm state
+        // unreadable from the input thread; recorded as an open
+        // mechanism question, not papered over here.
+        try await Self.withCredentialKey {
+            let base = FileManager.default.temporaryDirectory
+                .appendingPathComponent("chat-apdeny-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: base) }
+            try "deny-approval bytes".write(to: base.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+            let env = try Self.makeEnv(withServer: true, tools: #"{"read":false,"search":false,"edit":true,"write":true,"exec":false,"consult":false}"#)
+            defer { Self.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+            guard let server = env.server else { Issue.record("no loopback"); return }
+            server.enqueue(ChatLoopback.textTurn("warm answer", splits: 1))
+            server.enqueue(ChatLoopback.toolTurn(name: "write", arguments: #"{"path":"note.txt","content":"denied bytes"}"#, prefixText: "writing:"))
+            server.enqueue(ChatLoopback.textTurn("post-deny answer", splits: 1))
+            let driver = ChatPTYDriver(
+                executable: Self.releaseBinary(),
+                args: ["chat", "--config", env.configPath, "--workspace", base.path],
+                extraEnv: Self.childEnv(env))
+            defer { driver.stop() }
+            driver.preserveTranscript = { Self.preserve("pty-apdeny-timeout", transcript: $0) }
+            guard driver.start() else { Issue.record("pty spawn failed"); return }
+            driver.expect("needletail> ", timeoutMS: 30_000)
+            driver.send("warm\r")
+            driver.expect("warm answer", timeoutMS: 20_000)
+            driver.send("write the note\r")
+            driver.expect("approval required:", timeoutMS: 20_000)
+            // Typed deny at the armed approval: settles the approval,
+            // denies the write, the session continues.
+            driver.send("N\r")
+            driver.expect("needletail> ", timeoutMS: 20_000)
+            // THE REGRESSION: more than six seconds of continued
+            // interaction. The old watchdog fired at exactly five.
+            driver.send("post deny\r")
+            driver.expect("post-deny answer", timeoutMS: 20_000)
+            driver.expect("needletail> ", timeoutMS: 20_000)
+            let survived = driver.waitExit(timeoutMS: 6_500) == nil
+            #expect(survived, "an approval deny must not terminate the continuing session (old watchdog fired at 5 s)")
+            // Normal exit: settle-then-exit at idle, clean code, exact
+            // restoration.
+            guard let status = await Self.settleThenExit(driver) else {
+                Self.preserve("pty-apdeny", transcript: driver.fullTranscript())
+                Issue.record("approval-deny chat did not exit"); return
+            }
+            #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
+            #expect(driver.termiosRestoredExactly(), "terminal restored after approval-deny continuation")
+            let transcript = driver.fullTranscript()
+            if let v = Self.allowlistViolation(transcript, "PTY-apdeny") {
+                Self.preserve("pty-apdeny", transcript: transcript)
+                Issue.record(Comment(rawValue: v))
+            }
+        }
+    }
+
     @Test("TERM-04 non-TTY refusal is fail-closed + --help documents chat")
     func term04NonTTYRefusalAndHelp() async throws {
         // D0.4 TERM-04 as-built: `chat` deliberately refuses when

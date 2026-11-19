@@ -14,6 +14,81 @@ struct TerminalOutputOwnerTests {
         TerminalOutputOwner(caps: caps, writer: { written.append($0) }, now: now)
     }
 
+    // M4-MAC-04B: the output-shutdown invariant. A writer blocked
+    // inside an in-flight batch must not delay quiesce() unboundedly,
+    // and — after silence()+beginRestoreBarrier() — no batch may start
+    // or complete around a terminal restore. Deterministic: the test
+    // controls exactly when the blocked writer is released.
+    @Test("blocked writer: quiesce bounded, gate-dropped batch, no write past restore barrier")
+    func blockedWriterRestoreBarrier() throws {
+        let box = LockedBox()
+        let slowGate = NSCondition()
+        let releaseSlow = LockedFlag()
+        let enteredSlow = DispatchSemaphore(value: 0)
+        let o = TerminalOutputOwner(caps: TerminalCaps(), writer: { text in
+            if text.contains("slow-batch") {
+                slowGate.lock()
+                enteredSlow.signal()
+                while !releaseSlow.get() { slowGate.wait() }
+                slowGate.unlock()
+            }
+            box.append(text)
+        })
+        defer { o.close() }
+        let g = o.currentGeneration
+        // Batch A: the writer blocks inside it (holds the write gate).
+        o.emit([RenderedLine(spans: [TextSpan(text: "slow-batch", role: .normal)])], generation: g)
+        // Deterministic wait for the writer to reach the blocked write.
+        _ = enteredSlow.wait(timeout: .now() + 5)
+        // Batch B: queued while the writer is blocked. quiesce() must
+        // drop it (captured batches are re-checked at the write gate
+        // and never written once quiesced), and quiesce() itself must
+        // stay bounded even though the writer is stuck mid-batch.
+        o.emit([RenderedLine(spans: [TextSpan(text: "dropped-batch", role: .normal)])], generation: g)
+        let started = Date()
+        o.quiesce()
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(elapsed < 2.0, "quiesce must stay bounded with a blocked writer, took \(elapsed)s")
+        // The teardown sequence: silence (no new captures) then the
+        // restore barrier. The barrier thread BLOCKS in
+        // beginRestoreBarrier while batch A is mid-write — acquiring
+        // the gate PROVES batch A's accepted writes completed before
+        // the simulated restore ran. The test thread releases the
+        // writer; the write gate's mutual exclusion then orders
+        // [A's writes] -> [barrier] deterministically.
+        o.silence()
+        let barrierDone = DispatchSemaphore(value: 0)
+        let restoreThread = Thread {
+            o.beginRestoreBarrier() // returns only after batch A completed
+            // (the simulated terminal restore happens strictly here)
+            o.endRestoreBarrier()
+            barrierDone.signal()
+            slowGate.lock()
+            releaseSlow.set(true)
+            slowGate.broadcast()
+            slowGate.unlock()
+        }
+        restoreThread.start()
+        // Release the blocked writer: batch A finishes, the writer loop
+        // re-locks and (silenced) captures nothing further, so the
+        // barrier acquires right after A's last write.
+        slowGate.lock()
+        releaseSlow.set(true)
+        slowGate.broadcast()
+        slowGate.unlock()
+        let joined = barrierDone.wait(timeout: .now() + 10) == .success
+        #expect(joined, "the restore barrier must acquire after the blocked writer completed")
+        // Post-teardown emissions are dropped forever (silenced).
+        let late = o.emit([RenderedLine(spans: [TextSpan(text: "post-restore", role: .normal)])], generation: g)
+        #expect(late.droppedStale == true, "emissions after silence must drop")
+        o.flush()
+        let out = box.joined()
+        #expect(out.contains("slow-batch"), "the accepted in-flight batch wrote before the barrier")
+        #expect(!out.contains("dropped-batch"), "a batch queued once quiesced must never write")
+        #expect(!out.contains("post-restore"), "nothing may write after the restore barrier")
+        o.close()
+    }
+
     @Test("ordered writes under one lock, stale generations drop")
     func orderingAndStale() {
         let box = LockedBox()

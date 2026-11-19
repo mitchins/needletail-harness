@@ -437,10 +437,18 @@ func mac03TermiosComparatorProof() {
         // — never blind presses against an unknown state).
         driver.expect("needletail> ", timeoutMS: 20_000)
         let status = await ChatPTYTests.settleThenExit(driver)
-        // TRACKED DEFECT (receipt §17.3): after cancel + the bounded
-        // shutdown's forced exit, the slave termios can remain raw —
-        // the exact-restore assertion stays open until the post-cancel
-        // restore ordering is fixed. Do not assert it here yet.
+        #expect(status != nil, "backpressure cancel must still exit")
+        #expect(chatPTYCleanExit(status ?? 0), "backpressure cancel exits 0, raw \(status ?? -1)")
+        // M4-MAC-04B: the full output-shutdown invariant now holds —
+        // the teardown sequence silences the writer and takes the
+        // restore barrier, so the exact captured termios must be the
+        // last terminal transition even under writer backpressure.
+        #expect(driver.termiosRestoredExactly(), "exact restoration under backpressure (M4-MAC-04B invariant)")
+        // Zero surviving children: settleThenExit reaped the pty child
+        // (status non-nil above); a reaped child cannot survive. The
+        // reaped flag proves the reap happened on THIS driver (no
+        // orphaned chat child is possible).
+        #expect(driver.childReaped(), "the pty child was reaped — zero surviving children")
     }
 
     // M4-MAC-04 (P0): an idle session and a mid-stream session must
