@@ -1628,3 +1628,44 @@ lsof and ptrace all refused; the process sits in an uninterruptible
 exit state), so the exact blocking frame cannot be captured without
 host-level remediation (Xcode/toolchain reset or update — operator
 decision).
+
+## 19. M4-MAC-04B — terminal lifecycle closure (final head 2066bb8)
+
+**Linux final-head qualification: PASS.** Offline gate (build + full
+test suite incl. the terminal/PTY oracle, the MAC-02/03/04
+regressions and the feasibility legs): 35m38s, green at 2066bb8.
+Release bundle smoke (clean host): green. Sonar: the two known
+policy conditions (new_security_rating from the 2 documented S7694
+false positives; new_coverage deferral) — unchanged, operator UI
+actions.
+
+**Focused native tests (final head rebuilt from the 2066bb8
+tarball, release config, macOS 26.7.1 Intel):**
+- C1 idle-empty Ctrl+C ×2: exit 0, prompt cycle rendered (boot +
+  re-prompt), zero `NEs` orphans.
+- C2 empty-line Ctrl+D ×1: exit 0, prompt cycle rendered, zero
+  orphans.
+- Probe-harness notes: BSD `script(1)` requires the child command
+  unquoted; `mktemp` requires the XXXXXX template without a
+  suffix; chat configs are JSON (the ConfigSnapshot schema with a
+  `tools` object and `allow_http_origins` entries equal to real
+  origins) — three harness iterations were spent discovering these;
+  recorded here so future probes start from the working form:
+  `(sleep N; printf "\003") | script -q /dev/null BIN chat --config CFG`.
+- The PTY-02-style dispatch leg was exercised at this head but the
+  external python loopback harness proved fragile under the ssh
+  timeout regime (the server lifecycle vs the session HUP);
+  seen=NO with the chat alive. The dispatch/admission evidence at
+  this code is §16.9's recorded probe run (identical product
+  sources; 2066bb8 differs only by receipt/test files — CI green at
+  both 995d271 and 2066bb8). A native in-suite dispatch run remains
+  blocked by the toolchain runner wedge (§18).
+
+**The full-suite macOS runner wedge: unchanged** (§18's
+discrimination stands: the minimal child-spawning suite passes; the
+full PTY suite wedges the runner at launch/exit, unsampleable).
+
+**Verdict: HOLD.** All four immediate corrections from the MAC-04
+directive remain fixed and Linux-qualified at the final head; the
+focused native legs re-confirm the idle-exit and Ctrl+D lifecycle
+paths. No merge, no release, no M5.
