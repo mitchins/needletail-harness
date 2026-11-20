@@ -59,7 +59,8 @@ struct TerminalOutputOwnerTests {
         o.silence()
         let barrierDone = DispatchSemaphore(value: 0)
         let restoreThread = Thread {
-            o.beginRestoreBarrier() // returns only after batch A completed
+            let acquired = o.beginRestoreBarrier(timeoutMs: 5_000) // returns only after batch A completed
+            precondition(acquired, "the barrier must acquire once the blocked writer completed")
             // (the simulated terminal restore happens strictly here)
             o.endRestoreBarrier()
             barrierDone.signal()

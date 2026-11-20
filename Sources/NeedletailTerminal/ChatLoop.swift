@@ -546,9 +546,16 @@ public final class ChatLoop: @unchecked Sendable {
     /// or is dropped (silenced gate re-check) and can never start.
     private func restoreTerminalExclusively(_ editor: LineEditorSession) {
         owner.silence()
-        owner.beginRestoreBarrier()
-        editor.restoreSaneTermios()
-        owner.endRestoreBarrier()
+        // BOUNDED barrier: an in-flight writer stuck on replxx's
+        // notification pipe (Darwin's small pipe buffer) must not delay
+        // the terminal restore past the watchdog's reach. While blocked
+        // it cannot emit; after a forced exit nothing emits at all.
+        if owner.beginRestoreBarrier(timeoutMs: 500) {
+            editor.restoreSaneTermios()
+            owner.endRestoreBarrier()
+        } else {
+            editor.restoreSaneTermios()
+        }
     }
 
     /// Settles an armed confirm: resumes the shared box, restores the

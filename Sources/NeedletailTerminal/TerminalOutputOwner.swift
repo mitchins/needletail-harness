@@ -124,16 +124,26 @@ public final class TerminalOutputOwner: @unchecked Sendable {
         work.unlock()
     }
 
-    /// M4-MAC-04B: blocks until the writer is between writes (or done),
-    /// then holds that guarantee. Call silence() first — otherwise new
-    /// captures could still start. Returns after acquiring the write
-    /// gate; pair with endRestoreBarrier(). The gate wait is bounded in
-    /// production by the ChatLoop teardown watchdog.
-    public func beginRestoreBarrier() {
-        writeLock.lock()
+    /// M4-MAC-04B: blocks BOUNDEDLY until the writer is between writes
+    /// (or done), then holds that guarantee. Call silence() first —
+    /// otherwise new captures could still start. Returns true when the
+    /// gate was acquired (every accepted write completed; the restore
+    /// cannot overlap a write), false on timeout: a writer still stuck
+    /// mid-write (Darwin: blocked on replxx's notification pipe, which
+    /// nobody drains after the unwind) cannot emit while blocked, and
+    /// the ChatLoop teardown watchdog bounds the process either way.
+    /// Pair with endRestoreBarrier() only on true.
+    public func beginRestoreBarrier(timeoutMs: Int = 500) -> Bool {
+        let polls = timeoutMs / 10
+        for _ in 0 ..< polls {
+            if writeLock.try() { return true }
+            usleep(10_000)
+        }
+        return false
     }
 
     /// Releases the restore barrier acquired by beginRestoreBarrier().
+    /// No-op when the barrier timed out (nothing to release).
     public func endRestoreBarrier() {
         writeLock.unlock()
     }

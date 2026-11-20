@@ -48,9 +48,12 @@ struct ChatCommand: ParsableCommand {
             let (e, o) = lock.withLock { (editor, owner) }
             guard let e else { return }
             o?.silence()
-            o?.beginRestoreBarrier()
-            e.restoreSaneTermios()
-            o?.endRestoreBarrier()
+            if o?.beginRestoreBarrier(timeoutMs: 500) == true {
+                e.restoreSaneTermios()
+                o?.endRestoreBarrier()
+            } else {
+                e.restoreSaneTermios()
+            }
         }
     }
     private static let shutdownEditor = ShutdownEditorBox()
