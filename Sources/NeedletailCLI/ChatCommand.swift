@@ -271,6 +271,10 @@ struct ChatCommand: ParsableCommand {
             // at invoke return; run_finished drops via projections).
             tapBox.dropAll()
             try? await httpClient.shutdown().get()
+            // M4-MAC-04B: the teardown watchdog covers cleanup THROUGH
+            // this shutdown — disarm only here, never inside
+            // loop.run()'s own finish().
+            loop.markTeardownComplete()
         }
     }
 

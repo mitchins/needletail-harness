@@ -104,6 +104,12 @@ Terminal::Terminal( void )
 	_interrupt = CreateEvent( nullptr, true, false, TEXT( "replxx_interrupt_event" ) );
 #else
 	static_cast<void>( ::pipe( _interrupt ) == 0 );
+	/* needletail 0002: the wakeup pipe write end is nonblocking. The
+	 * pipe is a wakeup channel only; when it is full, an unread token
+	 * is already pending and the reader drains everything on wake (the
+	 * impl-side coalesced drain). A blocking write here deadlocks the
+	 * output thread against an input thread that is unwinding. */
+	static_cast<void>( ::fcntl( _interrupt[1], F_SETFL, ::fcntl( _interrupt[1], F_GETFL, 0 ) | O_NONBLOCK ) == 0 );
 #endif
 }
 
@@ -706,7 +712,13 @@ void Terminal::notify_event( EVENT_TYPE eventType_ ) {
 	SetEvent( _interrupt );
 #else
 	char data( ( eventType_ == EVENT_TYPE::KEY_PRESS ) ? 'k' : ( eventType_ == EVENT_TYPE::MESSAGE ? 'm' : 'r' ) );
-	static_cast<void>( write( _interrupt[1], &data, 1 ) == 1 );
+	/* needletail 0002: nonblocking wakeup. EAGAIN means the pipe is
+	 * full of unread tokens — a wakeup is already pending and the
+	 * reader will drain messages, keypresses and resizes on wake (the
+	 * impl-side coalesced drain re-checks every source per wakeup), so
+	 * dropping this token loses nothing. A blocking write here is the
+	 * output-thread/input-thread circular wait. */
+	static_cast<void>( ::write( _interrupt[1], &data, 1 ) == 1 || errno == EAGAIN );
 #endif
 }
 

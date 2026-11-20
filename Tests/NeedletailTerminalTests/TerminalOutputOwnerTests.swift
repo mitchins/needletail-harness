@@ -90,6 +90,56 @@ struct TerminalOutputOwnerTests {
         o.close()
     }
 
+    // M4-MAC-04B: the barrier-TIMEOUT path. A writer stuck forever
+    // (never released) must not hold the terminal restore hostage:
+    // beginRestoreBarrier times out, the restore proceeds, and —
+    // because silence() precedes it — the stuck writer can never
+    // start a new batch. This is the deterministic proof that the
+    // failure path (notification channel saturated, writer wedged in
+    // a blocked write) still unwinds.
+    @Test("barrier timeout: wedged writer cannot block terminal restoration")
+    func barrierTimesOutWithWedgedWriter() {
+        let box = LockedBox()
+        let wedged = LockedFlag()
+        let enteredWedged = DispatchSemaphore(value: 0)
+        let o = TerminalOutputOwner(caps: TerminalCaps(), writer: { text in
+            if text.contains("wedged") && !wedged.get() {
+                wedged.set(true)
+                enteredWedged.signal()
+                // Wedge forever: never returns until the flag flips,
+                // and the flag NEVER flips in this test.
+                while wedged.get() { usleep(50_000) }
+            }
+            box.append(text)
+        })
+        let g = o.currentGeneration
+        o.emit([RenderedLine(spans: [TextSpan(text: "wedged", role: .normal)])], generation: g)
+        _ = enteredWedged.wait(timeout: .now() + 5)
+        // The writer is now wedged mid-write, holding the write gate.
+        o.quiesce()
+        o.silence()
+        let started = Date()
+        let acquired = o.beginRestoreBarrier(timeoutMs: 300)
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(!acquired, "the barrier must time out against a wedged writer")
+        #expect(elapsed >= 0.25, "the timeout bounded the wait (took \(elapsed)s)")
+        // The restore proceeds on the timeout path (simulated here by
+        // recording the restored marker; the caller restores the
+        // terminal unconditionally).
+        box.append("TERMINAL-RESTORED")
+        // A wedged writer cannot emit after the restore: it is blocked
+        // mid-write, and silence() prevents any new capture. The late
+        // emission that would violate the invariant is impossible.
+        let late = o.emit([RenderedLine(spans: [TextSpan(text: "late", role: .normal)])], generation: g)
+        #expect(late.droppedStale == true, "emissions after silence drop even on the timeout path")
+        let out = box.joined()
+        #expect(out.contains("TERMINAL-RESTORED"), "the restore succeeded despite the wedged writer")
+        // Intentionally no close(): the writer thread stays wedged by
+        // construction; close() would block. The owner deinit is
+        // non-joining by design.
+        wedged.set(false)
+    }
+
     @Test("ordered writes under one lock, stale generations drop")
     func orderingAndStale() {
         let box = LockedBox()

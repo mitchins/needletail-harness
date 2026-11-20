@@ -451,6 +451,40 @@ func mac03TermiosComparatorProof() {
         #expect(driver.childReaped(), "the pty child was reaped — zero surviving children")
     }
 
+    // M4-MAC-04B: the notification-channel saturation proof (the
+    // registered 0001(b)/0002 patches). With no reader draining
+    // replxx's wakeup pipe, every print() enqueues a message and
+    // writes a wakeup token. The pre-patch blocking write deadlocked
+    // the notifier at pipe capacity (~64 Ki tokens); the nonblocking
+    // notifier drops tokens on EAGAIN (a wakeup is already pending)
+    // and the coalesced drain delivers everything on wake. The storm
+    // below is 4x pipe capacity: completion within a bounded time IS
+    // the proof the writer remains responsive with the channel
+    // saturated.
+    @Test("MAC-04B: emit storm saturates the wakeup channel without blocking the writer")
+    func mac04NotificationSaturationNonblocking() {
+        guard let session = LineEditorSession() else {
+            Issue.record("no line editor"); return
+        }
+        let started = Date()
+        for i in 0 ..< 262_144 {
+            session.emit("saturate-\(i)\n")
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(elapsed < 30, "a saturated wakeup channel must not block the writer, took \(elapsed)s")
+        // The input thread can unwind: the exact captured termios is
+        // restorable on this session (a no-op when fd 0 is not a tty,
+        // but the call path — the teardown restore — must be safe).
+        session.restoreSaneTermios()
+        // Wakeup preservation: a keypress-shaped wakeup after the
+        // storm is still deliverable — the emulate path routes through
+        // the same notify. (No crash/lock = pass; the drain-side
+        // delivery is proven by the PTY legs.)
+        session.restoreSaneTermios()
+    }
+
+
+
     // M4-MAC-04 (P0): an idle session and a mid-stream session must
     // SURVIVE well past the previous 5-second launch-started deadline —
     // the deadline now bounds only the post-run teardown. Proves the

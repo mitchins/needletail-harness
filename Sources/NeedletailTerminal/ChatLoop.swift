@@ -289,10 +289,20 @@ public final class ChatLoop: @unchecked Sendable {
             inboxContinuation = nil
         }
         owner.close()
-        // M4-MAC-04B: teardown completed. The input thread's watchdog —
-        // armed at the genuine EOF — checks this before firing: a
-        // teardown that finished within its 5 s bound leaves the
-        // watchdog disarmed (no late _exit, no exit-code perturbation).
+        // M4-MAC-04B: teardown-complete is NOT marked here — the
+        // watchdog must cover cleanup THROUGH httpClient.shutdown(),
+        // which runs after run() returns (ComposedSession.run).
+        // Callers that finish the full cleanup mark it explicitly via
+        // markTeardownComplete().
+    }
+
+    /// M4-MAC-04B: called by the session owner after the FULL cleanup
+    /// (including httpClient.shutdown()) completes. The input thread's
+    /// watchdog — armed at the genuine EOF — checks this before
+    /// firing: a cleanup that finished within the 5 s bound leaves the
+    /// watchdog disarmed (no late _exit, no exit-code perturbation);
+    /// a cleanup that hangs past the bound is force-exited.
+    public func markTeardownComplete() {
         lock.withLock { teardownComplete = true }
     }
 

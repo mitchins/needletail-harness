@@ -483,6 +483,17 @@ char32_t Replxx::ReplxxImpl::read_char( HINT_ACTION hintAction_ ) {
 		}
 		_lastRefreshTime = 0;
 		repaint();
+		/* needletail 0003: coalesced-wakeup drain. Wakeup tokens are
+		 * type-tagged, but when the pipe is full the notifier drops
+		 * tokens of ANY type (nonblocking write). A pending keypress
+		 * behind a message token must still be delivered on this wake:
+		 * re-check the keypress queue before waiting again, otherwise a
+		 * dropped 'k' token delays a keystroke until an unrelated
+		 * event. Messages and resizes self-drain: pending tokens wake
+		 * wait_for_input immediately. */
+		if ( ! _keyPresses.empty() ) {
+			break;
+		}
 	}
 	/* try scheduled key presses */ {
 		std::lock_guard<std::mutex> l( _mutex );

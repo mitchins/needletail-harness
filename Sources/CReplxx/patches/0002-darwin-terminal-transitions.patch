@@ -1,8 +1,19 @@
-diff --git a/Sources/CReplxx/replxx/terminal.cxx b/Sources/CReplxx/replxx/terminal.cxx
-index d737edf..961072b 100644
 --- a/Sources/CReplxx/replxx/terminal.cxx
 +++ b/Sources/CReplxx/replxx/terminal.cxx
-@@ -257,6 +257,7 @@ int Terminal::enable_raw_mode( void ) {
+@@ -104,6 +104,12 @@
+ 	_interrupt = CreateEvent( nullptr, true, false, TEXT( "replxx_interrupt_event" ) );
+ #else
+ 	static_cast<void>( ::pipe( _interrupt ) == 0 );
++	/* needletail 0002: the wakeup pipe write end is nonblocking. The
++	 * pipe is a wakeup channel only; when it is full, an unread token
++	 * is already pending and the reader drains everything on wake (the
++	 * impl-side coalesced drain). A blocking write here deadlocks the
++	 * output thread against an input thread that is unwinding. */
++	static_cast<void>( ::fcntl( _interrupt[1], F_SETFL, ::fcntl( _interrupt[1], F_GETFL, 0 ) | O_NONBLOCK ) == 0 );
+ #endif
+ }
+ 
+@@ -257,6 +263,7 @@
  }
  
  int Terminal::reset_raw_mode( void ) {
@@ -10,7 +21,7 @@ index d737edf..961072b 100644
  	if ( ! _rawMode ) {
  		return ( -1 );
  	}
-@@ -270,11 +271,31 @@ int Terminal::reset_raw_mode( void ) {
+@@ -270,11 +277,31 @@
  	return ( 0 );
  #else
  	/* put terminal in raw mode after flushing */
@@ -43,7 +54,7 @@ index d737edf..961072b 100644
  	if ( ! _rawMode ) {
  		return;
  	}
-@@ -285,9 +306,25 @@ void Terminal::disable_raw_mode(void) {
+@@ -285,9 +312,25 @@
  	_consoleIn = INVALID_HANDLE_VALUE;
  #else
  	_terminal_ = nullptr;
@@ -70,3 +81,18 @@ index d737edf..961072b 100644
  #endif
  	_rawMode = false;
  	return;
+@@ -669,7 +712,13 @@
+ 	SetEvent( _interrupt );
+ #else
+ 	char data( ( eventType_ == EVENT_TYPE::KEY_PRESS ) ? 'k' : ( eventType_ == EVENT_TYPE::MESSAGE ? 'm' : 'r' ) );
+-	static_cast<void>( write( _interrupt[1], &data, 1 ) == 1 );
++	/* needletail 0002: nonblocking wakeup. EAGAIN means the pipe is
++	 * full of unread tokens — a wakeup is already pending and the
++	 * reader will drain messages, keypresses and resizes on wake (the
++	 * impl-side coalesced drain re-checks every source per wakeup), so
++	 * dropping this token loses nothing. A blocking write here is the
++	 * output-thread/input-thread circular wait. */
++	static_cast<void>( ::write( _interrupt[1], &data, 1 ) == 1 || errno == EAGAIN );
+ #endif
+ }
+ 

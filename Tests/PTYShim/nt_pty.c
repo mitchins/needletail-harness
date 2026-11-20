@@ -6,10 +6,15 @@
  * ioctl(TIOCSWINSZ), waitpid with deadlines, and bounded select() reads.
  * Teardown kills only the child it spawned (never a generic name).
  */
+#define _XOPEN_SOURCE 600
+#define _DEFAULT_SOURCE 1
+#define _DARWIN_C_SOURCE 1
 #include "nt_pty.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
+
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -310,4 +315,42 @@ void nt_install_usr1_pipe(int writeFd) {
     sigemptyset(&set);
     sigaddset(&set, SIGUSR1);
     pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+}
+
+int nt_pty_open_pair(nt_pty_pair_t *pair) {
+    memset(pair, 0, sizeof(*pair));
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0) return -1;
+    if (grantpt(master) != 0 || unlockpt(master) != 0) {
+        close(master);
+        return -1;
+    }
+    const char *slaveName = ptsname(master);
+    if (slaveName == NULL) {
+        close(master);
+        return -1;
+    }
+    char slavePath[128];
+    snprintf(slavePath, sizeof(slavePath), "%s", slaveName);
+    int slave = open(slavePath, O_RDWR | O_NOCTTY);
+    if (slave < 0) {
+        close(master);
+        return -1;
+    }
+    pair->master = master;
+    pair->slave = slave;
+    pair->retainedSlave = -1;
+    struct termios t;
+    if (tcgetattr(slave, &t) == 0) {
+        pair->haveInitial = 1;
+        pair->initial = t;
+    }
+    return 0;
+}
+
+void nt_pty_pair_close(nt_pty_pair_t *pair) {
+    if (pair->master >= 0) close(pair->master);
+    if (pair->slave >= 0) close(pair->slave);
+    if (pair->retainedSlave >= 0) close(pair->retainedSlave);
+    memset(pair, 0, sizeof(*pair));
 }

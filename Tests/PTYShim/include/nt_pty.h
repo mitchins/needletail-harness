@@ -57,6 +57,18 @@ int nt_pty_slave_fd(nt_pty_t *pty);
 /* M4-MAC-03: meaningful-settings equality (flags, all NCCS control
  * chars, speeds) — no struct padding involvement. 1 = equal. */
 int nt_pty_termios_equal(struct termios *a, struct termios *b);
+
+/* A bare pty pair without a child process: for in-process editor
+ * probes that need a real terminal on fd 0. */
+typedef struct {
+    int master;
+    int slave;
+    int retainedSlave;
+    int haveInitial;
+    struct termios initial;
+} nt_pty_pair_t;
+int nt_pty_open_pair(nt_pty_pair_t *pair);
+void nt_pty_pair_close(nt_pty_pair_t *pair);
 /* 1 when the live slave termios equals the spawn-time capture exactly
  * (full struct memcmp, c_cc included); 0 when it differs; -1 if
  * unavailable. */

@@ -27,14 +27,26 @@ Provenance model (tree == upstream + registered patches):
 ## Registered patches (each independently reviewed)
 
 1. `patches/0001-bracketed-paste-decode-lf.patch` →
-   `replxx/replxx_impl.cxx` (`bracketed_paste`): decode pasted
-   `KEY::control('J')` (LF) back to `'\n'`. Terminal::read_char
-   control-maps C0 bytes; the paste path converted CR and TAB but not
-   LF, so a pasted newline arrived as the out-of-range key code
-   0x200004A and UTF-8-encoded as U+FFFD on output — multiline pastes
-   lost every line break (found by M4-D PTY-02 development evidence).
-   Mirrors the adjacent CR/TAB handling, same style. Required by
-   COMPLETE-SPEC PTY-02 (exact submitted text).
+   `replxx/replxx_impl.cxx` (two hunks).
+   (a) `bracketed_paste`: decode pasted `KEY::control('J')` (LF) back
+   to `'\n'`. Terminal::read_char control-maps C0 bytes; the paste
+   path converted CR and TAB but not LF, so a pasted newline arrived
+   as the out-of-range key code 0x200004A and UTF-8-encoded as U+FFFD
+   on output — multiline pastes lost every line break (found by M4-D
+   PTY-02 development evidence). Mirrors the adjacent CR/TAB
+   handling, same style. Required by COMPLETE-SPEC PTY-02 (exact
+   submitted text).
+   (b) `read_char` coalesced-wakeup drain (M4-MAC-04B notification
+   backpressure): after draining pending messages on a MESSAGE wakeup,
+   re-check the keypress queue and break to deliver it immediately.
+   Wakeup tokens are type-tagged, but when the pipe is full the
+   nonblocking notifier (0002) drops tokens of ANY type; a keypress
+   whose token was dropped behind a message token must still be
+   delivered on that wake, or it is delayed until an unrelated event.
+   Messages and resizes self-drain (any pending token wakes
+   wait_for_input immediately); only the keypress case needs the
+   explicit re-check. Required by the M4-MAC-04B saturation proof
+   (the writer stays responsive with the wakeup channel saturated).
 
 Swift boundary: `shim.h` exposes only the C API (`extern "C"` in
 replxx/replxx.h). C++ interoperability does not cross into Swift.
@@ -45,5 +57,11 @@ replxx/replxx.h). C++ interoperability does not cross into Swift.
 Darwin raw-mode transitions use TCSANOW (TCSADRAIN livelocks against a
 concurrent renderer on a pty — the M4-MAC-02/03 exit hangs) and retry
 tcsetattr on EINTR (a swallowed signal-interrupted restore left the
-terminal raw forever — the in-suite exit nondeterminism). Verified
-both directions by `./dev vendor-check`.
+terminal raw forever — the in-suite exit nondeterminism). The wakeup
+pipe's write end is nonblocking and `notify_event` drops its token on
+EAGAIN: the pipe is a wakeup channel only, a full pipe means an unread
+token is already pending, and the reader drains messages, keypresses
+and resizes on any wake (0001(b)) — so a dropped token loses nothing,
+while a blocking write is the output-thread/input-thread circular
+wait (M4-MAC-04B: the notification-pipe backpressure fixed at its
+source). Verified both directions by `./dev vendor-check`.

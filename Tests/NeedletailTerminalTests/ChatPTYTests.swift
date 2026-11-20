@@ -59,7 +59,13 @@ struct ChatPTYTests {
     /// or clobber PTY credentials (M4-D isolation fix).
     static func childEnv(_ env: PTYEnv, extra: [String: String] = [:]) -> [String: String] {
         var child = ["NEEDLETAIL_STATE_DIR": env.stateDir.path,
-                     ChatLoopback.credentialEnv: ChatLoopback.credentialValue]
+                     ChatLoopback.credentialEnv: ChatLoopback.credentialValue,
+                     // A real TERM by default: replxx routes a dumb or
+                     // unsupported TERM to its plain line reader — no
+                     // raw mode, no key bindings, no key decode — which
+                     // would make every raw-mode/keyboard leg vacuous.
+                     // The PTY-08 TERM matrix overrides per leg.
+                     "TERM": "xterm-256color"]
         for (k, v) in extra { child[k] = v }
         return child
     }
@@ -1011,6 +1017,77 @@ extension ChatPTYTests {
                 Issue.record(Comment(rawValue: v))
             }
             if let b = Self.bearerViolation(server) { Issue.record("credential: \(b)") }
+        }
+    }
+
+    @Test("M4-MAC-04B: EOF at armed approval denies, cancels the abandoned run, and the session continues past any watchdog bound")
+    func mac04ApprovalEOFContinues() async throws {
+        // The directive scenario, EOF variant: the child runs with a
+        // real TERM (pinned in childEnv), so replxx's raw path is
+        // engaged and the product's ctrlD binding fires. Ctrl+D on the
+        // empty decision buffer bails the readLine; the input thread
+        // must (a) NOT arm the teardown watchdog (the arm read happens
+        // before arming), (b) settle the approval as a deny, (c) cancel
+        // the abandoned run so the queue releases, and (d) keep
+        // interacting. The old defect armed the watchdog at every
+        // readLine(nil) and killed the continuing session at 5 s.
+        try await Self.withCredentialKey {
+            let base = FileManager.default.temporaryDirectory
+                .appendingPathComponent("chat-apeof-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: base) }
+            try "eof-approval bytes".write(to: base.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+            let env = try Self.makeEnv(withServer: true, tools: #"{"read":false,"search":false,"edit":true,"write":true,"exec":false,"consult":false}"#)
+            defer { Self.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+            guard let server = env.server else { Issue.record("no loopback"); return }
+            server.enqueue(ChatLoopback.textTurn("warm answer", splits: 1))
+            server.enqueue(ChatLoopback.toolTurn(name: "write", arguments: #"{"path":"note.txt","content":"eof bytes"}"#, prefixText: "writing:"))
+            server.enqueue(ChatLoopback.textTurn("post-eof answer", splits: 1))
+            let driver = ChatPTYDriver(
+                executable: Self.releaseBinary(),
+                args: ["chat", "--config", env.configPath, "--workspace", base.path],
+                extraEnv: Self.childEnv(env))
+            defer { driver.stop() }
+            driver.preserveTranscript = { Self.preserve("pty-apeof2-timeout", transcript: $0) }
+            guard driver.start() else { Issue.record("pty spawn failed"); return }
+            driver.expect("needletail> ", timeoutMS: 30_000)
+            driver.send("warm\r")
+            driver.expect("warm answer", timeoutMS: 20_000)
+            driver.send("write the note\r")
+            driver.expect("approval required:", timeoutMS: 20_000)
+            // Wait for the transcript to go quiet (the arm settle is
+            // async; bytes typed into an unwinding reader are lost).
+            func waitForQuiet(timeoutMS: Int) {
+                let deadline = Date().addingTimeInterval(Double(timeoutMS) / 1000)
+                while Date() < deadline {
+                    let mark = driver.transcriptMark()
+                    usleep(400_000)
+                    if driver.transcriptSince(mark).isEmpty { return }
+                }
+            }
+            driver.send([4]) // Ctrl+D: EOF at the armed approval
+            driver.expect("needletail> ", timeoutMS: 20_000)
+            waitForQuiet(timeoutMS: 10_000)
+            driver.expect("needletail> ", timeoutMS: 20_000)
+            // THE REGRESSION: idle past the old five-second bound. The
+            // session must stay alive and interactive (the settle-exit
+            // below is further interaction). NOTE: a denied run's queue
+            // disposition (free vs held) is Core-nondeterministic; the
+            // survival and the clean exit do not depend on it.
+            let survived = driver.waitExit(timeoutMS: 6_500) == nil
+            #expect(survived, "an approval-EOF deny must not terminate the continuing session")
+            guard let status = await Self.settleThenExit(driver) else {
+                Self.preserve("pty-apeof2", transcript: driver.fullTranscript())
+                Issue.record("approval-EOF chat did not exit"); return
+            }
+            #expect(chatPTYCleanExit(status), "exit code 0, raw \(status)")
+            #expect(driver.termiosRestoredExactly(), "exact restoration after approval-EOF continuation")
+            #expect(driver.childReaped(), "zero surviving children")
+            let transcript = driver.fullTranscript()
+            if let v = Self.allowlistViolation(transcript, "PTY-apeof2") {
+                Self.preserve("pty-apeof2", transcript: transcript)
+                Issue.record(Comment(rawValue: v))
+            }
         }
     }
 
