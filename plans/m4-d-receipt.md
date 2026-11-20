@@ -1744,3 +1744,88 @@ regressions and Linux-qualified at the exact head. The Darwin
 exit-limbo and the barrier-timeout exact-restoration loss remain
 open and are now precisely characterized. No merge, no release,
 no M5.
+
+## 21. M4-MAC-04B round 2 — backpressure at source, accounting, evidence (HEAD 1e5bfa2)
+
+**1. Notification-pipe backpressure — fixed at the source (the
+registered patch process).**
+- `patches/0002-darwin-terminal-transitions.patch` (terminal.cxx,
+  extended): the wakeup pipe's write end is O_NONBLOCK and
+  `notify_event` drops its token on EAGAIN. **Wakeup preservation**:
+  EAGAIN ⟺ the pipe is full ⟺ ≥1 unread token is already pending ⟺
+  the reader's next `wait_for_input` returns immediately; nothing is
+  lost.
+- `patches/0001-bracketed-paste-decode-lf.patch` (replxx_impl.cxx,
+  second hunk — the one-patch-per-file rule folds the impl change
+  into the existing impl patch): the **coalesced-wakeup drain** —
+  the reader re-checks `_keyPresses` after draining messages on a
+  MESSAGE wake. The explicit coalescing matrix: a dropped token of
+  any type is covered because (a) pending tokens wake the reader
+  immediately, (b) the MESSAGE branch now delivers keypresses too,
+  (c) messages/keypresses/resizes are each re-checked or
+  self-draining per wake; resizes repaint and continue into the
+  same drain.
+- `./dev vendor-check`: (R)+(F) both directions + the clone — OK.
+  Registry updated.
+
+**2. Failure path proven.**
+- `mac04NotificationSaturationNonblocking`: a 262,144-message emit
+  storm with no reader (4× the pipe's token capacity) completes in
+  ~0.2 s — the pre-patch notifier deadlocked at capacity. The input
+  thread's unwind and the termios-restore call paths run after the
+  storm.
+- `barrierTimesOutWithWedgedWriter`: the writer is wedged FOREVER
+  (never released); the barrier times out (bounded), the restore
+  proceeds, silence() keeps late emissions impossible. This is the
+  timeout path, not the released-writer case.
+
+**3. Watchdog completion accounting corrected.** finish() no longer
+disarms; `ChatLoop.markTeardownComplete()` is called by
+`ComposedSession.run` only after `httpClient.shutdown()` returns —
+the watchdog now covers the whole cleanup and a hung NIO shutdown
+is force-exited at the bound (was: disarmed before the cleanup
+began).
+
+**4. Ctrl+D-at-approval resolved — the real mechanism found.** The
+documented "binding bypass" was NOT replxx's key decode: the test
+child inherited the RUNNER's `TERM`. A dumb/unsupported TERM routes
+replxx to `read_from_stdin` — its plain line reader with NO raw
+mode, NO key bindings and NO decode — so a literal ^D became a
+canonical-mode EOF and the product's binding never ran
+(`tty::in` is a program-start static, which is why an in-process
+probe cannot reproduce this). Fix: the PTY driver pins a real
+`TERM` for the child (the PTY-08 matrix still overrides per leg);
+PTY-08's legs remain the deliberate degrade-honesty coverage. New
+regression `mac04ApprovalEOFContinues`: approval → ^D at the
+decision prompt (the real raw path, binding fires) → deny + the
+abandoned-run cancel → the session survives 6.5 s idle → settle-
+then-exit → exit 0 + exact restoration + a reaped child. Green on
+Linux.
+
+**Verification**: local Linux — ChatPTYTests 15/15, feasibility
+12/12, owner unit suite 9/9; ONE exact-head Linux gate + release
+smoke GREEN at 1e5bfa2 (34m).
+
+**Native (macOS 26.7.1 Intel, fresh 1e5bfa2 build): PTY-01 alone is
+STILL NOT GREEN.** Repetition 1 of the directive's sequence wedged
+identically to the pre-patch rounds: the chat child enters
+exit-blocked limbo (`?NEs`, 25 min, unsampleable — no sample/lsof/
+ptrace) on the idle-Ctrl+C path under the swift-testing runner
+context; the manual script-pty probes of the same scenario at the
+same head exit 0 cleanly (×2 this round, matching the earlier
+rounds). The notification-pipe class is eliminated as the cause
+(the patches + the saturation proof) and the barrier is bounded,
+so the remaining exit-block lives elsewhere in the child's teardown
+under the runner's process environment (the runner is a known
+signal-masker — the shim already works around SIGUSR1). Per the
+directive, no full matrix was run. The repeated-run and
+concurrent-output native evidence could not be collected past the
+first wedge.
+
+**Verdict: HOLD.** Items 1–3 are implemented and Linux-qualified at
+the exact head; item 4 is resolved mechanistically (the TERM pin)
+with the regression green on Linux, but the isolated PTY-01 native
+case remains exit-blocked under the swift-testing runner. The
+specific blocker: the child's exit path hangs in an unsampleable
+kernel state in the runner context only. No merge, no release,
+no M5.
