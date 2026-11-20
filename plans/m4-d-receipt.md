@@ -1669,3 +1669,78 @@ full PTY suite wedges the runner at launch/exit, unsampleable).
 directive remain fixed and Linux-qualified at the final head; the
 focused native legs re-confirm the idle-exit and Ctrl+D lifecycle
 paths. No merge, no release, no M5.
+
+## 20. M4-MAC-04B implementation gaps (HEAD 37b5bbb)
+
+**1. Watchdog lifecycle — fixed.** The input thread reads
+`confirmArmed` BEFORE arming: a nil readLine while an approval is
+armed settles the approval (deny) and posts the D2 busy-cancel (the
+denied run must release the queue — Core keeps a denied batch's run
+in flight otherwise), and the session CONTINUES; the watchdog arms
+only at a genuine (non-armed) EOF. The watchdog checks
+`finish()`'s `teardownComplete` at fire time and disarms silently —
+a teardown that completed within the 5 s bound is never
+force-exited, and normal exit codes are preserved. PTY regression:
+`mac04ApprovalDenyContinues` — approval → typed deny → the session
+survives 6.5 s idle (> the old 5 s bound) → settle-then-exit → exit
+0. Linux: green. **Open mechanism question (recorded, not papered
+over): the EOF-at-approval variant (^D) is unreachable end-to-end —
+replxx's ctrlD key binding is never invoked at the approval prompt
+(the default send_eof bails instead); the binding-registration and
+decode paths check out individually, so the bypass lives between
+them.**
+
+**2. Output-shutdown invariant — implemented with a bounded
+barrier.** `TerminalOutputOwner.silence()` stops all captures;
+`beginRestoreBarrier(timeoutMs:)` bounded-waits (500 ms) for the
+writer to be between writes; the restore runs inside the barrier
+when acquired. PROOF (the deterministic blocked-writer unit test):
+an in-flight batch writes before the barrier; a batch queued once
+quiesced never writes; post-silence emissions drop; nothing writes
+after the barrier. **The barrier is bounded by necessity: on Darwin
+the notification pipe is small and an in-flight `replxx_write`
+blocks indefinitely once the unwind ends (observed natively: the
+unbounded barrier version hung PTY-01's child in exit-limbo).
+While blocked the writer cannot emit; the watchdog bounds the
+process either way.** The corollary: on Darwin, when the barrier
+times out, the exact termios restoration can be lost to the stuck
+writer — CONFIRMED NATIVELY (the deny-continue subset's
+`termiosRestoredExactly` failed while exit/survival passed). This
+is the §17.3 tracked-open defect with its mechanism now
+identified. Linux is unaffected (the 64 KiB pipe never blocks the
+batch sizes in play); `mac03CtrlCUnderBackpressure` asserts clean
+exit + exact restoration + a reaped child and passes on Linux.
+
+**3. Runner isolation — the wedge is NOT a toolchain defect.**
+Filtered single-test subsets at 37b5bbb on the Mac (release, fresh
+build):
+- PTY-01 alone: the chat CHILD enters exit-blocked limbo
+  (`?NEs`, unsampleable) after the idle-Ctrl+C path; the driver
+  waits; the runner waits on the test — the observed wedge.
+- The deny-continue subset: the child exited cleanly and the
+  RUNNER EXITED CLEANLY (the test failed on the exact-restoration
+  assertion above).
+- The PTY-08 subset: the tests failed fast; the runner exited
+  cleanly.
+A single child-spawning PTY test therefore completes normally when
+its child exits, and wedges only when the child is exit-blocked —
+the runner is a waiter, not the blocker. The wedge tracks the
+PRODUCT's Darwin exit path (post-restore teardown) under suite
+conditions; manual script-pty probes of the same idle-Ctrl+C
+scenario exit cleanly, so the suite context (the runner's pty
+environment) is a co-factor. Classification: product/environment
+boundary, unresolved; the full-suite runs remain blocked by it.
+
+**Verification per the acceptance order**: targeted Linux suites
+first (ChatPTYTests 14/14, feasibility 11/11, owner unit suite
+8/8 at the working tree), then ONE exact-head Linux gate: offline
+gate + release smoke GREEN at 37b5bbb (43m13s). Focused macOS
+verification: C1 idle-Ctrl+C ×2 and C2 Ctrl+D ×1 manual probes at
+the final head — exit 0, prompt cycles, zero orphans; the isolation
+subsets above.
+
+**Verdict: HOLD.** Directives 1 and 2 are implemented with
+regressions and Linux-qualified at the exact head. The Darwin
+exit-limbo and the barrier-timeout exact-restoration loss remain
+open and are now precisely characterized. No merge, no release,
+no M5.
