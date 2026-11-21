@@ -152,10 +152,17 @@ struct ChatPTYTests {
         try await Self.withCredentialKey {
             let env = try Self.makeEnv(withServer: false, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
             defer { Self.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+            // NB_TEARDOWN_TRACE passthrough: when the operator context
+            // sets it, the child emits teardown breadcrumbs into the
+            // transcript — the evidence of WHERE a wedged child blocks
+            // (unsampleable on Darwin). Breadcrumbs are plain ASCII on
+            // the control channel and are covered by the allowlist.
+            var pty01Extra = Self.childEnv(env)
+            if getenv("NB_TEARDOWN_TRACE") != nil { pty01Extra["NB_TEARDOWN_TRACE"] = "1" }
             let driver = ChatPTYDriver(
                 executable: Self.releaseBinary(),
                 args: ["chat", "--config", env.configPath],
-                extraEnv: Self.childEnv(env))
+                extraEnv: pty01Extra)
             defer { driver.stop() }
             driver.preserveTranscript = { Self.preserve("pty-01-timeout", transcript: $0) }
             guard driver.start() else { Issue.record("pty spawn failed"); return }
