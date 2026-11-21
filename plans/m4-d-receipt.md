@@ -1829,3 +1829,76 @@ case remains exit-blocked under the swift-testing runner. The
 specific blocker: the child's exit path hangs in an unsampleable
 kernel state in the runner context only. No merge, no release,
 no M5.
+
+## 22. Review round 3 — notification correctness gaps (HEAD d76288f)
+
+**Resize preservation (Codatiel finding 2) — fixed in 0002.** A
+resize has no pending queue, so the SIGWINCH handler now sets the
+sticky `nt_pending_resize` flag BEFORE notifying, and
+`wait_for_input` consumes it before polling: a resize whose 'r'
+token was dropped on EAGAIN is still delivered; the flag IS the
+resize's pending state.
+
+**EAGAIN telemetry (Codatiel findings 1–2 evidence) — added as
+0003.** `replxx_notify_drops()` (declared in replxx.h by 0003,
+implemented in terminal.cxx by 0002, exposed through the shim to
+Swift as `LineEditorSession.notifyDrops`). vendor-check: all three
+patches verify in both directions + clone.
+
+**Genuine saturation test (Codatiel finding 1) — rebuilt.** The old
+test never touched the pipe (print() with no active readLine writes
+directly to stdout — confirmed). The replacement is
+`NTReplxxSaturationProbe`, a child process running the vendored
+editor on a REAL pty with an ACTIVE readLine reader (the raw path —
+the helper pins TERM=xterm-256color, the same dumb-TERM trap as the
+product child): a 200,000-message torrent plus an 80,000-ioctl
+resize flood. Asserted: the writer stays responsive (exit within
+bounds), the coalesced drain delivers the first and last messages,
+the resize flood does not wedge the reader, and the unwind +
+restoration complete. The drop counter is REPORTED — and the honest
+finding is recorded: **actual EAGAIN is architecturally
+unreachable**: message notifies serialize on the mutex the drainer
+holds (one token per wake cycle) and SIGWINCH is kernel-coalesced
+(one pending signal), so the wakeup pipe cannot reach token capacity
+through any real notifier path; the nonblocking branch is
+defense-in-depth. This also refines the original deadlock diagnosis:
+the writer's block during an unwind contends on the reader's mutex /
+the tty, not the pipe — which the quiesce + drop + bounded-barrier
+design already handles.
+
+**Barrier-timeout proof corrected (Codatiel finding 3).** The test
+now releases the wedged writer AFTER the simulated restoration and
+DETECTS late emissions: with the new per-line gate, exactly the one
+in-flight line may follow the restore; queued lines, later batches
+and post-silence emissions are asserted absent. The claimed
+invariant is now the provable one: post-timeout, output is bounded
+to the single in-flight line and nothing else.
+
+**Stale-k token (the retained earlier finding)**: the attempted
+KEY_PRESS skip was REVERTED — it spun without consuming a
+tty-ready byte (22 CI test failures traced to it, root-caused, and
+the rerun is green). The reader blocking on stdin behind a stale
+token is its designed function (the input thread is supposed to
+block in readLine); pending messages are delivered on the next wake.
+
+**Native PTY-01 — still not green, and now precisely located.**
+Three deterministic wedges at 75aa297 and one instrumented run at
+d76288f with NB_TEARDOWN_TRACE breadcrumbs: the transcript ends at
+the bracketed-paste enable + the prompt render; NO breadcrumb fires
+— not the EOF path, not the Ctrl+C binding. **The child freezes
+between the prompt render and the Ctrl+C binding, inside replxx's
+wait/read path, without consuming the ready ^C byte — runner-context
+only** (the manual script-pty probes of the identical scenario exit
+0 at the same heads, repeatedly). Not the notification pipe, not the
+watchdog, not the barrier, not the http shutdown — those are
+excluded by the breadcrumbs. The next evidence step is a replxx-level
+read-path trace (0002-gated) in the runner context, or host-level
+toolchain remediation. Linux: ChatPTYTests 15/15, feasibility 13/13,
+owner 9/9, ChatLoopTests 12/12; the exact-head gate + smoke green at
+1e5bfa2/75aa297 (one 22-test CI flake root-caused to the reverted
+stale-token hunk and re-run green).
+
+**Verdict: HOLD.** The notification correctness gaps are closed with
+honest evidence; the Darwin runner-context exit/read freeze remains
+the single blocker to native PTY-01, now narrowed to a precise
+location. No merge, no release, no M5.
