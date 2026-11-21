@@ -394,6 +394,7 @@ public final class ChatLoop: @unchecked Sendable {
                 self.owner.emitText(ComposerBridge.pendingExitWarning, generation: self.owner.currentGeneration)
                 return .continue
             case .exit:
+                ChatLoop.ttrace("ctrlC .exit binding entered")
                 // `.abort` bails `readLine`, which returns nil; the
                 // input thread then posts `.inputLine(nil)` and exits,
                 // and the main task sets `shutdown` in
@@ -405,7 +406,9 @@ public final class ChatLoop: @unchecked Sendable {
                 // queue. With emissions stopped the drain settles and
                 // the exit completes.
                 self.owner.quiesce()
+                ChatLoop.ttrace("ctrlC quiesce returned")
                 self.lock.withLock { self.ctrlCExitArmed = false }
+                ChatLoop.ttrace("ctrlC returning .abort")
                 return .abort
             }
         }
