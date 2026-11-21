@@ -354,3 +354,8 @@ void nt_pty_pair_close(nt_pty_pair_t *pair) {
     if (pair->retainedSlave >= 0) close(pair->retainedSlave);
     memset(pair, 0, sizeof(*pair));
 }
+
+unsigned long nt_replxx_notify_drops(void) {
+    extern unsigned long replxx_notify_drops(void);
+    return replxx_notify_drops();
+}

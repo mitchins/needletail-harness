@@ -270,11 +270,14 @@ struct ChatCommand: ParsableCommand {
             // Safety-net tap drop (per-request state already finalizes
             // at invoke return; run_finished drops via projections).
             tapBox.dropAll()
+            ChatLoop.ttrace("httpClient.shutdown entering")
             try? await httpClient.shutdown().get()
+            ChatLoop.ttrace("httpClient.shutdown done")
             // M4-MAC-04B: the teardown watchdog covers cleanup THROUGH
             // this shutdown — disarm only here, never inside
             // loop.run()'s own finish().
             loop.markTeardownComplete()
+            ChatLoop.ttrace("teardownComplete marked")
         }
     }
 

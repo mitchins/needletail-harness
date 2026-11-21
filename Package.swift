@@ -113,6 +113,10 @@ let package = Package(
             dependencies: ["NeedletailLineEditor", "PTYShim"]
         ),
         .executableTarget(
+            name: "NTReplxxSaturationProbe",
+            dependencies: ["NeedletailLineEditor"]
+        ),
+        .executableTarget(
             name: "NeedletailCLI",
             dependencies: [
                 "NeedletailCore",

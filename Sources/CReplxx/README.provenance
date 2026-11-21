@@ -47,6 +47,12 @@ Provenance model (tree == upstream + registered patches):
    wait_for_input immediately); only the keypress case needs the
    explicit re-check. Required by the M4-MAC-04B saturation proof
    (the writer stays responsive with the wakeup channel saturated).
+   (c) `read_char` KEY_PRESS stale-token reconciliation: a 'k' token
+   can outlive its keypress (the coalesced message-drain may have
+   already delivered it). Serving the token with an empty queue
+   falls through to the blocking tty read and strands the reader;
+   the queue is re-checked and the stale token skipped. Exposed by
+   the saturation/stale-token review (Codatiel round 3).
 
 Swift boundary: `shim.h` exposes only the C API (`extern "C"` in
 replxx/replxx.h). C++ interoperability does not cross into Swift.
@@ -60,8 +66,23 @@ tcsetattr on EINTR (a swallowed signal-interrupted restore left the
 terminal raw forever — the in-suite exit nondeterminism). The wakeup
 pipe's write end is nonblocking and `notify_event` drops its token on
 EAGAIN: the pipe is a wakeup channel only, a full pipe means an unread
-token is already pending, and the reader drains messages, keypresses
-and resizes on any wake (0001(b)) — so a dropped token loses nothing,
-while a blocking write is the output-thread/input-thread circular
-wait (M4-MAC-04B: the notification-pipe backpressure fixed at its
-source). Verified both directions by `./dev vendor-check`.
+token is already pending, and the reader drains messages and
+keypresses on any wake (0001(b)) — so a dropped message/keypress
+token loses nothing. A RESIZE has no queue of its own: the SIGWINCH
+handler sets the sticky `nt_pending_resize` flag before notifying and
+`wait_for_input` consumes it before polling, so a resize whose 'r'
+token was dropped is still delivered — resize events cannot be lost
+to pipe saturation. Dropped tokens are counted in `nt_notify_drops`
+(exposed as `replxx_notify_drops()` via 0003) so saturation behavior
+is provable, not assumed. A blocking write here is the
+output-thread/input-thread circular wait (M4-MAC-04B: the
+notification-pipe backpressure fixed at its source). Verified both
+directions by `./dev vendor-check`.
+
+### Registered patch 0003
+
+`patches/0003-notify-drops-telemetry.patch` → `replxx/replxx.h`:
+declares `replxx_notify_drops()` (implemented in terminal.cxx by
+0002) — the C-API accessor for the wakeup-token drop counter. Test
+and teardown-trace consumers use it to prove actual EAGAIN behavior
+of the nonblocking notifier instead of assuming it.

@@ -288,7 +288,9 @@ public final class ChatLoop: @unchecked Sendable {
             inboxContinuation?.finish()
             inboxContinuation = nil
         }
+        ChatLoop.ttrace("finish: owner.close entering")
         owner.close()
+        ChatLoop.ttrace("finish: owner.close done")
         // M4-MAC-04B: teardown-complete is NOT marked here — the
         // watchdog must cover cleanup THROUGH httpClient.shutdown(),
         // which runs after run() returns (ComposedSession.run).
@@ -476,10 +478,13 @@ public final class ChatLoop: @unchecked Sendable {
                 // render of the continuing session.
                 let armed = loop.lock.withLock { loop.confirmArmed }
                 if line == nil {
+                    ChatLoop.ttrace("eof armed=\(armed)")
                     if armed {
                         editor.restoreSaneTermios()
+                        ChatLoop.ttrace("restore(armed) done")
                     } else {
                         loop.restoreTerminalExclusively(editor)
+                        ChatLoop.ttrace("restore(exclusive) done")
                     }
                 }
                 // M4-MAC-04B: a nil line while an approval is armed is
@@ -501,9 +506,14 @@ public final class ChatLoop: @unchecked Sendable {
                     // normal exit). Plain Foundation Thread + usleep: no
                     // concurrency-runtime subtleties can delay or
                     // swallow this bound.
+                    ChatLoop.ttrace("watchdog armed")
                     let watchdog = Thread {
                         usleep(5_000_000)
-                        if loop.lock.withLock({ loop.teardownComplete }) { return }
+                        if loop.lock.withLock({ loop.teardownComplete }) {
+                            ChatLoop.ttrace("watchdog disarmed (teardown complete)")
+                            return
+                        }
+                        ChatLoop.ttrace("watchdog FIRING")
                         loop.restoreTerminalExclusively(editor)
 #if canImport(Glibc)
                         Glibc._exit(0)
@@ -547,6 +557,17 @@ public final class ChatLoop: @unchecked Sendable {
         thread.start()
     }
 
+    /// M4-MAC-04B: teardown breadcrumbs on stderr (the PTY transcript),
+    /// gated by NB_TEARDOWN_TRACE. Purpose: when a child wedges in an
+    /// unsampleable state, the last breadcrumb IS the evidence of where
+    /// it blocked; also dumps the notifier drop counter so saturation
+    /// behavior is provable rather than assumed.
+    nonisolated public static func ttrace(_ line: String) {
+        guard ProcessInfo.processInfo.environment["NB_TEARDOWN_TRACE"] != nil else { return }
+        let drops = LineEditorSession.notifyDrops
+        FileHandle.standardError.write(Data("[tt] \(line) drops=\(drops)\n".utf8))
+    }
+
     /// M4-MAC-04B: the exclusive terminal-restore sequence. Silence the
     /// output owner (no new captures), take the restore barrier (every
     /// accepted write has completed), restore the captured termios as
@@ -555,17 +576,21 @@ public final class ChatLoop: @unchecked Sendable {
     /// holds by construction: a batch either wrote before the barrier
     /// or is dropped (silenced gate re-check) and can never start.
     private func restoreTerminalExclusively(_ editor: LineEditorSession) {
+        ChatLoop.ttrace("silence")
         owner.silence()
         // BOUNDED barrier: an in-flight writer stuck on replxx's
         // notification pipe (Darwin's small pipe buffer) must not delay
         // the terminal restore past the watchdog's reach. While blocked
         // it cannot emit; after a forced exit nothing emits at all.
         if owner.beginRestoreBarrier(timeoutMs: 500) {
+            ChatLoop.ttrace("barrier acquired")
             editor.restoreSaneTermios()
             owner.endRestoreBarrier()
         } else {
+            ChatLoop.ttrace("barrier TIMEOUT (writer stuck)")
             editor.restoreSaneTermios()
         }
+        ChatLoop.ttrace("restore done")
     }
 
     /// Settles an armed confirm: resumes the shared box, restores the

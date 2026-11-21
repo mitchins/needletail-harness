@@ -60,6 +60,13 @@ public final class LineEditorSession: @unchecked Sendable {
         return String(cString: result)
     }
 
+    /// M4-MAC-04B: wakeup tokens dropped on EAGAIN by the nonblocking
+    /// notifier (the vendored 0002/0003 telemetry). Monotonic per
+    /// process; proves actual saturation behavior.
+    public static var notifyDrops: UInt64 {
+        UInt64(replxx_notify_drops())
+    }
+
     /// Writes streamed output above the live composer. This is the
     /// concurrent-output path the feasibility scenario exercises. Uses the
     /// non-variadic `replxx_write` (the variadic `replxx_print` is not

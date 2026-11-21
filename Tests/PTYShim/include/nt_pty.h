@@ -69,6 +69,7 @@ typedef struct {
 } nt_pty_pair_t;
 int nt_pty_open_pair(nt_pty_pair_t *pair);
 void nt_pty_pair_close(nt_pty_pair_t *pair);
+unsigned long nt_replxx_notify_drops(void);
 /* 1 when the live slave termios equals the spawn-time capture exactly
  * (full struct memcmp, c_cc included); 0 when it differs; -1 if
  * unavailable. */

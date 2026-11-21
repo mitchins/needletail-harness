@@ -73,6 +73,15 @@ public final class TerminalOutputOwner: @unchecked Sendable {
     /// restoration": writes either completed before the barrier or
     /// were dropped at the capture re-check.
     private let writeLock = NSLock()
+    /// M4-MAC-04B: the always-consistent read of `silenced` for the
+    /// per-line gate inside the write section (the write section runs
+    /// off the work lock; this tiny lock makes the gate race-free).
+    private let gateLock = NSLock()
+    private var silencedGate = false
+
+    private var silencedNow: Bool {
+        gateLock.withLock { silencedGate }
+    }
 
     /// Stops ALL further emissions (queued and future). The writer
     /// thread keeps running until stop() so teardown semantics are
@@ -115,6 +124,7 @@ public final class TerminalOutputOwner: @unchecked Sendable {
     /// reversible by design — it precedes the terminal-restore barrier.
     /// Idempotent; safe from any thread.
     public func silence() {
+        gateLock.withLock { silencedGate = true }
         work.lock()
         silenced = true
         pendingDroppable.removeAll()
@@ -336,16 +346,24 @@ public final class TerminalOutputOwner: @unchecked Sendable {
             }
             work.unlock()
             // Encode + write off-lock; this thread is the only writer.
-            if clearBeforeContent {
+            // M4-MAC-04B: the per-line gate. On the barrier-timeout
+            // path the restore proceeds while this thread may still be
+            // inside ONE writer() call (a blocked write cannot be
+            // cancelled). Once silenced, no further line is emitted:
+            // the late emission is bounded to the single in-flight
+            // line, and every subsequent line is dropped here.
+            if clearBeforeContent, !silencedNow {
                 writer("\r\u{1B}[K")
             }
             for line in controls {
+                if silencedNow { break }
                 writer(ANSISpans.encode(line, caps: caps) + "\n")
             }
             for line in droppable {
+                if silencedNow { break }
                 writer(ANSISpans.encode(line, caps: caps) + "\n")
             }
-            if let progress {
+            if let progress, !silencedNow {
                 writer(progress.text.map { "\r" + displaySafe($0) + "\u{1B}[K" } ?? "\r\u{1B}[K")
             }
             writeLock.unlock()

@@ -72,10 +72,27 @@ bool out( is_a_tty( 1 ) );
 
 #ifndef _WIN32
 Terminal* _terminal_ = nullptr;
+/* needletail 0002: wakeup-channel observability and resize liveness.
+ * nt_notify_drops counts tokens dropped on EAGAIN (each drop is safe:
+ * a full pipe means an unread token is already pending). The pipe is
+ * a wakeup channel only; messages and keypresses live in their own
+ * queues, but a resize has NO pending-state queue — a dropped 'r'
+ * token would lose the resize entirely. nt_pending_resize is the
+ * sticky pending-state: set by the SIGWINCH handler before notifying,
+ * consumed by wait_for_input (which returns RESIZE immediately while
+ * it is set, whether or not any 'r' token survived). */
+extern "C" {
+unsigned long nt_notify_drops = 0;
+volatile int nt_pending_resize = 0;
+unsigned long replxx_notify_drops( void ) {
+	return ( nt_notify_drops );
+}
+}
 static void WindowSizeChanged( int ) {
 	if ( ! _terminal_ ) {
 		return;
 	}
+	nt_pending_resize = 1;
 	_terminal_->notify_event( Terminal::EVENT_TYPE::RESIZE );
 }
 #endif
@@ -675,6 +692,14 @@ Terminal::EVENT_TYPE Terminal::wait_for_input( int long timeout_ ) {
 	fd_set fdSet;
 	int nfds( max( _interrupt[0], _interrupt[1] ) + 1 );
 	while ( true ) {
+		/* needletail 0002: a resize whose token was dropped on EAGAIN
+		 * is preserved by the sticky flag — resize has no queue of its
+		 * own, so the flag IS its pending state. Consume-before-poll
+		 * means a resize is never lost to pipe saturation. */
+		if ( nt_pending_resize ) {
+			nt_pending_resize = 0;
+			return ( EVENT_TYPE::RESIZE );
+		}
 		FD_ZERO( &fdSet );
 		FD_SET( 0, &fdSet );
 		FD_SET( _interrupt[0], &fdSet );
@@ -714,11 +739,14 @@ void Terminal::notify_event( EVENT_TYPE eventType_ ) {
 	char data( ( eventType_ == EVENT_TYPE::KEY_PRESS ) ? 'k' : ( eventType_ == EVENT_TYPE::MESSAGE ? 'm' : 'r' ) );
 	/* needletail 0002: nonblocking wakeup. EAGAIN means the pipe is
 	 * full of unread tokens — a wakeup is already pending and the
-	 * reader will drain messages, keypresses and resizes on wake (the
-	 * impl-side coalesced drain re-checks every source per wakeup), so
-	 * dropping this token loses nothing. A blocking write here is the
-	 * output-thread/input-thread circular wait. */
-	static_cast<void>( ::write( _interrupt[1], &data, 1 ) == 1 || errno == EAGAIN );
+	 * reader will drain messages and keypresses on wake (the impl-side
+	 * coalesced drain re-checks those sources per wakeup); resizes are
+	 * covered by the sticky nt_pending_resize flag set by the SIGWINCH
+	 * handler, so dropping this token loses nothing. A blocking write
+	 * here is the output-thread/input-thread circular wait. */
+	if ( ::write( _interrupt[1], &data, 1 ) != 1 ) {
+		++nt_notify_drops; /* EAGAIN (or a rare pipe error): wakeup semantics preserved, see above. */
+	}
 #endif
 }
 

@@ -97,25 +97,34 @@ struct TerminalOutputOwnerTests {
     // start a new batch. This is the deterministic proof that the
     // failure path (notification channel saturated, writer wedged in
     // a blocked write) still unwinds.
-    @Test("barrier timeout: wedged writer cannot block terminal restoration")
+    @Test("barrier timeout: wedged writer cannot block terminal restoration; late emission bounded to the in-flight line")
     func barrierTimesOutWithWedgedWriter() {
+        // The honest failure-path proof. The writer wedges INSIDE the
+        // first line of a MULTI-line batch; the barrier times out; the
+        // simulated restoration is recorded; and ONLY THEN is the
+        // wedged writer released. The per-line gate must detect the
+        // post-restore release and stop the batch after the one line
+        // that was already in flight — the test detects any late
+        // emission beyond it rather than assuming absence.
         let box = LockedBox()
         let wedged = LockedFlag()
         let enteredWedged = DispatchSemaphore(value: 0)
         let o = TerminalOutputOwner(caps: TerminalCaps(), writer: { text in
-            if text.contains("wedged") && !wedged.get() {
+            if text.contains("wedged-line") && !wedged.get() {
                 wedged.set(true)
                 enteredWedged.signal()
-                // Wedge forever: never returns until the flag flips,
-                // and the flag NEVER flips in this test.
-                while wedged.get() { usleep(50_000) }
+                while wedged.get() { usleep(20_000) }
             }
             box.append(text)
         })
         let g = o.currentGeneration
-        o.emit([RenderedLine(spans: [TextSpan(text: "wedged", role: .normal)])], generation: g)
+        // One batch, three lines; line 1 wedges the writer.
+        o.emit([
+            RenderedLine(spans: [TextSpan(text: "wedged-line-1", role: .normal)]),
+            RenderedLine(spans: [TextSpan(text: "queued-line-2", role: .normal)]),
+            RenderedLine(spans: [TextSpan(text: "queued-line-3", role: .normal)]),
+        ], generation: g)
         _ = enteredWedged.wait(timeout: .now() + 5)
-        // The writer is now wedged mid-write, holding the write gate.
         o.quiesce()
         o.silence()
         let started = Date()
@@ -123,21 +132,33 @@ struct TerminalOutputOwnerTests {
         let elapsed = Date().timeIntervalSince(started)
         #expect(!acquired, "the barrier must time out against a wedged writer")
         #expect(elapsed >= 0.25, "the timeout bounded the wait (took \(elapsed)s)")
-        // The restore proceeds on the timeout path (simulated here by
-        // recording the restored marker; the caller restores the
-        // terminal unconditionally).
+        // The restore proceeds on the timeout path.
         box.append("TERMINAL-RESTORED")
-        // A wedged writer cannot emit after the restore: it is blocked
-        // mid-write, and silence() prevents any new capture. The late
-        // emission that would violate the invariant is impossible.
-        let late = o.emit([RenderedLine(spans: [TextSpan(text: "late", role: .normal)])], generation: g)
+        // Post-teardown emissions are dropped.
+        let late = o.emit([RenderedLine(spans: [TextSpan(text: "late-batch", role: .normal)])], generation: g)
         #expect(late.droppedStale == true, "emissions after silence drop even on the timeout path")
-        let out = box.joined()
-        #expect(out.contains("TERMINAL-RESTORED"), "the restore succeeded despite the wedged writer")
-        // Intentionally no close(): the writer thread stays wedged by
-        // construction; close() would block. The owner deinit is
-        // non-joining by design.
+        // NOW release the wedged writer: it finishes the ONE in-flight
+        // line, and the per-line gate must stop everything after it.
         wedged.set(false)
+        for _ in 0 ..< 100 where !box.joined().contains("queued-line-2-or-never") && false { usleep(10_000) }
+        usleep(500_000)
+        let out = box.joined()
+        #expect(out.contains("wedged-line-1"), "the in-flight line was written (accepted pre-restore)")
+        #expect(out.contains("TERMINAL-RESTORED"), "the restore succeeded despite the wedged writer")
+        #expect(!out.contains("queued-line-2"), "the per-line gate must stop the batch after the in-flight line")
+        #expect(!out.contains("queued-line-3"), "no further lines after the restore")
+        #expect(!out.contains("late-batch"), "no new batches after silence")
+        // The one in-flight line is the ONLY thing after the restore:
+        // verify its position relative to the restore marker.
+        if let r = out.range(of: "TERMINAL-RESTORED") {
+            let after = out[r.upperBound...]
+            #expect(!after.contains("queued-line"), "nothing but the in-flight line follows the restore")
+        }
+        // Intentionally no close(): the writer thread is now released
+        // and the loop sees silence+stopped; close() is safe only after
+        // the writer returns, which the release above guarantees — but
+        // the loop may still be inside the gate section; poll-free close
+        // is avoided to keep the test deterministic.
     }
 
     @Test("ordered writes under one lock, stale generations drop")

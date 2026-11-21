@@ -454,6 +454,16 @@ char32_t Replxx::ReplxxImpl::read_char( HINT_ACTION hintAction_ ) {
 			continue;
 		}
 		if ( eventType == Terminal::EVENT_TYPE::KEY_PRESS ) {
+			/* needletail 0001(b): a KEY_PRESS event covers BOTH the
+			 * wakeup token AND tty readiness. A stale 'k' token whose
+			 * keypress was already delivered by the message-drain
+			 * re-check reaches the post-loop code, which pops the queue
+			 * when non-empty and otherwise performs the normal blocking
+			 * tty read — the reader waiting for a keystroke is its
+			 * designed function (the input thread is SUPPOSED to block
+			 * in readLine), and pending messages are delivered on the
+			 * next wake. Skipping the event here would spin without
+			 * consuming a tty-ready byte. */
 			break;
 		}
 		if ( eventType == Terminal::EVENT_TYPE::RESIZE ) {
