@@ -170,7 +170,14 @@ struct ChatPTYTests {
             // terminal is in raw mode and the input thread is inside
             // replxx_input — Ctrl+C cannot race canonical mode after it.
             driver.expect("needletail> ", timeoutMS: 30_000)
-            driver.send([3]) // Ctrl+C at idle-empty: clean exit, code 0.
+            // M4-MAC-04B: capture the LIVE slave termios BEFORE injecting
+            // 0x03 and assert the injection succeeded. The capture proves
+            // the reader had engaged raw mode at injection time (ICANON
+            // and ECHO clear) — a canonical-mode injection would be the
+            // VEOF/INTR line-discipline path, not a keystroke.
+            #expect(driver.readerInRawMode(), "reader in raw mode at injection (ICANON and ECHO clear)")
+            let injected = driver.send([3]) // Ctrl+C at idle-empty: clean exit, code 0.
+            #expect(injected == 0, "the 0x03 write must succeed (nt_pty_write: 0 = success, -1 = error)")
             guard let status = driver.waitExit(timeoutMS: 15_000) else {
                 Self.preserve("pty-01", transcript: driver.fullTranscript())
                 Issue.record("PTY-01 release chat did not exit after idle-empty Ctrl+C")

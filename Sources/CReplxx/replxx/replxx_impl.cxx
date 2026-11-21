@@ -28,6 +28,10 @@
 #endif
 
 #include "replxx_impl.hxx"
+
+extern "C" {
+void nt_input_mark( const char* op, int err );
+}
 #include "utf8string.hxx"
 #include "prompt.hxx"
 #include "util.hxx"
@@ -1411,6 +1415,11 @@ int Replxx::ReplxxImpl::get_input_line( void ) {
 		}
 
 		key_press_handlers_t::iterator it( _keyPressHandlers.find( c ) );
+		if ( getenv( "NB_INPUT_TRACE" ) ) {
+			char m[96];
+			snprintf( m, sizeof ( m ), "dispatch c=%lx handlers=%zu found=%d", static_cast<unsigned long>( c ), _keyPressHandlers.size( ), it != _keyPressHandlers.end() ? 1 : 0 );
+			nt_input_mark( m, 0 );
+		}
 		if ( it != _keyPressHandlers.end() ) {
 			next = it->second( c );
 			if ( _modifiedState ) {

@@ -60,6 +60,14 @@ public final class LineEditorSession: @unchecked Sendable {
         return String(cString: result)
     }
 
+    /// M4-MAC-04B: queue a synthetic keystroke (replxx's
+    /// emulate_key_press). Used by the stale-token regression: the
+    /// queued key and its wakeup token can be serviced in different
+    /// wake cycles, leaving the token stale in the pipe.
+    public func emulateKeyPress(_ code: UInt32) {
+        replxx_emulate_key_press(handle, code)
+    }
+
     /// M4-MAC-04B: wakeup tokens dropped on EAGAIN by the nonblocking
     /// notifier (the vendored 0002/0003 telemetry). Monotonic per
     /// process; proves actual saturation behavior.

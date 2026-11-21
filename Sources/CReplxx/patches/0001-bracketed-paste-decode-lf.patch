@@ -1,6 +1,17 @@
 --- a/Sources/CReplxx/replxx/replxx_impl.cxx
 +++ b/Sources/CReplxx/replxx/replxx_impl.cxx
-@@ -454,6 +454,16 @@
+@@ -28,6 +28,10 @@
+ #endif
+ 
+ #include "replxx_impl.hxx"
++
++extern "C" {
++void nt_input_mark( const char* op, int err );
++}
+ #include "utf8string.hxx"
+ #include "prompt.hxx"
+ #include "util.hxx"
+@@ -454,6 +458,16 @@
  			continue;
  		}
  		if ( eventType == Terminal::EVENT_TYPE::KEY_PRESS ) {
@@ -17,7 +28,7 @@
  			break;
  		}
  		if ( eventType == Terminal::EVENT_TYPE::RESIZE ) {
-@@ -483,6 +493,17 @@
+@@ -483,6 +497,17 @@
  		}
  		_lastRefreshTime = 0;
  		repaint();
@@ -35,7 +46,19 @@
  	}
  	/* try scheduled key presses */ {
  		std::lock_guard<std::mutex> l( _mutex );
-@@ -2406,6 +2427,13 @@
+@@ -1390,6 +1415,11 @@
+ 		}
+ 
+ 		key_press_handlers_t::iterator it( _keyPressHandlers.find( c ) );
++		if ( getenv( "NB_INPUT_TRACE" ) ) {
++			char m[96];
++			snprintf( m, sizeof ( m ), "dispatch c=%lx handlers=%zu found=%d", static_cast<unsigned long>( c ), _keyPressHandlers.size( ), it != _keyPressHandlers.end() ? 1 : 0 );
++			nt_input_mark( m, 0 );
++		}
+ 		if ( it != _keyPressHandlers.end() ) {
+ 			next = it->second( c );
+ 			if ( _modifiedState ) {
+@@ -2406,6 +2436,13 @@
  			c = '\n';
  		} else if ( c == KEY::control( 'I' ) ) {
  			c = '\t';

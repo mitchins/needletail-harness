@@ -14,6 +14,7 @@ import PTYShim
 /// FULL transcript to `.needletail-dev/m4d-pty/<case>.log`.
 final class ChatPTYDriver {
     private var pty = nt_pty_t()
+    var livePTY: nt_pty_t { pty }
     private var started = false
     private var cursor = ChatPTYTranscript()
     private let executable: String
@@ -174,8 +175,9 @@ final class ChatPTYDriver {
         return out
     }
 
-    func send(_ bytes: [UInt8]) {
-        bytes.withUnsafeBufferPointer { buffer in
+    @discardableResult
+    func send(_ bytes: [UInt8]) -> Int32 {
+        bytes.withUnsafeBufferPointer { buffer -> Int32 in
             nt_pty_write(&pty, buffer.baseAddress!, buffer.count)
         }
     }
@@ -227,6 +229,16 @@ final class ChatPTYDriver {
     /// restore as failed. Exact comparison also catches partial
     /// restores (e.g. a dropped IEXTEN), per the release-acceptance
     /// requirement.
+    /// M4-MAC-04B: the LIVE slave termios check — the reader must be
+    /// in raw mode (ICANON/ECHO clear) at the moment of a keystroke
+    /// injection; a canonical-mode injection would take the line
+    /// discipline's VEOF/INTR path instead of a keystroke.
+    func readerInRawMode() -> Bool {
+        var t = termios()
+        guard nt_pty_slave_termios(&pty, &t) == 0 else { return false }
+        return (t.c_lflag & tcflag_t(ICANON)) == 0 && (t.c_lflag & tcflag_t(ECHO)) == 0
+    }
+
     func termiosRestoredExactly() -> Bool {
         // Meaningful-settings comparison in the shim (M4-MAC-03): all
         // flags, every control character (VMIN/VTIME included) and

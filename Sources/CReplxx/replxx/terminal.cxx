@@ -87,6 +87,29 @@ volatile int nt_pending_resize = 0;
 unsigned long replxx_notify_drops( void ) {
 	return ( nt_notify_drops );
 }
+/* needletail 0002: bounded input-path instrumentation. When
+ * NB_INPUT_TRACE is set in the environment, each completed step of
+ * wait_for_input -> read_char -> decoded key -> handler dispatch is
+ * written to stderr (the test transcript) with errno and readiness
+ * state, and the LAST completed operation is kept in
+ * nt_input_last_op for post-mortem access. Off = zero cost. */
+char nt_input_last_op[128] = "init";
+int nt_input_last_errno = 0;
+int nt_input_trace_on( void ) {
+	static int on = -1;
+	if ( on < 0 ) {
+		on = getenv( "NB_INPUT_TRACE" ) ? 1 : 0;
+	}
+	return ( on );
+}
+void nt_input_mark( const char* op, int err ) {
+	snprintf( nt_input_last_op, sizeof ( nt_input_last_op ), "%s", op );
+	nt_input_last_errno = err;
+	if ( nt_input_trace_on() ) {
+		fprintf( stderr, "\n[it]%s errno=%d\n", op, err );
+		fflush( stderr );
+	}
+}
 }
 static void WindowSizeChanged( int ) {
 	if ( ! _terminal_ ) {
@@ -616,6 +639,11 @@ char32_t Terminal::read_char( void ) {
 	if ( is_control_code( c ) ) {
 		c = Replxx::KEY::control( control_to_human( c ) );
 	}
+	if ( nt_input_trace_on() ) {
+		char m[96];
+		snprintf( m, sizeof ( m ), "readc:decoded c=%lx", static_cast<unsigned long>( c ) );
+		nt_input_mark( m, 0 );
+	}
 #endif // #_WIN32
 	return ( c );
 }
@@ -704,17 +732,30 @@ Terminal::EVENT_TYPE Terminal::wait_for_input( int long timeout_ ) {
 		FD_SET( 0, &fdSet );
 		FD_SET( _interrupt[0], &fdSet );
 		timeval tv{ timeout_ / 1000, static_cast<suseconds_t>( ( timeout_ % 1000 ) * 1000 ) };
+		nt_input_mark( "wfis:select-enter", 0 );
 		int err( select( nfds, &fdSet, nullptr, nullptr, timeout_ > 0 ? &tv : nullptr ) );
 		if ( ( err == -1 ) && ( errno == EINTR ) ) {
+			nt_input_mark( "wfis:select-EINTR", errno );
 			continue;
 		}
 		if ( err == 0 ) {
+			nt_input_mark( "wfis:select-timeout", 0 );
 			return ( EVENT_TYPE::TIMEOUT );
+		}
+		if ( err == -1 ) {
+			nt_input_mark( "wfis:select-error", errno );
+			return ( EVENT_TYPE::TIMEOUT );
+		}
+		{
+			char ready[96];
+			snprintf( ready, sizeof ( ready ), "wfis:select-ready err=%d tty=%d pipe=%d", err, FD_ISSET( 0, &fdSet ) ? 1 : 0, FD_ISSET( _interrupt[0], &fdSet ) ? 1 : 0 );
+			nt_input_mark( ready, 0 );
 		}
 		if ( FD_ISSET( _interrupt[0], &fdSet ) ) {
 			char data( 0 );
 			static_cast<void>( read( _interrupt[0], &data, 1 ) == 1 );
 			if ( data == 'k' ) {
+				nt_input_mark( "wfis:token-k", 0 );
 				return ( EVENT_TYPE::KEY_PRESS );
 			}
 			if ( data == 'm' ) {
