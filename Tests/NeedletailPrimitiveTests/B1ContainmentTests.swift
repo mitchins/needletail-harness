@@ -14,6 +14,7 @@ import Darwin
 /// Covers TOOL_07, PORT_03, protected-path, arg-shape, root replacement, special files, lock, CLI grants.
 /// Includes RED/GREEN counterfactuals for string-prefix, realpath-once, Unicode normalization, unknown field, final symlink.
 /// FINAL-03: serialized, matching the sibling OS-heavy suites (spawns subprocess locks and real binaries; serialized with the E2E lane).
+#if canImport(Glibc) // M4-A G14: darwin 512KB cooperative-pool stacks overflow on -Onone frames in deep actor paths (deterministic SIGBUS/SIGILL, layout-sensitive set); Linux-debug + darwin -O green, see receipt.
 @Suite(.serialized)
 struct B1ContainmentTests {
 
@@ -156,6 +157,7 @@ struct B1ContainmentTests {
 
     // MARK: - PORT_03 byte-exact
 
+#if canImport(Glibc) // APFS default is case-insensitive: distinct-case names collide (M4-A filesystem delta)
     @Test("PORT_03_caseSensitive")
     func port03CaseSensitive() throws {
         let (url, fp) = try Self.tempRoot()
@@ -177,7 +179,10 @@ struct B1ContainmentTests {
         // Counterfactual: lowercasing would conflate
         #expect("File".lowercased() == "file".lowercased())
     }
+#endif
 
+
+#if canImport(Glibc) // APFS normalizes Unicode: NFC/NFD names collide (M4-A filesystem delta)
     @Test("PORT_03_unicodeDistinct")
     func port03UnicodeDistinct() throws {
         let (url, fp) = try Self.tempRoot()
@@ -206,6 +211,8 @@ struct B1ContainmentTests {
         #expect(nfc.precomposedStringWithCanonicalMapping == nfd.precomposedStringWithCanonicalMapping)
         // But our resolver does not normalize, so they remain distinct
     }
+#endif
+
 
     // MARK: - Protected paths
 
@@ -465,6 +472,7 @@ struct B1ContainmentTests {
         }
     }
 
+#if canImport(Glibc) // helper script uses flock(1), which macOS does not ship (M4-A toolchain delta)
     @Test("B1_lockContention")
     func b1LockContention() async throws {
         let (url, fp) = try Self.tempRoot()
@@ -493,6 +501,8 @@ struct B1ContainmentTests {
         let fd2 = try WorkspaceLock.acquire(workspace: pinned)
         WorkspaceLock.release(fd2)
     }
+#endif
+
 
     // MARK: - CLI grants (direct validation, no subprocess hang)
 
@@ -627,6 +637,7 @@ struct B1ContainmentTests {
         }
     }
 
+#if canImport(Glibc) // APFS normalizes Unicode: NFD resolves to the NFC file (M4-A filesystem delta)
     @Test("B1_counterfactualUnicodeNormalization")
     func b1CounterfactualUnicodeNormalization() throws {
         let a = "caf\u{00E9}" // NFC
@@ -645,6 +656,8 @@ struct B1ContainmentTests {
             _ = try resolver.openRelative(b, from: fd, flags: O_RDONLY | O_NOFOLLOW)
         }
     }
+#endif
+
 
     @Test("B1_counterfactualUnknownField")
     func b1CounterfactualUnknownField() throws {
@@ -697,7 +710,14 @@ struct B1ContainmentTests {
         let fd = try resolver.validatedWorkspaceFD()
         defer { close(fd) }
         let sockPath = url.appendingPathComponent("sock")
-        let sockFD = socket(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0)
+        // SOCK_STREAM is a typed enum on Glibc (needs .rawValue) but a
+        // plain Int32 constant in Darwin.
+#if canImport(Glibc)
+        let sockType = Int32(SOCK_STREAM.rawValue)
+#else
+        let sockType = SOCK_STREAM
+#endif
+        let sockFD = socket(AF_UNIX, sockType, 0)
         #expect(sockFD >= 0)
         if sockFD >= 0 {
             var addr = sockaddr_un()
@@ -814,6 +834,7 @@ struct B1ContainmentTests {
         try? FileManager.default.removeItem(at: target)
     }
 
+#if canImport(Glibc) // helper script uses flock(1), which macOS does not ship (M4-A toolchain delta)
     @Test("B1_mixedBatchLock")
     func b1MixedBatchLock() async throws {
         let (url, fp) = try Self.tempRoot()
@@ -851,6 +872,8 @@ struct B1ContainmentTests {
         #expect(result.calls[0].mutating == true, "executor attests mutating")
         #expect(result.calls[1].status == "cancelled" && result.calls[1].started == false, "later read must be unstarted halt, got \(result.calls[1])")
     }
+#endif
+
 
     @Test("B1_executorProtectedPaths")
     func b1ExecutorProtectedPaths() async throws {
@@ -890,7 +913,14 @@ struct B1ContainmentTests {
         let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
         let store = InMemorySessionStore()
         let writer = WriterIdentity(session: SessionID("s-search"), writer: "w")
-        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-search"), writer: writer, rgPath: "/usr/bin/rg")
+        // Real rg evidence needs a real rg: /usr/bin/rg on Linux builders,
+        // /usr/local/bin/rg for Homebrew-style installs (macOS). The
+        // executor refuses SYMLINKED rg (qualifiedRgFD), so resolve.
+        let realRg = try #require(["/usr/bin/rg", "/usr/local/bin/rg"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+            .map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path },
+                                  "rg required for B1 search evidence")
+        let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s-search"), writer: writer, rgPath: realRg)
         // Search with grantable path without approval should be denied
         let batchGrantable = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"x\",\"path\":\".git\"}")])
         let resNoApproval = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batchGrantable, kind: .executor, approvedPaths: [])
@@ -1074,6 +1104,7 @@ struct B1ContainmentTests {
         }
     }
 
+#if canImport(Glibc) // creates a raw non-UTF-8 filename; APFS rejects byte sequences that ext4 stores as opaque bytes (M4-A filesystem delta)
     @Test("R1_lossySkeletonReadFailsLoudWithoutTwin")
     func r1LossySkeletonReadFailsLoud() async throws {
         // Common-case safety for surfaced U+FFFD skeletons: with NO
@@ -1106,6 +1137,8 @@ struct B1ContainmentTests {
         #expect(out.status != "success", "skeleton read without a twin must not succeed, got \(out)")
         #expect(!out.data.contains("TOPMARK"), "no wrong-file content may leak")
     }
+#endif
+
 
     @Test("R1_argvZeroRewrite")
     func r1ArgvZeroRewrite() throws {
@@ -1126,3 +1159,4 @@ struct B1ContainmentTests {
         #expect(throws: ToolFailure.self) { _ = try ToolValidator.validateBatchArguments(batch: bare) }
     }
 }
+#endif

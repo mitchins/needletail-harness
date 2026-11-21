@@ -122,18 +122,101 @@ struct ActorApprovalTests {
     @Test("POLICY-04 trustedExec auto-allows; observe denies upfront")
     func POLICY_04_modesEndToEnd() async throws {
         // TrustedExec with an edit batch: no approval request is emitted.
+        // Hold the executor gate open: without it `executing` is
+        // transient (the canned executor auto-completes in one burst)
+        // and the test races the scheduler for the observation window —
+        // under load the window is missed and the single-response
+        // non-final script then wedges the continuation pump
+        // (POLICY-04 CI flake). The gate keeps `executing` observable;
+        // `isFinal: true` describes the single complete turn (no phantom
+        // continuation for the script to exhaust).
         let trustedApprovals = ScriptedApprovals()
         trustedApprovals.script = [.deny("must never be asked")]
         let tTransport = ScriptedTransport()
-        let (tActor, _) = try ActorFixtures.makeActor(mode: .trustedExec, permissive: true, transport: tTransport, executor: ScriptedExecutor(), approvals: trustedApprovals)
+        let tExecutor = ScriptedExecutor()
+        let (gateStream, releaseGate) = AsyncStream<Void>.makeStream()
+        tExecutor.gate = gateStream
+        let (tActor, _) = try ActorFixtures.makeActor(mode: .trustedExec, permissive: true, transport: tTransport, executor: tExecutor, approvals: trustedApprovals)
         tTransport.script = [ProviderResponse(
             requestID: RequestID("s"), generation: Revision(0),
             outcome: .textDeltaComplete(text: "calls", toolProposals: [
                 ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"hello\",\"new_string\":\"world\"}"),
-            ], isFinal: false))]
+            ], isFinal: true))]
         await tActor.submitText(commandID: CommandID("a-1"), text: "run", kind: .followUp, sealed: false)
         try await ActorFixtures.awaitPhase(tActor, { $0.phase == .executing }, "trustedExec executing")
         #expect(trustedApprovals.requests.isEmpty, "no approval asked in trustedExec")
+        #expect(tTransport.invocations.count == 1, "single turn, single invocation")
+        releaseGate.finish()
+    }
+
+    @Test("POLICY-04 observe: mutating proposals deny upfront, never authorise")
+    func POLICY_04_observeDeniesUpfront() async throws {
+        // Observe mode with VALID caps (read/search only — observe +
+        // mutating grants is refused at creation, pinned in
+        // ApprovalPolicyTests): a mutating batch is denied by effective
+        // capabilities as typed receipts — the run continues with a
+        // provider continuation, and NOTHING reaches authorising or the
+        // executor. (batchNeedsApproval(.observe) is false, so the
+        // caps layer is the only thing standing between a mutating
+        // proposal and dispatch — this leg proves it end to end.)
+        // The recording executor is the decisive oracle: authorization
+        // safety must be DEMONSTRATED (zero executor calls per proposal
+        // + denial receipts in the transcript), not inferred from the
+        // run completing.
+        let approvals = ScriptedApprovals()
+        approvals.script = [.deny("must never be asked")]
+        let transport = GatedTransport()
+        let (gateStream, gateContinuation) = AsyncStream<GatedTransport.TransportGateCommand>.makeStream()
+        transport.gate = gateStream
+        let recordingExecutor = ScriptedExecutor()
+        let (actor, store) = try ActorFixtures.makeActor(mode: .observe, permissive: false, transport: transport, executor: recordingExecutor, approvals: approvals)
+        // Drive via the gated transport: respond with the mutating
+        // batch, then the denial continuation, then the final.
+        await actor.submitText(commandID: CommandID("o-1"), text: "run", kind: .followUp, sealed: false)
+        try await ActorFixtures.awaitInvocations(transport, count: 1)
+        let inv1 = transport.invocations[0]
+        gateContinuation.yield(.respond(ProviderResponse(
+            requestID: inv1.requestID, generation: inv1.generation,
+            outcome: .textDeltaComplete(text: "calls", toolProposals: [
+                ToolProposal(callID: "c1", tool: "edit", argumentsDigest: "d", arguments: "{\"path\":\"a\",\"expectedHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"old_string\":\"h\",\"new_string\":\"w\"}"),
+                ToolProposal(callID: "c2", tool: "exec", argumentsDigest: "d", arguments: "{\"executable\":\"/usr/bin/pytest\",\"argv\":[\"/usr/bin/pytest\",\"-q\"]}"),
+                ToolProposal(callID: "c3", tool: "write", argumentsDigest: "d", arguments: "{\"path\":\"b\",\"content\":\"x\"}"),
+            ], isFinal: false))))
+        try await ActorFixtures.awaitInvocations(transport, count: 2)
+        // The denial continuation is a provider request, never an
+        // approval ask and never an execution.
+        #expect(approvals.requests.isEmpty, "observe must not ask approval for mutating tools")
+        #expect(recordingExecutor.calls.isEmpty, "edit/exec/write proposals must NEVER reach the executor in observe mode")
+        // Deliver the final response (the denial continuation).
+        let inv2 = transport.invocations[1]
+        gateContinuation.yield(.respond(ProviderResponse(
+            requestID: inv2.requestID, generation: inv2.generation,
+            outcome: .textDeltaComplete(text: "denials delivered", toolProposals: [], isFinal: true))))
+        gateContinuation.finish()
+        try await ActorFixtures.awaitPhase(actor, {
+            if case .completed = $0.phase { return true }
+            return false
+        }, "completed after typed denials")
+        let final = await actor.currentState()
+        #expect(final.pendingApproval == nil, "no approval request may linger")
+        #expect(recordingExecutor.calls.isEmpty, "executor must still have zero calls after completion")
+        // Denial receipts: the transcript carries one tool response per
+        // proposal with the typed denial text (I05 — never silently
+        // dropped). Records nest DurableRecord → transcript entry.
+        let (records, _) = try store.records(session: SessionID("s-actor"), since: 0, limit: 10_000)
+        var denialReceipts: [String] = []
+        for sequenced in records {
+            if case .transcriptAppended(.toolResponse(let callID, let text)) = sequenced.record,
+               text.contains("denied by effective capabilities") {
+                denialReceipts.append("\(callID): \(text)")
+            }
+        }
+        #expect(denialReceipts.count == 3, "one typed denial receipt per proposal, got \(denialReceipts.count): \(denialReceipts)")
+        for callID in ["c1", "c2", "c3"] {
+            #expect(denialReceipts.contains { $0.hasPrefix("\(callID):") },
+                "denial receipt must name \(callID)")
+        }
+        gateContinuation.finish()
     }
 
     @Test("HEAD-03 approval precedence: ask-gated schema-valid exec still asks")

@@ -52,6 +52,13 @@ struct BoundaryCompletionTests {
             return false
         }), "no further provider request")
         #expect(!out.state.queueHeld, "clean boundary does not hold the queue")
+        #expect(out.effects.contains(where: {
+            if case .emitUI(let p) = $0 {
+                return p.kind == "run:budget-boundary"
+                    && p.detail == "run finished at turn-budget boundary; verdict by oracle"
+            }
+            return false
+        }), "boundary landing projects the distinct UI kind, not plain run:completed")
     }
 
     @Test("R4 unknown outcomes at the budget still hold, never complete")

@@ -1,0 +1,8 @@
+{
+  "width": 80,
+  "lines": [
+    {"id": "status-idle", "runs": [{"text": "idle", "role": "status"}]},
+    {"id": "session-s1", "runs": [{"text": "s1 active m", "role": "normal"}]},
+    {"id": "session-s2", "runs": [{"text": "s2 stale m", "role": "normal"}]}
+  ]
+}

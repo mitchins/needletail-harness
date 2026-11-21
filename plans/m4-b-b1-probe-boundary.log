@@ -1,0 +1,28 @@
+# M4-B B1 BDD-06 probe log — mention boundary guard
+
+Date: 2026-11-07 UTC. Tree: `m4-a` B1 working tree (pre-commit).
+Oracle: `swift test --filter "UX_MENTION_01_emailIsNotTrigger"`.
+
+## Probe 1 (executed, RED confirmed)
+
+Patch (disposable, `Sources/NeedletailPresentation/MentionGrammar.swift`):
+replace the boundary closure body with unconditional true:
+  `if true { return true } // BDD-06 PROBE: boundary check disabled`
+
+Result: oracle FAILS as required —
+  `Expectation failed: state.suggestion == nil` (email `foo@bar`
+  triggers a query) and `Expectation failed: fx.isEmpty` (fetch
+  emitted). The boundary check is the load-bearing guard for
+  UX-MENTION-01/02.
+
+Restore: patch removed by exact inverse replacement; `grep -c PROBE`
+on the file returns 0; full `NeedletailPresentationTests` suite
+green after restore. No production fault switches added; no tree
+changes retained from the probe.
+
+## Attempted probe 0 (discarded, documented)
+
+Disabling only the backslash-escape line does NOT fail the oracle:
+the ASCII boundary set already excludes backslash, so the escape
+guard is defense-in-depth, not load-bearing. Recorded so a future
+reader does not mistake the guard's redundancy for coverage.

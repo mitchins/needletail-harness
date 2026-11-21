@@ -13,6 +13,21 @@ struct B2ReadSearchTests {
         return (url, FilePath(url.path))
     }
 
+    /// Real-rg evidence needs a real rg: /usr/bin/rg on Linux builders,
+    /// /usr/local/bin/rg where Homebrew-style installs land (macOS).
+    /// The executor's qualifiedRgFD refuses SYMLINKED rg (fixed
+    /// provisioned-binary posture), so resolve to the real file — a
+    /// symlinked candidate (…/Cellar/rg/x.y.z/bin/rg) would otherwise
+    /// deny every search leg.
+    private static func locateRg() -> String? {
+        for p in ["/usr/bin/rg", "/usr/local/bin/rg"] {
+            if FileManager.default.isExecutableFile(atPath: p) {
+                return URL(fileURLWithPath: p).resolvingSymlinksInPath().path
+            }
+        }
+        return nil
+    }
+
     @Test("TOOL_01_binary")
     func tool01Binary() async throws {
         let (url, fp) = try Self.tempRoot()
@@ -84,8 +99,7 @@ struct B2ReadSearchTests {
             if let v = oldRC { setenv("RIPGREP_CONFIG_PATH", v, 1) } else { unsetenv("RIPGREP_CONFIG_PATH") }
             if let v = oldRC2 { setenv("RIPGREP_CONFIG", v, 1) } else { unsetenv("RIPGREP_CONFIG") }
         }
-        let realRg = "/usr/bin/rg"
-        try #require(FileManager.default.fileExists(atPath: realRg), "rg required for B2 search evidence; silent skip is not evidence")
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello\"}")])
         let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
@@ -211,8 +225,7 @@ struct B2ReadSearchTests {
         }
         let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
         let store = InMemorySessionStore()
-        let realRg = "/usr/bin/rg"
-        try #require(FileManager.default.fileExists(atPath: realRg), "rg required for B2 search evidence; silent skip is not evidence")
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)
         let batch = ToolBatch([ToolProposal(callID: "c1", tool: "search", argumentsDigest: "d", arguments: "{\"pattern\":\"hello\"}")])
         let res = EffectReservation(effectID: EffectID("eff-1"), runID: RunID("r1"), requestID: RequestID("req1"), generation: Revision(1), revision: Revision(1), mutating: false, batch: batch, kind: .executor, approvedPaths: [])
@@ -384,8 +397,7 @@ struct B2ReadSearchTests {
         let docs = url.appendingPathComponent("docs", isDirectory: true)
         try FileManager.default.createDirectory(at: docs, withIntermediateDirectories: true)
         try "The hidden identifier is M3B-NEEDLE-7331.\n".write(to: docs.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
-        let realRg = "/usr/bin/rg"
-        try #require(FileManager.default.fileExists(atPath: realRg), "rg required for B2 search evidence")
+        let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
         let resolver = try WorkspaceResolver(workspace: fp, readRoots: [])
         let store = InMemorySessionStore()
         let exec = NativeToolExecutor(resolver: resolver, store: store, sessionID: SessionID("s"), writer: WriterIdentity(session: SessionID("s"), writer: "w"), rgPath: realRg)

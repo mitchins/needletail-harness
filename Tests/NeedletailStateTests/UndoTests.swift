@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 import NeedletailCore
 
 /// M2-D D2 pure-state tests: change-group recording, undo eligibility
@@ -6,6 +7,9 @@ import NeedletailCore
 /// crash-boundary journal reconciliation — through the real reducer only
 /// (no I/O). Filesystem fidelity (hashing, identity, no-follow, modes)
 /// belongs to the Runtime UndoFiles tests; the actor loop to UndoActorTests.
+/// Darwin-debug: suite gated (B6 G14-class — the debug runner SIGBUSes
+/// on these deep transition chains; Linux-debug + Darwin `-O` green).
+#if canImport(Glibc)
 struct UndoTests {
 
     // MARK: - Fixtures
@@ -567,7 +571,7 @@ struct UndoTests {
         let unknownEntry = QueueEntry(
             entryID: "q-9", commandID: CommandID("cmd-9"), kind: .followUp,
             state: .heldUnknown, revision: 2, text: "maybe sent",
-            targetEpochID: EpochID("epoch-1"), orderKey: 9, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 9, rank: Double(9), sealed: false)
         let idle = try StateFixtures.idle()
         let held = idle.replacing(queue: [unknownEntry], queueHeld: true)
         #expect(!undoQuiescent(held), "heldUnknown is a deliveryUnknown leg")
@@ -580,7 +584,7 @@ struct UndoTests {
         let stale = QueueEntry(
             entryID: "q-8", commandID: CommandID("cmd-8"), kind: .followUp,
             state: .held, revision: 2, text: "stale",
-            targetEpochID: EpochID("epoch-1"), orderKey: 8, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 8, rank: Double(8), sealed: false)
         let staleHeld = idle.replacing(queue: [stale], queueHeld: true)
         #expect(undoQuiescent(staleHeld), "non-delivery holds do not gate undo")
     }
@@ -827,7 +831,7 @@ struct UndoTests {
         let entry = QueueEntry(
             entryID: "q-7", commandID: CommandID("cmd-7"), kind: .followUp,
             state: .queued, revision: 1, text: "x",
-            targetEpochID: EpochID("epoch-1"), orderKey: 7, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 7, rank: Double(7), sealed: false)
         let fork = LineageFork(
             forkID: "fork-17", sessionID: SessionID("s-1"),
             parentEpochID: EpochID("epoch-1"),
@@ -843,7 +847,7 @@ struct UndoTests {
         let junk = QueueEntry(
             entryID: "q-abc", commandID: CommandID("cmd-x"), kind: .followUp,
             state: .queued, revision: 1, text: "x",
-            targetEpochID: EpochID("epoch-1"), orderKey: 0, sealed: false)
+            targetEpochID: EpochID("epoch-1"), orderKey: 0, rank: Double(0), sealed: false)
         let records: [DurableRecord] = [
             .eventAppended(seq: SequenceNumber(5), kind: "k", digest: "d"),
             .queueAdmitted(entry), .queueAdmitted(junk),
@@ -854,4 +858,20 @@ struct UndoTests {
         ]
         #expect(durableIDHighWater(records) == 17, "max over seq/orderKey/entry/group/undo/fork; junk ignored")
     }
+    // MARK: - UX-UNDO-08: rewind lineage fork records the fork
+
+    @Test("UX-UNDO-08: rewind lineage fork records the fork boundary")
+    func UX_UNDO_08_rewindRecordsFork() throws {
+        // Pure reducer: no workspace, no filesystem. The byte-intact
+        // legs live in UndoActorTests (actor-driven); asserting file
+        // bytes here would hold for any reducer behavior, so this test
+        // pins only the fork record itself.
+        var ids = StateFixtures.ids()
+        var state = try StateFixtures.idle()
+        state = state.replacing(lastSequence: 40)
+        let boundary = LineageBoundary(epochID: state.epoch.epochID, throughSequence: 12)
+        let t = transition(state, .lineageForkRequest(boundary: boundary, atMillis: 1000), &ids)
+        #expect(t.records.contains(where: { if case .lineageFork = $0 { return true }; return false }), "fork recorded")
+    }
 }
+#endif

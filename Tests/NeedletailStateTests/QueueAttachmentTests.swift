@@ -306,7 +306,7 @@ struct QueueAttachmentTests {
         let rogue = QueueEntry(
             entryID: "q-rogue", commandID: CommandID("cmd-rogue"), kind: .followUp,
             state: .queued, revision: 1, text: "rogue", targetEpochID: state.epoch.epochID,
-            orderKey: 99, sealed: true,
+            orderKey: 99, rank: 99.0, sealed: true,
             attachments: [snapshot], attachmentConsentEpoch: state.epoch.epochID)
         state = state.replacing(queue: [rogue])
         let requested = transition(state, Self.finalResponse(run), &ids)
@@ -564,7 +564,7 @@ struct QueueAttachmentTests {
             QueueEntry(
                 entryID: id, commandID: CommandID("cmd-\(id)"), kind: kind,
                 state: .queued, revision: 1, text: id, targetEpochID: idle.epoch.epochID,
-                orderKey: 1, sealed: false,
+                orderKey: 1, rank: 1.0, sealed: false,
                 attachments: [snap], attachmentConsentEpoch: idle.epoch.epochID)
         }
         let state = idle.replacing(

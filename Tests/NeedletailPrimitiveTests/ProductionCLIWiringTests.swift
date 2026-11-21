@@ -209,6 +209,7 @@ struct ProductionCLIWiringTests {
         try (FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int) ?? -1
     }
 
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("A5-1 cli run persists session epoch transcript to production store")
     func runPersistsSessionEpochTranscript() throws {
         let server = try LoopbackSSEServer()
@@ -290,6 +291,7 @@ struct ProductionCLIWiringTests {
                 "text-only run holds nothing and completes nothing operational")
     }
 
+#endif
     @Test("A5-1 cli refuses corrupt store without overwrite")
     func refusesCorruptStoreWithoutOverwrite() throws {
         let directory = try Self.freshDirectory()
@@ -320,6 +322,7 @@ struct ProductionCLIWiringTests {
         }
     }
 
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("A5-1 cli provider failure reports without completion")
     func providerFailureReportsWithoutCompletion() throws {
         // Mid-stream abort classifies as postContent (provider failure),
@@ -365,6 +368,8 @@ struct ProductionCLIWiringTests {
                 "failed run keeps its ownership claim")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("A5-1 cli sealed run leaves no persistent store")
     func sealedRunLeavesNoPersistentStore() throws {
         let server = try LoopbackSSEServer()
@@ -383,6 +388,8 @@ struct ProductionCLIWiringTests {
                 "sealed runs create no state directory at all")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("A5-1 cli denied tool fails the run without completion")
     func deniedToolFailsRunWithoutCompletion() throws {
         // Workspace headless policy denies ungranted mutating tools at
@@ -431,6 +438,8 @@ struct ProductionCLIWiringTests {
                 "denied run retains its claim")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("A5-1 cli killed run retains claim and ledger for new run")
     func killedRunRetainsClaimAndLedger() throws {
         // The loopback server writes paced chunks on its own thread; when
@@ -526,6 +535,8 @@ struct ProductionCLIWiringTests {
                 "retention + clean-release, not takeover")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("A5-1 cli state directory resolution and repair")
     func stateDirectoryResolutionAndRepair() throws {
         let server = try LoopbackSSEServer()
@@ -614,6 +625,8 @@ struct ProductionCLIWiringTests {
                 "XDG location untouched when the override is set")
     }
 
+#endif
+#if canImport(Glibc) // M4-A G14: spawns the debug `needletail run` child, which overflows darwin 512KB cooperative-pool stacks on -Onone frames (child SIGBUS, deterministic per scenario); Linux-debug + darwin -O green, see receipt.
     @Test("A5-1 cli sealed trace stays private and storeless")
     func sealedTraceStaysPrivateAndStoreless() throws {
         let server = try LoopbackSSEServer()
@@ -636,6 +649,7 @@ struct ProductionCLIWiringTests {
                 "sealed runs create no state directory at all")
     }
 
+#endif
     @Test("sandbox-grant inside the workspace refuses (exit 2), absolute, relative and symlinked")
     func sandboxGrantInsideWorkspaceRefuses() throws {
         // Compose-time tripwire: the grant must live outside the

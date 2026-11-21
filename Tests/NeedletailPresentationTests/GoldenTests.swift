@@ -49,6 +49,62 @@ enum GoldenFixtures {
         return data
     }
 
+    static func mentionScenario() -> RenderFrame {
+        var state = UIState()
+        (state, _) = reduce(state, .input(.insertText("see @doc#L30-L10")))
+        let rev = state.suggestion!.revision
+        (state, _) = reduce(state, .completion(CompletionResult(
+            queryRevision: rev,
+            candidates: [CandidateFile(path: "doc.md"), CandidateFile(path: "docs/guide.md")])))
+        (state, _) = reduce(state, .mention(.selectNext))
+        (state, _) = reduce(state, .mention(.acceptSelected))
+        return render(state, width: 80, capabilities: TerminalCapabilities())
+    }
+
+    static func queueScenario() -> RenderFrame {
+        var state = UIState()
+        let live = EpochID("e-1")
+        let stale = QueueEntry(entryID: "q-2", commandID: CommandID("b"), kind: .steer,
+            state: .held, revision: 2, text: "t", targetEpochID: EpochID("e-0"),
+            orderKey: 2, rank: 2.0)
+        let fresh = QueueEntry(entryID: "q-1", commandID: CommandID("a"), kind: .followUp,
+            state: .queued, revision: 1, text: "t", targetEpochID: live,
+            orderKey: 1, rank: 1.0)
+        (state, _) = reduce(state, .queueSync(QueueSyncSnapshot(
+            entries: [fresh, stale], activeRequest: nil,
+            queueHeld: true, heldReason: .cancelled(sinceMillis: 9),
+            pendingApproval: ApprovalRequestView(
+                requestID: RequestID("r-2"), generation: Revision(4), operation: "exec",
+                requiredGrant: "exec", protectedPaths: [], sandbox: true),
+            admittedCommandIDs: [CommandID("a"), CommandID("b")],
+            liveEpoch: live)))
+        return render(state, width: 80, capabilities: TerminalCapabilities())
+    }
+
+    static func undoScenario() -> RenderFrame {
+        var state = UIState()
+        (state, _) = reduce(state, .inspectResult(.undoPreview(preview: UIUndoPreview(
+            groupID: "g-2",
+            files: [UIUndoFile(path: "a", eligible: true),
+                    UIUndoFile(path: "b", eligible: false, conflict: "changed by user")],
+            canRun: false,
+            notice: "1 conflict blocks the run"))))
+        return render(state, width: 80, capabilities: TerminalCapabilities())
+    }
+
+    static func sessionsScenario() -> RenderFrame {
+        var state = UIState()
+        (state, _) = reduce(state, .inspectResult(.sessions(rows: [
+            UISessionRow(sessionID: SessionID("s1"), phase: "requesting",
+                lastActivityMillis: 999_000, routeAlias: "local-coder",
+                locality: "local", modelAlias: "m", isLive: true),
+            UISessionRow(sessionID: SessionID("s2"), phase: "idle",
+                lastActivityMillis: 100, routeAlias: "local-coder",
+                locality: "local", modelAlias: "m", isLive: false),
+        ], asOfMillis: 1_000_000)))
+        return render(state, width: 80, capabilities: TerminalCapabilities())
+    }
+
     static func scenario() -> RenderFrame {
         var state = UIState()
         state.suggestion = MentionSuggestionState(query: "src/", revision: 5, candidates: [])
@@ -84,6 +140,70 @@ struct GoldenTests {
         let golden = try JSONDecoder().decode(
             GoldenFrame.self, from: GoldenFixtures.load("basic-chat.json"))
         let frame = GoldenFixtures.scenario()
+        #expect(frame.width == golden.width)
+        #expect(frame.lines.count == golden.lines.count,
+                "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
+        for (actual, expected) in zip(frame.lines, golden.lines) {
+            #expect(actual.id == expected.id, "line id: \(actual.id) vs \(expected.id)")
+            #expect(actual.runs.map(\.text) == expected.runs.map(\.text), "text for \(expected.id)")
+            #expect(actual.runs.map(\.role.rawValue) == expected.runs.map(\.role),
+                    "roles for \(expected.id)")
+        }
+    }
+
+    @Test("DX-07 queue hold, stale target and approval render")
+    func DX_07_queueGoldenFramesMatch() throws {
+        let golden = try JSONDecoder().decode(
+            GoldenFrame.self, from: GoldenFixtures.load("queue-held.json"))
+        let frame = GoldenFixtures.queueScenario()
+        #expect(frame.width == golden.width)
+        #expect(frame.lines.count == golden.lines.count,
+                "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
+        for (actual, expected) in zip(frame.lines, golden.lines) {
+            #expect(actual.id == expected.id, "line id: \(actual.id) vs \(expected.id)")
+            #expect(actual.runs.map(\.text) == expected.runs.map(\.text), "text for \(expected.id)")
+            #expect(actual.runs.map(\.role.rawValue) == expected.runs.map(\.role),
+                    "roles for \(expected.id)")
+        }
+    }
+
+    @Test("DX-07 undo preview renders eligibility and conflicts")
+    func DX_07_undoGoldenFramesMatch() throws {
+        let golden = try JSONDecoder().decode(
+            GoldenFrame.self, from: GoldenFixtures.load("undo-preview.json"))
+        let frame = GoldenFixtures.undoScenario()
+        #expect(frame.width == golden.width)
+        #expect(frame.lines.count == golden.lines.count,
+                "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
+        for (actual, expected) in zip(frame.lines, golden.lines) {
+            #expect(actual.id == expected.id, "line id: \(actual.id) vs \(expected.id)")
+            #expect(actual.runs.map(\.text) == expected.runs.map(\.text), "text for \(expected.id)")
+            #expect(actual.runs.map(\.role.rawValue) == expected.runs.map(\.role),
+                    "roles for \(expected.id)")
+        }
+    }
+
+    @Test("DX-07 sessions view renders liveness labels")
+    func DX_07_sessionsGoldenFramesMatch() throws {
+        let golden = try JSONDecoder().decode(
+            GoldenFrame.self, from: GoldenFixtures.load("sessions-basic.json"))
+        let frame = GoldenFixtures.sessionsScenario()
+        #expect(frame.width == golden.width)
+        #expect(frame.lines.count == golden.lines.count,
+                "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")
+        for (actual, expected) in zip(frame.lines, golden.lines) {
+            #expect(actual.id == expected.id, "line id: \(actual.id) vs \(expected.id)")
+            #expect(actual.runs.map(\.text) == expected.runs.map(\.text), "text for \(expected.id)")
+            #expect(actual.runs.map(\.role.rawValue) == expected.runs.map(\.role),
+                    "roles for \(expected.id)")
+        }
+    }
+
+    @Test("DX-07 mention popup renders selection and range error")
+    func DX_07_mentionPopupFramesMatch() throws {
+        let golden = try JSONDecoder().decode(
+            GoldenFrame.self, from: GoldenFixtures.load("mention-popup.json"))
+        let frame = GoldenFixtures.mentionScenario()
         #expect(frame.width == golden.width)
         #expect(frame.lines.count == golden.lines.count,
                 "line count: \(frame.lines.map(\.id)) vs \(golden.lines.map(\.id))")

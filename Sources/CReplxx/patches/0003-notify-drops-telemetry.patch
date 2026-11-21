@@ -1,0 +1,16 @@
+--- a/Sources/CReplxx/replxx/replxx.h
++++ b/Sources/CReplxx/replxx/replxx.h
+@@ -44,6 +44,13 @@
+ extern "C" {
+ #endif
+ 
++/* needletail 0003: wakeup-channel telemetry. Tokens dropped on EAGAIN
++ * by the nonblocking notifier (0002). Each drop preserves wakeup
++ * semantics (a full pipe means a pending token); the counter exists so
++ * tests and the product teardown trace can prove saturation behavior
++ * instead of assuming it. */
++unsigned long replxx_notify_drops( void );
++
+ /*
+  * For use in Windows DLLs:
+  *

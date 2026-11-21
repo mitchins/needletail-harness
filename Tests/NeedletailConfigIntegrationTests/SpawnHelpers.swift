@@ -1,6 +1,13 @@
 import Testing
 import Subprocess
+// swift-subprocess binds the SDK `System` module where available (Apple
+// platforms) and `SystemPackage` elsewhere — import the same one so
+// FilePath/Arguments resolve to the types its API expects.
+#if canImport(System)
+import System
+#else
 import SystemPackage
+#endif
 import Foundation
 
 /// Spawn seam for M1-A integration variants: the tests drive the **built**

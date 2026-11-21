@@ -534,6 +534,7 @@ struct C2ExecDurableTests {
 
     // MARK: - Executor dispatch
 
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: approved command runs once and produces a durable result")
     func execApprovedRunsOnceDurable() async throws {
         defer { Self.resetHooks() }
@@ -571,7 +572,10 @@ struct C2ExecDurableTests {
         #expect(try Self.leaseRows(store, atPath: dbPath) == 0, "no lease leak")
         #expect(try Self.stagingFiles(store, dbPath: dbPath).isEmpty, "no staging leak")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: substituted executable never launches")
     func execSubstitutionNeverLaunches() async throws {
         defer { Self.resetHooks() }
@@ -603,6 +607,8 @@ struct C2ExecDurableTests {
         #expect(result2.calls.first?.status == "success", "fresh approval of current bytes runs, got \(String(describing: result2.calls.first))")
         #expect(FileManager.default.fileExists(atPath: wsURL.appendingPathComponent("SENTINEL").path), "counterfactual: approved current bytes execute")
     }
+#endif
+
 
     @Test("C2 exec: missing approval and missing grant never spawn")
     func execMissingApprovalOrGrantRefused() async throws {
@@ -629,6 +635,7 @@ struct C2ExecDurableTests {
         #expect(!FileManager.default.fileExists(atPath: wsURL.appendingPathComponent("SENTINEL2").path), "nothing spawned without approval/grant")
     }
 
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: cwd swap refuses pre-spawn")
     func execCwdSwapConflict() async throws {
         defer { Self.resetHooks() }
@@ -655,7 +662,10 @@ struct C2ExecDurableTests {
         #expect(result.calls.first?.status == "conflict", "cwd escape refuses, got \(String(describing: result.calls.first))")
         #expect(!FileManager.default.fileExists(atPath: wsURL.appendingPathComponent("SENTINEL3").path), "escaped cwd never launches")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: truncation carries exact discarded-byte counts")
     func execTruncationExactCounts() async throws {
         defer { Self.resetHooks() }
@@ -678,7 +688,10 @@ struct C2ExecDurableTests {
         #expect(out.summary.contains("stdout-discarded=8388608"), "discarded count exact (40MiB-32MiB), got \(out.summary)")
         #expect(out.summary.contains("stdout 33554432B"), "kept count exact, got \(out.summary)")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: deadline timeout maps to started-unknown, never success")
     func execTimeoutMapsUnknown() async throws {
         defer { Self.resetHooks() }
@@ -697,7 +710,10 @@ struct C2ExecDurableTests {
         #expect(out.status == "timeout", "deadline kill is a timeout, got \(out)")
         #expect(out.started == true, "a deadline-killed child definitely started: hold, not done")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: artifact failure after spawn maps to started-unknown, never success")
     func execArtifactFailureMapsUnknown() async throws {
         defer { Self.resetHooks() }
@@ -721,6 +737,8 @@ struct C2ExecDurableTests {
         #expect(out.started == true, "the child ran: hold, never a fabricated receipt")
         #expect(out.artifactID == nil, "no artifact reference without durable bytes")
     }
+#endif
+
 
     @Test("C2 exec: spill-grant refusal prevents spawn (failed, unstarted)")
     func execGrantRefusalPreventsSpawn() async throws {
@@ -809,6 +827,7 @@ struct C2ExecDurableTests {
         #expect(!FileManager.default.fileExists(atPath: wsURL.appendingPathComponent("g").path), "halted write never runs")
     }
 
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: shebang script runs with resolved-path argv0")
     func execShebangArgv0() async throws {
         defer { Self.resetHooks() }
@@ -837,7 +856,10 @@ struct C2ExecDurableTests {
         // shebang $0). The leg proves the inheritable-fd split works.
         #expect(out.data.contains("argv0=/proc/self/fd/"), "shebang $0 is the exec-fd path, got \(out.data)")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: post-commit suspension past the deadline stays unknown despite completion")
     func execPostCommitSuspensionTimeout() async throws {
         defer { Self.resetHooks() }
@@ -860,9 +882,12 @@ struct C2ExecDurableTests {
         #expect(out.status == "timeout", "post-commit suspension loses to the deadline, got \(out)")
         #expect(out.started == true, "completed-but-unreceipted stays unknown: hold")
     }
+#endif
+
 
     // MARK: - Spawn classification (runner level)
 
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 spawn: ENOENT, EACCES and ENOEXEC classify pre-dispatch, never started")
     func spawnErrorClassification() throws {
         // ENOENT: nothing at the path.
@@ -914,7 +939,10 @@ struct C2ExecDurableTests {
             #expect(summary.contains("invalid executable format"), "got \(summary)")
         }
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 spawn: death after the marker is started-signal-terminated, never success")
     func spawnDeathAfterMarker() throws {
         defer {
@@ -932,7 +960,10 @@ struct C2ExecDurableTests {
         #expect(!run.timedOut, "prompt SIGKILL is a determined failure, not a timeout")
         #expect(run.stdout.isEmpty, "image never executed: no output")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 spawn: hang after the marker times out unknown, never success")
     func spawnHangAfterMarker() throws {
         defer {
@@ -949,7 +980,10 @@ struct C2ExecDurableTests {
         #expect(run.timedOut, "stalled launch must time out, got \(run)")
         #expect(run.stdout.isEmpty, "no output from a never-executed image")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C3 spawn: cancel during classification converges on reap, never leaks")
     func spawnCancelDuringClassificationReaps() async throws {
         defer {
@@ -991,7 +1025,10 @@ struct C2ExecDurableTests {
             timeout: 10, cwdFD: nil, execPath: nil, useSession: false)
         #expect(again.status == 0 && !again.timedOut, "lane usable after cancelled classification")
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 exec: orphaned same-group grandchild blocks clean success (timeout, no zombie)")
     func execOrphanedGrandchildNoCleanSuccess() async throws {
         defer { Self.resetHooks() }
@@ -1015,6 +1052,8 @@ struct C2ExecDurableTests {
         #expect(out.status == "timeout", "lingering same-group descendant forbids clean success, got \(out)")
         #expect(out.started == true, "the leader verifiably started: hold, not done")
     }
+#endif
+
 
     @Test("C2 exec: absolute cwd is invalid-arguments, never spawned")
     func execAbsoluteCwdRejected() throws {
@@ -1032,6 +1071,7 @@ struct C2ExecDurableTests {
         }
     }
 
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 spawn: bad cwd descriptor classifies pre-dispatch")
     func spawnBadCwdDescriptor() throws {
         // An fd number that can never be open in this process: fchdir fails
@@ -1050,6 +1090,8 @@ struct C2ExecDurableTests {
             #expect(summary.contains("Bad file descriptor") || summary.contains("bad descriptor"), "got \(summary)")
         }
     }
+#endif
+
 
     // MARK: - Recovery (store + reconcile level)
 
@@ -1325,6 +1367,7 @@ struct C2ExecDurableTests {
         return .success
     }
 
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 actor: approved exec runs once through the real loop with durable agreement")
     func actorApprovedExecRunsOnceDurable() async throws {
         defer { Self.resetHooks() }
@@ -1337,7 +1380,10 @@ struct C2ExecDurableTests {
             }
         }
     }
+#endif
 
+
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 actor: completion store-fail leaves an unresolved hold, no silent retry")
     func actorCompletionStoreFailLeavesHold() async throws {
         defer { Self.resetHooks() }
@@ -1398,6 +1444,9 @@ struct C2ExecDurableTests {
         #expect(final.unresolvedOperations.count == 1, "one held operation")
         #expect(final.unresolvedOperations.first?.state == .unknown, "completion-fail is unknown, never done")
     }
+#endif
+
+#if canImport(Glibc) // M4-A G-exec: actor digest-approved exec refuses on Darwin (ExecRunner)
     @Test("C2 exec: omitted cwd pins the workspace root (never inherits process cwd)")
     func execOmittedCwdPinsRoot() async throws {
         defer { Self.resetHooks() }
@@ -1426,6 +1475,7 @@ struct C2ExecDurableTests {
                 "child cwd is pinned, not inherited")
     }
 
+#endif
     @Test("C2 store: forged spill handles are rejected, never publish or delete")
     func spillForgedHandlesRejected() throws {
         defer { Self.resetHooks() }
@@ -1514,6 +1564,7 @@ struct C2ExecDurableTests {
         #expect(try Self.leaseRows(store, atPath: dbPath) == 0, "cancelled grant leaves no lease")
     }
 
+#if canImport(Glibc) // M4-A G-exec: actor digest-approved exec refuses on Darwin (ExecRunner)
     @Test("C2 exec: stderr-only output publishes stderr, releases stdout")
     func execStderrOnlyPublishesStderr() async throws {
         defer { Self.resetHooks() }
@@ -1544,6 +1595,8 @@ struct C2ExecDurableTests {
         #expect(try Self.stagingFiles(f.store, dbPath: f.dbPath).isEmpty)
     }
 
+#endif
+#if canImport(Glibc) // M4-A G-exec: actor digest-approved exec refuses on Darwin (ExecRunner)
     @Test("C2 exec: cancellation propagates and releases spill leases")
     func execCancelPropagatesAndReleases() async throws {
         defer { Self.resetHooks() }
@@ -1568,6 +1621,8 @@ struct C2ExecDurableTests {
         #expect(try Self.stagingFiles(f.store, dbPath: f.dbPath).isEmpty)
     }
 
+#endif
+#if canImport(Glibc) // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
     @Test("C2 actor: intent store-fail prevents spawn (failed, unstarted)")
     func actorIntentStoreFailPreventsSpawn() async throws {
         defer { Self.resetHooks() }
@@ -1614,4 +1669,5 @@ struct C2ExecDurableTests {
         #expect(transport.invocations == 1, "no continuation past the unpersisted intent")
         #expect(!FileManager.default.fileExists(atPath: wsURL.appendingPathComponent("SENTINEL6").path), "intent failure prevents spawn")
     }
+#endif // M4-A G1: digest-approved exec / fork-side fault hooks are Linux-only
 }

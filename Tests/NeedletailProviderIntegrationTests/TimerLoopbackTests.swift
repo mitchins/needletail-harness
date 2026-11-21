@@ -11,6 +11,7 @@ import NeedletailTestSupport
 /// explicit test tick — dispatches the retry, and cancelled timers never
 /// dispatch after the grace. Slow by design (real 1 s backoff / 5 s grace);
 /// case-gated, never quick.
+#if canImport(Glibc) // M4-A G14: darwin 512KB cooperative-pool stacks overflow on -Onone frames in deep actor paths (deterministic SIGBUS/SIGILL, layout-sensitive set); Linux-debug + darwin -O green, see receipt.
 @Suite(.serialized)
 struct TimerLoopbackTests {
     typealias LoopActor = SessionActor<
@@ -38,24 +39,34 @@ struct TimerLoopbackTests {
         defer { server.stop() }
         let (actor, flaky, live) = try await Self.actor(server: server, prefix: "tmr")
         // The actor owns a transport copy sharing this client; drain it at
-        // scope exit (AHC traps on un-shut-down deinit).
-        defer { await LoopbackFixtures.shutdown(live.client) }
-        await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
-        // Armed by the classified preSend; then HANDS OFF — no tick call.
-        _ = try await ActorLoopback.awaitState({ $0.retryDeadlineMillis != nil }, "retry armed", actor: actor)
-        // The production 1 s timer dispatches the retry on its own.
-        // Real sleep: the VirtualClock-based timer fires after 1 s wall
-        // time (see SessionActor.scheduleTimer), not after yields.
-        let done = try await Self.awaitRealTime({
-            if case .completed = $0.phase { return true }
-            return false
-        }, label: "timer-completed run", actor: actor, timeoutSeconds: 3)
-        #expect(flaky.failures == 1 && flaky.delegated == 1, "one failure, one timer-dispatched retry")
-        #expect(server.connectionCount == 1, "single connection")
-        guard case .completed(let receipt) = done.phase else {
-            Issue.record("expected completed, got \(done.phase)"); return
+        // scope exit (AHC traps on un-shut-down deinit). No `defer` for the
+        // shutdown (await-in-defer needs Swift 6.2+); the nested function
+        // is the unit of unwind-safety.
+        func runTimer() async throws {
+            await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
+            // Armed by the classified preSend; then HANDS OFF — no tick call.
+            _ = try await ActorLoopback.awaitState({ $0.retryDeadlineMillis != nil }, "retry armed", actor: actor)
+            // The production 1 s timer dispatches the retry on its own.
+            // Real sleep: the VirtualClock-based timer fires after 1 s wall
+            // time (see SessionActor.scheduleTimer), not after yields.
+            let done = try await Self.awaitRealTime({
+                if case .completed = $0.phase { return true }
+                return false
+            }, label: "timer-completed run", actor: actor, timeoutSeconds: 3)
+            #expect(flaky.failures == 1 && flaky.delegated == 1, "one failure, one timer-dispatched retry")
+            #expect(server.connectionCount == 1, "single connection")
+            guard case .completed(let receipt) = done.phase else {
+                Issue.record("expected completed, got \(done.phase)"); return
+            }
+            #expect(receipt.turnsUsed == 2, "initial + timer retry")
         }
-        #expect(receipt.turnsUsed == 2, "initial + timer retry")
+        do {
+            try await runTimer()
+            await LoopbackFixtures.shutdown(live.client)
+        } catch {
+            await LoopbackFixtures.shutdown(live.client)
+            throw error
+        }
     }
 
     private static func awaitRealTime(
@@ -82,22 +93,33 @@ struct TimerLoopbackTests {
         defer { server.stop() }
         let (actor, flaky, live) = try await Self.actor(server: server, prefix: "tmr-cancel")
         // The actor owns a transport copy sharing this client; drain it at
-        // scope exit (AHC traps on un-shut-down deinit).
-        defer { await LoopbackFixtures.shutdown(live.client) }
-        await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
-        _ = try await ActorLoopback.awaitState({ $0.retryDeadlineMillis != nil }, "retry armed", actor: actor)
-        let before = flaky.delegated
-        await actor.cancel()
-        // Past the 1 s backoff AND the 5 s cancel grace: neither timer may
-        // dispatch or resurrect. Poll with early exit (fails fast).
-        for _ in 0..<140 {
-            if flaky.delegated > before {
-                Issue.record("stale timer dispatched after cancel")
-                return
+        // scope exit (AHC traps on un-shut-down deinit). No `defer` for the
+        // shutdown (await-in-defer needs Swift 6.2+); the nested function
+        // is the unit of unwind-safety.
+        func runCancel() async throws {
+            await actor.submitText(commandID: CommandID("t-1"), text: "hello", kind: .followUp, sealed: false)
+            _ = try await ActorLoopback.awaitState({ $0.retryDeadlineMillis != nil }, "retry armed", actor: actor)
+            let before = flaky.delegated
+            await actor.cancel()
+            // Past the 1 s backoff AND the 5 s cancel grace: neither timer may
+            // dispatch or resurrect. Poll with early exit (fails fast).
+            for _ in 0..<140 {
+                if flaky.delegated > before {
+                    Issue.record("stale timer dispatched after cancel")
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)
             }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            #expect(flaky.delegated == before, "no dispatch after cancel")
+            #expect(server.requests.isEmpty, "zero bytes after cancel")
         }
-        #expect(flaky.delegated == before, "no dispatch after cancel")
-        #expect(server.requests.isEmpty, "zero bytes after cancel")
+        do {
+            try await runCancel()
+            await LoopbackFixtures.shutdown(live.client)
+        } catch {
+            await LoopbackFixtures.shutdown(live.client)
+            throw error
+        }
     }
 }
+#endif

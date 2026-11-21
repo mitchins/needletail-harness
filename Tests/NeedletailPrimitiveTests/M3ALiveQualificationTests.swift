@@ -92,7 +92,11 @@ struct M3ALiveQualificationTests {
         let snap = try m3aSnapshot()
         let profile = try #require(snap.profiles["local-coder"])
         let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: ChatTransportPolicy.configuration(profile: profile))
-        defer { try? await client.shutdown().get() }
+        // No `await` in `defer` on Swift 6.1/Xcode 16.3 toolchains: the
+        // unstructured task retains `client` until the drain completes, so
+        // deinit still runs post-shutdown (no AHC trap). Nothing after the
+        // invoke touches the client, so the concurrent drain is harmless.
+        defer { Task { try? await client.shutdown().get() } }
         let transport = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "Reply with exactly the word 'pong' and nothing else.")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 64))
         let inv = ProviderInvocation(effectID: EffectID("m3a-1"), requestID: RequestID("m3a-1"), runID: RunID("m3a-1"), generation: Revision(0), alias: "local-coder", epochID: EpochID("m3a"), sealed: false, turnsLeft: 1, deadlineMillis: nil, historyDigest: "m3a-1")
         let result = try await transport.invoke(inv, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
@@ -104,6 +108,8 @@ struct M3ALiveQualificationTests {
         #expect(result.response.returnedModel == "halogen-qwen3.8-flash-next")
         #expect(result.response.usageInput != nil)
         #expect(text.lowercased().contains("pong"))
+        // Awaited drain (normal path); the deferred task is the throw-path backstop.
+        try? await client.shutdown().get()
     }
 
     @Test("M3-A 2: streaming deltas are nonempty and final is complete (live)", .enabled(if: m3aLiveEnabled, "set M3A_LIVE=1"))
@@ -114,7 +120,11 @@ struct M3ALiveQualificationTests {
         let box = Box()
         let sink: @Sendable (String) -> Void = { t in box.lock.withLock { box.deltas.append(t) } }
         let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: ChatTransportPolicy.configuration(profile: profile))
-        defer { try? await client.shutdown().get() }
+        // No `await` in `defer` on Swift 6.1/Xcode 16.3 toolchains: the
+        // unstructured task retains `client` until the drain completes, so
+        // deinit still runs post-shutdown (no AHC trap). Nothing after the
+        // invoke touches the client, so the concurrent drain is harmless.
+        defer { Task { try? await client.shutdown().get() } }
         let transport = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "Count from 1 to 5 slowly, one number per line.")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 32), deltaSink: sink)
         let inv = ProviderInvocation(effectID: EffectID("m3a-2"), requestID: RequestID("m3a-2"), runID: RunID("m3a-2"), generation: Revision(0), alias: "local-coder", epochID: EpochID("m3a"), sealed: false, turnsLeft: 1, deadlineMillis: nil, historyDigest: "m3a-2")
         let result = try await transport.invoke(inv, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
@@ -128,6 +138,8 @@ struct M3ALiveQualificationTests {
         #expect(!text.isEmpty, "final must be complete and valid")
         #expect(deltaText.utf8.count <= text.utf8.count + 200)
         if case .textDeltaComplete(_, _, let isFinal) = result.response.outcome { #expect(isFinal) }
+        // Awaited drain (normal path); the deferred task is the throw-path backstop.
+        try? await client.shutdown().get()
     }
 
     @Test("M3-A 3: genuine validated tool-call (live, at least one, fail-closed)", .enabled(if: m3aLiveEnabled, "set M3A_LIVE=1"))
@@ -136,7 +148,11 @@ struct M3ALiveQualificationTests {
         let profile = try #require(snap.profiles["local-coder"])
         let caps = ToolCapabilities(read: true, search: true, edit: false, write: false, exec: .denied, consult: false)
         let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: ChatTransportPolicy.configuration(profile: profile))
-        defer { try? await client.shutdown().get() }
+        // No `await` in `defer` on Swift 6.1/Xcode 16.3 toolchains: the
+        // unstructured task retains `client` until the drain completes, so
+        // deinit still runs post-shutdown (no AHC trap). Nothing after the
+        // invoke touches the client, so the concurrent drain is harmless.
+        defer { Task { try? await client.shutdown().get() } }
         var lastProposals: [ToolProposal] = []
         var attempts = 0
         var lastRaw: [UInt8] = []
@@ -165,6 +181,8 @@ struct M3ALiveQualificationTests {
             if p.tool == "search" { #expect((args?["pattern"] as? String) == "hello") }
             #expect(p.callID.count > 0)
         }
+        // Awaited drain (normal path); the deferred task is the throw-path backstop.
+        try? await client.shutdown().get()
     }
 
     @Test("M3-A 4: cancellation terminates and cannot resurrect (live)", .enabled(if: m3aLiveEnabled, "set M3A_LIVE=1"))
@@ -172,7 +190,11 @@ struct M3ALiveQualificationTests {
         let snap = try m3aSnapshot()
         let profile = try #require(snap.profiles["local-coder"])
         let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: ChatTransportPolicy.configuration(profile: profile))
-        defer { try? await client.shutdown().get() }
+        // No `await` in `defer` on Swift 6.1/Xcode 16.3 toolchains: the
+        // unstructured task retains `client` until the drain completes, so
+        // deinit still runs post-shutdown (no AHC trap). Nothing after the
+        // invoke touches the client, so the concurrent drain is harmless.
+        defer { Task { try? await client.shutdown().get() } }
         let transport = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "Write a long story of 1000 words about a journey, slowly.")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 512))
         let inv = ProviderInvocation(effectID: EffectID("m3a-4"), requestID: RequestID("m3a-4"), runID: RunID("m3a-4"), generation: Revision(0), alias: "local-coder", epochID: EpochID("m3a"), sealed: false, turnsLeft: 1, deadlineMillis: nil, historyDigest: "m3a-4")
         let task = Task { try await transport.invoke(inv, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10)) }
@@ -215,6 +237,8 @@ struct M3ALiveQualificationTests {
         let recordData = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
         let (_, cancelDigest) = try writeEvidence(id: "m3a-4-classification", data: recordData)
         print("M3-A4 classification: \(classification) digest=\(cancelDigest)")
+        // Awaited drain (normal path); the deferred task is the throw-path backstop.
+        try? await client.shutdown().get()
     }
 
     @Test("M3-A 5: genuine continuation preserves ordering and bytes (live)", .enabled(if: m3aLiveEnabled, "set M3A_LIVE=1"))
@@ -222,7 +246,11 @@ struct M3ALiveQualificationTests {
         let snap = try m3aSnapshot()
         let profile = try #require(snap.profiles["local-coder"])
         let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: ChatTransportPolicy.configuration(profile: profile))
-        defer { try? await client.shutdown().get() }
+        // No `await` in `defer` on Swift 6.1/Xcode 16.3 toolchains: the
+        // unstructured task retains `client` until the drain completes, so
+        // deinit still runs post-shutdown (no AHC trap). Nothing after the
+        // invoke touches the client, so the concurrent drain is harmless.
+        defer { Task { try? await client.shutdown().get() } }
         // First turn: ask model to invent a code word — the distinctive value will be in the assistant's reply, not the user prompt
         let t1 = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "Invent a random 4-letter code word (all caps, e.g., ABCD) and reply with exactly 'noted <WORD>' where <WORD> is the invented word.")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 32))
         let inv1 = ProviderInvocation(effectID: EffectID("m3a-5a"), requestID: RequestID("m3a-5a"), runID: RunID("m3a-5a"), generation: Revision(0), alias: "local-coder", epochID: EpochID("m3a"), sealed: false, turnsLeft: 2, deadlineMillis: nil, historyDigest: "m3a-5a")
@@ -256,6 +284,8 @@ struct M3ALiveQualificationTests {
         let persistedRequest = try JSONDecoder().decode([ChatMessage].self, from: requestData)
         #expect(persistedRequest.contains(where: { $0.text.contains(inventedWord) }), "persisted outgoing request contains invented word via assistant turn")
         #expect(persistedRequest.first?.role == .assistant, "outgoing request starts with genuine assistant turn, not replayed user")
+        // Awaited drain (normal path); the deferred task is the throw-path backstop.
+        try? await client.shutdown().get()
     }
 
     @Test("M3-A 6: numeric-string fidelity via live echo (live, opt-in)", .enabled(if: m3aLiveEnabled, "set M3A_LIVE=1"))
@@ -263,7 +293,11 @@ struct M3ALiveQualificationTests {
         let snap = try m3aSnapshot()
         let profile = try #require(snap.profiles["local-coder"])
         let client = HTTPClient(eventLoopGroupProvider: .singleton, configuration: ChatTransportPolicy.configuration(profile: profile))
-        defer { try? await client.shutdown().get() }
+        // No `await` in `defer` on Swift 6.1/Xcode 16.3 toolchains: the
+        // unstructured task retains `client` until the drain completes, so
+        // deinit still runs post-shutdown (no AHC trap). Nothing after the
+        // invoke touches the client, so the concurrent drain is harmless.
+        defer { Task { try? await client.shutdown().get() } }
         let transport = ChatCompletionsTransport(client: client, messageProvider: { _ in [ChatMessage(role: .user, text: "Echo exactly these strings, one per line: \"007\" and \"0123\". No extra formatting.")] }, credentialProvider: { _, _ in nil }, snapshotProvider: { snap }, requestOverride: ChatRequestOverride(maxTokens: 32))
         let inv = ProviderInvocation(effectID: EffectID("m3a-6a"), requestID: RequestID("m3a-6a"), runID: RunID("m3a-6a"), generation: Revision(0), alias: "local-coder", epochID: EpochID("m3a"), sealed: false, turnsLeft: 1, deadlineMillis: nil, historyDigest: "m3a-6a")
         let result = try await transport.invoke(inv, intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
@@ -274,5 +308,7 @@ struct M3ALiveQualificationTests {
         #expect(!text.isEmpty, "echo produced non-empty text (live)")
         if text.contains("007") && text.contains("0123") { print("M3-A6 live: numeric strings preserved in model output") }
         else { print("M3-A6 live note: model did not echo both strings verbatim — INCONCLUSIVE for live echo, wire fidelity still PASS") }
+        // Awaited drain (normal path); the deferred task is the throw-path backstop.
+        try? await client.shutdown().get()
     }
 }

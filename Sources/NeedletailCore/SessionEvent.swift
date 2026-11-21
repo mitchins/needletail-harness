@@ -20,6 +20,11 @@ public enum SessionEvent: Sendable, Equatable {
     /// delivery (requeue for redispatch, or withdraw to drop). Recorded;
     /// never automatic, never a non-delivery proof.
     case queueReconcile(entryID: String, atMillis: UInt64)
+    /// M4-B B2: explicit operator reorder of a queued/held entry. Moves
+    /// display position via a separate `rank` field; `orderKey` (ack/
+    /// watermark identity) is immutable and never reassigned. Recorded;
+    /// refused loudly for unknown/dispatched entries or anchors.
+    case queueReorder(entryID: String, beforeID: String?, atMillis: UInt64)
     /// M2-D D3: explicit operator reconciliation of one unknown mutating
     /// operation (cancel-ambiguous, inverse-ambiguous, or otherwise
     /// unknowable). The operator accepts the stated determination and the

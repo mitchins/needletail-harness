@@ -454,6 +454,16 @@ char32_t Replxx::ReplxxImpl::read_char( HINT_ACTION hintAction_ ) {
 			continue;
 		}
 		if ( eventType == Terminal::EVENT_TYPE::KEY_PRESS ) {
+			/* needletail 0001(b): a KEY_PRESS event covers BOTH the
+			 * wakeup token AND tty readiness. A stale 'k' token whose
+			 * keypress was already delivered by the message-drain
+			 * re-check reaches the post-loop code, which pops the queue
+			 * when non-empty and otherwise performs the normal blocking
+			 * tty read — the reader waiting for a keystroke is its
+			 * designed function (the input thread is SUPPOSED to block
+			 * in readLine), and pending messages are delivered on the
+			 * next wake. Skipping the event here would spin without
+			 * consuming a tty-ready byte. */
 			break;
 		}
 		if ( eventType == Terminal::EVENT_TYPE::RESIZE ) {
@@ -483,6 +493,17 @@ char32_t Replxx::ReplxxImpl::read_char( HINT_ACTION hintAction_ ) {
 		}
 		_lastRefreshTime = 0;
 		repaint();
+		/* needletail 0003: coalesced-wakeup drain. Wakeup tokens are
+		 * type-tagged, but when the pipe is full the notifier drops
+		 * tokens of ANY type (nonblocking write). A pending keypress
+		 * behind a message token must still be delivered on this wake:
+		 * re-check the keypress queue before waiting again, otherwise a
+		 * dropped 'k' token delays a keystroke until an unrelated
+		 * event. Messages and resizes self-drain: pending tokens wake
+		 * wait_for_input immediately. */
+		if ( ! _keyPresses.empty() ) {
+			break;
+		}
 	}
 	/* try scheduled key presses */ {
 		std::lock_guard<std::mutex> l( _mutex );
@@ -2406,6 +2427,13 @@ Replxx::ACTION_RESULT Replxx::ReplxxImpl::bracketed_paste( char32_t ) {
 			c = '\n';
 		} else if ( c == KEY::control( 'I' ) ) {
 			c = '\t';
+		} else if ( c == KEY::control( 'J' ) ) {
+			/* M4-D Needletail patch: pasted line feeds arrive
+			 * control-mapped (Terminal::read_char maps C0); decode back
+			 * so multiline pastes round-trip byte-exact. Without this,
+			 * the out-of-range key code encodes as U+FFFD on output.
+			 * Upstream handles CR and TAB the same way; LF was missed. */
+			c = '\n';
 		}
 		buf.push_back( c );
 	}

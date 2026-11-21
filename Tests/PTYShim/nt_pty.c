@@ -1,14 +1,22 @@
 /*
- * PTYShim implementation — Linux. Uses forkpty-family facilities through
+ * PTYShim implementation — Linux (macOS: same openpty-family API via
+ * util.h; M4-A build-portability only, no PTY behavior change).
+ * Uses forkpty-family facilities through
  * openpty + login_tty (forkpty itself glibc-internal), termios save/restore,
  * ioctl(TIOCSWINSZ), waitpid with deadlines, and bounded select() reads.
  * Teardown kills only the child it spawned (never a generic name).
  */
+#define _XOPEN_SOURCE 600
+#define _DEFAULT_SOURCE 1
+#define _DARWIN_C_SOURCE 1
 #include "nt_pty.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
+
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -16,10 +24,18 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <pthread.h>
 
 int nt_pty_spawn(nt_pty_t *pty, char *const argv[]) {
+    return nt_pty_spawn_env(pty, argv, NULL);
+}
+
+int nt_pty_spawn_env(nt_pty_t *pty, char *const argv[], char *const env[]) {
     if (pty == NULL || argv == NULL) {
         return -1;
     }
@@ -56,12 +72,31 @@ int nt_pty_spawn(nt_pty_t *pty, char *const argv[]) {
         if (slave > STDERR_FILENO) {
             close(slave);
         }
+        /* Apply caller-supplied environment overrides in the child
+         * (the parent's environment is never mutated, so concurrent
+         * suites cannot cross-contaminate spawned children): each
+         * entry is "KEY=VALUE" to set, or bare "KEY" to unset. */
+        if (env != NULL) {
+            for (char *const *entry = env; *entry != NULL; entry++) {
+                char *equals = strchr(*entry, '=');
+                if (equals != NULL) {
+                    *equals = '\0';
+                    setenv(*entry, equals + 1, 1);
+                    *equals = '=';
+                } else {
+                    unsetenv(*entry);
+                }
+            }
+        }
         execvp(argv[0], argv);
         _exit(127);
     }
 
-    /* Parent. */
-    close(slave);
+    /* Parent. The slave fd stays open (stored, never used for I/O):
+     * it anchors the post-exit termios oracle — a pty whose only slave
+     * handle closed tears down, and the restore state would be
+     * unobservable (the M4-MAC-02 oracle defect). */
+    pty->slaveFd = slave;
     pty->masterFd = master;
     pty->childPid = pid;
     return 0;
@@ -124,6 +159,78 @@ int nt_pty_resize(nt_pty_t *pty, int rows, int cols) {
     return ioctl(pty->masterFd, TIOCSWINSZ, &size);
 }
 
+int nt_pty_slave_termios(nt_pty_t *pty, struct termios *current) {
+    if (pty == NULL || current == NULL || pty->slaveFd < 0) {
+        return -1;
+    }
+    return tcgetattr(pty->slaveFd, current);
+}
+
+int nt_pty_have_initial_termios(nt_pty_t *pty) {
+    return (pty != NULL && pty->haveSavedTermios) ? 1 : 0;
+}
+
+int nt_pty_slave_fd(nt_pty_t *pty) {
+    return (pty != NULL) ? pty->slaveFd : -1;
+}
+
+/* M4-MAC-03 finding C: compare MEANINGFUL terminal settings only —
+ * all four flag fields, every control character, and both speeds.
+ * No memcmp: struct padding is unspecified and could make the verdict
+ * depend on bytes that are not terminal state at all. */
+static int termios_equal_meaningful(const struct termios *a, const struct termios *b) {
+    if (a->c_iflag != b->c_iflag) return 0;
+    if (a->c_oflag != b->c_oflag) return 0;
+    if (a->c_cflag != b->c_cflag) return 0;
+    if (a->c_lflag != b->c_lflag) return 0;
+    for (int i = 0; i < NCCS; i++) {
+        if (a->c_cc[i] != b->c_cc[i]) return 0;
+    }
+    if (cfgetispeed(a) != cfgetispeed(b)) return 0;
+    if (cfgetospeed(a) != cfgetospeed(b)) return 0;
+    return 1;
+}
+
+/* 1 = equal, 0 = differ (M4-MAC-03 regression-provable: flips of
+ * VMIN/VTIME (c_cc) or IEXTEN (c_lflag) change the verdict). */
+int nt_pty_termios_equal(struct termios *a, struct termios *b) {
+    return termios_equal_meaningful(a, b);
+}
+
+/* M4-MAC-02: exact restoration verdict — full meaningful comparison. */
+int nt_pty_termios_restored_exactly(nt_pty_t *pty) {
+    if (pty == NULL || !pty->haveSavedTermios || pty->slaveFd < 0) {
+        return -1;
+    }
+    struct termios current;
+    if (tcgetattr(pty->slaveFd, &current) != 0) {
+        return -1;
+    }
+    int verdict = termios_equal_meaningful(&current, &pty->savedSlaveTermios);
+    if (verdict != 1) {
+        int fd = open("/tmp/nb-td.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf), "saved: l=%lx i=%lx o=%lx c=%lx cc[VT]=%x cc[VM]=%x\n",
+                (unsigned long)pty->savedSlaveTermios.c_lflag,
+                (unsigned long)pty->savedSlaveTermios.c_iflag, (unsigned long)pty->savedSlaveTermios.c_oflag,
+                (unsigned long)pty->savedSlaveTermios.c_cflag,
+                (unsigned)pty->savedSlaveTermios.c_cc[VTIME], (unsigned)pty->savedSlaveTermios.c_cc[VMIN]);
+            ssize_t w1 = write(fd, buf, (size_t)n);
+            (void)w1;
+            n = snprintf(buf, sizeof(buf), "curr : l=%lx i=%lx o=%lx c=%lx cc[VT]=%x cc[VM]=%x\n",
+                (unsigned long)current.c_lflag,
+                (unsigned long)current.c_iflag, (unsigned long)current.c_oflag,
+                (unsigned long)current.c_cflag,
+                (unsigned)current.c_cc[VTIME], (unsigned)current.c_cc[VMIN]);
+            ssize_t w2 = write(fd, buf, (size_t)n);
+            (void)w2;
+            close(fd);
+        }
+    }
+    return verdict;
+}
+
 int nt_pty_signal(nt_pty_t *pty, int sig) {
     if (pty == NULL || pty->childPid <= 0) {
         return -1;
@@ -177,6 +284,7 @@ void nt_pty_close(nt_pty_t *pty) {
     }
     if (pty->masterFd >= 0) {
         close(pty->masterFd);
+	if (pty->slaveFd >= 0) { close(pty->slaveFd); pty->slaveFd = -1; }
         pty->masterFd = -1;
     }
 }
@@ -207,4 +315,47 @@ void nt_install_usr1_pipe(int writeFd) {
     sigemptyset(&set);
     sigaddset(&set, SIGUSR1);
     pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+}
+
+int nt_pty_open_pair(nt_pty_pair_t *pair) {
+    memset(pair, 0, sizeof(*pair));
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0) return -1;
+    if (grantpt(master) != 0 || unlockpt(master) != 0) {
+        close(master);
+        return -1;
+    }
+    const char *slaveName = ptsname(master);
+    if (slaveName == NULL) {
+        close(master);
+        return -1;
+    }
+    char slavePath[128];
+    snprintf(slavePath, sizeof(slavePath), "%s", slaveName);
+    int slave = open(slavePath, O_RDWR | O_NOCTTY);
+    if (slave < 0) {
+        close(master);
+        return -1;
+    }
+    pair->master = master;
+    pair->slave = slave;
+    pair->retainedSlave = -1;
+    struct termios t;
+    if (tcgetattr(slave, &t) == 0) {
+        pair->haveInitial = 1;
+        pair->initial = t;
+    }
+    return 0;
+}
+
+void nt_pty_pair_close(nt_pty_pair_t *pair) {
+    if (pair->master >= 0) close(pair->master);
+    if (pair->slave >= 0) close(pair->slave);
+    if (pair->retainedSlave >= 0) close(pair->retainedSlave);
+    memset(pair, 0, sizeof(*pair));
+}
+
+unsigned long nt_replxx_notify_drops(void) {
+    extern unsigned long replxx_notify_drops(void);
+    return replxx_notify_drops();
 }

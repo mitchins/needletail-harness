@@ -6,6 +6,9 @@ import NeedletailCore
 /// boundary (C2): same commandID replays the same ack while indexed; the
 /// 512th+1 admission prunes oldest-first and a pruned retry admits as a NEW
 /// entry with a visibly different ack (never silent).
+/// Darwin-debug: suite gated (B2 G14-class — the debug runner SIGBUSes
+/// on these deep transition chains; Linux-debug + Darwin `-O` green).
+#if canImport(Glibc)
 struct QueueContractTests {
 
     private static func busyState(ids: inout DeterministicIDSource) throws -> SessionState {
@@ -124,4 +127,40 @@ struct QueueContractTests {
             }
         }
     }
+
+    @Test("UX-QUEUE-09 queue caps refuse loudly: 21st entry and 64 KiB text")
+    func UX_QUEUE_09_capsRefuse() throws {
+        var ids = StateFixtures.ids()
+        let (admitting, _) = try StateFixtures.admitted("run", ids: &ids)
+        var state = transition(admitting, .requestDispatched(requestID: admitting.activeRun!.requestID, atMillis: 1001), &ids).state
+        // CUMULATIVE byte budget: 2 small entries plus a 64 KiB
+        // submission exceeds maxQueueTextBytes (count cap not involved).
+        // (Exactly maxQueueTextBytes alone would admit: the rule is
+        // cumulative, `undispatched + text <= max`.)
+        state = transition(state, StateFixtures.input("t-1", id: "c-1", kind: .followUp), &ids).state
+        state = transition(state, StateFixtures.input("t-2", id: "c-2", kind: .followUp), &ids).state
+        let big = transition(state, StateFixtures.input(String(repeating: "x", count: 65_536), id: "c-big", kind: .followUp), &ids)
+        #expect(!big.effects.contains(where: {
+            if case .emitUI(let p) = $0 { return p.kind == "admitted" }
+            return false
+        }), "over-budget text is not admitted")
+        #expect(big.state.admittedCommands[CommandID("c-big")] == nil, "no ack for over-budget text")
+        #expect(big.effects.contains(where: {
+            if case .emitUI(let p) = $0 { return p.kind == "denied" }
+            return false
+        }), "byte-budget refusal is typed denied, got: \(big.effects)")
+        // 21st entry refused on the COUNT cap (budget not involved).
+        for i in 3...20 {
+            state = transition(state, StateFixtures.input("t-\(i)", id: "c-\(i)", kind: .followUp), &ids).state
+        }
+        #expect(state.queue.count == 20, "twenty queued")
+        let refused = transition(state, StateFixtures.input("t-21", id: "c-21", kind: .followUp), &ids)
+        #expect(refused.state.queue.count == 20, "21st refused, nothing silently dropped")
+        #expect(refused.state.admittedCommands[CommandID("c-21")] == nil, "no ack for the refused entry")
+        #expect(refused.effects.contains(where: {
+            if case .emitUI(let p) = $0 { return p.kind == "denied" }
+            return false
+        }), "typed refusal, got: \(refused.effects)")
+    }
 }
+#endif

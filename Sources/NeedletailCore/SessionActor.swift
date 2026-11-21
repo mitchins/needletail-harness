@@ -264,6 +264,12 @@ public actor SessionActor<Transport: ModelTransport, Executor: ToolExecutor, Sto
         await apply(.queueReconcile(entryID: entryID, atMillis: clock.nowMillis()))
     }
 
+    /// M4-B B2: explicit operator reorder (display rank only; ack
+    /// identity untouched).
+    public func reorderQueueEntry(entryID: String, beforeID: String?) async {
+        await apply(.queueReorder(entryID: entryID, beforeID: beforeID, atMillis: clock.nowMillis()))
+    }
+
     /// M2-D D3: explicit operator reconciliation of one unknown mutating
     /// operation. Records the determination and discharges the recovery
     /// marker (never a silent drop, never a retry). Unknown deliveries

@@ -71,7 +71,9 @@ public func probeRoute(
     let client = HTTPClient(
         eventLoopGroupProvider: .singleton,
         configuration: ChatTransportPolicy.configuration(profile: profile))
-    defer { try? await client.shutdown().get() }
+    // Transport + invocation are built BEFORE the clock starts, matching
+    // the pre-6.1 `defer` shape (elapsedMillis measures the wire, not
+    // construction).
     let transport = ChatCompletionsTransport(
         client: client,
         messageProvider: { _ in ProbePacket.messages() },
@@ -86,26 +88,38 @@ public func probeRoute(
     // Probe-level whole cap (60 s) regardless of profile timeouts: a probe
     // is a liveness check, never a workload (focused correction recorded
     // in the milestone report).
-    let result = try await withThrowingTaskGroup(of: TransportResult.self) { group in
-        group.addTask {
-            try await transport.invoke(
-                invocation,
-                intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
+    func runProbe() async throws -> TransportResult {
+        return try await withThrowingTaskGroup(of: TransportResult.self) { group in
+            group.addTask {
+                try await transport.invoke(
+                    invocation,
+                    intake: BoundedChannelState<ProviderResponse>(itemCap: 8, byteCap: 64 << 10))
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 60_000_000_000)
+                throw TransportFailure(phase: .postContent, message: "probe whole-request cap (60 s) exceeded")
+            }
+            guard let first = try await group.next() else {
+                throw TransportFailure(phase: .ambiguous, message: "probe produced nothing")
+            }
+            group.cancelAll()
+            return first
         }
-        group.addTask {
-            try await Task.sleep(nanoseconds: 60_000_000_000)
-            throw TransportFailure(phase: .postContent, message: "probe whole-request cap (60 s) exceeded")
-        }
-        guard let first = try await group.next() else {
-            throw TransportFailure(phase: .ambiguous, message: "probe produced nothing")
-        }
-        group.cancelAll()
-        return first
     }
-    let elapsed = UInt64(Date().timeIntervalSince(started) * 1000.0)
-    return ProbeResult(
-        endpoint: endpoint, configuredModel: profile.modelID,
-        returnedModel: result.response.returnedModel,
-        usageInput: result.response.usageInput,
-        usageOutput: result.response.usageOutput, elapsedMillis: elapsed)
+    // Portable shutdown: Swift 6.1/Xcode 16.3 toolchains reject `await` in
+    // `defer`, so the best-effort client shutdown runs explicitly on both
+    // the success and failure paths instead of in a defer.
+    do {
+        let result = try await runProbe()
+        let elapsed = UInt64(Date().timeIntervalSince(started) * 1000.0)
+        try? await client.shutdown().get()
+        return ProbeResult(
+            endpoint: endpoint, configuredModel: profile.modelID,
+            returnedModel: result.response.returnedModel,
+            usageInput: result.response.usageInput,
+            usageOutput: result.response.usageOutput, elapsedMillis: elapsed)
+    } catch {
+        try? await client.shutdown().get()
+        throw error
+    }
 }

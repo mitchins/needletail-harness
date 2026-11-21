@@ -178,8 +178,8 @@ struct TerminalGatewayTests {
         let text = String(data: prompt, encoding: .utf8) ?? ""
         let bytes = [UInt8](prompt)
         #expect(!bytes.contains(0x1B), "no ESC byte may reach the terminal")
-        #expect(!text.contains("\u{202E}"), "bidi override neutralized")
-        #expect(!text.contains("\u{200B}"), "zero-width neutralized")
+        #expect(!hasScalar(text, 0x202E), "bidi override neutralized")
+        #expect(!hasScalar(text, 0x200B), "zero-width neutralized")
         #expect(text.contains("\u{FFFD}"), "neutralization marker present")
         #expect(text.contains("Approve and execute?") == true)
     }

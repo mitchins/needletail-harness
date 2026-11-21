@@ -12,6 +12,7 @@ import yaml  # CI-only Ubuntu python3-yaml; not a Needletail runtime dependency.
 APPROVED = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",  # v7.0.1
     "SonarSource/sonarqube-scan-action": "d209202bc7d53ff1cc128f7f907dac145c9d6ae9",  # v8.3.0 #ggignore public Git commit, not a token
+    "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",  # v7.0.2 (node24)
 }
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 

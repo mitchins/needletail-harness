@@ -1,0 +1,23 @@
+# M4-B B5 BDD-06 probe log — queue-row frame cap
+
+Date: 2026-11-07 UTC. Tree: `m4-a` B5 working tree (pre-commit).
+Oracle: `swift test --filter "B5_frameBounded"`.
+
+Probe (disposable, `Sources/NeedletailPresentation/Render.swift`):
+replaced the queue-row cap condition with unconditional false:
+  `if false { // BDD-06 PROBE: queue cap disabled`
+
+Result: oracle FAILS as required —
+  `Expectation failed: frame.lines.contains(where: { $0.id == "queue-truncated" })`.
+  (The 512-line absolute bound still held for 300 short rows; the
+  visible queue marker is the load-bearing assertion.)
+
+Restore: exact inverse replacement; `grep -c PROBE` returns 0;
+oracle green after restore. No production fault switches added;
+no tree changes retained from the probe.
+
+Probe 2 (same session): `maxFrameLines` 512 → 100000. Oracle
+`B5_frameAbsoluteBound` fails (no `frame-truncated` marker under
+wrap overflow in either capability mode). Restored identically;
+oracle green. The absolute cap — not just the queue marker — is
+load-bearing and pinned.

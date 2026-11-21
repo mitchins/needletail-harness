@@ -1,0 +1,9 @@
+{
+  "width": 80,
+  "lines": [
+    {"id": "status-idle", "runs": [{"text": "idle", "role": "status"}]},
+    {"id": "undo-preview-g-2", "runs": [{"text": "undo g-2: blocked — 1 conflict blocks the run", "role": "errorNotice"}]},
+    {"id": "undo-file-a", "runs": [{"text": "a: eligible", "role": "normal"}]},
+    {"id": "undo-file-b", "runs": [{"text": "b: ineligible (changed by user)", "role": "errorNotice"}]}
+  ]
+}
