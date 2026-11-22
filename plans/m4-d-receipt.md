@@ -1902,3 +1902,91 @@ stale-token hunk and re-run green).
 honest evidence; the Darwin runner-context exit/read freeze remains
 the single blocker to native PTY-01, now narrowed to a precise
 location. No merge, no release, no M5.
+
+## 23. Codatiel duplication-advisory reconciliation (review run 9c57650b, head a44f504)
+
+The latest review's 21 reuse suggestions + 2 unassessed correctness
+candidates consolidate into EIGHT distinct opportunities. Each has a
+disposition; nothing is blanket-deferred.
+
+**OP-1 — LineEditorSession replxx state-setting duplication**
+(8 of the 21 suggestions; clearBuffer / replaceBuffer /
+insertNewline / deleteForwardCharacter / dropLastHistoryEntry all
+repeat the `withCString` → `ReplxxState` → `replxx_set_state`
+sequence; `dropLastHistoryEntry` re-derives
+`replxx_history_add` instead of calling `addHistoryEntry`).
+Present at HEAD: yes. Risk: moderate maintenance (identical FFI
+sequences can drift independently on a future edit); no behavioural
+divergence today (the sequences are byte-identical).
+**DEFER — post-M4.** The editor seam is under the frozen
+input-path qualification; a mechanical consolidation is cosmetic
+relative to the open native qualification. Tracked in the follow-up
+issue (M4-FU-1, item 1).
+
+**OP-2 — LineEditorSession callback Unmanaged-conversion repetition**
+(the key/modify/completion handlers repeat the
+`fromOpaque(userData).takeUnretainedValue()` decode; 6 supporting
+pairs in the review). Present: yes. Risk: low (one-line idiom).
+**DEFER — post-M4** (M4-FU-1, item 2): same frozen-seam reason;
+a helper is a trivial mechanical follow-up.
+
+**OP-3 — ChatPTYTests PTY fixture/lifecycle duplication** (12
+suggestions: credential/env/driver/prompt bootstrap and the
+clean-exit harness repeated across pty01/02/03/04/05/06/07/08, the
+hygiene, parity and resubmit legs). Present: yes. Risk: low (suite
+readability, not behaviour — every leg is green and asserts
+independently). **DEFER — post-M4, and explicitly NOT during
+qualification** per the standing directive (no PTY-fixture
+refactoring while correctness qualification is open).
+Tracked (M4-FU-1, item 3).
+
+**OP-4 — Approval-flow test harness** (the deny / EOF-approval /
+D2.7-hygiene legs share the workspace+loopback+warm-up+approval+
+settle+restore+allowlist skeleton; 3 pairs). Present: yes. Risk:
+low. **DEFER — post-M4** (M4-FU-1, item 4): same fixture-freeze
+reason; the parameterized approval harness is the accepted shape.
+
+**OP-5 — Feasibility probe-runner duplication** (the saturation and
+stale-token legs share the spawn/read/complete/drain/status loop; 1
+suggestion). Present: yes. Risk: low. **DEFER — post-M4**
+(M4-FU-1, item 5): PTY-fixture exclusion applies.
+
+**OP-6 — Input-path trace records decoded keystroke codes**
+(Codatiel agent-001, unassessed correctness candidate; CONFIRMED by
+inspection). `readc:decoded c=<hex>` and `dispatch c=<hex>`
+reconstruct typed prompt text from captured diagnostics. Present at
+a44f504: yes. Risk: real (privacy-class: the trace is env-gated and
+off in production, but captured test/diagnostic transcripts would
+carry reconstructable keystrokes).
+**ACCEPT — fixed at 8162bf0-lineage HEAD (this round, pre-merge)**:
+both trace sites narrowed to stage marks, errno and readiness state
+(the directive's stated scope); the key payload is deliberately not
+recorded. vendor-check re-verified both directions; the stale-token
+regression re-run green.
+
+**OP-7 — Synthetic-key strand claim (Codatiel agent-000)** —
+**REJECT as a defect.** The stale-token path (a 'k' token whose
+keypress was already serviced by the coalesced message-drain) ends
+in the reader's designed blocking tty read: the input thread is
+SUPPOSED to block in readLine, and the earlier token-skip fix for
+exactly this shape spun on tty-ready events and broke 22 CI tests
+(reverted, §22). The regression `mac04StaleKeypressTokenResumes`
+asserts delivery resumes after a real keystroke and nothing wedges;
+the "ordering not established" critique is addressed by the
+union-outcome assertions (delivery + resumption + restoration hold
+under either wake order).
+
+**OP-8 — CI flake note (not a duplication item, recorded for
+completeness)**: run 44955330764 failed 22 scripted-loop tests at
+a44f504; the job logs were unretrievable (GitHub zip-cache error)
+and the failure was not reproducible locally (ChatLoopTests 12/12).
+A rerun was issued; the disposition (flake vs real) is pending the
+rerun result and is tracked as an open verification item, not an
+M4-FU engineering opportunity.
+
+No production behavioural duplication was left undispositioned; the
+repeated terminal-state operations were inspected for inconsistent
+semantics (OP-1/OP-2 sequences are byte-identical FFI calls — no
+divergence exists today). No qualification campaign was run for this
+reconciliation; the only code change (OP-6) is covered by the
+vendor-check, the stale-token regression and the existing suites.
