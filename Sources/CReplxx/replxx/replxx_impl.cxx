@@ -1417,7 +1417,9 @@ int Replxx::ReplxxImpl::get_input_line( void ) {
 		key_press_handlers_t::iterator it( _keyPressHandlers.find( c ) );
 		if ( getenv( "NB_INPUT_TRACE" ) ) {
 			char m[96];
-			snprintf( m, sizeof ( m ), "dispatch c=%lx handlers=%zu found=%d", static_cast<unsigned long>( c ), _keyPressHandlers.size( ), it != _keyPressHandlers.end() ? 1 : 0 );
+			/* The key code is not recorded (it reconstructs typed text);
+			 * found/not-found + handler count locate dispatch wedges. */
+			snprintf( m, sizeof ( m ), "dispatch handlers=%zu found=%d", _keyPressHandlers.size( ), it != _keyPressHandlers.end() ? 1 : 0 );
 			nt_input_mark( m, 0 );
 		}
 		if ( it != _keyPressHandlers.end() ) {

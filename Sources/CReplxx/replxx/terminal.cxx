@@ -639,11 +639,11 @@ char32_t Terminal::read_char( void ) {
 	if ( is_control_code( c ) ) {
 		c = Replxx::KEY::control( control_to_human( c ) );
 	}
-	if ( nt_input_trace_on() ) {
-		char m[96];
-		snprintf( m, sizeof ( m ), "readc:decoded c=%lx", static_cast<unsigned long>( c ) );
-		nt_input_mark( m, 0 );
-	}
+	/* Stage mark only: the decoded keystroke VALUE is deliberately not
+	 * recorded (it reconstructs typed text, including potentially
+	 * sensitive prompts, from captured diagnostics). Readiness and
+	 * dispatch stages locate a wedge; the payload is not needed. */
+	nt_input_mark( "readc:decoded", 0 );
 #endif // #_WIN32
 	return ( c );
 }

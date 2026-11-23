@@ -105,7 +105,7 @@
  	if ( ! _rawMode ) {
  		return;
  	}
-@@ -285,9 +352,25 @@
+@@ -285,10 +352,26 @@
  	_consoleIn = INVALID_HANDLE_VALUE;
  #else
  	_terminal_ = nullptr;
@@ -119,28 +119,29 @@
 +		_rv = tcsetattr( 0, TCSANOW, &_origTermios );
 +	} while ( _rv == -1 && errno == EINTR );
 +	if ( _rv == -1 ) {
- 		return;
- 	}
++		return;
++	}
 +#else
 +	do {
 +		_rv = tcsetattr( 0, TCSADRAIN, &_origTermios );
 +	} while ( _rv == -1 && errno == EINTR );
 +	if ( _rv == -1 ) {
-+		return;
-+	}
-+#endif
+ 		return;
+ 	}
  #endif
++#endif
  	_rawMode = false;
  	return;
+ }
 @@ -556,6 +639,11 @@
  	if ( is_control_code( c ) ) {
  		c = Replxx::KEY::control( control_to_human( c ) );
  	}
-+	if ( nt_input_trace_on() ) {
-+		char m[96];
-+		snprintf( m, sizeof ( m ), "readc:decoded c=%lx", static_cast<unsigned long>( c ) );
-+		nt_input_mark( m, 0 );
-+	}
++	/* Stage mark only: the decoded keystroke VALUE is deliberately not
++	 * recorded (it reconstructs typed text, including potentially
++	 * sensitive prompts, from captured diagnostics). Readiness and
++	 * dispatch stages locate a wedge; the payload is not needed. */
++	nt_input_mark( "readc:decoded", 0 );
  #endif // #_WIN32
  	return ( c );
  }

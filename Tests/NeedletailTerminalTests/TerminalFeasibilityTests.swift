@@ -558,7 +558,7 @@ func mac03TermiosComparatorProof() {
     // throughout (no token-skipping hack: the previous such fix broke
     // 22 CI tests by spinning on tty-ready events without consuming
     // them).
-    @Test("MAC-04B: stale keypress token — delivery resumes after a real keystroke, no wedge")
+    @Test("MAC-04B: stale keypress token — delivery resumes after a real keystroke, no wedge; trace records no keystroke payloads")
     func mac04StaleKeypressTokenResumes() async throws {
         let helper = ChatPTYTests.repoRoot() + "/.build/debug/NTReplxxSaturationProbe"
         guard FileManager.default.fileExists(atPath: helper) else {
@@ -566,6 +566,8 @@ func mac03TermiosComparatorProof() {
         }
         var pty = nt_pty_t()
         var argv: [UnsafeMutablePointer<CChar>?] = [strdup(helper), strdup("stalek"), nil]
+        setenv("NB_INPUT_TRACE", "1", 1)
+        defer { unsetenv("NB_INPUT_TRACE") }
         let rc = nt_pty_spawn(&pty, &argv)
         argv.forEach { $0?.deallocate() }
         #expect(rc == 0, "probe spawn")
@@ -608,6 +610,15 @@ func mac03TermiosComparatorProof() {
         #expect(reapStatus == 0, "the stale-token child must exit 0, got \(String(describing: reapStatus))")
         #expect(delivered.contains("STALEK-DONE"), "the child's completion report must be present")
         #expect(nt_pty_termios_restored_exactly(&pty) == 1, "exact termios restoration after the stale-token sequence")
+        // OP-6 proof: with NB_INPUT_TRACE=1 and the word "done" typed
+        // through the pty, the diagnostic stream contains NO decoded
+        // keystroke payloads (the old `readc:decoded c=<hex>` /
+        // `dispatch c=<hex>` marks) and no hex fragment of the typed
+        // word — stage marks and readiness only.
+        #expect(!delivered.contains("readc:decoded c="), "no decoded-payload trace may be emitted")
+        #expect(!delivered.contains("dispatch c="), "no dispatch-payload trace may be emitted")
+        #expect(delivered.contains("[it]dispatch handlers="), "the input-trace stage marks are present (the trace is live)")
+        #expect(delivered.range(of: "c=64") == nil, "the hex code of the typed 'd' must not appear")
     }
 
     // M4-MAC-04 (P0): an idle session and a mid-stream session must
