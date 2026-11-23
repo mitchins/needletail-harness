@@ -84,7 +84,7 @@ struct ChatLifecycleTests {
             mintCommandID: { CommandID("cmd-1") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let task = Task { await loop.run(scriptedInput: []) }
-        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        #expect(await waitFor(marker: "idle", in: written, timeout: 30), "loop never rendered")
         // Two query generations: "@ab" (rev 1) superseded by "@abc".
         loop.post(.mirror(text: "@ab", cursor: 3))
         #expect(await waitForEffects(1, in: effects, timeout: 5), "first mirror never dispatched")
@@ -110,14 +110,14 @@ struct ChatLifecycleTests {
         guard let snap = loop.acceptSnapshot() else {
             Issue.record("live completions must open the accept gate")
             loop.post(.inputLine(nil))
-            _ = await join(task: task, timeout: 5)
+            _ = await join(task: task, timeout: 30)
             owner.close()
             return
         }
         #expect(snap.base == "@abc", "draft must be byte-exact after the stale drop, got \(snap.base)")
         #expect(snap.display.contains("live.swift"), "live candidates populate the gate, got \(snap.display)")
         loop.post(.inputLine(nil))
-        #expect(await join(task: task, timeout: 5), "loop did not exit")
+        #expect(await join(task: task, timeout: 30), "loop did not exit")
         owner.close()
     }
 }

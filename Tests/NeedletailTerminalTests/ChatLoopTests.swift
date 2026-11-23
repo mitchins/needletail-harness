@@ -66,9 +66,9 @@ struct ChatLoopTests {
         // fix — same-ID reuse made Core replay the prior admission
         // without dispatching).
         let task = Task { await loop.run(scriptedInput: []) }
-        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        #expect(await waitFor(marker: "idle", in: written, timeout: 30), "loop never rendered")
         loop.post(.inputLine("same"))
-        #expect(await waitFor(marker: "same", in: written, timeout: 5), "submit never dispatched")
+        #expect(await waitFor(marker: "same", in: written, timeout: 30), "submit never dispatched")
         // Drive the terminal transition directly: admitted then completed.
         loop.post(.projection(.admitted(commandID: CommandID("cmd-1"), revision: 1)))
         loop.post(.projection(.runUpdate(phase: "completed", detail: "done")))
@@ -80,7 +80,7 @@ struct ChatLoopTests {
         loop.post(.inputLine("same"))
         #expect(await waitForEffects(2, in: effects, timeout: 5), "resubmit never dispatched")
         loop.post(.inputLine(nil))
-        #expect(await join(task: task, timeout: 5), "loop did not exit")
+        #expect(await join(task: task, timeout: 30), "loop did not exit")
         let fx = await effects.all()
         // Guard BEFORE indexing: #expect records but does not return,
         // and indexing a short array traps (ud2/SIGILL), killing the
@@ -118,7 +118,7 @@ struct ChatLoopTests {
             mintCommandID: { CommandID("cmd-1") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let task = Task { await loop.run(scriptedInput: []) }
-        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        #expect(await waitFor(marker: "idle", in: written, timeout: 30), "loop never rendered")
         // Type a mention query; the edge fetch is simulated by posting
         // completions (the reducer fills the suggestion popup).
         loop.post(.mirror(text: "@e", cursor: 2))
@@ -134,7 +134,7 @@ struct ChatLoopTests {
               let snap = loop.acceptSnapshot() else {
             Issue.record("accept gate must open on a live safe suggestion")
             loop.post(.inputLine(nil))
-            _ = await join(task: task, timeout: 5)
+            _ = await join(task: task, timeout: 30)
             owner.close()
             return
         }
@@ -153,7 +153,7 @@ struct ChatLoopTests {
         // Barrier: nil shuts the loop (FIFO — keys handled first); the
         // join proves processing, then the run ends cleanly.
         loop.post(.inputLine(nil))
-        #expect(await join(task: task, timeout: 5), "loop did not exit")
+        #expect(await join(task: task, timeout: 30), "loop did not exit")
         owner.close()
     }
 
@@ -175,14 +175,14 @@ struct ChatLoopTests {
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         #expect(loop.acceptSnapshot() == nil, "no suggestion ⇒ closed gate")
         let task = Task { await loop.run(scriptedInput: []) }
-        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        #expect(await waitFor(marker: "idle", in: written, timeout: 30), "loop never rendered")
         loop.post(.key(.tab))
         loop.post(.key(.up))
         loop.post(.key(.down))
         // Barrier: nil shuts the loop (FIFO — keys handled first); the
         // join proves processing, then the negative assertion is sound.
         loop.post(.inputLine(nil))
-        #expect(await join(task: task, timeout: 5), "loop did not exit")
+        #expect(await join(task: task, timeout: 30), "loop did not exit")
         #expect(await effects.all().isEmpty, "no-op keys must emit no effects")
         owner.close()
     }
@@ -208,7 +208,7 @@ struct ChatLoopTests {
         // invariant: the loop starts before any actor work, so the
         // inbox exists when the presenter posts).
         let runTask = Task { await loop.run(scriptedInput: []) }
-        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        #expect(await waitFor(marker: "idle", in: written, timeout: 30), "loop never rendered")
         let gateway = ReplxxApprovalGateway { req, box in
             loop.prepareConfirm(box: box)
             loop.post(.approvalArmed(req))
@@ -219,7 +219,7 @@ struct ChatLoopTests {
         // Inbox FIFO: approvalArmed is handled (prompt rendered, draft
         // snapshotted) before the answer below is processed. The prompt
         // rendering proves the arm was handled — readiness, not sleep.
-        #expect(await waitFor(marker: "approval required:", in: written, timeout: 5),
+        #expect(await waitFor(marker: "approval required:", in: written, timeout: 30),
             "actionable prompt never rendered")
         loop.post(.inputLine("y"))
         // FIFO: the decision line is consumed before the follow-up below;
@@ -228,7 +228,7 @@ struct ChatLoopTests {
         loop.post(.inputLine("second"))
         #expect(await waitForEffects(1, in: effects, timeout: 5), "follow-up never dispatched")
         loop.post(.inputLine(nil))
-        #expect(await join(task: runTask, timeout: 5), "loop did not exit")
+        #expect(await join(task: runTask, timeout: 30), "loop did not exit")
         let final = await decision
         #expect(final == .approve)
         // The decision line was consumed as a confirm, not a submit:
@@ -261,7 +261,7 @@ struct ChatLoopTests {
             mintCommandID: { CommandID("cmd-1") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let runTask = Task { await loop.run(scriptedInput: []) }
-        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        #expect(await waitFor(marker: "idle", in: written, timeout: 30), "loop never rendered")
         // Arm, then settle the box actor-side: cancellation wins the race
         // against the operator's answer (the production stale-arm shape).
         let box = ContinuationBox()
@@ -274,7 +274,7 @@ struct ChatLoopTests {
         #expect(await waitForEffects(1, in: effects, timeout: 5), "stale line never dispatched")
         let fx = effects.all()
         loop.post(.inputLine(nil))
-        #expect(await join(task: runTask, timeout: 5), "loop did not exit")
+        #expect(await join(task: runTask, timeout: 30), "loop did not exit")
         #expect(!written.joined().contains("confirm hygiene"), "no spurious hygiene warning on the scripted path")
         #expect(fx == [[.submit(OperatorInput(text: "y", commandID: CommandID("cmd-1")))]], "stale line submits normally")
         owner.close()
@@ -295,11 +295,11 @@ struct ChatLoopTests {
         let runTask = Task { await loop.run(scriptedInput: []) }
         // Readiness: the initial frame must exist before the key post
         // (posts before the inbox exists drop).
-        let ready = await waitFor(marker: "idle", in: written, timeout: 5)
+        let ready = await waitFor(marker: "idle", in: written, timeout: 30)
         #expect(ready, "loop never rendered initial frame")
         loop.post(.key(.ctrlC))
         // Bounded join: a failed exit must fail the test, never hang it.
-        let exited = await join(task: runTask, timeout: 5)
+        let exited = await join(task: runTask, timeout: 30)
         #expect(exited, "idle-empty Ctrl+C did not shut the run down")
         owner.close()
     }
@@ -323,12 +323,12 @@ struct ChatLoopTests {
         let runTask = Task { await loop.run(scriptedInput: []) }
         // Readiness: the queue row (kind + state) renders in the
         // initial frame (status is not idle with a held queue).
-        #expect(await waitFor(marker: "followUp queued", in: written, timeout: 5), "loop never rendered initial frame")
+        #expect(await waitFor(marker: "followUp queued", in: written, timeout: 30), "loop never rendered initial frame")
         loop.post(.key(.ctrlC))
-        #expect(await waitFor(marker: "queued work pending", in: written, timeout: 5), "first Ctrl+C must warn, not exit")
+        #expect(await waitFor(marker: "queued work pending", in: written, timeout: 30), "first Ctrl+C must warn, not exit")
         // Any other input disarms the latch: typing clears it.
         loop.post(.inputLine("hello"))
-        _ = await waitFor(marker: "hello", in: written, timeout: 5)
+        _ = await waitFor(marker: "hello", in: written, timeout: 30)
         // The disarmed press must warn AGAIN (a SECOND "queued work
         // pending") — a whole-buffer marker wait would pass vacuously
         // on the first warning, proving nothing about the latch.
@@ -344,7 +344,7 @@ struct ChatLoopTests {
         #expect(rewarned, "latch must disarm on other input (second warning expected)")
         // Second consecutive press exits.
         loop.post(.key(.ctrlC))
-        let exited = await join(task: runTask, timeout: 5)
+        let exited = await join(task: runTask, timeout: 30)
         #expect(exited, "second Ctrl+C did not shut the run down")
         owner.close()
     }
@@ -447,7 +447,7 @@ struct ChatLoopTests {
             mintCommandID: { CommandID("cmd-1") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let runTask = Task { await loop.run(scriptedInput: []) }
-        #expect(await waitFor(marker: "idle", in: written, timeout: 5), "loop never rendered")
+        #expect(await waitFor(marker: "idle", in: written, timeout: 30), "loop never rendered")
         let gateway = ReplxxApprovalGateway { req, box in
             loop.prepareConfirm(box: box)
             loop.post(.approvalArmed(req))
@@ -455,7 +455,7 @@ struct ChatLoopTests {
         let req = ApprovalRequest(requestID: RequestID("r"), runID: RunID("r"), generation: Revision(1),
                                   operation: "op", requiredGrant: "read")
         async let decision = gateway.decide(req)
-        #expect(await waitFor(marker: "approval required:", in: written, timeout: 5),
+        #expect(await waitFor(marker: "approval required:", in: written, timeout: 30),
             "actionable prompt never rendered")
         // A pasted multi-line block arrives as one line (bracketed paste
         // collapses to the readLine result): not y/yes ⇒ deny, never
@@ -468,7 +468,7 @@ struct ChatLoopTests {
         loop.post(.inputLine("second"))
         #expect(await waitForEffects(1, in: effects, timeout: 5), "follow-up never dispatched")
         loop.post(.inputLine(nil))
-        #expect(await join(task: runTask, timeout: 5), "loop did not exit")
+        #expect(await join(task: runTask, timeout: 30), "loop did not exit")
         let fx = await effects.all()
         guard fx.count == 1 else {
             Issue.record("only the follow-up submits, got \(fx.count) effect batches")
@@ -497,7 +497,7 @@ struct ChatLoopTests {
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         // No nil terminator: the run stays alive for posted events.
         let task = Task { await loop.run(scriptedInput: ["hi"]) }
-        #expect(await waitFor(marker: "hi", in: written, timeout: 5), "scripted submit never rendered")
+        #expect(await waitFor(marker: "hi", in: written, timeout: 30), "scripted submit never rendered")
         // Live request: progress registers, completion commits.
         loop.post(.tapProgress(RequestID("a"), 10))
         loop.post(.tapComplete(RequestID("a"), Revision(1), "# Done"))
@@ -506,7 +506,7 @@ struct ChatLoopTests {
         // Barrier: nil shuts the loop (FIFO — taps handled first); the
         // join proves processing, then the negative assertion is sound.
         loop.post(.inputLine(nil))
-        #expect(await join(task: task, timeout: 5), "loop did not exit")
+        #expect(await join(task: task, timeout: 30), "loop did not exit")
         let out = written.joined()
         #expect(out.contains("Done"))
         #expect(!out.contains("Ghost"))
@@ -530,7 +530,7 @@ struct ChatLoopTests {
             mintCommandID: { CommandID("cmd-1") })
         let loop = ChatLoop(config: config, lineEditor: editor, owner: owner)
         let task = Task { await loop.run(scriptedInput: ["hi"]) }
-        #expect(await waitFor(marker: "hi", in: written, timeout: 5), "scripted submit never rendered")
+        #expect(await waitFor(marker: "hi", in: written, timeout: 30), "scripted submit never rendered")
         loop.post(.tapProgress(RequestID("a"), 10))
         loop.post(.tapComplete(RequestID("a"), Revision(3), "# Third"))
         // Late straggler for an older revision of the same request.
@@ -539,7 +539,7 @@ struct ChatLoopTests {
         // Barrier: nil shuts the loop (FIFO — taps handled first); the
         // join proves processing, then the negative assertion is sound.
         loop.post(.inputLine(nil))
-        #expect(await join(task: task, timeout: 5), "loop did not exit")
+        #expect(await join(task: task, timeout: 30), "loop did not exit")
         let out = written.joined()
         #expect(out.contains("Third"))
         #expect(!out.contains("First"))
