@@ -8,6 +8,9 @@
  */
 #define _XOPEN_SOURCE 600
 #define _DEFAULT_SOURCE 1
+#include <spawn.h>
+#include <unistd.h>
+extern char **environ;
 #define _DARWIN_C_SOURCE 1
 #include "nt_pty.h"
 
@@ -96,6 +99,85 @@ int nt_pty_spawn_env(nt_pty_t *pty, char *const argv[], char *const env[]) {
      * it anchors the post-exit termios oracle — a pty whose only slave
      * handle closed tears down, and the restore state would be
      * unobservable (the M4-MAC-02 oracle defect). */
+    pty->slaveFd = slave;
+    pty->masterFd = master;
+    pty->childPid = pid;
+    return 0;
+}
+
+/* needletail 0000-A/B: posix_spawn launcher variant. The fork-based
+ * launcher's children are session leaders with a controlling pty; on
+ * macOS 26.7.1 under the Swift Testing runner such children have been
+ * observed entering an unsampleable kernel-held exit state (?NEs) at
+ * nondeterministic lifecycle points. This variant spawns WITHOUT
+ * setsid/TIOCSCTTY: the child keeps the caller's process group
+ * (posix_spawn SETPGROUP(0) gives it its own pgroup), has no
+ * controlling terminal, and therefore has no session-leader tty
+ * teardown to hang in. Semantics preserved for the raw-mode path:
+ * tcsetattr/tcgetattr are fd-based (no ctty needed); ISIG is off in
+ * raw mode so Ctrl+C arrives as a byte; there is no ctty so no
+ * SIGTTOU can be raised by termio calls; SIGWINCH is NOT delivered
+ * (no foreground process group) — resize-driven legs must use the
+ * fork launcher. Both launchers are kept as an A/B control pair. */
+int nt_pty_spawn_posix(nt_pty_t *pty, char *const argv[], char *const env[]) {
+    if (pty == NULL || argv == NULL) {
+        return -1;
+    }
+    memset(pty, 0, sizeof(*pty));
+
+    int master = -1;
+    int slave = -1;
+    if (openpty(&master, &slave, NULL, NULL, NULL) != 0) {
+        return -1;
+    }
+    if (tcgetattr(slave, &pty->savedSlaveTermios) == 0) {
+        pty->haveSavedTermios = 1;
+    }
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(master);
+        close(slave);
+        return -1;
+    }
+    posix_spawn_file_actions_adddup2(&actions, slave, STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, slave, STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, slave, STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, master);
+    if (slave > STDERR_FILENO) {
+        posix_spawn_file_actions_addclose(&actions, slave);
+    }
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(master);
+        close(slave);
+        return -1;
+    }
+    sigset_t allSignals;
+    sigset_t noSignals;
+    sigfillset(&allSignals);
+    sigemptyset(&noSignals);
+    (void)(posix_spawnattr_setsigdefault(&attr, &allSignals) == 0);
+    (void)(posix_spawnattr_setsigmask(&attr, &noSignals) == 0);
+    (void)(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETPGROUP) == 0);
+    (void)(posix_spawnattr_setpgroup(&attr, 0) == 0);
+
+    pid_t pid = -1;
+    int rc;
+    if (env != NULL) {
+        rc = posix_spawnp(&pid, argv[0], &actions, &attr, argv, env);
+    } else {
+        rc = posix_spawnp(&pid, argv[0], &actions, &attr, argv, environ);
+    }
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) {
+        close(master);
+        close(slave);
+        errno = rc;
+        return -1;
+    }
     pty->slaveFd = slave;
     pty->masterFd = master;
     pty->childPid = pid;

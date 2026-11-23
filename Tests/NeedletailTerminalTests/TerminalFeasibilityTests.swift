@@ -566,9 +566,16 @@ func mac03TermiosComparatorProof() {
         }
         var pty = nt_pty_t()
         var argv: [UnsafeMutablePointer<CChar>?] = [strdup(helper), strdup("stalek"), nil]
-        setenv("NB_INPUT_TRACE", "1", 1)
-        defer { unsetenv("NB_INPUT_TRACE") }
-        let rc = nt_pty_spawn(&pty, &argv)
+        // CHILD-ONLY override (Codatiel test-isolation finding): the
+        // trace env must never be set on this process — concurrent
+        // suites would inherit it. nt_pty_spawn_env applies overrides
+        // inside the forked child only.
+        var env: [UnsafeMutablePointer<CChar>?] = [strdup("NB_INPUT_TRACE=1"), nil]
+        let rc = env.withUnsafeMutableBufferPointer { envBuf in
+            argv.withUnsafeMutableBufferPointer { argvBuf in
+                nt_pty_spawn_env(&pty, argvBuf.baseAddress!, envBuf.baseAddress!)
+            }
+        }
         argv.forEach { $0?.deallocate() }
         #expect(rc == 0, "probe spawn")
         guard rc == 0 else { return }

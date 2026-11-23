@@ -830,6 +830,10 @@ struct ChatCommand: ParsableCommand {
     }
 
     private static func executeStatic(config: String?, trace: String?, alias: String?, maxTurns: Int?, allowExec: Bool, workspace: String?, readRoot: [String], sandboxGrant: String?, acknowledgedDetermination: String?) async throws {
+        // M4-MAC-04B: the post-exec marker — proves a spawned child
+        // actually executed this binary (pre/post-exec discrimination
+        // for the launcher A/B), not merely that a prompt is missing.
+        ChatLoop.ttrace("exec-ok chat entry")
         let session = try await compose(
             config: config, trace: trace, alias: alias,
             maxTurns: maxTurns, allowExec: allowExec,

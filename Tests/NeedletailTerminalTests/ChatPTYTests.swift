@@ -159,10 +159,16 @@ struct ChatPTYTests {
             // the control channel and are covered by the allowlist.
             var pty01Extra = Self.childEnv(env)
             if getenv("NB_TEARDOWN_TRACE") != nil { pty01Extra["NB_TEARDOWN_TRACE"] = "1" }
-            let driver = ChatPTYDriver(
+            // M4-MAC-04B A/B: the launcher is chosen by the NB_LAUNCHER
+            // env (the runner context), so the same test drives both
+            // variants: "fork" (the original control) and "posix" (the
+            // session-teardown-avoidance variant).
+            let driverLauncher = getenv("NB_LAUNCHER").map { String(cString: $0) } ?? "fork"
+            var driver = ChatPTYDriver(
                 executable: Self.releaseBinary(),
                 args: ["chat", "--config", env.configPath],
                 extraEnv: pty01Extra)
+            driver.launcher = driverLauncher
             defer { driver.stop() }
             driver.preserveTranscript = { Self.preserve("pty-01-timeout", transcript: $0) }
             guard driver.start() else { Issue.record("pty spawn failed"); return }
@@ -170,6 +176,14 @@ struct ChatPTYTests {
             // terminal is in raw mode and the input thread is inside
             // replxx_input — Ctrl+C cannot race canonical mode after it.
             driver.expect("needletail> ", timeoutMS: 30_000)
+            // M4-MAC-04B: PRE/POST-EXEC discrimination. "exec-ok" is
+            // written by the chat binary itself after successful launch
+            // (gated by NB_TEARDOWN_TRACE): its presence in the
+            // transcript proves the child executed the binary, rather
+            // than inferring the lifecycle stage from a missing prompt.
+            if pty01Extra["NB_TEARDOWN_TRACE"] != nil {
+                #expect(driver.fullTranscript().contains("exec-ok"), "the child must have executed the binary (post-exec marker)")
+            }
             // M4-MAC-04B: capture the LIVE slave termios BEFORE injecting
             // 0x03 and assert the injection succeeded. The capture proves
             // the reader had engaged raw mode at injection time (ICANON

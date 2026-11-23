@@ -15,6 +15,9 @@ import PTYShim
 final class ChatPTYDriver {
     private var pty = nt_pty_t()
     var livePTY: nt_pty_t { pty }
+    /// M4-MAC-04B A/B: "fork" (the original: session leader + ctty) or
+    /// "posix" (no setsid/ctty — the session-teardown-avoidance control).
+    var launcher: String = "fork"
     private var started = false
     private var cursor = ChatPTYTranscript()
     private let executable: String
@@ -57,7 +60,11 @@ final class ChatPTYDriver {
         eStrings.append(nil)
         let result = cStrings.withUnsafeMutableBufferPointer { argvBuffer in
             eStrings.withUnsafeMutableBufferPointer { envBuffer in
-                nt_pty_spawn_env(&pty, argvBuffer.baseAddress!, envBuffer.baseAddress!)
+                if launcher == "posix" {
+                    nt_pty_spawn_posix(&pty, argvBuffer.baseAddress!, envBuffer.baseAddress!)
+                } else {
+                    nt_pty_spawn_env(&pty, argvBuffer.baseAddress!, envBuffer.baseAddress!)
+                }
             }
         }
         guard result == 0 else {

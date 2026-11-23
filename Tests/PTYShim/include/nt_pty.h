@@ -28,6 +28,10 @@ int nt_pty_spawn(nt_pty_t *pty, char *const argv[]);
  * set, or bare "KEY" to unset. `env` may be NULL. Returns 0 on
  * success. */
 int nt_pty_spawn_env(nt_pty_t *pty, char *const argv[], char *const env[]);
+/* A/B control (M4-MAC-04B): posix_spawn variant WITHOUT setsid/TIOCSCTTY
+ * (no session-leader tty teardown); raw-mode semantics preserved, no
+ * SIGWINCH delivery. */
+int nt_pty_spawn_posix(nt_pty_t *pty, char *const argv[], char *const env[]);
 
 /* Bounded read from the master. Returns bytes read, 0 on EOF, -1 on error
  * or timeout (timeout in milliseconds). Never blocks past the deadline. */
