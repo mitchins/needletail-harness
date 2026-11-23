@@ -95,6 +95,9 @@ unsigned long replxx_notify_drops( void ) {
  * nt_input_last_op for post-mortem access. Off = zero cost. */
 char nt_input_last_op[128] = "init";
 int nt_input_last_errno = 0;
+/* needletail 0002: the bounded-select fallback pushback. */
+static char nt_tty_pushback = 0;
+static int nt_have_pushback = 0;
 int nt_input_trace_on( void ) {
 	static int on = -1;
 	if ( on < 0 ) {
@@ -387,6 +390,11 @@ void Terminal::disable_raw_mode(void) {
 char32_t read_unicode_character(void) {
 	static char8_t utf8String[5];
 	static size_t utf8Count = 0;
+	/* needletail 0002: the bounded-select fallback pushback. */
+	if ( nt_have_pushback ) {
+		nt_have_pushback = 0;
+		return ( static_cast<char32_t>( static_cast<unsigned char>( nt_tty_pushback ) ) );
+	}
 	while (true) {
 		char8_t c;
 
@@ -731,14 +739,41 @@ Terminal::EVENT_TYPE Terminal::wait_for_input( int long timeout_ ) {
 		FD_ZERO( &fdSet );
 		FD_SET( 0, &fdSet );
 		FD_SET( _interrupt[0], &fdSet );
-		timeval tv{ timeout_ / 1000, static_cast<suseconds_t>( ( timeout_ % 1000 ) * 1000 ) };
+		/* needletail 0002: bound the wait to one second. On a runner
+		 * context select(2) on the tty has been observed to block
+		 * indefinitely without reporting readiness (the prompt is
+		 * rendered, a keystroke sits on the pty master, select never
+		 * returns); a bounded wait with a nonblocking peek keeps the
+		 * reader live regardless. */
+		int long bounded( timeout_ <= 0 ? 1000 : ( timeout_ > 1000 ? 1000 : timeout_ ) );
+		timeval tv{ bounded / 1000, static_cast<suseconds_t>( ( bounded % 1000 ) * 1000 ) };
 		nt_input_mark( "wfis:select-enter", 0 );
-		int err( select( nfds, &fdSet, nullptr, nullptr, timeout_ > 0 ? &tv : nullptr ) );
+		int err( select( nfds, &fdSet, nullptr, nullptr, &tv ) );
 		if ( ( err == -1 ) && ( errno == EINTR ) ) {
 			nt_input_mark( "wfis:select-EINTR", errno );
 			continue;
 		}
 		if ( err == 0 ) {
+			/* needletail 0002: the bounded-select fallback — a real
+			 * keystroke may be present even though select reported
+			 * nothing. One nonblocking read attempt; a byte is pushed
+			 * back for read_unicode_character and reported as
+			 * KEY_PRESS, an empty tty returns TIMEOUT (the caller
+			 * refreshes and loops). The fd is restored to blocking
+			 * before returning in every path. */
+			int flags( ::fcntl( 0, F_GETFL, 0 ) );
+			static_cast<void>( ::fcntl( 0, F_SETFL, flags | O_NONBLOCK ) == 0 );
+			char c( 0 );
+			ssize_t n( ::read( 0, &c, 1 ) );
+			int peekErrno( errno );
+			static_cast<void>( ::fcntl( 0, F_SETFL, flags ) == 0 );
+			if ( n == 1 ) {
+				nt_tty_pushback = c;
+				nt_have_pushback = 1;
+				nt_input_mark( "wfis:timeout-peek byte", 0 );
+				return ( EVENT_TYPE::KEY_PRESS );
+			}
+			nt_input_mark( "wfis:timeout-peek empty", peekErrno );
 			nt_input_mark( "wfis:select-timeout", 0 );
 			return ( EVENT_TYPE::TIMEOUT );
 		}
