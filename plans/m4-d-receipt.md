@@ -1990,3 +1990,13 @@ semantics (OP-1/OP-2 sequences are byte-identical FFI calls — no
 divergence exists today). No qualification campaign was run for this
 reconciliation; the only code change (OP-6) is covered by the
 vendor-check, the stale-token regression and the existing suites.
+
+**§23 addendum — CI status:** both a44f504 and a4fbc31 attempt-1 runs
+failed the same scripted-loop cluster (20 tests, all
+`waitFor(marker:…, timeout: 5)` timeouts in ChatLoopTests); attempt-2
+reruns are GREEN for both (44955330764 and 45000857410), and the
+cluster is not reproducible locally (ChatLoopTests 12/12). Pattern:
+runner-load sensitivity of the 5-second scripted waitFors, not a code
+regression — the identical suite set passes on the same commits on
+retry. If it recurs a third time, widen the scripted waitFors as a
+test-only change.
