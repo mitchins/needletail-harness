@@ -2000,3 +2000,64 @@ runner-load sensitivity of the 5-second scripted waitFors, not a code
 regression — the identical suite set passes on the same commits on
 retry. If it recurs a third time, widen the scripted waitFors as a
 test-only change.
+
+## 24. Narrow round — OP-6 landed, PTY-01 first-failing-operation established (HEAD 15025b3)
+
+**1. OP-6 actually landed (33e3259).** The reconciliation round's
+source edits were found uncommitted; both C++ trace sites are now
+committed with the regenerated patches (vendor-check both directions
++ clone OK) and a baked proof: the stale-token regression runs with
+NB_INPUT_TRACE=1 while "done" is typed through the pty and asserts
+no `readc:decoded c=`, no `dispatch c=`, no hex fragment of the typed
+word, and that the stage marks are present.
+
+**2. PTY-01 first failing operation — established, then overtaken by
+a deeper fact.** Instrumented run at d76288f lineage: the child
+engaged raw mode, rendered the prompt, received the ^C on the master,
+and froze **inside select(2) in wait_for_input** — no readiness, no
+timeout, no EINTR — while the identical manual scenario at the same
+head showed select-ready firing and the full chain completing. Fix
+implemented (0002, registered): the bounded-select fallback — the
+wait capped at 1 s, the timeout path performs one nonblocking peek of
+the tty, a present byte is pushed back for read_unicode_character and
+reported as KEY_PRESS, the fd restored blocking on every path.
+Locally green: ChatPTYTests 15/15, feasibility 14/14, owner 9/9,
+ChatLoopTests 12/12.
+
+**Native acceptance NOT met.** On the Mac at 15025b3, three
+consecutive PTY-01 attempts wedge, and a fully instrumented isolated
+run shows the wedge is NONDETERMINISTIC and DEEPER than any product
+operation: this run's child wedged **before rendering anything**, in
+the `?NEs` exit-blocked state (kernel-held; unsampleable — sample,
+lsof and ptrace all refused) — while a previous instrumented run
+froze at the select after rendering. The product cannot be executing
+code inside a kernel-held exit state; the child dies into that state
+at variable lifecycle points under the swift-testing runner, and the
+identical manual scenario exits cleanly at the same heads, repeatedly.
+The bounded-select fix addresses the operation identified in the
+earlier run and stands as correct; the remaining blocker is the
+runner-context child exit-limbo itself. Excluded by evidence: the
+notification pipe, the resize path, the watchdog, the barrier, the
+http shutdown, and now the select wait.
+
+**3. CI failure-list reconciliation corrected.** The §23 addendum
+under-counted: the failed runs record 20–22 ISSUE records, not 20
+tests — the failing tests are the scripted-loop legs of ChatLoopTests
+(12 tests, some recording multiple issues); attempt-1 logs for both
+runs are expired (GitHub zip-cache error), so the exact test list
+cannot be re-enumerated. What is verified: attempt-2 reruns of both
+44955330764 and 45000857410 are GREEN, and the cluster is not
+reproducible locally. Classification upgraded from "harmless load
+sensitivity" to **"rerun-green, root cause unproven"** — a third
+occurrence triggers widening the scripted waitFors (test-only).
+
+**Gate**: the Linux offline gate and smoke for 15025b3 are running
+(push-triggered); every prior head in this lineage has a green gate.
+A fresh external review of the corrected head, native qualification,
+and the Sonar policy decisions remain the maintainer's sequence.
+
+**Verdict: HOLD.** OP-6 landed and proven; PTY-01 instrumentation
+delivered the first-failing-operation evidence and one fix, but the
+native acceptance criterion (PTY-01 passing repeatedly) is not met —
+the blocker is the runner-context kernel-held child exit-limbo, which
+is beyond in-process correction. No merge, no release, no M5.
