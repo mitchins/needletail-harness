@@ -438,9 +438,10 @@ void nt_pty_pair_close(nt_pty_pair_t *pair) {
     memset(pair, 0, sizeof(*pair));
 }
 
+#pragma weak replxx_notify_drops
 unsigned long nt_replxx_notify_drops(void) {
-    extern unsigned long replxx_notify_drops(void) __attribute__((weak));
-    if (replxx_notify_drops) {
+    extern unsigned long replxx_notify_drops(void);
+    if ((void *)replxx_notify_drops != NULL) {
         return replxx_notify_drops();
     }
     return 0;
