@@ -201,6 +201,13 @@ struct ChatPTYTests {
                 Self.preserve("pty-01", transcript: driver.fullTranscript())
             }
             #expect(chatPTYCleanExit(status), "PTY-01 exit must be code 0, raw status \(status)")
+            if !driver.termiosRestoredExactly() {
+                // M4-MAC-04B: dump the transcript (incl. the [tt]
+                // teardown breadcrumbs and the [it] input trace) so the
+                // ctty-less posix launcher's restoration delta is
+                // diagnosable.
+                Self.preserve("pty-01-restore", transcript: driver.fullTranscript())
+            }
             #expect(driver.termiosRestoredExactly(), "PTY-01 terminal must return to canonical echo after exit")
         }
     }
