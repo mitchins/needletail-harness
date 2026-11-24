@@ -15,9 +15,13 @@ import PTYShim
 final class ChatPTYDriver {
     private var pty = nt_pty_t()
     var livePTY: nt_pty_t { pty }
-    /// M4-MAC-04B A/B: "fork" (the original: session leader + ctty) or
-    /// "posix" (no setsid/ctty — the session-teardown-avoidance control).
+    /// M4-MAC-04B A/B: "fork" (the original: session leader + ctty),
+    /// "posix" (no setsid/ctty control), or "posix-ctty" (posix_spawn
+    /// + SETSID bootstrap that acquires the controlling terminal and
+    /// execs the real binary — the qualified launcher).
     var launcher: String = "fork"
+    /// The bootstrap fixture executable path for the posix-ctty launcher.
+    var bootstrapPath: String = ""
     private var started = false
     private var cursor = ChatPTYTranscript()
     private let executable: String
@@ -45,6 +49,21 @@ final class ChatPTYDriver {
         // release binary under test.
         var envStrings = extraEnv.map { "\($0.key)=\($0.value)" }
         envStrings.append("NEEDLETAIL_REQUEST_BUDGET")
+        if launcher == "posix-ctty" {
+            // The posix launcher receives the FULL merged environment
+            // (the parent builds it here; the C passes it straight to
+            // posix_spawnp). Child-only overrides, no parent mutation.
+            let overrideKeys = envStrings.map { entry -> String in
+                if let eq = entry.firstIndex(of: "=") { return String(entry[..<eq]) }
+                return entry
+            }
+            var merged: [String] = []
+            for (k, v) in ProcessInfo.processInfo.environment {
+                if !overrideKeys.contains(k) { merged.append("\(k)=\(v)") }
+            }
+            merged.append(contentsOf: envStrings)
+            envStrings = merged
+        }
         var cStrings: [UnsafeMutablePointer<CChar>?] = []
         var eStrings: [UnsafeMutablePointer<CChar>?] = []
         defer {
@@ -58,20 +77,42 @@ final class ChatPTYDriver {
         cStrings.append(nil)
         for entry in envStrings { eStrings.append(strdup(entry)) }
         eStrings.append(nil)
-        let result = cStrings.withUnsafeMutableBufferPointer { argvBuffer in
-            eStrings.withUnsafeMutableBufferPointer { envBuffer in
-                if launcher == "posix" {
-                    nt_pty_spawn_posix(&pty, argvBuffer.baseAddress!, envBuffer.baseAddress!)
-                } else {
-                    nt_pty_spawn_env(&pty, argvBuffer.baseAddress!, envBuffer.baseAddress!)
+        var spawnResult: Int32 = -1
+        if launcher == "posix-ctty" {
+            // The child argv is prebuilt: [bootstrap, executable, args..., NULL].
+            // OWNERSHIP: the bootstrap slot is owned by this array (freed
+            // here); the executable/args slots ALIAS cStrings, which the
+            // existing defer frees exactly once — freeing them here too
+            // is a double free (the observed runner crash).
+            var childC: [UnsafeMutablePointer<CChar>?] = [strdup(bootstrapPath)]
+            for c in cStrings where c != nil { childC.append(c) }
+            childC.append(nil)
+            spawnResult = childC.withUnsafeMutableBufferPointer { childBuffer in
+                eStrings.withUnsafeMutableBufferPointer { envBuffer in
+                    nt_pty_spawn_posix_ctty(&pty, childBuffer.baseAddress!, envBuffer.baseAddress!)
+                }
+            }
+            if let bp = childC[0] { free(bp) }
+        } else {
+            spawnResult = cStrings.withUnsafeMutableBufferPointer { argvBuffer in
+                eStrings.withUnsafeMutableBufferPointer { envBuffer in
+                    if launcher == "posix" {
+                        nt_pty_spawn_posix(&pty, argvBuffer.baseAddress!, envBuffer.baseAddress!)
+                    } else {
+                        nt_pty_spawn_env(&pty, argvBuffer.baseAddress!, envBuffer.baseAddress!)
+                    }
                 }
             }
         }
+        let result = spawnResult
         guard result == 0 else {
             Issue.record("pty.spawn-failure: could not spawn \(executable) \(args.joined(separator: " "))")
             return false
         }
         started = true
+        if getenv("NB_INPUT_TRACE") != nil {
+            FileHandle.standardError.write(Data("[it]driver:spawn-returned launcher=\(launcher)\n".utf8))
+        }
         return true
     }
 

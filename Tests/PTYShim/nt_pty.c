@@ -8,6 +8,7 @@
  */
 #define _XOPEN_SOURCE 600
 #define _DEFAULT_SOURCE 1
+#define _GNU_SOURCE 1
 #include <spawn.h>
 #include <unistd.h>
 extern char **environ;
@@ -438,6 +439,140 @@ void nt_pty_pair_close(nt_pty_pair_t *pair) {
 }
 
 unsigned long nt_replxx_notify_drops(void) {
-    extern unsigned long replxx_notify_drops(void);
-    return replxx_notify_drops();
+    extern unsigned long replxx_notify_drops(void) __attribute__((weak));
+    if (replxx_notify_drops) {
+        return replxx_notify_drops();
+    }
+    return 0;
+}
+
+static void nt_shim_trace(const char *msg) {
+    if (getenv("NB_INPUT_TRACE") != NULL) {
+        fprintf(stderr, "[it]%s\n", msg);
+        fflush(stderr);
+    }
+}
+
+int nt_bootstrap_acquire_ctty(void) {
+    return ioctl(0, TIOCSCTTY, 0);
+}
+
+/* needletail 0000-A/B: build the FULL inherited environment with
+ * child-only overrides/unsets applied in the parent (matching the fork
+ * launcher's semantics — the child inherits everything except the
+ * explicit overrides). Returns a malloc'd NULL-terminated array the
+ * caller owns. */
+static char **nt_build_full_env(char *const env[]) {
+    size_t baseCount = 0;
+    while (environ[baseCount] != NULL) baseCount++;
+    size_t overrideCount = 0;
+    if (env != NULL) while (env[overrideCount] != NULL) overrideCount++;
+    size_t capacity = baseCount + overrideCount + 2;
+    char **merged = calloc(capacity, sizeof(char *));
+    if (merged == NULL) return NULL;
+    size_t used = 0;
+    for (size_t i = 0; i < baseCount; i++) {
+        const char *entry = environ[i];
+        const char *equals = strchr(entry, '=');
+        size_t keyLen = equals != NULL ? (size_t)(equals - entry) : strlen(entry);
+        int overridden = 0;
+        for (size_t j = 0; j < overrideCount; j++) {
+            const char *o = env[j];
+            if (strncmp(o, entry, keyLen) == 0 &&
+                (o[keyLen] == '=' || o[keyLen] == '\0')) {
+                overridden = 1;
+                break;
+            }
+        }
+        if (!overridden) {
+            merged[used] = strdup(entry);
+            if (merged[used] != NULL) used++;
+        }
+    }
+    for (size_t j = 0; j < overrideCount; j++) {
+        if (strchr(env[j], '=') != NULL) {
+            merged[used] = strdup(env[j]);
+            if (merged[used] != NULL) used++;
+        }
+    }
+    return merged;
+}
+
+/* needletail 0000-A/B: the CONTROLLED posix launcher. Spawns
+ * argv[0] (the bootstrap fixture) with POSIX_SPAWN_SETSID (a new
+ * session, NOT SETPGROUP); the bootstrap acquires the controlling
+ * terminal, verifies session/foreground ownership and execs the real
+ * executable (the caller prebuilds argv: [bootstrap, executable,
+ * args..., NULL]). env entries are "KEY=VALUE" overrides or bare
+ * "KEY" unsets merged over the full inherited environment in the
+ * parent. */
+int nt_pty_spawn_posix_ctty(nt_pty_t *pty, char *const argv[], char *const env[]) {
+    nt_shim_trace("spct:enter");
+    if (pty == NULL || argv == NULL || argv[0] == NULL) {
+        return -1;
+    }
+    memset(pty, 0, sizeof(*pty));
+
+    int master = -1;
+    int slave = -1;
+    if (openpty(&master, &slave, NULL, NULL, NULL) != 0) {
+        return -1;
+    }
+    if (tcgetattr(slave, &pty->savedSlaveTermios) == 0) {
+        pty->haveSavedTermios = 1;
+    }
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(master);
+        close(slave);
+        return -1;
+    }
+    posix_spawn_file_actions_adddup2(&actions, slave, STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, slave, STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, slave, STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, master);
+    if (slave > STDERR_FILENO) {
+        posix_spawn_file_actions_addclose(&actions, slave);
+    }
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(master);
+        close(slave);
+        return -1;
+    }
+    sigset_t allSignals;
+    sigset_t noSignals;
+    sigfillset(&allSignals);
+    sigemptyset(&noSignals);
+    (void)(posix_spawnattr_setsigdefault(&attr, &allSignals) == 0);
+    (void)(posix_spawnattr_setsigmask(&attr, &noSignals) == 0);
+    /* SETSID only: a new session (and its own process group) without
+     * SETPGROUP, so the bootstrap can acquire the controlling terminal
+     * as the session leader. */
+    int spawnFlags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+    if (getenv("NB_NO_SETSID") == NULL) spawnFlags |= POSIX_SPAWN_SETSID;
+    (void)(posix_spawnattr_setflags(&attr, spawnFlags) == 0);
+    (void)(getenv("NB_NO_SETSID") == NULL); /* bisection knob retained */
+    nt_shim_trace("spct:spawning");
+    pid_t pid = -1;
+    int rc = posix_spawnp(&pid, argv[0], &actions, &attr, argv, env);
+    {
+        char m[64];
+        snprintf(m, sizeof(m), "spct:spawned rc=%d pid=%d", rc, (int)pid);
+        nt_shim_trace(m);
+    }
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) {
+        close(master);
+        close(slave);
+        errno = rc;
+        return -1;
+    }
+    pty->slaveFd = slave;
+    pty->masterFd = master;
+    pty->childPid = pid;
+    return 0;
 }

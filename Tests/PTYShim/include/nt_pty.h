@@ -32,6 +32,12 @@ int nt_pty_spawn_env(nt_pty_t *pty, char *const argv[], char *const env[]);
  * (no session-leader tty teardown); raw-mode semantics preserved, no
  * SIGWINCH delivery. */
 int nt_pty_spawn_posix(nt_pty_t *pty, char *const argv[], char *const env[]);
+/* The CONTROLLED posix launcher: spawns the bootstrap (POSIX_SPAWN_SETSID)
+ * which acquires the ctty, verifies session/foreground ownership, and execs
+ * argv (the real application). env = "KEY=VALUE"/"KEY" overrides merged over
+ * the full inherited environment in the parent. */
+int nt_pty_spawn_posix_ctty(nt_pty_t *pty, char *const argv[], char *const env[]);
+/* argv is prebuilt by the caller: [bootstrap, executable, args..., NULL]. */
 
 /* Bounded read from the master. Returns bytes read, 0 on EOF, -1 on error
  * or timeout (timeout in milliseconds). Never blocks past the deadline. */
@@ -74,6 +80,7 @@ typedef struct {
 int nt_pty_open_pair(nt_pty_pair_t *pair);
 void nt_pty_pair_close(nt_pty_pair_t *pair);
 unsigned long nt_replxx_notify_drops(void);
+int nt_bootstrap_acquire_ctty(void);
 /* 1 when the live slave termios equals the spawn-time capture exactly
  * (full struct memcmp, c_cc included); 0 when it differs; -1 if
  * unavailable. */

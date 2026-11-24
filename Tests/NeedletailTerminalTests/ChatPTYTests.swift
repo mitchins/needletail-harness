@@ -169,6 +169,7 @@ struct ChatPTYTests {
                 args: ["chat", "--config", env.configPath],
                 extraEnv: pty01Extra)
             driver.launcher = driverLauncher
+            driver.bootstrapPath = Self.repoRoot() + "/.build/debug/NTPTYBootstrap"
             defer { driver.stop() }
             driver.preserveTranscript = { Self.preserve("pty-01-timeout", transcript: $0) }
             guard driver.start() else { Issue.record("pty spawn failed"); return }
