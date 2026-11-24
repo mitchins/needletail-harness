@@ -2061,3 +2061,59 @@ delivered the first-failing-operation evidence and one fix, but the
 native acceptance criterion (PTY-01 passing repeatedly) is not met —
 the blocker is the runner-context kernel-held child exit-limbo, which
 is beyond in-process correction. No merge, no release, no M5.
+
+## 25. Launcher A/B — the wedge cause confirmed; the posix variant is not a drop-in (HEAD 2f7f4fc)
+
+**The A/B (the directive's item 1) is DECISIVE.** Same commit, same
+Swift Testing environment, same test:
+- fork launcher (the original: setsid + TIOCSCTTY, session leader
+  with a controlling pty): the runner wedges with ZERO test output —
+  reproduced in the same session (4 "did not exit" context lines
+  match the earlier signature).
+- posix_spawn launcher (no setsid/TIOCSCTTY, own process group,
+  default signal disposition/mask, stdio on the slave): PTY-01
+  COMPLETED — in 0.276 s and 0.298 s across two runs: the child
+  executed, the prompt rendered, Ctrl+C processed, exit 0, NO child
+  hang, NO wedge.
+
+**The launcher semantics are the wedge cause.** The fork launcher's
+session-leader-with-controlling-pty children enter the kernel-held
+exit limbo under the runner; removing the session/ctty relationship
+removes the wedge.
+
+**But the posix variant is NOT a drop-in (item 3's condition fails
+on the other side).** With NB_TEARDOWN_TRACE/NB_INPUT_TRACE on, the
+instrumented posix run shows: `exec-ok chat entry` (the post-exec
+marker — item 2's discrimination works), then `[?2004h` + the prompt,
+then the transcript ENDS: **zero input-path marks and zero teardown
+breadcrumbs** — the child exited 0 in 0.276 s WITHOUT ever entering
+the input-read dispatch (no select-enter, no decode, no dispatch, no
+Ctrl+C processing) and WITHOUT restoring the termios (the oracle
+fails). The ctty-less semantics break replxx's lifecycle differently:
+the raw-mode session depends on the controlling-terminal relationship
+in ways the pure posix_spawn variant does not provide, and the child
+takes an early clean exit instead of running the loop.
+
+**Item 3 resolution:** the bounded-select fallback was REMOVED
+(0002 regenerated, vendor-check OK) — the launcher A/B proves the
+select freeze was a symptom of the fork-launcher wedge, not an
+independent read-path defect. The resize preservation, the drop
+telemetry and the input-stage marks are retained.
+
+**Item 5:** the stale-token regression now uses a CHILD-ONLY trace
+env via nt_pty_spawn_env (the parent process env is never mutated
+during concurrent suites) — Codatiel's test-isolation finding
+corrected.
+
+**The next candidate fix (not attempted this round):** the binary
+self-acquiring the controlling terminal post-exec (ioctl(TIOCSCTTY)
+on fd 0 when absent, product-side, one guarded call at chat startup)
+— combining the posix launcher's non-wedging spawn with the session
+semantics replxx requires. That is a product change requiring its own
+qualification pass.
+
+**Verdict: HOLD.** The wedge cause is confirmed and discriminated by
+A/B; neither launcher currently satisfies the acceptance (fork:
+kernel-held limbo; posix: early clean exit without the input
+lifecycle or restoration). PTY-01 passing repeatedly on native macOS
+remains the open blocker. No merge, no release, no M5.
