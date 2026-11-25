@@ -2132,3 +2132,57 @@ lineage); the CI gate remains advisory for them. This disposition
 supersedes the §23 addendum's "third occurrence triggers widening
 the waitFors" — the widening is unnecessary because the failures are
 not confined to any one suite or commit.
+
+## 26. Controlled PTY launcher qualification (HEAD 14b9acd lineage)
+
+**Implemented per directive:**
+- **The corrected posix environment**: the posix+ctty launcher merges
+  the FULL inherited environment with child-only overrides/unsets in
+  the parent (matching the fork launcher's semantics); NB_INPUT_TRACE
+  propagates explicitly through the driver's extra env.
+- **The test-only bootstrap** (`NTPTYBootstrap`, a dependency-free C
+  fixture): spawned via posix_spawn with POSIX_SPAWN_SETSID (no
+  SETPGROUP), acquires the controlling terminal (TIOCSCTTY on Linux;
+  the macOS reopen-after-leader rule), verifies session/foreground
+  ownership (tcsetpgrp + tcgetpgrp + the session id), then execs the
+  real Needletail binary. Phase markers BOOTSTRAP:ctty-ok/fg-ok/exec;
+  phase exits 120/121/127.
+- **The A/B**: PTY-01 driven by NB_LAUNCHER with the identical
+  arguments/environment/terminal configuration; the fork launcher
+  preserved as the control.
+- **Item 2**: the post-exec marker (`exec-ok chat entry`) written by
+  the binary itself — the executed-vs-not discrimination no longer
+  infers from a missing prompt.
+
+**Linux**: PTY-01 through the posix+ctty launcher — green (exit 0,
+the exact restoration, the reaped child, all assertions), and the
+full ChatPTYTests + feasibility suites green with the fork default.
+The launch-chain SEGV during development was root-caused to a double
+free of aliased child-argv pointers in the driver (fixed; ownership
+documented at the site).
+
+**Native macOS acceptance: NOT met — and the evidence now shows the
+blocker is the HOST, not the launcher.** The controlled qualification
+sequence: posix-ctty rep 1 = the runner launched, the test started,
+wedged; posix-ctty reps 2–3 = the runner wedged AT LAUNCH (zero test
+output); fork-1 = wedged at launch identically. Across the whole
+campaign every Mac runner invocation now wedges nondeterministically
+— at launch, mid-test, or at the child's kernel-held exit — with a
+progressively worsening rate (the earlier rounds completed most runs;
+this round = 4/4 wedged), launcher-independent, commit-independent,
+config-independent, at a host uptime of 3+ days after repeated
+wedge accumulation. The phase classification the directive asks for
+cannot be captured when the wedge precedes the test body; the one
+mid-test wedge from the earlier instrumented run = the child's
+select/wait (fixed separately and superseded by this evidence).
+
+**The operator decision required**: the host needs a full reboot (and
+ideally the Xcode toolchain reset/update) before any further native
+qualification. Self-executed host resets were prohibited by the
+standing directives, so this is recorded, not performed. The Linux
+lineage remains fully green.
+
+**Verdict: HOLD.** The controlled launcher is implemented, proven
+wedge-free on Linux, and preserved alongside the fork control; the
+native acceptance cannot be met on the current degraded host. No
+merge, no release, no M5.
