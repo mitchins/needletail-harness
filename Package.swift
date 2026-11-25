@@ -117,8 +117,7 @@ let package = Package(
             dependencies: ["NeedletailLineEditor"]
         ),
         .executableTarget(
-            name: "NTPTYBootstrap",
-            dependencies: ["PTYShim"]
+            name: "NTPTYBootstrap"
         ),
         .executableTarget(
             name: "NeedletailCLI",
