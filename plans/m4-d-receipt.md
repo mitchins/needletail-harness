@@ -2186,3 +2186,46 @@ lineage remains fully green.
 wedge-free on Linux, and preserved alongside the fork control; the
 native acceptance cannot be met on the current degraded host. No
 merge, no release, no M5.
+
+## 27. Host reboot test — the environment defect is confirmed permanent on this host (HEAD 738685d lineage)
+
+The operator rebooted the Mac (the fresh boot verified: uptime 48s,
+zero wedged processes, a from-scratch deploy of the full head, the
+release product + the test bundle + the bootstrap rebuilt clean).
+
+**The qualification sequence on the rebooted host is IDENTICAL to the
+pre-reboot pattern**: posix-ctty rep 1 = the runner launched, the test
+started, WEDGED (no test completion); posix-ctty reps 2–3 = wedged at
+launch (zero runner output); fork-1 = wedged at launch. The Xcode
+version is already the newest available for macOS 26 on Intel and
+cannot be upgraded further (the operator).
+
+**The hang-phase record (the directive's item):** across the campaign
+the wedges occur (a) at the runner launch, before any terminal
+acquisition (the bootstrap never runs — zero BOOTSTRAP markers), and
+(b) mid-test during application execution/exit (the instrumented
+runs: the prompt rendered, the freeze in the read path, or the child's
+kernel-held ?NEs exit state). **The hang has NEVER been at terminal
+acquisition** — the bootstrap's ctty path completes whenever it runs.
+
+**The final qualification verdict**: the product's PTY lifecycle is
+fully qualified outside the swift-testing runner (the manual script-pty
+probes: C1 ×many, C2 ×2, the dispatch probe, the deny/EOF flows — all
+green across every head) and fully qualified INSIDE the Linux CI and
+local Linux runner (every suite green at every head of this lineage).
+The swift-testing runner on macOS 26.7.1 + Xcode 26.6 (Intel) cannot
+complete a child-spawning PTY suite reliably on a pristine-boot host —
+a toolchain defect that no in-repo change can address, and the
+toolchain cannot be upgraded on this hardware. Native PTY-01 acceptance
+under swift-testing is therefore blocked by the environment
+permanently, unless the qualification moves to different Mac hardware
+or a different native runner.
+
+**Verdict: HOLD.** All in-repo work is complete and qualified where
+the environment is sound: Linux full-green at every head, the
+launcher A/B implemented with the controlled posix+ctty bootstrap, the
+notification correctness closed with honest evidence, and the
+duplication advisories reconciled. The remaining items are the
+maintainer's: a fresh external review of the corrected head, the Sonar
+policy decisions, and the native-qualification infrastructure choice.
+No merge, no release, no M5.
