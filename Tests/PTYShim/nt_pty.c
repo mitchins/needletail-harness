@@ -343,25 +343,84 @@ int nt_pty_wait(nt_pty_t *pty, int timeout_ms) {
     }
 }
 
+/* M4-MAC-06 harness defect A: the teardown reaping is BOUNDED. The old
+ * path ended in an unconditional blocking waitpid(..., 0) after SIGKILL
+ * — a kernel-held child hung the caller forever. Every wait now uses
+ * WNOHANG with explicit handling of interruption, already-reaped
+ * children and deadline exhaustion; an unreapable child is reported
+ * (its PID and last known state) via nt_last_reap_report and the
+ * outcome is never "success". Only our own child is signalled, by PID;
+ * no process-name matching, no unowned-process cleanup. */
+
+char nt_last_reap_report[160] = "no-teardown-yet";
+const char *nt_last_reap_report_cstr(void) {
+    return nt_last_reap_report;
+}
+
 void nt_pty_close(nt_pty_t *pty) {
     if (pty == NULL) {
         return;
     }
     if (pty->childPid > 0) {
+        pid_t pid = pty->childPid;
         int status = 0;
-        /* Reap only our own child; bounded, then signal, then reap. */
-        if (waitpid(pty->childPid, &status, WNOHANG) == 0) {
-            kill(pty->childPid, SIGTERM);
-            for (int waited = 0; waited < 500; waited += 10) {
-                if (waitpid(pty->childPid, &status, WNOHANG) == pty->childPid) {
+        int reaped = 0;
+        int lastErrno = 0;
+        /* Phase 1: already exited? */
+        for (int attempt = 0; attempt < 3 && !reaped; attempt++) {
+            pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid) { reaped = 1; break; }
+            if (r < 0) {
+                if (errno == EINTR) continue; /* interrupted: retry */
+                lastErrno = errno;
+                break; /* no such child / other error: report below */
+            }
+            break; /* r == 0: still running */
+        }
+        /* Phase 2: SIGTERM, bounded 1 s. */
+        if (!reaped) {
+            kill(pid, SIGTERM);
+            int waited = 0;
+            while (waited < 1000 && !reaped) {
+                pid_t r = waitpid(pid, &status, WNOHANG);
+                if (r == pid) { reaped = 1; break; }
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    lastErrno = errno;
                     break;
                 }
                 usleep(10 * 1000);
+                waited += 10;
             }
-            if (waitpid(pty->childPid, &status, WNOHANG) == 0) {
-                kill(pty->childPid, SIGKILL);
-                waitpid(pty->childPid, &status, 0);
+        }
+        /* Phase 3: SIGKILL, bounded 2 s. */
+        if (!reaped) {
+            kill(pid, SIGKILL);
+            int waited = 0;
+            while (waited < 2000 && !reaped) {
+                pid_t r = waitpid(pid, &status, WNOHANG);
+                if (r == pid) { reaped = 1; break; }
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    lastErrno = errno;
+                    break;
+                }
+                usleep(10 * 1000);
+                waited += 10;
             }
+        }
+        if (reaped) {
+            snprintf(nt_last_reap_report, sizeof(nt_last_reap_report),
+                     "reaped pid=%d status=%x", (int)pid, status);
+        } else {
+            /* Unreapable: report explicitly. NEVER claim success — the
+             * caller must treat this as a failed teardown with the
+             * child possibly still alive under its PID. */
+            snprintf(nt_last_reap_report, sizeof(nt_last_reap_report),
+                     "UNREAPED pid=%d lastErrno=%d state=kernel-held",
+                     (int)pid, lastErrno);
+            fprintf(stderr, "[shim] %s\n", nt_last_reap_report);
+            fflush(stderr);
         }
         pty->childPid = -1;
     }

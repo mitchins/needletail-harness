@@ -2229,3 +2229,64 @@ duplication advisories reconciled. The remaining items are the
 maintainer's: a fresh external review of the corrected head, the Sonar
 policy decisions, and the native-qualification infrastructure choice.
 No merge, no release, no M5.
+
+## 28. M4-MAC-06 — independent native PTY qualification (HEAD 2f7f4fc lineage + the harness fixes)
+
+**Harness defects corrected (items 1A/1B/1C, all test-harness only):**
+- **A. Bounded reaping**: `nt_pty_close` no longer ends in the
+  unconditional blocking `waitpid(..., 0)`; every wait is WNOHANG with
+  explicit EINTR, already-reaped and deadline handling (SIGTERM ≤1 s,
+  SIGKILL ≤2 s), an explicit `nt_last_reap_report` (the PID, errno,
+  state) for unreapable children, no process-name killing, and no
+  success claim when the child survives.
+- **B. Bootstrap verification**: the macOS ctty path now fails
+  explicitly on terminal-identify/open/duplicate/acquisition-verify
+  (tcgetsid==getsid + tcsetpgrp), with distinct phase exits; success
+  markers are no longer emitted on attempted operations.
+- **C. Posix environment**: the driver builds the complete child
+  environment in the parent (the full inherited env + the overrides −
+  the removed keys); the bare `NEEDLETAIL_REQUEST_BUDGET` unset marker
+  no longer reaches posix_spawn. The verification test is baked into
+  the acceptance runner (the budget absent from the child).
+
+**The standalone runner — implemented**: `NTPTYAcceptance` (a
+dependency-light executable, NOT Swift Testing / `swift test`): the
+controlled posix+ctty launcher, the shim's pty + the exact-restoration
+oracle, per-phase timestamps, deadlines on every blocking operation,
+transcript preservation on failure, and the app-vs-harness failure
+tagging. PTY-01 reproduces all ten contract steps including the
+exec-ok post-exec proof, the raw-mode assertion before injection, the
+successful 0x03 write, and the explicit reaping report.
+
+**PTY-01 result: FAILED at the first repetition — the boundary is
+the PTY input delivery / input dispatch.** Evidence: the bootstrap
+markers complete (ctty-ok, fg-ok, exec — the launcher and terminal
+acquisition work); the binary executes (exec-ok); the prompt renders;
+raw mode verified active; the 0x03 write succeeds; then the child's
+last input trace is `[it]wfis:select-enter` — the reader enters
+select() and the transcript ends. The child exits 0 (~30 s later,
+silently, with no teardown breadcrumbs) — an exit that cannot be the
+Ctrl+C path because the dispatch never ran. **The unobservable
+operation is stated plainly**: whether the kernel ever reported the
+tty ready to the child's select is not observable from the parent;
+the missing dispatch marker is evidence of the wedge location, not
+proof the byte was never delivered. The discriminating control exists:
+the identical scenario under `script(1)` completes with the ^C
+dispatched, every time.
+
+**The fix candidate is identified but NOT applied**: the
+bounded-select fallback (the previously reverted 0002 hunks — the
+1-second select bound + the nonblocking peek) addresses exactly this
+readiness-report failure. Reintroducing it modifies the vendored patch
+against the "no new replxx patches" constraint of this mission, so it
+is recorded as the awaiting-authorization next step.
+
+**Repeated runs**: the failure reproduced on the second run (the same
+boundary, the same markers), before the stop-on-first-failure rule
+halting further repetitions. Linux remains fully green (the local
+PTY-01 fork-launcher leg + the suites at this round's start).
+
+**Verdict: HOLD.** The standalone native route exists and works up to
+the input-dispatch boundary; the wedge is now isolated to a single
+operation (select readiness reporting) with a ready, authorized-step
+pending fix. No merge, no release, no M5.

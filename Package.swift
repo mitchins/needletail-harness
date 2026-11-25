@@ -120,6 +120,10 @@ let package = Package(
             name: "NTPTYBootstrap"
         ),
         .executableTarget(
+            name: "NTPTYAcceptance",
+            dependencies: ["NeedletailTestSupport", "PTYShim"]
+        ),
+        .executableTarget(
             name: "NeedletailCLI",
             dependencies: [
                 "NeedletailCore",

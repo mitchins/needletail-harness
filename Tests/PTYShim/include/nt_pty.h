@@ -81,6 +81,9 @@ int nt_pty_open_pair(nt_pty_pair_t *pair);
 void nt_pty_pair_close(nt_pty_pair_t *pair);
 unsigned long nt_replxx_notify_drops(void);
 int nt_bootstrap_acquire_ctty(void);
+/* M4-MAC-06: the last teardown reaping outcome (the bounded report). */
+extern char nt_last_reap_report[160];
+const char *nt_last_reap_report_cstr(void);
 /* 1 when the live slave termios equals the spawn-time capture exactly
  * (full struct memcmp, c_cc included); 0 when it differs; -1 if
  * unavailable. */

@@ -32,18 +32,22 @@ int main(int argc, char **argv) {
      *   macOS/BSD: a session leader acquires the ctty on the first open
      *   of the terminal AFTER becoming the leader — reopen and re-dup. */
 #if defined(__APPLE__)
-    {
-        const char *name = ttyname(0);
-        if (name != NULL) {
-            int fd = open(name, O_RDWR);
-            if (fd >= 0) {
-                dup2(fd, 0);
-                dup2(fd, 1);
-                dup2(fd, 2);
-                if (fd > 2) close(fd);
-            }
-        }
-    }
+    /* macOS/BSD: a session leader acquires the ctty on the first open
+     * of the terminal AFTER becoming the leader. Every step is
+     * verified; any failure is explicit (M4-MAC-06 defect B: success
+     * markers were previously emitted on attempted, unverified paths). */
+    const char *name = ttyname(0);
+    if (name == NULL) fail(120, "terminal-identify");
+    int fd = open(name, O_RDWR);
+    if (fd < 0) fail(120, "terminal-open");
+    if (dup2(fd, 0) < 0 || dup2(fd, 1) < 0 || dup2(fd, 2) < 0)
+        fail(120, "descriptor-duplicate");
+    if (fd > 2) close(fd);
+    /* Acquisition verification: the fd's controlling session must now
+     * be OUR session and its foreground group OUR group. */
+    if (tcgetsid(0) == (pid_t)-1 || tcgetsid(0) != getsid(0))
+        fail(120, "ctty-acquisition-verify");
+    if (tcsetpgrp(0, getpgrp()) == -1) fail(120, "tcsetpgrp");
 #else
     if (ioctl(0, TIOCSCTTY, 0) == -1) fail(120, "ctty");
 #endif

@@ -41,28 +41,27 @@ final class ChatPTYDriver {
 
     @discardableResult
     func start() -> Bool {
-        // Child-only environment: overrides are applied in the forked
-        // child (never via parent setenv), so concurrently running
-        // suites that mutate process env cannot leak into PTY children.
-        // PTY legs always run unbudgeted: an inherited
-        // NEEDLETAIL_REQUEST_BUDGET from another suite must not cap the
-        // release binary under test.
-        var envStrings = extraEnv.map { "\($0.key)=\($0.value)" }
-        envStrings.append("NEEDLETAIL_REQUEST_BUDGET")
-        if launcher == "posix-ctty" {
-            // The posix launcher receives the FULL merged environment
-            // (the parent builds it here; the C passes it straight to
-            // posix_spawnp). Child-only overrides, no parent mutation.
-            let overrideKeys = envStrings.map { entry -> String in
-                if let eq = entry.firstIndex(of: "=") { return String(entry[..<eq]) }
-                return entry
+        // M4-MAC-06 defect C: the COMPLETE child environment is built in
+        // the parent — the full inherited environment with the child-only
+        // overrides applied and the removed keys (bare names) dropped —
+        // so every launcher receives only valid KEY=VALUE entries.
+        // Overrides never touch the parent process env, so concurrently
+        // running suites cannot leak into PTY children.
+        // NEEDLETAIL_REQUEST_BUDGET is explicitly removed: an inherited
+        // budget from another suite must not cap the release binary.
+        var overrideMap: [String: String?] = [:]
+        for (k, v) in extraEnv { overrideMap[k] = .some(v) }
+        overrideMap["NEEDLETAIL_REQUEST_BUDGET"] = nil // removed key
+        var envStrings: [String] = []
+        for (k, v) in ProcessInfo.processInfo.environment {
+            if let override = overrideMap[k] {
+                if let value = override { envStrings.append("\(k)=\(value)") }
+                continue // removed key: absent from the child
             }
-            var merged: [String] = []
-            for (k, v) in ProcessInfo.processInfo.environment {
-                if !overrideKeys.contains(k) { merged.append("\(k)=\(v)") }
-            }
-            merged.append(contentsOf: envStrings)
-            envStrings = merged
+            envStrings.append("\(k)=\(v)")
+        }
+        for (k, override) in overrideMap where ProcessInfo.processInfo.environment[k] == nil {
+            if let value = override { envStrings.append("\(k)=\(value)") }
         }
         var cStrings: [UnsafeMutablePointer<CChar>?] = []
         var eStrings: [UnsafeMutablePointer<CChar>?] = []
