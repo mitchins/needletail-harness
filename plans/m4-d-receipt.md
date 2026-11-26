@@ -2290,3 +2290,57 @@ PTY-01 fork-launcher leg + the suites at this round's start).
 the input-dispatch boundary; the wedge is now isolated to a single
 operation (select readiness reporting) with a ready, authorized-step
 pending fix. No merge, no release, no M5.
+
+## 29. M4-MAC-06A — the acceptance-oracle repairs (HEAD ddec0ff lineage)
+
+**All five directive items implemented:**
+1. **Drain-during-exit**: `waitExitDraining` interleaves the master
+   pump with bounded WNOHANG reaping — the dispatch and teardown
+   markers are now captured BEFORE the exit verdict (the child's full
+   teardown chain is in the transcript: the binding, the quiesce, the
+   abort, the EOF, the silence, the barrier acquired, the restore, the
+   watchdog, the finish, the shutdown, the teardownComplete).
+2. **Reaping ownership unified**: `nt_pty_wait` records the completed
+   reaping (`childReaped=1`); ECHILD is the distinct
+   reaped-elsewhere state (`childReaped=2`); the teardown never
+   signals a reaped child; the report is asserted AFTER the recorded
+   teardown.
+3. **Environment removals**: the explicit removals set (the nested
+   optional replaced); the env proof case asserts
+   NEEDLETAIL_REQUEST_BUDGET absent from the child and HOME present.
+   Both PASS on Linux.
+4. **Trace contract**: NB_TEARDOWN_TRACE/NB_INPUT_TRACE are enabled on
+   every repetition; the trace-backed markers are unconditional; the
+   default invocation passes.
+5. **The runner proven**: `NTPTYInputFixture` — the byte in through
+   the controlled launcher, the observable post-input marker captured,
+   exit 0, the reaping recorded ("already-reaped-by-wait") — PASS.
+
+**Local (Linux)**: PTY-01 ×3 through the standalone runner — all pass
+(exit 0, the exact restoration, reaped); the fixture and env proofs
+pass.
+
+**Native macOS result**: the runner now EXECUTES on the Mac (the
+dyld rpath fixed via the SharedFrameworks path) — and the wedge is
+GONE: **five consecutive PTY-01 repetitions, zero hangs**, each
+completing in ~0.5 s with the full teardown chain captured. The swift
+Testing runner was the wedge environment, as suspected.
+
+**The single remaining failure — precisely located**: the restoration
+oracle returns **-1 (the oracle-error path, not the mismatch)**: the
+post-exit `tcgetattr(slaveFd)` FAILS on the Mac under the posix+ctty
+launcher, while the identical pre-injection `tcgetattr` succeeds and
+the identical post-exit oracle PASSES on Linux. The parent's slave fd
+is held open by design (the shim keeps it for this oracle), so the
+failure indicates the fd or its terminal state is invalidated by the
+macOS session-teardown when the controlling-terminal session leader
+exits — a behaviour specific to the acquired-ctty posix_spawn path on
+macOS 26.7.1 that needs a parent-side fd-lifetime investigation
+(e.g. duplicating the slave before the exit, or a pre-exit termios
+snapshot comparison).
+
+**Verdict: HOLD.** The standalone native acceptance route is REAL
+and working: no hangs, deterministic, dispatch proven, exit 0,
+reaping recorded. One oracle-correctness issue (the post-exit slave
+tcgetattr failure) remains before "exact restoration" can be asserted
+on this launcher. No merge, no release, no M5.
