@@ -7,9 +7,8 @@ import NeedletailTestSupport
 /// the server thread past stop(). stop() returns promptly and the
 /// thread exits; the bounded join is real, not notional.
 ///
-/// Linux-only fixture coverage (LoopbackSSEServer refuses non-Linux at
-/// init); the file contributes no tests elsewhere.
-#if os(Linux)
+/// Runs where LoopbackSSEServer runs (Linux + macOS per its Darwin branch).
+#if os(Linux) || os(macOS)
 struct LoopbackServerShutdownTests {
 
     @Test("silent client does not pin the server thread past stop")
@@ -18,7 +17,13 @@ struct LoopbackServerShutdownTests {
         server.start()
         defer { server.stop() }
         // Raw client: connect, send nothing (no request head).
+        // SOCK_STREAM is a typed enum on Glibc (needs .rawValue) but a
+        // plain Int32 constant in Darwin.
+#if canImport(Glibc)
         let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+#else
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+#endif
         try #require(fd >= 0, "test socket creation failed")
         defer { close(fd) }
         var address = sockaddr_in()

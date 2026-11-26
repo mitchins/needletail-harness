@@ -1,0 +1,340 @@
+import Testing
+import Foundation
+@testable import NeedletailTerminal
+
+/// C5.2/C5.4/C5.5: single-writer ordering, stale suppression, quotas,
+/// control-lane priority, progress coalescing + plain suppression.
+/// The writer thread drains asynchronously: every assertion flushes.
+struct TerminalOutputOwnerTests {
+    private func owner(
+        caps: TerminalCaps = TerminalCaps(),
+        now: @escaping @Sendable () -> Date = Date.init,
+        written: LockedBox
+    ) -> TerminalOutputOwner {
+        TerminalOutputOwner(caps: caps, writer: { written.append($0) }, now: now)
+    }
+
+    // M4-MAC-04B: the output-shutdown invariant. A writer blocked
+    // inside an in-flight batch must not delay quiesce() unboundedly,
+    // and — after silence()+beginRestoreBarrier() — no batch may start
+    // or complete around a terminal restore. Deterministic: the test
+    // controls exactly when the blocked writer is released.
+    @Test("blocked writer: quiesce bounded, gate-dropped batch, no write past restore barrier")
+    func blockedWriterRestoreBarrier() throws {
+        let box = LockedBox()
+        let slowGate = NSCondition()
+        let releaseSlow = LockedFlag()
+        let enteredSlow = DispatchSemaphore(value: 0)
+        let o = TerminalOutputOwner(caps: TerminalCaps(), writer: { text in
+            if text.contains("slow-batch") {
+                slowGate.lock()
+                enteredSlow.signal()
+                while !releaseSlow.get() { slowGate.wait() }
+                slowGate.unlock()
+            }
+            box.append(text)
+        })
+        defer { o.close() }
+        let g = o.currentGeneration
+        // Batch A: the writer blocks inside it (holds the write gate).
+        o.emit([RenderedLine(spans: [TextSpan(text: "slow-batch", role: .normal)])], generation: g)
+        // Deterministic wait for the writer to reach the blocked write.
+        _ = enteredSlow.wait(timeout: .now() + 5)
+        // Batch B: queued while the writer is blocked. quiesce() must
+        // drop it (captured batches are re-checked at the write gate
+        // and never written once quiesced), and quiesce() itself must
+        // stay bounded even though the writer is stuck mid-batch.
+        o.emit([RenderedLine(spans: [TextSpan(text: "dropped-batch", role: .normal)])], generation: g)
+        let started = Date()
+        o.quiesce()
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(elapsed < 2.0, "quiesce must stay bounded with a blocked writer, took \(elapsed)s")
+        // The teardown sequence: silence (no new captures) then the
+        // restore barrier. The barrier thread BLOCKS in
+        // beginRestoreBarrier while batch A is mid-write — acquiring
+        // the gate PROVES batch A's accepted writes completed before
+        // the simulated restore ran. The test thread releases the
+        // writer; the write gate's mutual exclusion then orders
+        // [A's writes] -> [barrier] deterministically.
+        o.silence()
+        let barrierDone = DispatchSemaphore(value: 0)
+        let restoreThread = Thread {
+            let acquired = o.beginRestoreBarrier(timeoutMs: 5_000) // returns only after batch A completed
+            precondition(acquired, "the barrier must acquire once the blocked writer completed")
+            // (the simulated terminal restore happens strictly here)
+            o.endRestoreBarrier()
+            barrierDone.signal()
+            slowGate.lock()
+            releaseSlow.set(true)
+            slowGate.broadcast()
+            slowGate.unlock()
+        }
+        restoreThread.start()
+        // Release the blocked writer: batch A finishes, the writer loop
+        // re-locks and (silenced) captures nothing further, so the
+        // barrier acquires right after A's last write.
+        slowGate.lock()
+        releaseSlow.set(true)
+        slowGate.broadcast()
+        slowGate.unlock()
+        let joined = barrierDone.wait(timeout: .now() + 10) == .success
+        #expect(joined, "the restore barrier must acquire after the blocked writer completed")
+        // Post-teardown emissions are dropped forever (silenced).
+        let late = o.emit([RenderedLine(spans: [TextSpan(text: "post-restore", role: .normal)])], generation: g)
+        #expect(late.droppedStale == true, "emissions after silence must drop")
+        o.flush()
+        let out = box.joined()
+        #expect(out.contains("slow-batch"), "the accepted in-flight batch wrote before the barrier")
+        #expect(!out.contains("dropped-batch"), "a batch queued once quiesced must never write")
+        #expect(!out.contains("post-restore"), "nothing may write after the restore barrier")
+        o.close()
+    }
+
+    // M4-MAC-04B: the barrier-TIMEOUT path. A writer stuck forever
+    // (never released) must not hold the terminal restore hostage:
+    // beginRestoreBarrier times out, the restore proceeds, and —
+    // because silence() precedes it — the stuck writer can never
+    // start a new batch. This is the deterministic proof that the
+    // failure path (notification channel saturated, writer wedged in
+    // a blocked write) still unwinds.
+    @Test("barrier timeout: wedged writer cannot block terminal restoration; late emission bounded to the in-flight line")
+    func barrierTimesOutWithWedgedWriter() {
+        // The honest failure-path proof. The writer wedges INSIDE the
+        // first line of a MULTI-line batch; the barrier times out; the
+        // simulated restoration is recorded; and ONLY THEN is the
+        // wedged writer released. The per-line gate must detect the
+        // post-restore release and stop the batch after the one line
+        // that was already in flight — the test detects any late
+        // emission beyond it rather than assuming absence.
+        let box = LockedBox()
+        let wedged = LockedFlag()
+        let enteredWedged = DispatchSemaphore(value: 0)
+        let o = TerminalOutputOwner(caps: TerminalCaps(), writer: { text in
+            if text.contains("wedged-line") && !wedged.get() {
+                wedged.set(true)
+                enteredWedged.signal()
+                while wedged.get() { usleep(20_000) }
+            }
+            box.append(text)
+        })
+        let g = o.currentGeneration
+        // One batch, three lines; line 1 wedges the writer.
+        o.emit([
+            RenderedLine(spans: [TextSpan(text: "wedged-line-1", role: .normal)]),
+            RenderedLine(spans: [TextSpan(text: "queued-line-2", role: .normal)]),
+            RenderedLine(spans: [TextSpan(text: "queued-line-3", role: .normal)]),
+        ], generation: g)
+        _ = enteredWedged.wait(timeout: .now() + 5)
+        o.quiesce()
+        o.silence()
+        let started = Date()
+        let acquired = o.beginRestoreBarrier(timeoutMs: 300)
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(!acquired, "the barrier must time out against a wedged writer")
+        #expect(elapsed >= 0.25, "the timeout bounded the wait (took \(elapsed)s)")
+        // The restore proceeds on the timeout path.
+        box.append("TERMINAL-RESTORED")
+        // Post-teardown emissions are dropped.
+        let late = o.emit([RenderedLine(spans: [TextSpan(text: "late-batch", role: .normal)])], generation: g)
+        #expect(late.droppedStale == true, "emissions after silence drop even on the timeout path")
+        // NOW release the wedged writer: it finishes the ONE in-flight
+        // line, and the per-line gate must stop everything after it.
+        wedged.set(false)
+        for _ in 0 ..< 100 where !box.joined().contains("queued-line-2-or-never") && false { usleep(10_000) }
+        usleep(500_000)
+        let out = box.joined()
+        #expect(out.contains("wedged-line-1"), "the in-flight line was written (accepted pre-restore)")
+        #expect(out.contains("TERMINAL-RESTORED"), "the restore succeeded despite the wedged writer")
+        #expect(!out.contains("queued-line-2"), "the per-line gate must stop the batch after the in-flight line")
+        #expect(!out.contains("queued-line-3"), "no further lines after the restore")
+        #expect(!out.contains("late-batch"), "no new batches after silence")
+        // The one in-flight line is the ONLY thing after the restore:
+        // verify its position relative to the restore marker.
+        if let r = out.range(of: "TERMINAL-RESTORED") {
+            let after = out[r.upperBound...]
+            #expect(!after.contains("queued-line"), "nothing but the in-flight line follows the restore")
+        }
+        // Intentionally no close(): the writer thread is now released
+        // and the loop sees silence+stopped; close() is safe only after
+        // the writer returns, which the release above guarantees — but
+        // the loop may still be inside the gate section; poll-free close
+        // is avoided to keep the test deterministic.
+    }
+
+    @Test("ordered writes under one lock, stale generations drop")
+    func orderingAndStale() {
+        let box = LockedBox()
+        let o = owner(written: box)
+        defer { o.close() }
+        let g = o.currentGeneration
+        let r1 = o.emit([RenderedLine(spans: [TextSpan(text: "a", role: .normal)])], generation: g)
+        #expect(r1 == TerminalOutputOwner.EmitResult(written: 1, truncated: 0, droppedStale: false, controlOverflow: false))
+        o.invalidate()
+        let r2 = o.emit([RenderedLine(spans: [TextSpan(text: "b", role: .normal)])], generation: g)
+        #expect(r2.droppedStale == true)
+        o.flush()
+        #expect(box.joined() == "a\n")
+    }
+
+    @Test("droppable quota keeps tail with marker")
+    func droppableQuota() {
+        let box = LockedBox()
+        let o = owner(written: box)
+        defer { o.close() }
+        let lines = (0 ..< 600).map { i in RenderedLine(spans: [TextSpan(text: "l\(i)", role: .normal)]) }
+        let r = o.emit(lines, generation: o.currentGeneration)
+        #expect(r.truncated == 600 - TerminalOutputOwner.maxDroppableItems)
+        o.flush()
+        let out = box.joined()
+        #expect(out.contains("…[output truncated]"))
+        #expect(out.range(of: "…[output truncated]")!.lowerBound < out.range(of: "l88")!.lowerBound)
+        #expect(out.contains("l599"))
+        #expect(!out.contains("l0\n") && !out.contains("\nl0"))
+    }
+
+    @Test("control lane never truncates and drains first")
+    func controlNeverTruncates() {
+        let box = LockedBox()
+        let o = owner(written: box)
+        defer { o.close() }
+        let g = o.currentGeneration
+        let controls = (0 ..< 100).map { i in RenderedLine(spans: [TextSpan(text: "c\(i)", role: .errorNotice)]) }
+        let r = o.emit(controls, generation: g, lane: .control)
+        #expect(r.truncated == 0)
+        #expect(r.written == 100)
+        #expect(r.controlOverflow == true)
+        o.emit([RenderedLine(spans: [TextSpan(text: "d0", role: .normal)])], generation: g)
+        o.flush()
+        // Color caps wrap each record in SGR: count records, not raw text.
+        let records = box.joined().split(separator: "\n").filter { !$0.isEmpty }
+        #expect(records.count == 101)
+        #expect(records.first?.contains("c0") == true)
+        #expect(records[99].contains("c99"))
+        #expect(records.last?.contains("d0") == true)
+    }
+
+    @Test("progress coalesces to 10 Hz, clears pass, plain suppresses")
+    func progressRules() {
+        let box = LockedBox()
+        let clock = ManualClock(start: Date(timeIntervalSince1970: 1_000_000))
+        let o = owner(now: { clock.now() }, written: box)
+        defer { o.close() }
+        let g = o.currentGeneration
+        o.setProgress("streaming… 10 bytes", generation: g)
+        o.flush()
+        clock.advance(by: 0.01)
+        o.setProgress("streaming… 20 bytes", generation: g) // throttled out
+        o.flush()
+        clock.advance(by: 0.2)
+        o.setProgress("streaming… 30 bytes", generation: g)
+        o.flush()
+        o.setProgress("stale", generation: g + 99) // stale: dropped
+        o.setProgress(nil, generation: g) // clear passes (progress shown)
+        o.flush()
+        let writes = box.values()
+        #expect(writes.count == 3)
+        #expect(writes[0].contains("10 bytes"))
+        #expect(!writes.joined().contains("20 bytes"))
+        #expect(writes[1].contains("30 bytes"))
+        #expect(writes[2] == "\r\u{1B}[K")
+        // Adjacent updates without a drain collapse to the latest.
+        let box2 = LockedBox()
+        let o2 = owner(now: { clock.now() }, written: box2)
+        defer { o2.close() }
+        clock.advance(by: 1.0)
+        o2.setProgress("streaming… 40 bytes", generation: o2.currentGeneration)
+        clock.advance(by: 1.0)
+        o2.setProgress("streaming… 50 bytes", generation: o2.currentGeneration)
+        o2.flush()
+        let writes2 = box2.values()
+        // The writer thread may drain the 40-byte update before the
+        // 50-byte call lands: assert the guaranteed property (the
+        // latest update wins, nothing follows it), never one drain.
+        #expect((1...2).contains(writes2.count))
+        #expect(writes2.last?.contains("50 bytes") == true, "latest update wins")
+
+        let plainBox = LockedBox()
+        let plain = owner(caps: .plain, written: plainBox)
+        defer { plain.close() }
+        plain.setProgress("streaming… 1 byte", generation: plain.currentGeneration)
+        plain.flush()
+        #expect(plainBox.values().isEmpty)
+
+        // NO_COLOR (no color, addressing on): progress suppressed too —
+        // the clear-to-EOL is ANSI, and NO_COLOR means zero ANSI bytes.
+        let noColorBox = LockedBox()
+        let noColorCaps = TerminalCaps(color: false, cursorAddressing: true, width: 80)
+        let noColor = owner(caps: noColorCaps, written: noColorBox)
+        defer { noColor.close() }
+        noColor.setProgress("streaming… 1 byte", generation: noColor.currentGeneration)
+        noColor.flush()
+        #expect(noColorBox.values().isEmpty)
+    }
+
+    @Test("content clears a visible progress line before writing")
+    func contentClearsVisibleProgress() {
+        let box = LockedBox()
+        let o = owner(written: box)
+        defer { o.close() }
+        let g = o.currentGeneration
+        o.setProgress("streaming… 10 bytes", generation: g)
+        o.flush()
+        o.emit([RenderedLine(spans: [TextSpan(text: "hello", role: .normal)])], generation: g)
+        o.flush()
+        let writes = box.values()
+        #expect(writes.count == 3)
+        #expect(writes[0].contains("10 bytes"))
+        // The progress line is cleared before the content batch lands,
+        // so stale progress text is never committed to scrollback.
+        #expect(writes[1] == "\r\u{1B}[K")
+        #expect(writes[2].contains("hello"))
+    }
+
+    @Test("progress path never carries live control bytes (C5.2 partial oracle)")
+    func progressNoLiveControls() {
+        let box = LockedBox()
+        let o = owner(written: box)
+        defer { o.close() }
+        let g = o.currentGeneration
+        // Hostile progress content is sanitized to visible escapes; the
+        // ONLY raw ESC on the wire is the clear-to-EOL framing.
+        o.setProgress("streaming… \u{1B}[31m9999999 bytes", generation: g)
+        o.flush()
+        let writes = box.values()
+        #expect(writes.count == 1)
+        #expect(writes[0].contains("9999999")) // the count itself shows
+        #expect(writes[0].contains("\\u{1b}")) // the attack shows escaped
+        #expect(writes[0].filter { $0 == "\u{1B}" }.count == 1) // framing only
+    }
+
+    @Test("emitText sanitizes; plain route has zero ANSI")
+    func emitTextSafe() {
+        let box = LockedBox()
+        let o = owner(caps: .plain, written: box)
+        defer { o.close() }
+        o.emitText("a\u{1B}[31mb", generation: o.currentGeneration)
+        o.flush()
+        let out = box.joined()
+        #expect(!hasScalar(out, 0x1B))
+        #expect(out.contains("\\u{1b}"))
+    }
+}
+
+/// Manual clock for throttle tests (Sendable test double).
+final class ManualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+    init(start: Date) { current = start }
+    func now() -> Date { lock.withLock { current } }
+    func advance(by interval: TimeInterval) { lock.withLock { current = current.addingTimeInterval(interval) } }
+}
+
+/// Lock-boxed writer capture (Sendable test double).
+final class LockedBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [String] = []
+
+    func append(_ s: String) { lock.withLock { items.append(s) } }
+    func values() -> [String] { lock.withLock { items } }
+    func joined() -> String { lock.withLock { items.joined() } }
+}

@@ -45,10 +45,17 @@ public struct SSEScript: Sendable {
 public struct ScriptChunk: Sendable {
     public var bytes: [UInt8]
     public var delayMillis: UInt64
+    /// M4-D mid-stream injection barrier: when set, the server arms the
+    /// named gate and withholds this (and subsequent) chunks until the
+    /// test calls `releaseGate`. Lets a test prove input was injected
+    /// DURING a stream (gate-armed assertion), not after it. nil =
+    /// send immediately (existing behavior).
+    public var holdGate: String?
 
-    public init(bytes: [UInt8], delayMillis: UInt64 = 0) {
+    public init(bytes: [UInt8], delayMillis: UInt64 = 0, holdGate: String? = nil) {
         self.bytes = bytes
         self.delayMillis = delayMillis
+        self.holdGate = holdGate
     }
 }
 
@@ -94,6 +101,55 @@ public final class LoopbackSSEServer: @unchecked Sendable {
     private var stopped = false
     public let port: UInt16
 
+    /// M4-D gate state: armed = server is currently withholding a gated
+    /// chunk; released = test approved continuation (latches until reset).
+    private var gates: [String: (armed: Bool, released: Bool)] = [:]
+
+    /// Block the serve thread until `releaseGate(name)` or server stop /
+    /// a 60 s deadlock guard. Returns true iff released by the test.
+    /// A guard expiry is fail-open server-side; tests must assert
+    /// `waitUntilGateArmed` first so a missed barrier fails loudly.
+    private func awaitGate(_ name: String) -> Bool {
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
+            let done = lock.withLock { gates[name]?.released == true || stopped }
+            if done { return lock.withLock { gates[name]?.released == true } }
+            usleep(10_000)
+        }
+        return false
+    }
+
+    /// Test side: approve continuation of the named gate.
+    public func releaseGate(_ name: String) {
+        lock.withLock {
+            var state = gates[name] ?? (armed: false, released: false)
+            state.released = true
+            gates[name] = state
+        }
+    }
+
+    /// Test side: reset a gate for reuse across scripts.
+    public func resetGate(_ name: String) {
+        lock.withLock { gates[name] = (armed: false, released: false) }
+    }
+
+    /// Test side: bounded wait until the server is actually withholding
+    /// a chunk at the named gate. The true return is the non-vacuity
+    /// proof that subsequent input lands mid-stream.
+    /// Polls cooperatively: `Task.sleep` yields the Swift
+    /// concurrency executor thread instead of burning it in `usleep`.
+    /// Under parallel CI load, spinning polls starve the very tasks
+    /// they wait for (observed as readiness timeouts + a runner
+    /// crash); yielding polls do not.
+    public func waitUntilGateArmed(_ name: String, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if lock.withLock({ gates[name]?.armed == true }) { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
+    }
+
     public var connectionCount: Int { lock.withLock { connections } }
     public var requests: [CapturedRequest] { lock.withLock { captured } }
     public var threadExited: Bool { lock.withLock { _exited } }
@@ -109,8 +165,15 @@ public final class LoopbackSSEServer: @unchecked Sendable {
     }
 
     public init() throws {
+#if os(Linux) || os(macOS)
+        // BSD sockets are identical on Linux and Darwin; only the SOCK_STREAM
+        // spelling differs (typed enum on Glibc, plain Int32 on Darwin).
 #if os(Linux)
-        let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        let sockType = Int32(SOCK_STREAM.rawValue)
+#else
+        let sockType = SOCK_STREAM
+#endif
+        let fd = socket(AF_INET, sockType, 0)
         guard fd >= 0 else { throw LoopbackError.socketFailed }
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
@@ -265,6 +328,18 @@ public final class LoopbackSSEServer: @unchecked Sendable {
             }
             if lock.withLock({ stopped }) {
                 return
+            }
+            if let gate = chunk.holdGate {
+                lock.withLock { gates[gate] = (armed: true, released: gates[gate]?.released == true) }
+                _ = awaitGate(gate)
+                lock.withLock {
+                    var state = gates[gate] ?? (armed: false, released: false)
+                    state.armed = false
+                    gates[gate] = state
+                }
+                if lock.withLock({ stopped }) {
+                    return
+                }
             }
             if chunk.delayMillis > 0 {
                 usleep(useconds_t(min(chunk.delayMillis, 60_000) * 1_000))

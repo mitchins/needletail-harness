@@ -22,9 +22,13 @@ struct B2ClosureTests {
         return url
     }
 
+    /// See B2ReadSearchTests.locateRg: symlink candidates must resolve
+    /// — qualifiedRgFD refuses symlinked rg outright.
     private static func locateRg() -> String? {
         for p in ["/usr/bin/rg", "/usr/local/bin/rg"] {
-            if FileManager.default.isExecutableFile(atPath: p) { return p }
+            if FileManager.default.isExecutableFile(atPath: p) {
+                return URL(fileURLWithPath: p).resolvingSymlinksInPath().path
+            }
         }
         return nil
     }
@@ -70,6 +74,7 @@ struct B2ClosureTests {
 
     // MARK: - 1. Explicit search-root replacement between validation and launch
 
+#if canImport(Glibc)
     @Test("CLOSURE_01_explicitRootRace")
     func explicitRootRace() async throws {
         let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
@@ -107,9 +112,11 @@ struct B2ClosureTests {
         try? FileManager.default.removeItem(at: scope)
         try? FileManager.default.moveItem(at: parent.appendingPathComponent("scope.orig"), to: scope)
     }
+#endif // Linux-only (no fd-bound search or non-UTF8 names on Darwin)
 
     // MARK: - 2. Workspace-root replacement when searching without explicit path
 
+#if canImport(Glibc)
     @Test("CLOSURE_02_workspaceRootRace")
     func workspaceRootRace() async throws {
         let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
@@ -148,6 +155,7 @@ struct B2ClosureTests {
         let (direct, _) = try Self.runDirectRg(realRg, args: ["SENTINEL_OUTSIDE_2", ws.path])
         #expect(direct.contains("SENTINEL_OUTSIDE_2"), "counterfactual: pathname launch reads the sentinel")
     }
+#endif // Linux-only (no fd-bound search or non-UTF8 names on Darwin)
 
     // MARK: - 3. Genuine poisoned environment + PATH shadowing
     // (Process-global setenv; benign per the note in TOOL_03_poisonedEnv —
@@ -476,6 +484,7 @@ struct B2ClosureTests {
 
     // MARK: - 10. Non-UTF-8 paths classified, never bypassed
 
+#if canImport(Glibc)
     @Test("CLOSURE_10_nonUTF8Paths")
     func nonUTF8Paths() async throws {
         let realRg = try #require(Self.locateRg(), "rg required for B2 search evidence; silent skip is not evidence")
@@ -539,6 +548,7 @@ struct B2ClosureTests {
         #expect(result2.calls[0].data.contains("REAL3MARK"), "exact literal-U+FFFD approval must show its own file")
         #expect(!result2.calls[0].data.contains("GHOST3MARK"), "lossy skeleton must never satisfy an approval")
     }
+#endif // Linux-only (no fd-bound search or non-UTF8 names on Darwin)
 
     // MARK: - 7. Ripgrep qualification matrix
 

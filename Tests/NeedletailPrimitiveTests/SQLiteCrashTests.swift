@@ -23,6 +23,7 @@ private enum POSIXRequired: Error {
 
 struct SQLiteCrashTests {
 
+#if canImport(Glibc)
     @Test("STORE-02 SIGKILL mid-transaction rolls back and the database reopens writable")
     func STORE_02_sigkillMidTransactionRollsBack() throws {
         // The kill primitive shells a real sqlite3 CLI: fail closed with a
@@ -154,4 +155,6 @@ struct SQLiteCrashTests {
         }
         #expect(count == 2, "database must be writable after kill, got \(count) rows")
     }
+#endif // STORE-02 needs sqlite spill-into-DB mid-transaction (Linux sqlite spills; macOS system sqlite 3.51.0 does not)
+
 }

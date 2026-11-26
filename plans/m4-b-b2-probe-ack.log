@@ -1,0 +1,26 @@
+# M4-B B2 BDD-06 probe log — optimistic ack-correlation guard
+
+Date: 2026-11-07 UTC. Tree: `m4-a` B2 working tree (pre-commit).
+Oracle: `swift test --filter "UX_QUEUE_02_syncConfirms"`.
+
+Probe (disposable, `Sources/NeedletailPresentation/UIReducer.swift`):
+in `reduceQueueSync`, replaced
+  `if snapshot.admittedCommandIDs.contains(commandID) { continue }`
+with
+  `if false { continue } // BDD-06 PROBE: ack correlation disabled`
+
+Result: oracle FAILS as required —
+  `Expectation failed: state.queue.count == 1`
+  (optimistic row survives alongside the authoritative row: 2 rows).
+The admitted-commands check is the load-bearing guard for
+optimistic/authoritative reconciliation (UX-QUEUE-02); without it
+every confirmation duplicates.
+
+Restore: exact inverse replacement; `grep -c PROBE` on the file
+returns 0; oracle green after restore. No production fault
+switches added; no tree changes retained from the probe.
+
+Note (harness evolution, same slice): the hostile-trace harness
+grew an `@m` alphabet entry plus projection-carrier exemptions and
+per-command optimistic accounting after the reducer learned
+optimistic rows; each change was RED-pinned before implementation.

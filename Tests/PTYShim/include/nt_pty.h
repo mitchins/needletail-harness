@@ -16,11 +16,29 @@ typedef struct {
     int masterFd;
     pid_t childPid;
     struct termios savedSlaveTermios;
+    int slaveFd; /* kept open in the parent: post-exit termios oracle */
     int haveSavedTermios;
+    int childReaped;
 } nt_pty_t;
 
 /* Spawn `argv` under a fresh PTY. Returns 0 on success. */
 int nt_pty_spawn(nt_pty_t *pty, char *const argv[]);
+
+/* Spawn with child-only environment overrides applied after fork (the
+ * parent environment is never touched): each entry is "KEY=VALUE" to
+ * set, or bare "KEY" to unset. `env` may be NULL. Returns 0 on
+ * success. */
+int nt_pty_spawn_env(nt_pty_t *pty, char *const argv[], char *const env[]);
+/* A/B control (M4-MAC-04B): posix_spawn variant WITHOUT setsid/TIOCSCTTY
+ * (no session-leader tty teardown); raw-mode semantics preserved, no
+ * SIGWINCH delivery. */
+int nt_pty_spawn_posix(nt_pty_t *pty, char *const argv[], char *const env[]);
+/* The CONTROLLED posix launcher: spawns the bootstrap (POSIX_SPAWN_SETSID)
+ * which acquires the ctty, verifies session/foreground ownership, and execs
+ * argv (the real application). env = "KEY=VALUE"/"KEY" overrides merged over
+ * the full inherited environment in the parent. */
+int nt_pty_spawn_posix_ctty(nt_pty_t *pty, char *const argv[], char *const env[]);
+/* argv is prebuilt by the caller: [bootstrap, executable, args..., NULL]. */
 
 /* Bounded read from the master. Returns bytes read, 0 on EOF, -1 on error
  * or timeout (timeout in milliseconds). Never blocks past the deadline. */
@@ -38,6 +56,43 @@ int nt_pty_signal(nt_pty_t *pty, int sig);
 /* Wait for the child to exit within the deadline. Returns the wait status,
  * -1 on timeout. */
 int nt_pty_wait(nt_pty_t *pty, int timeout_ms);
+/* 0 = running/not-waited, 1 = reaped via nt_pty_wait, 2 = reaped elsewhere (ECHILD). */
+int childReapedState(const nt_pty_t *pty);
+#define NT_CHILD_RUNNING 0
+#define NT_CHILD_REAPED_BY_WAIT 1
+#define NT_CHILD_REAPED_ECHILD 2
+
+/* M4-MAC-02 exact-restore oracle: the parent keeps the slave open, so
+ * after the child exits the termios is still readable. Returns 0 and
+ * fills current with the slave's live termios; -1 if unavailable. */
+int nt_pty_slave_termios(nt_pty_t *pty, struct termios *current);
+/* 1 when the spawn-time initial termios was captured, else 0. */
+int nt_pty_have_initial_termios(nt_pty_t *pty);
+/* The retained slave descriptor (post-exit termios oracle anchor). */
+int nt_pty_slave_fd(nt_pty_t *pty);
+/* M4-MAC-03: meaningful-settings equality (flags, all NCCS control
+ * chars, speeds) — no struct padding involvement. 1 = equal. */
+int nt_pty_termios_equal(struct termios *a, struct termios *b);
+
+/* A bare pty pair without a child process: for in-process editor
+ * probes that need a real terminal on fd 0. */
+typedef struct {
+    int master;
+    int slave;
+    int retainedSlave;
+    int haveInitial;
+    struct termios initial;
+} nt_pty_pair_t;
+int nt_pty_open_pair(nt_pty_pair_t *pair);
+void nt_pty_pair_close(nt_pty_pair_t *pair);
+int nt_bootstrap_acquire_ctty(void);
+/* M4-MAC-06: the last teardown reaping outcome (the bounded report). */
+extern char nt_last_reap_report[160];
+const char *nt_last_reap_report_cstr(void);
+/* 1 when the live slave termios equals the spawn-time capture exactly
+ * (full struct memcmp, c_cc included); 0 when it differs; -1 if
+ * unavailable. */
+int nt_pty_termios_restored_exactly(nt_pty_t *pty);
 
 /* Close the master and reap if needed. */
 void nt_pty_close(nt_pty_t *pty);

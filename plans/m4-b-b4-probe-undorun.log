@@ -1,0 +1,19 @@
+# M4-B B4 BDD-06 probe log — undo-run intent mapping
+
+Date: 2026-11-07 UTC. Tree: `m4-a` B4 working tree (pre-commit).
+Oracle: `swift test --filter "UX_UNDO_08_rewindForkView|UX_UNDO_08_rewindRequest"`.
+
+Probe (disposable, `Sources/NeedletailPresentation/UIReducer.swift`):
+in `reduce(state, .undoIntent(.run))`, replaced the effect with `[]`
+(run intent swallowed).
+
+Result: oracle FAILS as required —
+  `Expectation failed: fx == [.runUndo(groupID: "g-9")]`.
+The intent→effect mapping is the load-bearing guard for B4's
+request-not-perform contract (a swallowed run would silently drop
+an explicit operator command; a forged effect would claim an
+unrequested mutation).
+
+Restore: exact inverse replacement; `grep -c PROBE` returns 0;
+oracle green after restore. No production fault switches added;
+no tree changes retained from the probe.

@@ -20,6 +20,7 @@ class ActionPinPolicyTests(unittest.TestCase):
                 f"jobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n"
                 f"      - uses: actions/checkout@{policy.APPROVED['actions/checkout']}\n"
                 f"      - uses: SonarSource/sonarqube-scan-action@{policy.APPROVED['SonarSource/sonarqube-scan-action']}\n"
+                f"      - uses: actions/upload-artifact@{policy.APPROVED['actions/upload-artifact']}\n"
                 f"{addition}{header}", encoding="utf-8",
             )
             return policy.check(workflows)

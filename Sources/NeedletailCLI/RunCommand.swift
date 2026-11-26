@@ -980,10 +980,16 @@ struct RunCommand: ParsableCommand {
 
         // H2: catchable SIGINT drives production cancellation (not a default
         // termination), so JSONL runs can emit terminal run_finished and
-        // return 130. Broken-pipe handling remains unchanged.
+        // return 130. Broken-pipe handling remains unchanged. The ignore
+        // must be installed on every platform with a dispatch-source
+        // handler: without it the default disposition can terminate the
+        // process before the source delivers (M4-A G8: Darwin was missing).
 #if canImport(Glibc)
         signal(SIGINT, SIG_IGN)
         signal(SIGPIPE, SIG_IGN)
+#elseif canImport(Darwin)
+        Darwin.signal(SIGINT, SIG_IGN)
+        Darwin.signal(SIGPIPE, SIG_IGN)
 #endif
         let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
         sigintSource.setEventHandler {

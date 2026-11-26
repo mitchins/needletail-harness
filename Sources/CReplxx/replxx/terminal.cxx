@@ -72,10 +72,50 @@ bool out( is_a_tty( 1 ) );
 
 #ifndef _WIN32
 Terminal* _terminal_ = nullptr;
+/* needletail 0002: wakeup-channel observability and resize liveness.
+ * nt_notify_drops counts tokens dropped on EAGAIN (each drop is safe:
+ * a full pipe means an unread token is already pending). The pipe is
+ * a wakeup channel only; messages and keypresses live in their own
+ * queues, but a resize has NO pending-state queue — a dropped 'r'
+ * token would lose the resize entirely. nt_pending_resize is the
+ * sticky pending-state: set by the SIGWINCH handler before notifying,
+ * consumed by wait_for_input (which returns RESIZE immediately while
+ * it is set, whether or not any 'r' token survived). */
+extern "C" {
+unsigned long nt_notify_drops = 0;
+volatile int nt_pending_resize = 0;
+unsigned long replxx_notify_drops( void ) {
+	return ( nt_notify_drops );
+}
+/* needletail 0002: bounded input-path instrumentation. When
+ * NB_INPUT_TRACE is set in the environment, each completed step of
+ * wait_for_input -> read_char -> decoded key -> handler dispatch is
+ * written to stderr (the test transcript) with errno and readiness
+ * state, and the LAST completed operation is kept in
+ * nt_input_last_op for post-mortem access. Off = zero cost. */
+char nt_input_last_op[128] = "init";
+int nt_input_last_errno = 0;
+int nt_input_trace_on( void ) {
+	static int on = -1;
+	if ( on < 0 ) {
+		on = getenv( "NB_INPUT_TRACE" ) ? 1 : 0;
+	}
+	return ( on );
+}
+void nt_input_mark( const char* op, int err ) {
+	snprintf( nt_input_last_op, sizeof ( nt_input_last_op ), "%s", op );
+	nt_input_last_errno = err;
+	if ( nt_input_trace_on() ) {
+		fprintf( stderr, "\n[it]%s errno=%d\n", op, err );
+		fflush( stderr );
+	}
+}
+}
 static void WindowSizeChanged( int ) {
 	if ( ! _terminal_ ) {
 		return;
 	}
+	nt_pending_resize = 1;
 	_terminal_->notify_event( Terminal::EVENT_TYPE::RESIZE );
 }
 #endif
@@ -104,6 +144,12 @@ Terminal::Terminal( void )
 	_interrupt = CreateEvent( nullptr, true, false, TEXT( "replxx_interrupt_event" ) );
 #else
 	static_cast<void>( ::pipe( _interrupt ) == 0 );
+	/* needletail 0002: the wakeup pipe write end is nonblocking. The
+	 * pipe is a wakeup channel only; when it is full, an unread token
+	 * is already pending and the reader drains everything on wake (the
+	 * impl-side coalesced drain). A blocking write here deadlocks the
+	 * output thread against an input thread that is unwinding. */
+	static_cast<void>( ::fcntl( _interrupt[1], F_SETFL, ::fcntl( _interrupt[1], F_GETFL, 0 ) | O_NONBLOCK ) == 0 );
 #endif
 }
 
@@ -257,6 +303,7 @@ int Terminal::enable_raw_mode( void ) {
 }
 
 int Terminal::reset_raw_mode( void ) {
+	int _rv = 0;
 	if ( ! _rawMode ) {
 		return ( -1 );
 	}
@@ -270,11 +317,31 @@ int Terminal::reset_raw_mode( void ) {
 	return ( 0 );
 #else
 	/* put terminal in raw mode after flushing */
-	return ( tcsetattr( 0, TCSADRAIN, &_rawModeTermios ) );
+#if defined(__APPLE__)
+	/* needletail local patch (0002): TCSADRAIN on a Darwin pty waits
+	 * for the output queue to go fully idle; with a concurrent
+	 * renderer streaming frames the drain never settles and every
+	 * raw-mode transition (per-keystroke IOModeGuard, read-loop
+	 * unwind) can block indefinitely. TCSANOW applies the flags
+	 * immediately; output already queued was processed under the
+	 * flags in effect when it was written. */
+	/* needletail local patch (0003): a signal delivery can EINTR the
+	 * transition; silently failing leaves the terminal raw forever. */
+	do {
+		_rv = tcsetattr( 0, TCSANOW, &_rawModeTermios );
+	} while ( _rv == -1 && errno == EINTR );
+	return ( _rv );
+#else
+	do {
+		_rv = tcsetattr( 0, TCSADRAIN, &_rawModeTermios );
+	} while ( _rv == -1 && errno == EINTR );
+	return ( _rv );
+#endif
 #endif
 }
 
 void Terminal::disable_raw_mode(void) {
+	int _rv = 0;
 	if ( ! _rawMode ) {
 		return;
 	}
@@ -285,9 +352,25 @@ void Terminal::disable_raw_mode(void) {
 	_consoleIn = INVALID_HANDLE_VALUE;
 #else
 	_terminal_ = nullptr;
-	if ( tcsetattr( 0, TCSADRAIN, &_origTermios ) == -1 ) {
+#if defined(__APPLE__)
+	/* needletail local patch (0002)+(0003): TCSANOW on Darwin (0002);
+	 * EINTR retry — a swallowed tcsetattr failure leaves the terminal
+	 * RAW forever (observed: in-suite exit nondeterminism; the unwind
+	 * completed but the restore was EINTR'd). */
+	do {
+		_rv = tcsetattr( 0, TCSANOW, &_origTermios );
+	} while ( _rv == -1 && errno == EINTR );
+	if ( _rv == -1 ) {
 		return;
 	}
+#else
+	do {
+		_rv = tcsetattr( 0, TCSADRAIN, &_origTermios );
+	} while ( _rv == -1 && errno == EINTR );
+	if ( _rv == -1 ) {
+		return;
+	}
+#endif
 #endif
 	_rawMode = false;
 	return;
@@ -556,6 +639,11 @@ char32_t Terminal::read_char( void ) {
 	if ( is_control_code( c ) ) {
 		c = Replxx::KEY::control( control_to_human( c ) );
 	}
+	/* Stage mark only: the decoded keystroke VALUE is deliberately not
+	 * recorded (it reconstructs typed text, including potentially
+	 * sensitive prompts, from captured diagnostics). Readiness and
+	 * dispatch stages locate a wedge; the payload is not needed. */
+	nt_input_mark( "readc:decoded", 0 );
 #endif // #_WIN32
 	return ( c );
 }
@@ -632,21 +720,42 @@ Terminal::EVENT_TYPE Terminal::wait_for_input( int long timeout_ ) {
 	fd_set fdSet;
 	int nfds( max( _interrupt[0], _interrupt[1] ) + 1 );
 	while ( true ) {
+		/* needletail 0002: a resize whose token was dropped on EAGAIN
+		 * is preserved by the sticky flag — resize has no queue of its
+		 * own, so the flag IS its pending state. Consume-before-poll
+		 * means a resize is never lost to pipe saturation. */
+		if ( nt_pending_resize ) {
+			nt_pending_resize = 0;
+			return ( EVENT_TYPE::RESIZE );
+		}
 		FD_ZERO( &fdSet );
 		FD_SET( 0, &fdSet );
 		FD_SET( _interrupt[0], &fdSet );
 		timeval tv{ timeout_ / 1000, static_cast<suseconds_t>( ( timeout_ % 1000 ) * 1000 ) };
+		nt_input_mark( "wfis:select-enter", 0 );
 		int err( select( nfds, &fdSet, nullptr, nullptr, timeout_ > 0 ? &tv : nullptr ) );
 		if ( ( err == -1 ) && ( errno == EINTR ) ) {
+			nt_input_mark( "wfis:select-EINTR", errno );
 			continue;
 		}
 		if ( err == 0 ) {
+			nt_input_mark( "wfis:select-timeout", 0 );
 			return ( EVENT_TYPE::TIMEOUT );
+		}
+		if ( err == -1 ) {
+			nt_input_mark( "wfis:select-error", errno );
+			return ( EVENT_TYPE::TIMEOUT );
+		}
+		{
+			char ready[96];
+			snprintf( ready, sizeof ( ready ), "wfis:select-ready err=%d tty=%d pipe=%d", err, FD_ISSET( 0, &fdSet ) ? 1 : 0, FD_ISSET( _interrupt[0], &fdSet ) ? 1 : 0 );
+			nt_input_mark( ready, 0 );
 		}
 		if ( FD_ISSET( _interrupt[0], &fdSet ) ) {
 			char data( 0 );
 			static_cast<void>( read( _interrupt[0], &data, 1 ) == 1 );
 			if ( data == 'k' ) {
+				nt_input_mark( "wfis:token-k", 0 );
 				return ( EVENT_TYPE::KEY_PRESS );
 			}
 			if ( data == 'm' ) {
@@ -669,7 +778,16 @@ void Terminal::notify_event( EVENT_TYPE eventType_ ) {
 	SetEvent( _interrupt );
 #else
 	char data( ( eventType_ == EVENT_TYPE::KEY_PRESS ) ? 'k' : ( eventType_ == EVENT_TYPE::MESSAGE ? 'm' : 'r' ) );
-	static_cast<void>( write( _interrupt[1], &data, 1 ) == 1 );
+	/* needletail 0002: nonblocking wakeup. EAGAIN means the pipe is
+	 * full of unread tokens — a wakeup is already pending and the
+	 * reader will drain messages and keypresses on wake (the impl-side
+	 * coalesced drain re-checks those sources per wakeup); resizes are
+	 * covered by the sticky nt_pending_resize flag set by the SIGWINCH
+	 * handler, so dropping this token loses nothing. A blocking write
+	 * here is the output-thread/input-thread circular wait. */
+	if ( ::write( _interrupt[1], &data, 1 ) != 1 ) {
+		++nt_notify_drops; /* EAGAIN (or a rare pipe error): wakeup semantics preserved, see above. */
+	}
 #endif
 }
 

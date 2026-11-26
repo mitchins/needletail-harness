@@ -17,11 +17,11 @@ struct QueueGateTests {
         try store.claimWriterOwnership(session: idB, writer: "w")
         let idAIdent = WriterIdentity(session: idA, writer: "w")
         let idBIdent = WriterIdentity(session: idB, writer: "w")
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 1, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 1, rank: Double(1), sealed: false)
         let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
-        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 1, sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 1, rank: Double(1), sealed: false)
         try store.appendBatch([.queueAdmitted(entry), .queueUpdated(history), .queueDispatched(link)], as: idAIdent)
-        let other = QueueEntry(entryID: "q-9", commandID: CommandID("c-9"), kind: .followUp, state: .queued, revision: 1, text: "b", targetEpochID: EpochID("e-1"), orderKey: 2, sealed: false)
+        let other = QueueEntry(entryID: "q-9", commandID: CommandID("c-9"), kind: .followUp, state: .queued, revision: 1, text: "b", targetEpochID: EpochID("e-1"), orderKey: 2, rank: Double(2), sealed: false)
         try store.appendBatch([.queueAdmitted(other)], as: idBIdent)
         let holds = try CrossRunGate.unresolvedHolds(store: store)
         #expect(holds.count == 1, "only the unknown-delivery session holds, got \(holds.count)")
@@ -36,9 +36,9 @@ struct QueueGateTests {
         let idA = SessionID("s-A")
         try store.claimWriterOwnership(session: idA, writer: "w")
         let ident = WriterIdentity(session: idA, writer: "w")
-        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 1, sealed: false)
+        let entry = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .queued, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 1, rank: Double(1), sealed: false)
         let link = QueueDispatchLink(entryID: "q-1", commandID: CommandID("c-1"), runID: RunID("r-9"), requestID: RequestID("req-9"), effectID: EffectID("eff-9"), epochID: EpochID("e-1"))
-        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 1, sealed: false)
+        let history = QueueEntry(entryID: "q-1", commandID: CommandID("c-1"), kind: .followUp, state: .admittedToHistory, revision: 1, text: "a", targetEpochID: EpochID("e-1"), orderKey: 1, rank: Double(1), sealed: false)
         var records: [DurableRecord] = [
             .queueAdmitted(entry), .queueUpdated(history), .queueDispatched(link),
             .eventAppended(seq: SequenceNumber(4), kind: "completed", digest: eventDigest("completed", "r-9")),

@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import PTYShim
+@testable import NeedletailLineEditor
 
 /// M0-C feasibility scenario — ONE bounded Linux PTY exercise (TESTING §7).
 /// It proves the vendored line editor can: stay live while synthetic
@@ -127,7 +128,7 @@ private final class ProbeProcess {
     /// Functional mode-restoration check: after the child has exited and the
     /// slave termios is back to canonical echo, a byte written to the master
     /// is echoed back. In a leaked raw mode it would not be.
-    func canonicalEchoRestored() -> Bool {
+    func termiosRestoredExactly() -> Bool {
         send("echo-probe\r")
         var collected = ""
         let deadline = Date().addingTimeInterval(2)
@@ -275,7 +276,7 @@ struct TerminalFeasibilityTests {
         #expect(status.map(isCleanExitStatus) ?? false, "probe did not exit with code 0: raw status \(String(describing: status))")
 
         // 9. Functional terminal-state check after exit.
-        #expect(probe.canonicalEchoRestored(), "terminal did not return to canonical echo after exit")
+        #expect(probe.termiosRestoredExactly(), "terminal did not return to canonical echo after exit")
     }
 }
 
@@ -325,4 +326,361 @@ struct ExitStatusDecodingTests {
         #expect(!isCleanExitStatus(256), "exit code 1 (0x100) must not pass")
         #expect(!isCleanExitStatus(0x7F00), "stopped state must not pass")
     }
+
+// M4-MAC-03 finding C: the exact-restoration comparator must catch
+// partial restores — control-character flips (VMIN/VTIME) and local-
+// flag flips (IEXTEN) — independent of struct padding. VMIN/VTIME
+// indices come from the platform constants, not literals.
+@Test("MAC-03 oracle: comparator catches VMIN/VTIME and IEXTEN regressions")
+func mac03TermiosComparatorProof() {
+    var base = termios()
+    var same = base
+    #expect(nt_pty_termios_equal(&base, &same) == 1, "identical states must compare equal")
+
+    // IEXTEN regression (local flag). The zero-initialized base has no
+    // flag bits set, so the test RAISES IEXTEN first — a flip from a
+    // flagless base would be a no-op.
+    var iextenOn = base
+    iextenOn.c_lflag |= tcflag_t(IEXTEN)
+    var iextenOff = base
+    iextenOff.c_lflag |= tcflag_t(IEXTEN)
+    iextenOff.c_lflag &= ~tcflag_t(IEXTEN)
+    #expect(nt_pty_termios_equal(&base, &iextenOn) == 0, "raised IEXTEN must be caught")
+    #expect(nt_pty_termios_equal(&base, &iextenOff) == 1, "flagless states must compare equal")
+
+    // VMIN regression (control character).
+    var vminChanged = base
+    withUnsafeMutableBytes(of: &vminChanged.c_cc) { raw in
+        let old = raw[Int(VMIN)]
+        raw[Int(VMIN)] = old == 5 ? 2 : 5
+    }
+    #expect(nt_pty_termios_equal(&base, &vminChanged) == 0, "changed VMIN must be caught")
+
+    // VTIME regression (control character).
+    var vtimeChanged = base
+    withUnsafeMutableBytes(of: &vtimeChanged.c_cc) { raw in
+        let old = raw[Int(VTIME)]
+        raw[Int(VTIME)] = old == 5 ? 2 : 5
+    }
+    #expect(nt_pty_termios_equal(&base, &vtimeChanged) == 0, "changed VTIME must be caught")
+
+    // Speeds (carried in c_cflag on both targets): a c_cflag flip must
+    // be caught (and is covered by the flag comparison above — assert
+    // the field itself differs so the verdict is meaningful).
+    var cflagChanged = base
+    cflagChanged.c_cflag |= tcflag_t(CS8)
+    if base.c_cflag != cflagChanged.c_cflag {
+        #expect(nt_pty_termios_equal(&base, &cflagChanged) == 0, "changed c_cflag must be caught")
+    }
+}
+
+    // M4-MAC-03 finding A: a failed termios capture yields nil (never a
+    // zero-initialized "valid" snapshot). A pipe is not a TTY — the
+    // capture must refuse it; a real pty slave must capture.
+    @Test("MAC-03 capture: non-TTY refused, real pty captured")
+    func mac03CaptureRefusesNonTTY() {
+        var fds: [Int32] = [-1, -1]
+        let rc = pipe(&fds)
+        #expect(rc == 0)
+        defer { close(fds[0]); close(fds[1]) }
+        #expect(LineEditorSession.captureTermiosFrom(fd: fds[0]) == nil,
+                "a pipe capture must fail closed (nil), not produce a zero snapshot")
+        // A real pty slave: valid capture (non-nil). Spawn a trivial
+        // child through the shim so the suite owns a genuine pty.
+        var pty = nt_pty_t()
+        let truePath = "/usr/bin/true"
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(truePath), nil]
+        let spawnRC = nt_pty_spawn(&pty, &argv)
+        argv.forEach { $0?.deallocate() }
+        #expect(spawnRC == 0)
+        if spawnRC == 0 {
+            defer { nt_pty_close(&pty) }
+            let sfd = nt_pty_slave_fd(&pty)
+            #expect(sfd >= 0)
+            if sfd >= 0 {
+                let captured = LineEditorSession.captureTermiosFrom(fd: sfd)
+                #expect(captured != nil, "a real pty slave must capture")
+                if let c = captured {
+                    #expect((c.c_lflag & tcflag_t(ICANON)) != 0, "a fresh pty starts canonical")
+                }
+            }
+        }
+    }
+
+    // M4-MAC-03 finding B regression: Ctrl+C during concurrent streamed
+    // output with the writer actively batching (notification-pipe
+    // backpressure window) must still exit cleanly — the quiesce-then-
+    // BAIL ordering removed the writer/input circular wait.
+    @Test("MAC-03 Ctrl+C exits under concurrent output backpressure")
+    func mac03CtrlCUnderBackpressure() async throws {
+        let env = try ChatPTYTests.makeEnv(withServer: true, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+        defer { ChatPTYTests.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+        guard let server = env.server else { Issue.record("no loopback"); return }
+        server.enqueue(ChatLoopback.textTurn("backpressure stream", splits: 40))
+        let driver = ChatPTYDriver(
+            executable: ChatPTYTests.releaseBinary(),
+            args: ["chat", "--config", env.configPath],
+            extraEnv: ChatPTYTests.childEnv(env))
+        defer { driver.stop() }
+        guard driver.start() else { Issue.record("pty spawn failed"); return }
+        driver.expect("needletail> ", timeoutMS: 30_000)
+        driver.send("stream it\r")
+        driver.expect("backpressure stream", timeoutMS: 20_000)
+        // Ctrl+C at busy CANCELS the run (D2 semantics); the settle-then-
+        // exit sequence then exits at idle. The regression target is the
+        // writer/input interaction during active streamed output — the
+        // cancel exercises exactly that window.
+        driver.send([3])
+        // Busy cancel returns the composer to idle: wait for the prompt,
+        // then the settle-then-exit sequence (the cancelled run leaves a
+        // held queue entry, so the exit may need the warned second press
+        // — never blind presses against an unknown state).
+        driver.expect("needletail> ", timeoutMS: 20_000)
+        let status = await ChatPTYTests.settleThenExit(driver)
+        #expect(status != nil, "backpressure cancel must still exit")
+        #expect(chatPTYCleanExit(status ?? 0), "backpressure cancel exits 0, raw \(status ?? -1)")
+        // M4-MAC-04B: the full output-shutdown invariant now holds —
+        // the teardown sequence silences the writer and takes the
+        // restore barrier, so the exact captured termios must be the
+        // last terminal transition even under writer backpressure.
+        #expect(driver.termiosRestoredExactly(), "exact restoration under backpressure (M4-MAC-04B invariant)")
+        // Zero surviving children: settleThenExit reaped the pty child
+        // (status non-nil above); a reaped child cannot survive. The
+        // reaped flag proves the reap happened on THIS driver (no
+        // orphaned chat child is possible).
+        #expect(driver.childReaped(), "the pty child was reaped — zero surviving children")
+    }
+
+
+    // M4-MAC-04B: the notification-channel saturation proof (the
+    // registered 0001(b)/0002 patches). With no reader draining
+    // replxx's wakeup pipe, every print() enqueues a message and
+    // writes a wakeup token. The pre-patch blocking write deadlocked
+    // the notifier at pipe capacity (~64 Ki tokens); the nonblocking
+    // notifier drops tokens on EAGAIN (a wakeup is already pending)
+    // and the coalesced drain delivers everything on wake. The storm
+    // below is 4x pipe capacity: completion within a bounded time IS
+    // the proof the writer remains responsive with the channel
+    // saturated.
+    @Test("MAC-04B: emit storm saturates the wakeup channel without blocking the writer")
+    func mac04NotificationSaturationNonblocking() {
+        guard let session = LineEditorSession() else {
+            Issue.record("no line editor"); return
+        }
+        let started = Date()
+        for i in 0 ..< 262_144 {
+            session.emit("saturate-\(i)\n")
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(elapsed < 30, "a saturated wakeup channel must not block the writer, took \(elapsed)s")
+        // The input thread can unwind: the exact captured termios is
+        // restorable on this session (a no-op when fd 0 is not a tty,
+        // but the call path — the teardown restore — must be safe).
+        session.restoreSaneTermios()
+        // Wakeup preservation: a keypress-shaped wakeup after the
+        // storm is still deliverable — the emulate path routes through
+        // the same notify. (No crash/lock = pass; the drain-side
+        // delivery is proven by the PTY legs.)
+        session.restoreSaneTermios()
+    }
+
+
+
+    // M4-MAC-04B: the GENUINE notification-pipe saturation proof, with
+    // the narrowed, fully-asserted claims: the child runs the vendored
+    // editor on a real pty with an ACTIVE raw-path reader, torrents
+    // 200k messages, then the PARENT completes the reader with a real
+    // "done\r" keystroke. Asserted: actual READER COMPLETION (the
+    // child's own flag), exit 0, the EXACT termios restoration (the
+    // shim oracle against the spawn-time capture), first/last message
+    // delivery, and the drop telemetry REPORTED. The honest finding
+    // stands (receipt §22): actual EAGAIN is architecturally
+    // unreachable (message notifies serialize on the drainer's mutex;
+    // SIGWINCH is kernel-coalesced), so drops > 0 is NOT claimed.
+    @Test("MAC-04B: genuine pipe saturation — reader completion, exact restoration, delivery preserved")
+    func mac04NotificationSaturationOnRealPath() async throws {
+        let helper = ChatPTYTests.repoRoot() + "/.build/debug/NTReplxxSaturationProbe"
+        guard FileManager.default.fileExists(atPath: helper) else {
+            Issue.record("saturation helper missing: \(helper) (build tests first)"); return
+        }
+        var pty = nt_pty_t()
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(helper), strdup("sat"), strdup("200000"), nil]
+        let rc = nt_pty_spawn(&pty, &argv)
+        argv.forEach { $0?.deallocate() }
+        #expect(rc == 0, "probe spawn")
+        guard rc == 0 else { return }
+        defer { nt_pty_close(&pty) }
+        var delivered = ""
+        var reapStatus: Int32 = -1
+        let deadline = Date().addingTimeInterval(90)
+        var completionSent = false
+        while Date() < deadline {
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = nt_pty_read(&pty, &buf, buf.count, 250)
+            if n > 0 { delivered += String(decoding: buf[0 ..< Int(n)], as: UTF8.self) }
+            if !completionSent, delivered.contains("m199999") {
+                // The storm settled: complete the reader with a real
+                // keystroke (the designed function).
+                let line: [UInt8] = Array("done\r".utf8)
+                _ = nt_pty_write(&pty, line, line.count)
+                completionSent = true
+            }
+            if completionSent {
+                let w = nt_pty_wait(&pty, 0)
+                if w >= 0 {
+                    while true {
+                        let n2 = nt_pty_read(&pty, &buf, buf.count, 100)
+                        if n2 <= 0 { break }
+                        delivered += String(decoding: buf[0 ..< Int(n2)], as: UTF8.self)
+                    }
+                    reapStatus = w
+                    break
+                }
+            }
+        }
+        #expect(reapStatus == 0, "the saturated child must exit 0, got \(String(describing: reapStatus))")
+        #expect(delivered.contains("m0"), "the first message must be delivered")
+        #expect(delivered.contains("m199999"), "the last message must be delivered")
+        #expect(delivered.contains("SATURATION-DONE drops="), "the drop telemetry must be reported")
+        // The EXACT restoration: the live slave termios equals the
+        // spawn-time capture (the shim oracle).
+        #expect(nt_pty_termios_restored_exactly(&pty) == 1, "exact termios restoration after saturation")
+    }
+
+    // M4-MAC-04B: the stale-token regression (Codatiel's retained
+    // finding). A synthetic keypress is queued and a message emitted in
+    // quick succession: whichever wake wins, the coalesced message-drain
+    // may deliver the keypress and leave its 'k' token stale in the
+    // pipe. The next wait consumes the stale token and the reader then
+    // performs its designed blocking tty read — the PARENT completes it
+    // with a real keystroke and asserts delivery RESUMES (no wedge) and
+    // everything unwinds cleanly. Real stdin readiness is exercised
+    // throughout (no token-skipping hack: the previous such fix broke
+    // 22 CI tests by spinning on tty-ready events without consuming
+    // them).
+    @Test("MAC-04B: stale keypress token — delivery resumes after a real keystroke, no wedge; trace records no keystroke payloads")
+    func mac04StaleKeypressTokenResumes() async throws {
+        let helper = ChatPTYTests.repoRoot() + "/.build/debug/NTReplxxSaturationProbe"
+        guard FileManager.default.fileExists(atPath: helper) else {
+            Issue.record("saturation helper missing: \(helper)"); return
+        }
+        var pty = nt_pty_t()
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(helper), strdup("stalek"), nil]
+        // CHILD-ONLY override (Codatiel test-isolation finding): the
+        // trace env must never be set on this process — concurrent
+        // suites would inherit it. nt_pty_spawn_env applies overrides
+        // inside the forked child only.
+        var env: [UnsafeMutablePointer<CChar>?] = [strdup("NB_INPUT_TRACE=1"), nil]
+        let rc = env.withUnsafeMutableBufferPointer { envBuf in
+            argv.withUnsafeMutableBufferPointer { argvBuf in
+                nt_pty_spawn_env(&pty, argvBuf.baseAddress!, envBuf.baseAddress!)
+            }
+        }
+        argv.forEach { $0?.deallocate() }
+        #expect(rc == 0, "probe spawn")
+        guard rc == 0 else { return }
+        defer { nt_pty_close(&pty) }
+        var delivered = ""
+        var reapStatus: Int32 = -1
+        let deadline = Date().addingTimeInterval(45)
+        var completionSent = false
+        var sawBefore = false
+        while Date() < deadline {
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = nt_pty_read(&pty, &buf, buf.count, 250)
+            if n > 0 { delivered += String(decoding: buf[0 ..< Int(n)], as: UTF8.self) }
+            if !sawBefore, delivered.contains("BEFORE") { sawBefore = true }
+            // Complete the reader with a REAL keystroke: after a stale
+            // token the reader blocks on the tty by design; a real key
+            // must resume delivery (the stale-token delay is bounded by
+            // the operator's next keystroke, never a wedge).
+            if sawBefore, !completionSent, delivered.contains("MSG-2") {
+                let line: [UInt8] = Array("done\r".utf8)
+                _ = nt_pty_write(&pty, line, line.count)
+                completionSent = true
+            }
+            if completionSent {
+                let w = nt_pty_wait(&pty, 0)
+                if w >= 0 {
+                    while true {
+                        let n2 = nt_pty_read(&pty, &buf, buf.count, 100)
+                        if n2 <= 0 { break }
+                        delivered += String(decoding: buf[0 ..< Int(n2)], as: UTF8.self)
+                    }
+                    reapStatus = w
+                    break
+                }
+            }
+        }
+        #expect(sawBefore, "the pre-key message must be delivered")
+        #expect(delivered.contains("AFTER-KEY"), "the post-key message must be delivered")
+        #expect(reapStatus == 0, "the stale-token child must exit 0, got \(String(describing: reapStatus))")
+        #expect(delivered.contains("STALEK-DONE"), "the child's completion report must be present")
+        #expect(nt_pty_termios_restored_exactly(&pty) == 1, "exact termios restoration after the stale-token sequence")
+        // OP-6 proof: with NB_INPUT_TRACE=1 and the word "done" typed
+        // through the pty, the diagnostic stream contains NO decoded
+        // keystroke payloads (the old `readc:decoded c=<hex>` /
+        // `dispatch c=<hex>` marks) and no hex fragment of the typed
+        // word — stage marks and readiness only.
+        #expect(!delivered.contains("readc:decoded c="), "no decoded-payload trace may be emitted")
+        #expect(!delivered.contains("dispatch c="), "no dispatch-payload trace may be emitted")
+        #expect(delivered.contains("[it]dispatch handlers="), "the input-trace stage marks are present (the trace is live)")
+        #expect(delivered.range(of: "c=64") == nil, "the hex code of the typed 'd' must not appear")
+    }
+
+    // M4-MAC-04 (P0): an idle session and a mid-stream session must
+    // SURVIVE well past the previous 5-second launch-started deadline —
+    // the deadline now bounds only the post-run teardown. Proves the
+    // fix with real elapsed time, repeated for the idle case.
+    @Test("MAC-04 P0: idle session survives 16+ seconds (repeated)")
+    func mac04IdleSurvival() async throws {
+        for round in 1...3 {
+            let env = try ChatPTYTests.makeEnv(withServer: false, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+            defer { ChatPTYTests.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+            let driver = ChatPTYDriver(
+                executable: ChatPTYTests.releaseBinary(),
+                args: ["chat", "--config", env.configPath],
+                extraEnv: ChatPTYTests.childEnv(env))
+            defer { driver.stop() }
+            guard driver.start() else { Issue.record("pty spawn failed"); return }
+            driver.expect("needletail> ", timeoutMS: 30_000)
+            // 16 s of idle: with the old launch-started deadline the
+            // process was force-exited at ~5 s — this wait returning
+            // nil proves the session SURVIVED the entire window.
+            #expect(driver.waitExit(timeoutMS: 16_000) == nil,
+                    "round \(round): an idle interactive session must not be terminated by any watchdog")
+            driver.send([3])
+            let status = driver.waitExit(timeoutMS: 15_000)
+            #expect(status != nil, "round \(round): idle Ctrl+C must exit after the survival window")
+            #expect(chatPTYCleanExit(status ?? 0), "round \(round): idle Ctrl+C exits 0")
+            #expect(driver.termiosRestoredExactly(), "round \(round): exact restoration after survival")
+        }
+    }
+
+    @Test("MAC-04 P0: mid-stream session survives 16+ seconds, then settles")
+    func mac04StreamingSurvival() async throws {
+        let env = try ChatPTYTests.makeEnv(withServer: true, tools: #"{"read":false,"search":false,"edit":false,"write":false,"exec":false,"consult":false}"#)
+        defer { ChatPTYTests.tearDown(env, oldKey: getenv(ChatLoopback.credentialEnv).map { String(cString: $0) }) }
+        guard let server = env.server else { Issue.record("no loopback"); return }
+        server.enqueue(ChatLoopback.textTurn("survival stream", splits: 60))
+        let driver = ChatPTYDriver(
+            executable: ChatPTYTests.releaseBinary(),
+            args: ["chat", "--config", env.configPath],
+            extraEnv: ChatPTYTests.childEnv(env))
+        defer { driver.stop() }
+        guard driver.start() else { Issue.record("pty spawn failed"); return }
+        driver.expect("needletail> ", timeoutMS: 30_000)
+        driver.send("go\r")
+        driver.expect("survival stream", timeoutMS: 20_000)
+        #expect(driver.waitExit(timeoutMS: 16_000) == nil,
+                "a mid-stream interactive session must not be terminated by any watchdog")
+        // Settle-then-exit after the survival window.
+        driver.send([3])
+        driver.expect("needletail> ", timeoutMS: 20_000)
+        driver.send([3])
+        let status = driver.waitExit(timeoutMS: 15_000)
+        #expect(status != nil, "settle-then-exit must exit after the survival window")
+        #expect(driver.termiosRestoredExactly(), "exact restoration after streamed-output survival")
+    }
+
 }

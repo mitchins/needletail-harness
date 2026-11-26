@@ -53,7 +53,7 @@ struct TranscriptTests {
             .queueAdmitted(QueueEntry(
                 entryID: "e-1", commandID: CommandID("c-1"), kind: .followUp,
                 state: .held, revision: 1, text: "not-transcript",
-                targetEpochID: EpochID("epoch-1"), orderKey: 0)),
+                targetEpochID: EpochID("epoch-1"), orderKey: 0, rank: 0.0)),
             .transcriptAppended(.assistantText("two")),
         ])
         let messages = try loadTranscript(from: store, session: identity.session)

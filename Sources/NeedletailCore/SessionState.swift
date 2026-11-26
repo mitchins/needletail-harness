@@ -151,8 +151,14 @@ public struct QueueEntry: Sendable, Equatable, Codable {
     public let revision: UInt64
     public let text: String
     public let targetEpochID: EpochID
-    /// Reserved for M2-D reorder flows; M1-B never reorders (no code path assigns order).
+    /// Admission/ack/watermark identity (B2 R1: immutable — reorder never
+    /// reassigns it; acks and reseed read ONLY this field).
     public let orderKey: UInt64
+    /// Display order, independent of the admission/ack identity (B2 R1).
+    /// Assigned `Double(orderKey)` at admission; changed ONLY by the
+    /// reorder transition. `orderKey` stays the immutable ack/watermark
+    /// identity — rank never feeds acks, watermarks, or reseed.
+    public let rank: Double
     /// Sealing travels WITH the entry (S6): a sealed submission queued
     /// behind a non-sealed run keeps its own flag into its own run.
     public let sealed: Bool
@@ -167,7 +173,7 @@ public struct QueueEntry: Sendable, Equatable, Codable {
     /// equal the live epoch (plus the local→cloud rule).
     public let attachmentConsentEpoch: EpochID?
 
-    public init(entryID: String, commandID: CommandID, kind: QueueKind, state: QueueEntryState, revision: UInt64, text: String, targetEpochID: EpochID, orderKey: UInt64, sealed: Bool = false, attachments: [AttachmentSnapshot] = [], attachmentConsentEpoch: EpochID? = nil) {
+    public init(entryID: String, commandID: CommandID, kind: QueueKind, state: QueueEntryState, revision: UInt64, text: String, targetEpochID: EpochID, orderKey: UInt64, rank: Double, sealed: Bool = false, attachments: [AttachmentSnapshot] = [], attachmentConsentEpoch: EpochID? = nil) {
         self.entryID = entryID
         self.commandID = commandID
         self.kind = kind
@@ -176,16 +182,18 @@ public struct QueueEntry: Sendable, Equatable, Codable {
         self.text = text
         self.targetEpochID = targetEpochID
         self.orderKey = orderKey
+        self.rank = rank
         self.sealed = sealed
         self.attachments = attachments
         self.attachmentConsentEpoch = attachmentConsentEpoch
     }
 
     /// Backward-compatible decode: rows written before D1 carry neither
-    /// key (RecordCodec legacy-row test pins this).
+    /// attachment key (RecordCodec legacy-row test pins this); rows
+    /// written before B2 carry no rank and resume at `Double(orderKey)`.
     private enum CodingKeys: String, CodingKey {
         case entryID, commandID, kind, state, revision, text
-        case targetEpochID, orderKey, sealed, attachments, attachmentConsentEpoch
+        case targetEpochID, orderKey, rank, sealed, attachments, attachmentConsentEpoch
     }
 
     public init(from decoder: Decoder) throws {
@@ -198,6 +206,7 @@ public struct QueueEntry: Sendable, Equatable, Codable {
         text = try container.decode(String.self, forKey: .text)
         targetEpochID = try container.decode(EpochID.self, forKey: .targetEpochID)
         orderKey = try container.decode(UInt64.self, forKey: .orderKey)
+        rank = try container.decodeIfPresent(Double.self, forKey: .rank) ?? Double(orderKey)
         sealed = try container.decode(Bool.self, forKey: .sealed)
         attachments = try container.decodeIfPresent([AttachmentSnapshot].self, forKey: .attachments) ?? []
         attachmentConsentEpoch = try container.decodeIfPresent(EpochID.self, forKey: .attachmentConsentEpoch)
@@ -207,7 +216,7 @@ public struct QueueEntry: Sendable, Equatable, Codable {
         QueueEntry(
             entryID: entryID, commandID: commandID, kind: kind,
             state: state, revision: revision, text: text,
-            targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed,
+            targetEpochID: targetEpochID, orderKey: orderKey, rank: rank, sealed: sealed,
             attachments: attachments, attachmentConsentEpoch: attachmentConsentEpoch)
     }
 
@@ -215,7 +224,7 @@ public struct QueueEntry: Sendable, Equatable, Codable {
         QueueEntry(
             entryID: entryID, commandID: commandID, kind: kind,
             state: state, revision: revision, text: text,
-            targetEpochID: targetEpochID, orderKey: orderKey, sealed: sealed,
+            targetEpochID: targetEpochID, orderKey: orderKey, rank: rank, sealed: sealed,
             attachments: attachments, attachmentConsentEpoch: attachmentConsentEpoch)
     }
 
