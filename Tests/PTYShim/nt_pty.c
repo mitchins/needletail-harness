@@ -182,7 +182,12 @@ int nt_pty_spawn_posix(nt_pty_t *pty, char *const argv[], char *const env[]) {
     pty->slaveFd = slave;
     pty->masterFd = master;
     pty->childPid = pid;
+    pty->childReaped = 0;
     return 0;
+}
+
+int childReapedState(const nt_pty_t *pty) {
+    return pty == NULL ? -1 : pty->childReaped;
 }
 
 int nt_pty_read(nt_pty_t *pty, unsigned char *buf, size_t capacity, int timeout_ms) {
@@ -330,9 +335,18 @@ int nt_pty_wait(nt_pty_t *pty, int timeout_ms) {
         int status = 0;
         pid_t result = waitpid(pty->childPid, &status, WNOHANG);
         if (result < 0) {
+            /* ECHILD: the child was already reaped (M4-MAC-06A) — a
+             * distinct ownership state, never a signal condition. */
+            if (errno == ECHILD) {
+                pty->childReaped = 2;
+                return -1;
+            }
             return -1;
         }
         if (result == pty->childPid) {
+            /* Ownership recorded: the teardown must not signal or
+             * double-reap this child. */
+            pty->childReaped = 1;
             return status;
         }
         if (timeout_ms >= 0 && waited_ms >= timeout_ms) {
@@ -366,6 +380,21 @@ void nt_pty_close(nt_pty_t *pty) {
         int status = 0;
         int reaped = 0;
         int lastErrno = 0;
+        /* M4-MAC-06A: a child already reaped via nt_pty_wait is owned
+         * and complete — never signal it again. ECHILD from waitpid is
+         * the same ownership state, not a reason to signal. */
+        if (pty->childReaped == 1) {
+            snprintf(nt_last_reap_report, sizeof(nt_last_reap_report),
+                     "already-reaped-by-wait pid=%d", (int)pid);
+            pty->childPid = -1;
+        } else if (pty->childReaped == 2) {
+            snprintf(nt_last_reap_report, sizeof(nt_last_reap_report),
+                     "already-reaped-elsewhere pid=%d (ECHILD)", (int)pid);
+            pty->childPid = -1;
+        }
+        if (pty->childPid < 0) {
+            return;
+        }
         /* Phase 1: already exited? */
         for (int attempt = 0; attempt < 3 && !reaped; attempt++) {
             pid_t r = waitpid(pid, &status, WNOHANG);

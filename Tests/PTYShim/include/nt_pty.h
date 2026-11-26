@@ -18,6 +18,7 @@ typedef struct {
     struct termios savedSlaveTermios;
     int slaveFd; /* kept open in the parent: post-exit termios oracle */
     int haveSavedTermios;
+    int childReaped;
 } nt_pty_t;
 
 /* Spawn `argv` under a fresh PTY. Returns 0 on success. */
@@ -55,6 +56,11 @@ int nt_pty_signal(nt_pty_t *pty, int sig);
 /* Wait for the child to exit within the deadline. Returns the wait status,
  * -1 on timeout. */
 int nt_pty_wait(nt_pty_t *pty, int timeout_ms);
+/* 0 = running/not-waited, 1 = reaped via nt_pty_wait, 2 = reaped elsewhere (ECHILD). */
+int childReapedState(const nt_pty_t *pty);
+#define NT_CHILD_RUNNING 0
+#define NT_CHILD_REAPED_BY_WAIT 1
+#define NT_CHILD_REAPED_ECHILD 2
 
 /* M4-MAC-02 exact-restore oracle: the parent keeps the slave open, so
  * after the child exits the termios is still readable. Returns 0 and

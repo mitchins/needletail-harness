@@ -120,6 +120,9 @@ let package = Package(
             name: "NTPTYBootstrap"
         ),
         .executableTarget(
+            name: "NTPTYInputFixture"
+        ),
+        .executableTarget(
             name: "NTPTYAcceptance",
             dependencies: ["NeedletailTestSupport", "PTYShim"]
         ),

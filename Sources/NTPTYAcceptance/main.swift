@@ -144,14 +144,24 @@ final class Session {
         }
     }
 
-    func waitExit(timeoutMS: Int32) -> Int32? {
+    /// M4-MAC-06A: output draining is INTERLEAVED with bounded reaping —
+    /// the master is pumped while waitpid(WNOHANG) polls, so final output
+    /// (dispatch/teardown markers) is captured before the exit verdict.
+    func waitExitDraining(timeoutMS: Int32) -> Int32? {
         let deadline = Date().addingTimeInterval(Double(timeoutMS) / 1000)
         while Date() < deadline {
-            let status = nt_pty_wait(&pty, 250)
+            pump(timeoutMS: 200)
+            let status = nt_pty_wait(&pty, 0) // WNOHANG-style bounded poll
             if status >= 0 {
                 rawExitStatus = status
-                reaped = true
+                reaped = childReapedState(&pty) == NT_CHILD_REAPED_BY_WAIT
+                pump(timeoutMS: 300) // the final output the child wrote before exiting
                 return status
+            }
+            if childReapedState(&pty) == NT_CHILD_REAPED_ECHILD {
+                reaped = true
+                pump(timeoutMS: 300)
+                return nil // reaped elsewhere: the exit status is unrecordable
             }
         }
         return nil
@@ -180,11 +190,12 @@ final class Session {
 /// "application:" / "terminal:" / "harness:" / "bootstrap:".
 func runPty01(binary: String, bootstrap: String, rep: Int, trace: Bool) -> String? {
     let name = "pty01-rep\(rep)"
-    var overrides = ["NEEDLETAIL_CHAT_TEST_KEY": "acceptance-key"]
-    if trace {
-        overrides["NB_TEARDOWN_TRACE"] = "1"
-        overrides["NB_INPUT_TRACE"] = "1"
-    }
+    // M4-MAC-06A item 4: the trace is REQUIRED on every repetition — the
+    // exec-ok post-exec marker and the Ctrl+C processing markers are
+    // trace-only, so a default invocation must be capable of passing.
+    var overrides = ["NEEDLETAIL_CHAT_TEST_KEY": "acceptance-key",
+                     "NB_TEARDOWN_TRACE": "1",
+                     "NB_INPUT_TRACE": "1"]
     let dir = runDir + "/" + name
     let config = makeConfig(directory: dir, baseURL: "http://127.0.0.1:9", tools: toolsNone)
 
@@ -209,7 +220,7 @@ func runPty01(binary: String, bootstrap: String, rep: Int, trace: Bool) -> Strin
     }
 
     // The application executed (its own post-launch marker) and the
-    // prompt rendered.
+    // prompt rendered (the marker is trace-backed: the trace is always on).
     guard session.expect("exec-ok chat entry", timeoutMS: 30_000) else {
         dumpFailure(name, session.transcript, "application: no post-launch marker (or prompt missing)")
         return "application: startup not confirmed"
@@ -232,7 +243,7 @@ func runPty01(binary: String, bootstrap: String, rep: Int, trace: Bool) -> Strin
     }
 
     // Normal exit within the bound.
-    guard let raw = session.waitExit(timeoutMS: 15_000) else {
+    guard let raw = session.waitExitDraining(timeoutMS: 15_000) else {
         dumpFailure(name, session.transcript, "application: no exit after Ctrl+C")
         return "application: no exit after Ctrl+C"
     }
@@ -244,12 +255,10 @@ func runPty01(binary: String, bootstrap: String, rep: Int, trace: Bool) -> Strin
     // The input handler processed Ctrl+C (trace-gated): the teardown
     // breadcrumbs show the EOF path ran; the exact restoration below is
     // only reachable through that path.
-    if trace {
-        guard session.transcript.contains("[tt] eof armed="),
-              session.transcript.contains("restore") else {
-            dumpFailure(name, session.transcript, "application: Ctrl+C processing markers absent")
-            return "application: Ctrl+C processing not observed"
-        }
+    guard session.transcript.contains("[tt] eof armed="),
+          session.transcript.contains("restore") else {
+        dumpFailure(name, session.transcript, "application: Ctrl+C processing markers absent")
+        return "application: Ctrl+C processing not observed"
     }
     guard exited, exitCode == 0 else {
         dumpFailure(name, session.transcript, "application: abnormal termination raw=\(raw) code=\(exitCode) termsig=\(termSig)")
@@ -268,8 +277,11 @@ func runPty01(binary: String, bootstrap: String, rep: Int, trace: Bool) -> Strin
         dumpFailure(name, session.transcript, "harness: child not reaped")
         return "harness: child not reaped"
     }
+    // The teardown runs BEFORE the reaping report is read (the report is
+    // produced by the bounded teardown itself).
+    session.teardown()
     let report = String(cString: nt_last_reap_report_cstr())
-    guard report.hasPrefix("reaped") else {
+    guard report.hasPrefix("reaped") || report.hasPrefix("already-reaped") else {
         dumpFailure(name, session.transcript, "harness: \(report)")
         return "harness: \(report)"
     }
@@ -307,8 +319,98 @@ guard FileManager.default.fileExists(atPath: bootstrapPath) else {
 }
 mark("runner: binary=\(binaryPath) case=\(caseName) reps=\(reps) trace=\(traceRun)")
 
+struct CaseResult {
+    let name: String
+    let passed: Bool
+    let detail: String
+}
+
+// M4-MAC-06A item 5: prove the runner itself with the input fixture —
+// a byte goes in, an observable post-input marker comes out, the exit
+// status is 0, the bounded wait works, and the reaping is recorded.
+func runFixture(selfDir: String, bootstrapPath: String) -> CaseResult {
+    let fixture = selfDir + "/NTPTYInputFixture"
+    guard FileManager.default.fileExists(atPath: fixture) else {
+        return CaseResult(name: "fixture", passed: false, detail: "harness: fixture missing at \(fixture)")
+    }
+    let session = Session(launcher: "posix-ctty", bootstrapPath: bootstrapPath)
+    defer { session.teardown() }
+    guard session.start(binary: fixture, args: [], overrides: [:]) else {
+        return CaseResult(name: "fixture", passed: false, detail: "harness: spawn failed")
+    }
+    usleep(200_000)
+    // The fixture reads canonically (no raw mode): the byte needs the
+    // line terminator to be delivered by the line discipline.
+    guard session.send([UInt8(ascii: "x"), UInt8(ascii: "\n")]) else {
+        return CaseResult(name: "fixture", passed: false, detail: "harness: the input write failed")
+    }
+    guard session.expect("FIXTURE:post-input-marker", timeoutMS: 10_000) else {
+        dumpFailure("fixture", session.transcript, "harness: the post-input marker was never captured")
+        return CaseResult(name: "fixture", passed: false, detail: "harness: the marker was not captured (byte delivery or capture failed)")
+    }
+    guard let raw = session.waitExitDraining(timeoutMS: 10_000), raw == 0 else {
+        dumpFailure("fixture", session.transcript, "harness: the fixture did not exit 0")
+        return CaseResult(name: "fixture", passed: false, detail: "harness: the fixture did not exit 0")
+    }
+    session.teardown()
+    let report = String(cString: nt_last_reap_report_cstr())
+    guard report.hasPrefix("reaped") || report.hasPrefix("already-reaped") else {
+        return CaseResult(name: "fixture", passed: false, detail: "harness: \(report)")
+    }
+    return CaseResult(name: "fixture", passed: true, detail: report)
+}
+
+// M4-MAC-06A item 3: the child-environment proof. The fixture prints
+// one variable; the budget must be ABSENT and an ordinary inherited
+// variable must survive.
+func runEnvProof(selfDir: String, bootstrapPath: String) -> [CaseResult] {
+    let fixture = selfDir + "/NTPTYInputFixture"
+    var results: [CaseResult] = []
+    let budgetKey = "NEEDLETAIL_REQUEST_BUDGET"
+    let homeKey = "HOME"
+    let envCases: [(key: String, mustBeAbsent: Bool)] = [(budgetKey, true), (homeKey, false)]
+    for (key, mustBeAbsent) in envCases {
+        let session = Session(launcher: "posix-ctty", bootstrapPath: bootstrapPath)
+        defer { session.teardown() }
+        guard session.start(binary: fixture, args: ["envdump", key],
+                            overrides: ["NEEDLETAIL_CHAT_TEST_KEY": "acceptance-key"]) else {
+            results.append(CaseResult(name: "env-\(key)", passed: false, detail: "harness: spawn failed"))
+            continue
+        }
+        var out = ""
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = nt_pty_read(&session.pty, &buf, buf.count, 200)
+            if n > 0 { out += String(decoding: buf[0 ..< Int(n)], as: UTF8.self) }
+            if out.contains("ENV:\(key)=") { break }
+        }
+        if mustBeAbsent {
+            let absent = out.contains("ENV:\(key)=ABSENT")
+            results.append(CaseResult(name: "env-\(key)", passed: absent, detail: absent ? "removed key absent from the child" : "REMOVAL FAILED"))
+        } else {
+            let present = out.contains("ENV:\(key)=") && !out.contains("ENV:\(key)=ABSENT")
+            results.append(CaseResult(name: "env-\(key)", passed: present, detail: present ? "the inherited variable survives" : "the inherited variable was lost"))
+        }
+    }
+    return results
+}
+
+if caseName == "fixture" {
+    let r = runFixture(selfDir: selfDir, bootstrapPath: bootstrapPath)
+    mark("\(r.name): \(r.passed ? "PASS" : "FAIL") — \(r.detail)")
+    exit(r.passed ? 0 : 1)
+}
+if caseName == "env" {
+    var all = true
+    for r in runEnvProof(selfDir: selfDir, bootstrapPath: bootstrapPath) {
+        mark("\(r.name): \(r.passed ? "PASS" : "FAIL") — \(r.detail)")
+        all = all && r.passed
+    }
+    exit(all ? 0 : 1)
+}
 if caseName != "pty01" {
-    FileHandle.standardError.write(Data("only the pty01 case exists in this runner build\n".utf8))
+    FileHandle.standardError.write(Data("cases: pty01, fixture, env\n".utf8))
     exit(2)
 }
 
