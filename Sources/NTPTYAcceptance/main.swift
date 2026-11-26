@@ -174,7 +174,9 @@ final class Session {
     }
 
     var restoredExactly: Bool {
-        nt_pty_termios_restored_exactly(&pty) == 1
+        let verdict = nt_pty_termios_restored_exactly(&pty)
+        mark("oracle: verdict=\(verdict) (1=restored, 0=mismatch, -1=oracle-error)")
+        return verdict == 1
     }
 
     func teardown() {
